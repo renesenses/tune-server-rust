@@ -14,14 +14,29 @@
 use serde::{Deserialize, Serialize};
 use tune_core::audio::crete_vraie::CreteVraie;
 
+use crate::traitements::filtres::{Cascade, Coefs, Q_BUTTERWORTH_2};
+
 /// Seuils de déclenchement des règles par défaut (voir le contrat, §5).
 pub mod seuils {
     /// Composante continue au-dessus de laquelle on propose le passe-haut.
     pub const CONTINU_DBFS: f64 = -60.0;
-    /// Corrélation L/R à partir de laquelle les canaux sont dits inversés.
-    pub const CORRELATION_INVERSEE: f64 = -0.5;
-    /// La somme doit être plus faible que la différence d'au moins ce rapport.
+    // Polarité RELATIVE inversée entre canaux : les QUATRE critères à la
+    // fois (une stéréo très large ou décorrélée ne doit jamais être signalée).
+    /// 1. Corrélation L/R sur tout le fichier, au plus.
+    pub const CORRELATION_INVERSEE: f64 = -0.6;
+    /// 2. La somme plus faible que la différence d'au moins ce rapport.
     pub const RAPPORT_SOMME_DIFFERENCE_DB: f64 = 6.0;
+    /// 3. Corrélation des GRAVES (passe-bas à [`GRAVES_HZ`]), au plus : les
+    ///    graves d'un mixage sont presque toujours au centre ; une stéréo
+    ///    élargie garde des graves corrélés, une inversion les inverse aussi.
+    pub const CORRELATION_GRAVES_INVERSEE: f64 = -0.6;
+    pub const GRAVES_HZ: f64 = 250.0;
+    /// 4. Part des blocs de [`BLOC_POLARITE_S`] non silencieux dont la
+    ///    corrélation est au plus [`CORRELATION_BLOC_INVERSEE`] : l'inversion
+    ///    tient tout le fichier, pas un passage.
+    pub const PART_BLOCS_INVERSES: f64 = 0.75;
+    pub const CORRELATION_BLOC_INVERSEE: f64 = -0.3;
+    pub const BLOC_POLARITE_S: f64 = 1.0;
     /// En dessous, le signal est jugé silencieux : pas de verdict inter-canaux.
     pub const SILENCE_DBFS: f64 = -60.0;
     /// Énergie de la différence sous la somme, pour dire « double-mono ».
@@ -44,6 +59,14 @@ pub struct MesuresFichier {
     pub correlation: Option<f64>,
     /// Somme/différence, en dB (`10·log10(E(L+R) / E(L−R))`).
     pub rapport_somme_difference_db: Option<f64>,
+    /// Corrélation L/R des graves (sous [`seuils::GRAVES_HZ`]).
+    #[serde(default)]
+    pub correlation_graves: Option<f64>,
+    /// Part des blocs d'une seconde à corrélation nettement négative.
+    #[serde(default)]
+    pub part_blocs_inverses: Option<f64>,
+    /// Polarité RELATIVE inversée entre les canaux (jamais absolue : aucune
+    /// mesure ne dit si le programme entier est inversé).
     pub polarite_inversee: bool,
     /// Niveau gauche − niveau droit, en dB.
     pub ecart_lr_db: Option<f64>,
@@ -101,6 +124,101 @@ pub struct Analyseur {
     bloc_crete: Vec<f64>,
     /// Par canal : (RMS × √2, crête) des blocs complets.
     blocs: Vec<Vec<(f64, f64)>>,
+    polarite: Option<DetecteurDePolarite>,
+}
+
+/// Les critères 3 et 4 de la polarité (voir [`seuils`]), stéréo seulement.
+struct DetecteurDePolarite {
+    graves: Cascade,
+    /// Σl, Σr, Σl², Σr², Σlr des graves.
+    sommes_graves: [f64; 5],
+    trames_par_bloc: u64,
+    bloc_trames: u64,
+    /// Σl², Σr², Σlr du bloc courant.
+    bloc: [f64; 3],
+    blocs_actifs: u64,
+    blocs_inverses: u64,
+}
+
+fn correlation_de(n: f64, s: [f64; 5]) -> Option<f64> {
+    let (ml, mr) = (s[0] / n, s[1] / n);
+    let vl = s[2] / n - ml * ml;
+    let vr = s[3] / n - mr * mr;
+    let cov = s[4] / n - ml * mr;
+    (vl > 0.0 && vr > 0.0).then(|| (cov / (vl * vr).sqrt()).clamp(-1.0, 1.0))
+}
+
+impl DetecteurDePolarite {
+    fn new(cadence: u32) -> Self {
+        Self {
+            graves: Cascade::new(
+                vec![Coefs::passe_bas(
+                    seuils::GRAVES_HZ,
+                    f64::from(cadence.max(1)),
+                    Q_BUTTERWORTH_2,
+                )],
+                2,
+            ),
+            sommes_graves: [0.0; 5],
+            trames_par_bloc: ((f64::from(cadence) * seuils::BLOC_POLARITE_S) as u64).max(1),
+            bloc_trames: 0,
+            bloc: [0.0; 3],
+            blocs_actifs: 0,
+            blocs_inverses: 0,
+        }
+    }
+
+    fn nourrir(&mut self, l: f64, r: f64) {
+        let (gl, gr) = (self.graves.traiter(0, l), self.graves.traiter(1, r));
+        let s = &mut self.sommes_graves;
+        s[0] += gl;
+        s[1] += gr;
+        s[2] += gl * gl;
+        s[3] += gr * gr;
+        s[4] += gl * gr;
+        self.bloc[0] += l * l;
+        self.bloc[1] += r * r;
+        self.bloc[2] += l * r;
+        self.bloc_trames += 1;
+        if self.bloc_trames == self.trames_par_bloc {
+            self.clore_le_bloc();
+        }
+    }
+
+    fn compter(&self, bloc: [f64; 3], n: u64) -> (u64, u64) {
+        let rms = ((bloc[0] + bloc[1]) / (2.0 * n.max(1) as f64)).sqrt();
+        if db_amplitude(rms) <= seuils::SILENCE_DBFS || bloc[0] == 0.0 || bloc[1] == 0.0 {
+            return (0, 0);
+        }
+        let c = bloc[2] / (bloc[0] * bloc[1]).sqrt();
+        (1, u64::from(c <= seuils::CORRELATION_BLOC_INVERSEE))
+    }
+
+    fn clore_le_bloc(&mut self) {
+        let (a, i) = self.compter(self.bloc, self.bloc_trames);
+        self.blocs_actifs += a;
+        self.blocs_inverses += i;
+        self.bloc = [0.0; 3];
+        self.bloc_trames = 0;
+    }
+
+    /// (corrélation des graves, part des blocs inversés), sur `trames`.
+    fn resultat(&self, trames: u64) -> (Option<f64>, Option<f64>) {
+        let s = self.sommes_graves;
+        let n = trames.max(1) as f64;
+        let rms_graves = ((s[2] + s[3]) / (2.0 * n)).sqrt();
+        let graves = if db_amplitude(rms_graves) > seuils::SILENCE_DBFS {
+            correlation_de(n, s)
+        } else {
+            None
+        };
+        let (mut actifs, mut inverses) = (self.blocs_actifs, self.blocs_inverses);
+        if actifs == 0 && self.bloc_trames > 0 {
+            (actifs, inverses) = self.compter(self.bloc, self.bloc_trames);
+        }
+        let part = (actifs > 0).then(|| inverses as f64 / actifs as f64);
+        (graves, part)
+    }
 }
 
 impl Analyseur {
@@ -121,6 +239,7 @@ impl Analyseur {
             bloc_carres: vec![0.0; c],
             bloc_crete: vec![0.0; c],
             blocs: vec![Vec::new(); c],
+            polarite: (c == 2).then(|| DetecteurDePolarite::new(cadence)),
         }
     }
 
@@ -142,6 +261,9 @@ impl Analyseur {
                 let (s, d) = (t[0] + t[1], t[0] - t[1]);
                 self.energie_somme += s * s;
                 self.energie_difference += d * d;
+                if let Some(p) = self.polarite.as_mut() {
+                    p.nourrir(t[0], t[1]);
+                }
             }
             self.trames += 1;
             self.bloc_trames += 1;
@@ -201,13 +323,20 @@ impl Analyseur {
 
         let (mut correlation, mut rapport, mut ecart) = (None, None, None);
         let (mut polarite_inversee, mut double_mono) = (false, false);
+        let (mut correlation_graves, mut part_blocs_inverses) = (None, None);
         if self.canaux == 2 && self.trames > 0 && non_silencieux {
-            let (ml, mr) = (self.somme[0] / n, self.somme[1] / n);
-            let vl = self.somme_carres[0] / n - ml * ml;
-            let vr = self.somme_carres[1] / n - mr * mr;
-            let cov = self.somme_lr / n - ml * mr;
-            if vl > 0.0 && vr > 0.0 {
-                correlation = Some((cov / (vl * vr).sqrt()).clamp(-1.0, 1.0));
+            correlation = correlation_de(
+                n,
+                [
+                    self.somme[0],
+                    self.somme[1],
+                    self.somme_carres[0],
+                    self.somme_carres[1],
+                    self.somme_lr,
+                ],
+            );
+            if let Some(p) = &self.polarite {
+                (correlation_graves, part_blocs_inverses) = p.resultat(self.trames);
             }
             if self.somme_carres[0] > 0.0 && self.somme_carres[1] > 0.0 {
                 ecart = Some(db_puissance(self.somme_carres[0] / self.somme_carres[1]));
@@ -218,7 +347,9 @@ impl Analyseur {
                 let r = db_puissance(self.energie_somme / self.energie_difference);
                 rapport = Some(r);
                 polarite_inversee = correlation.is_some_and(|c| c <= seuils::CORRELATION_INVERSEE)
-                    && r <= -seuils::RAPPORT_SOMME_DIFFERENCE_DB;
+                    && r <= -seuils::RAPPORT_SOMME_DIFFERENCE_DB
+                    && correlation_graves.is_some_and(|c| c <= seuils::CORRELATION_GRAVES_INVERSEE)
+                    && part_blocs_inverses.is_some_and(|p| p >= seuils::PART_BLOCS_INVERSES);
             } else {
                 rapport = Some(-PLANCHER_DB);
             }
@@ -230,6 +361,8 @@ impl Analyseur {
             trames: self.trames,
             continu_dbfs,
             correlation,
+            correlation_graves,
+            part_blocs_inverses,
             rapport_somme_difference_db: rapport,
             polarite_inversee,
             ecart_lr_db: ecart,
@@ -312,7 +445,7 @@ pub fn pistes_preaccentuees_du_cue(feuille: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traitements::essais::{bruit, sinus};
+    use crate::traitements::essais::{bruit, rose, sinus};
 
     fn analyser(entree: &[f64], cadence: u32, canaux: u16, bloc: usize) -> MesuresFichier {
         let mut a = Analyseur::new(cadence, canaux);
@@ -364,6 +497,89 @@ mod tests {
         // Une stéréo décorrélée (bruit indépendant) non plus.
         let m = analyser(&bruit(44_100, 2, 0.5, 8), 44_100, 2, 1_000);
         assert!(!m.polarite_inversee);
+    }
+
+    fn entrelacer(l: &[f64], r: &[f64]) -> Vec<f64> {
+        l.iter().zip(r).flat_map(|(a, b)| [*a, *b]).collect()
+    }
+
+    const DIX_S: usize = 10 * 44_100;
+
+    /// Une vraie inversion relative, sur un programme « musical » (centre
+    /// rose, côtés faibles) : signalée.
+    #[test]
+    fn polarite_relative_inversee_sur_un_programme_rose() {
+        let m = rose(DIX_S, 1);
+        let s = rose(DIX_S, 2);
+        let l: Vec<f64> = m.iter().zip(&s).map(|(m, s)| m + 0.3 * s).collect();
+        let r: Vec<f64> = m.iter().zip(&s).map(|(m, s)| -(m - 0.3 * s)).collect();
+        let me = analyser(&entrelacer(&l, &r), 44_100, 2, 4_096);
+        assert!(me.polarite_inversee, "{me:?}");
+        assert!(me.correlation_graves.unwrap() < -0.8);
+        assert_eq!(me.part_blocs_inverses, Some(1.0));
+    }
+
+    /// Contre-épreuve : des stéréos très décorrélées ou très larges ne sont
+    /// JAMAIS signalées.
+    #[test]
+    fn stereos_decorrelees_jamais_signalees() {
+        let mut cas: Vec<(&str, Vec<f64>)> = Vec::new();
+        // Bruits roses indépendants.
+        for graine in 1..=5u64 {
+            cas.push((
+                "roses indépendants",
+                entrelacer(&rose(DIX_S, graine), &rose(DIX_S, graine + 50)),
+            ));
+        }
+        // Orgue : dix partiels de do1, phases différentes par canal, canal
+        // droit désaccordé de 0,37 Hz par partiel (battements lents).
+        let orgue = |desaccord: f64, phase: f64| -> Vec<f64> {
+            (0..DIX_S)
+                .map(|n| {
+                    let t = n as f64 / 44_100.0;
+                    (1..=10)
+                        .map(|k| {
+                            let k = f64::from(k);
+                            0.05 / k
+                                * (2.0 * std::f64::consts::PI * (65.41 * k + desaccord * k) * t
+                                    + phase * k * k)
+                                    .sin()
+                        })
+                        .sum::<f64>()
+                })
+                .collect()
+        };
+        cas.push(("orgue", entrelacer(&orgue(0.0, 0.0), &orgue(0.37, 1.3))));
+        // Ambiance : une source retardée de 13 ms et deux souffles
+        // indépendants.
+        let x = rose(DIX_S, 7);
+        let (n1, n2) = (rose(DIX_S, 8), rose(DIX_S, 9));
+        let l: Vec<f64> = (0..DIX_S).map(|i| x[i] + 0.5 * n1[i]).collect();
+        let r: Vec<f64> = (0..DIX_S)
+            .map(|i| if i >= 573 { x[i - 573] } else { 0.0 } + 0.5 * n2[i])
+            .collect();
+        cas.push(("ambiance", entrelacer(&l, &r)));
+        // Stéréo élargie à l'extrême (côtés aigus 4× le centre) : corrélation
+        // −0,74, somme 8 dB sous la différence, tous les blocs négatifs — seuls
+        // les graves, restés au centre, la distinguent d'une inversion.
+        let m = rose(DIX_S, 11);
+        let mut cote = rose(DIX_S, 12);
+        let mut hp = Cascade::new(vec![Coefs::passe_haut(500.0, 44_100.0, Q_BUTTERWORTH_2)], 1);
+        cote.iter_mut().for_each(|x| *x = 4.0 * hp.traiter(0, *x));
+        let l: Vec<f64> = m.iter().zip(&cote).map(|(m, s)| m + s).collect();
+        let r: Vec<f64> = m.iter().zip(&cote).map(|(m, s)| m - s).collect();
+        let large = entrelacer(&l, &r);
+        let me = analyser(&large, 44_100, 2, 4_096);
+        assert!(
+            me.correlation.unwrap() < -0.6,
+            "le cas doit rester piégeux : {me:?}"
+        );
+        cas.push(("stéréo élargie", large));
+
+        for (nom, e) in cas {
+            let me = analyser(&e, 44_100, 2, 4_096);
+            assert!(!me.polarite_inversee, "{nom} signalé à tort : {me:?}");
+        }
     }
 
     #[test]

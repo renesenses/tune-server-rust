@@ -10,7 +10,13 @@
 //!   AUCUN échantillon (pas même une multiplication par 1,0) ;
 //! - **jamais de saut** : un gain glisse en [`RAMPE_MS`] (la constante de
 //!   TESS, lue et non redéfinie) ; activer ou couper un filtre est un fondu
-//!   enchaîné sec/traité de la même durée ([`Fondu`]).
+//!   enchaîné sec/traité de la même durée ([`Fondu`]) ;
+//! - **sécurité auditive** : 20 ms ne valent que pour une BAISSE de niveau.
+//!   Toute bascule qui peut faire MONTER le niveau déclare d'abord sa hausse
+//!   maximale ([`Traitement::hausse_si`]) ; l'étage TESS la confie à la borne
+//!   de remontée de TESS ([`crate::hausses::PorteDesHausses`]), qui la retient
+//!   et la rend en ~0,5 s sans jamais dépasser le niveau d'avant. Aucun
+//!   mécanisme de remontée lente n'existe dans cette caisse.
 
 use serde::{Deserialize, Serialize};
 
@@ -140,9 +146,11 @@ pub enum Reglages {
     },
     Loudness {
         reference_phon: f64,
-        plafond_db: f64,
+        palier: loudness::PalierLoudness,
     },
-    /// `crete_vraie_dbtp` : `None` tant qu'aucune mesure n'existe (réserve nulle).
+    /// Une CONTRAINTE exportée vers l'autorité de marge unique de TESS, pas un
+    /// étage : [`Reglages::construire`] rend `None`. `crete_vraie_dbtp` :
+    /// `None` tant qu'aucune mesure n'existe (aucune contrainte).
     Reserve {
         crete_vraie_dbtp: Option<f64>,
         marge_db: f64,
@@ -185,7 +193,7 @@ impl Reglages {
             GenreTraitement::Equilibre => Self::Equilibre { ecart_db: 0.0 },
             GenreTraitement::Loudness => Self::Loudness {
                 reference_phon: loudness::REFERENCE_PHON,
-                plafond_db: loudness::PLAFOND_PAR_DEFAUT_DB,
+                palier: loudness::PalierLoudness::default(),
             },
             GenreTraitement::Reserve => Self::Reserve {
                 crete_vraie_dbtp: None,
@@ -195,9 +203,10 @@ impl Reglages {
     }
 
     /// Construit le traitement, INACTIF (voir [`Traitement::activer`]).
-    /// `origine` ne sert qu'au filtre ultrasonique.
-    pub fn construire(&self, origine: OrigineDsd) -> Box<dyn Traitement> {
-        match *self {
+    /// `origine` ne sert qu'au filtre ultrasonique. `None` pour la réserve,
+    /// qui n'est pas un étage (voir [`reserve`]).
+    pub fn construire(&self, origine: OrigineDsd) -> Option<Box<dyn Traitement>> {
+        Some(match *self {
             Self::UltrasoniqueDsd { coupure_hz } => {
                 Box::new(ultrasonique::Ultrasonique::new(coupure_hz, origine))
             }
@@ -211,16 +220,10 @@ impl Reglages {
             Self::Equilibre { ecart_db } => Box::new(equilibre::Equilibre::new(ecart_db)),
             Self::Loudness {
                 reference_phon,
-                plafond_db,
-            } => Box::new(loudness::Loudness::new(reference_phon, plafond_db)),
-            Self::Reserve {
-                crete_vraie_dbtp,
-                marge_db,
-            } => Box::new(reserve::Reserve::new(
-                crete_vraie_dbtp.unwrap_or(f64::NEG_INFINITY),
-                marge_db,
-            )),
-        }
+                palier,
+            } => Box::new(loudness::Loudness::new(reference_phon, palier)),
+            Self::Reserve { .. } => return None,
+        })
     }
 }
 
@@ -258,6 +261,12 @@ pub trait Traitement: Send {
 
     /// Vrai quand [`Self::traiter`] ne touche AUCUN échantillon.
     fn est_neutre(&self) -> bool;
+
+    /// La hausse de niveau MAXIMALE (dB, ≥ 0) qu'entraînerait le passage à
+    /// `actif` depuis l'état visé actuel, sur la bande audible (20 Hz –
+    /// min(20 kHz, 0,45·fs)), canal par canal. 0 : baisse ou niveau constant,
+    /// la rampe de 20 ms suffit. Hors temps réel.
+    fn hausse_si(&self, actif: bool) -> f64;
 
     /// HORS TEMPS RÉEL : volume de la zone, en dB (0 = plein volume). Seul le
     /// loudness s'en sert.
@@ -429,6 +438,24 @@ impl RampeDeGain {
 
 /// Vérifie un format : au moins un canal, au plus [`MAX_CANAUX`], cadence non
 /// nulle.
+/// La plus forte hausse (dB, ≥ 0) que rend le passage de la réponse `avant`
+/// à la réponse `apres` sur la bande audible : `max(0, apres(f) − avant(f))`.
+/// Les écarts sous 1e-6 dB (arrondis) comptent pour zéro.
+pub fn hausse_spectrale_db<A: Fn(f64) -> f64, B: Fn(f64) -> f64>(
+    cadence: u32,
+    avant: A,
+    apres: B,
+) -> f64 {
+    let haut = 20_000f64.min(0.45 * f64::from(cadence.max(1)));
+    let mut f = 20.0;
+    let mut m = 0.0f64;
+    while f <= haut {
+        m = m.max(apres(f) - avant(f));
+        f *= 1.02;
+    }
+    if m < 1e-6 { 0.0 } else { m }
+}
+
 pub(crate) fn verifier_format(canaux: u16, cadence: u32) -> Result<(), ErreurTraitement> {
     if canaux == 0 || usize::from(canaux) > MAX_CANAUX || cadence == 0 {
         return Err(ErreurTraitement::FormatNonPrisEnCharge { canaux, cadence });

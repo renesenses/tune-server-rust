@@ -71,6 +71,7 @@ impl Traitement for Rumble {
             filtre,
             fondu,
             canaux,
+            ..
         } = &mut self.socle;
         let lateral = &mut self.lateral;
         let voile = !lateral.sections().is_empty();
@@ -106,6 +107,21 @@ impl Traitement for Rumble {
 
     fn actif(&self) -> bool {
         self.socle.fondu.actif()
+    }
+
+    /// Couper rend le grondement ET, avec le voile, les graves latéraux :
+    /// borne prudente = somme des deux atténuations.
+    fn hausse_si(&self, actif: bool) -> f64 {
+        if self.socle.fondu.actif() && !actif {
+            let fs = f64::from(self.socle.cadence);
+            super::hausse_spectrale_db(
+                self.socle.cadence,
+                |f| self.socle.filtre.reponse_db(f, fs) + self.lateral.reponse_db(f, fs),
+                |_| 0.0,
+            )
+        } else {
+            0.0
+        }
     }
 
     fn est_neutre(&self) -> bool {

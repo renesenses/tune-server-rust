@@ -56,6 +56,11 @@ impl Traitement for Polarite {
         self.fondu.actif()
     }
 
+    /// L'inversion ne change le niveau d'aucun canal.
+    fn hausse_si(&self, _actif: bool) -> f64 {
+        0.0
+    }
+
     fn est_neutre(&self) -> bool {
         self.canaux != 2 || self.fondu.eteint_au_repos()
     }

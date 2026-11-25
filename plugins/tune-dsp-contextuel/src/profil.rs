@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::analyse::{MesuresFichier, seuils};
+use crate::traitements::reserve::{ContrainteDeMarge, reserve_pour_la_crete};
 use crate::traitements::{Canal, GenreTraitement, OrigineDsd, Reglages};
 
 /// Le support d'origine d'un album.
@@ -35,6 +36,33 @@ pub enum SourcePreaccentuation {
     Cue,
 }
 
+/// Qui règle le volume de la zone. Le loudness n'a de sens qu'en volume
+/// LOGICIEL : ailleurs, Tune ne connaît pas le niveau d'écoute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceDuVolume {
+    Logiciel,
+    Materiel,
+    Dac,
+    LecteurReseau,
+    Fixe,
+    #[default]
+    Inconnue,
+}
+
+impl SourceDuVolume {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Logiciel => "logiciel",
+            Self::Materiel => "materiel",
+            Self::Dac => "dac",
+            Self::LecteurReseau => "lecteur_reseau",
+            Self::Fixe => "fixe",
+            Self::Inconnue => "inconnue",
+        }
+    }
+}
+
 /// Les droits ouverts par la licence de l'utilisateur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DroitsDisponibles {
@@ -56,6 +84,8 @@ pub struct ContexteAlbum {
     /// Mode Pur de la zone : rien d'actif.
     pub mode_pur: bool,
     pub droits: DroitsDisponibles,
+    /// Qui règle le volume de la zone (loudness).
+    pub volume: SourceDuVolume,
 }
 
 /// Un label comparé sans casse ni espaces de bord.
@@ -275,6 +305,9 @@ pub enum Etat {
     Actif,
     Propose,
     Refuse,
+    /// Demandé, mais sans effet possible ici (loudness sans volume
+    /// logiciel) : aucun étage n'est construit, la raison dit pourquoi.
+    Neutre,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,7 +345,33 @@ impl ProfilResolu {
     pub fn actifs(&self) -> impl Iterator<Item = &TraitementResolu> {
         self.traitements.iter().filter(|t| t.etat == Etat::Actif)
     }
+
+    /// Ce que ce profil demande à l'autorité de marge UNIQUE de TESS : la
+    /// crête vraie (anti-écrêtage actif) et le gain positif maximal des
+    /// étages actifs (plafond du loudness).
+    pub fn contrainte_de_marge(&self) -> ContrainteDeMarge {
+        let mut c = ContrainteDeMarge::default();
+        for t in self.actifs() {
+            match t.reglages {
+                Reglages::Reserve {
+                    crete_vraie_dbtp,
+                    marge_db,
+                } => {
+                    c.crete_vraie_dbtp = crete_vraie_dbtp;
+                    c.reserve_crete_db = reserve_pour_la_crete(crete_vraie_dbtp, marge_db);
+                }
+                Reglages::Loudness { palier, .. } => {
+                    c.gain_positif_max_db = c.gain_positif_max_db.max(palier.plafond_db());
+                }
+                _ => {}
+            }
+        }
+        c
+    }
 }
+
+pub const CLE_LOUDNESS_SANS_VOLUME_LOGICIEL: &str =
+    "dsp_contextuel.raison.loudness_sans_volume_logiciel";
 
 fn rang(p: &Portee) -> u8 {
     match p {
@@ -374,9 +433,10 @@ fn raison(cle: &str, r: &Reglages, c: &ContexteAlbum) -> Raison {
         Reglages::Reserve {
             crete_vraie_dbtp: Some(crete),
             marge_db,
-        } => base
-            .avec("crete_dbtp", arrondi(crete, 1))
-            .avec("reserve_db", arrondi((crete + marge_db).max(0.0), 1)),
+        } => base.avec("crete_dbtp", arrondi(crete, 1)).avec(
+            "reserve_db",
+            arrondi(reserve_pour_la_crete(Some(crete), marge_db), 1),
+        ),
         Reglages::Reserve { .. } => base,
         Reglages::Rumble { coupure_hz, .. } => base.avec("coupure_hz", arrondi(coupure_hz, 0)),
         Reglages::Loudness { .. } | Reglages::Mono => base,
@@ -477,6 +537,15 @@ pub fn resoudre(
         if etat == Etat::Actif && (contexte.mode_pur || droit_requis) {
             etat = Etat::Propose;
         }
+        let mut raison_ = raison_;
+        if genre == GenreTraitement::Loudness
+            && etat != Etat::Refuse
+            && contexte.volume != SourceDuVolume::Logiciel
+        {
+            etat = Etat::Neutre;
+            raison_ = Raison::new(CLE_LOUDNESS_SANS_VOLUME_LOGICIEL)
+                .avec("volume", json!(contexte.volume.code()));
+        }
         if genre == GenreTraitement::UltrasoniqueDsd
             && contexte.origine_dsd != OrigineDsd::ConvertieEnPcm
         {
@@ -550,7 +619,7 @@ pub fn profil_vague_1() -> Profil {
                 10,
             ),
             regle(
-                "polarite",
+                "polarite_relative",
                 vec![Condition::PolariteInversee],
                 Reglages::Polarite {
                     canal: Canal::Droit,
@@ -581,7 +650,7 @@ pub fn profil_vague_1() -> Profil {
                 vec![Condition::Toujours],
                 Reglages::Loudness {
                     reference_phon: loudness::REFERENCE_PHON,
-                    plafond_db: loudness::PLAFOND_PAR_DEFAUT_DB,
+                    palier: loudness::PalierLoudness::Standard,
                 },
                 100,
             ),

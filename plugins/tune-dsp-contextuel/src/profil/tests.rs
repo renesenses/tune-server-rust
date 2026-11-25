@@ -7,6 +7,8 @@ fn mesures() -> MesuresFichier {
         trames: 1_000_000,
         continu_dbfs: vec![-90.0, -90.0],
         correlation: Some(0.4),
+        correlation_graves: Some(0.8),
+        part_blocs_inverses: Some(0.0),
         rapport_somme_difference_db: Some(4.0),
         polarite_inversee: false,
         ecart_lr_db: Some(0.1),
@@ -25,6 +27,7 @@ fn cd_preaccentue() -> ContexteAlbum {
         support: Support::Cd,
         preaccentuation: Some(SourcePreaccentuation::Toc),
         mesures: Some(mesures()),
+        volume: SourceDuVolume::Logiciel,
         ..Default::default()
     }
 }
@@ -399,4 +402,83 @@ fn profil_resolu_en_json() {
     let p = profil_vague_1();
     let relu: Profil = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
     assert_eq!(relu, p);
+}
+
+#[test]
+fn loudness_neutre_sans_volume_logiciel() {
+    for volume in [
+        SourceDuVolume::Materiel,
+        SourceDuVolume::Dac,
+        SourceDuVolume::LecteurReseau,
+        SourceDuVolume::Fixe,
+        SourceDuVolume::Inconnue,
+    ] {
+        let mut c = cd_preaccentue();
+        c.volume = volume;
+        let r = resoudre(
+            &profil_vague_1(),
+            &c,
+            &[ChoixUtilisateur {
+                portee: Portee::Global,
+                genre: GenreTraitement::Loudness,
+                decision: Decision::Toujours,
+            }],
+        );
+        let l = r
+            .traitements
+            .iter()
+            .find(|t| t.genre == GenreTraitement::Loudness)
+            .unwrap();
+        assert_eq!(l.etat, Etat::Neutre, "{volume:?}");
+        assert_eq!(l.raison.cle, CLE_LOUDNESS_SANS_VOLUME_LOGICIEL);
+        assert_eq!(l.raison.params["volume"], json!(volume.code()));
+        assert_eq!(r.contrainte_de_marge().gain_positif_max_db, 0.0);
+    }
+}
+
+#[test]
+fn contrainte_de_marge_exportee_pour_tess() {
+    let mut c = cd_preaccentue();
+    c.mesures.as_mut().unwrap().crete_vraie_dbtp = 0.9;
+    let toujours = |genre| ChoixUtilisateur {
+        portee: Portee::Album(42),
+        genre,
+        decision: Decision::Toujours,
+    };
+    // Proposés seulement : aucune contrainte.
+    let r = resoudre(&profil_vague_1(), &c, &[]);
+    assert!(r.contrainte_de_marge().est_vide());
+    // Anti-écrêtage et loudness actifs : crête + plafond du loudness.
+    let r = resoudre(
+        &profil_vague_1(),
+        &c,
+        &[
+            toujours(GenreTraitement::Reserve),
+            toujours(GenreTraitement::Loudness),
+        ],
+    );
+    let m = r.contrainte_de_marge();
+    assert_eq!(m.crete_vraie_dbtp, Some(0.9));
+    assert!((m.reserve_crete_db - 1.2).abs() < 1e-12);
+    assert_eq!(m.gain_positif_max_db, 3.0);
+    // La réserve n'est jamais un étage.
+    let res = r
+        .traitements
+        .iter()
+        .find(|t| t.genre == GenreTraitement::Reserve)
+        .unwrap();
+    assert!(res.reglages.construire(OrigineDsd::Aucune).is_none());
+}
+
+#[test]
+fn la_raison_de_polarite_est_relative() {
+    let mut c = cd_preaccentue();
+    c.mesures.as_mut().unwrap().polarite_inversee = true;
+    let r = resoudre(&profil_vague_1(), &c, &[]);
+    let p = r
+        .traitements
+        .iter()
+        .find(|t| t.genre == GenreTraitement::Polarite)
+        .unwrap();
+    assert_eq!(p.raison.cle, "dsp_contextuel.raison.polarite_relative");
 }

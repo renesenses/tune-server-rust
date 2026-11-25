@@ -1,116 +1,80 @@
-//! #8 — Anti-écrêtage inter-échantillons : une réserve calée sur la CRÊTE
-//! VRAIE mesurée (BS.1770, `tune_core::audio::crete_vraie`) au lieu des
-//! −3 dB fixes. Gain = −max(0, crête vraie + marge) dB, posé par une rampe de
-//! `RAMPE_MS`. Un master dont la crête vraie reste sous −marge n'est pas
-//! touché du tout.
+//! #8 — Anti-écrêtage inter-échantillons : une CONTRAINTE, pas un étage.
+//!
+//! TESS a déjà UNE autorité de marge (headroom automatique ou manuel, #9520,
+//! #9546). Un second étage de réserve s'y ADDITIONNERAIT (le cas de #9518 ×
+//! #9520). Cette caisse ne pose donc aucun gain : elle exporte ce qu'elle
+//! sait — la crête vraie mesurée (BS.1770, `tune_core::audio::crete_vraie`)
+//! et le gain positif maximal de ses étages (loudness) — dans une
+//! [`ContrainteDeMarge`], que l'autorité de TESS combine avec ses propres
+//! exigences en prenant le MAXIMUM, jamais la somme.
 
-use super::{
-    ErreurTraitement, GenreTraitement, RampeDeGain, Traitement, lineaire, verifier_format,
-};
+use serde::{Deserialize, Serialize};
 
 pub const MARGE_PAR_DEFAUT_DB: f64 = 0.3;
-/// Au-delà, la mesure est suspecte : la réserve est bornée.
+/// Au-delà, la mesure est suspecte : la réserve demandée est bornée.
 pub const RESERVE_MAX_DB: f64 = 6.0;
 
-pub struct Reserve {
-    reserve_db: f64,
-    rampe: RampeDeGain,
-    actif: bool,
-    canaux: usize,
-}
-
-impl Reserve {
-    pub fn new(crete_vraie_dbtp: f64, marge_db: f64) -> Self {
-        let marge = if marge_db.is_finite() {
-            marge_db.clamp(0.0, 3.0)
-        } else {
-            MARGE_PAR_DEFAUT_DB
-        };
-        let reserve_db = if crete_vraie_dbtp.is_finite() {
-            (crete_vraie_dbtp + marge).clamp(0.0, RESERVE_MAX_DB)
-        } else {
-            0.0
-        };
-        Self {
-            reserve_db,
-            rampe: RampeDeGain::au_repos(1.0),
-            actif: false,
-            canaux: 0,
-        }
-    }
-
-    /// La réserve appliquée une fois active, en dB (≥ 0).
-    pub fn reserve_db(&self) -> f64 {
-        self.reserve_db
+/// La réserve qu'appelle une crête vraie : `max(0, crête + marge)`, bornée à
+/// [`RESERVE_MAX_DB`]. Une crête inconnue ou non finie n'appelle rien.
+pub fn reserve_pour_la_crete(crete_vraie_dbtp: Option<f64>, marge_db: f64) -> f64 {
+    let marge = if marge_db.is_finite() {
+        marge_db.clamp(0.0, 3.0)
+    } else {
+        MARGE_PAR_DEFAUT_DB
+    };
+    match crete_vraie_dbtp {
+        Some(c) if c.is_finite() => (c + marge).clamp(0.0, RESERVE_MAX_DB),
+        _ => 0.0,
     }
 }
 
-impl Traitement for Reserve {
-    fn genre(&self) -> GenreTraitement {
-        GenreTraitement::Reserve
+/// Ce que les profils contextuels d'un album demandent à l'autorité de marge
+/// de TESS.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct ContrainteDeMarge {
+    /// Crête vraie mesurée de l'album, si l'anti-écrêtage est actif.
+    pub crete_vraie_dbtp: Option<f64>,
+    /// Réserve qu'appelle cette crête (dB, ≥ 0).
+    pub reserve_crete_db: f64,
+    /// Plus fort gain positif que les étages contextuels actifs peuvent
+    /// apporter, à toute fréquence et tout volume (dB, ≥ 0) : le plafond du
+    /// loudness.
+    pub gain_positif_max_db: f64,
+}
+
+impl ContrainteDeMarge {
+    /// La marge totale à garantir avant les étages contextuels (dB, ≥ 0) :
+    /// crête et gain positif s'ajoutent, car le loudness peut monter un
+    /// master déjà au-dessus de 0 dBTP. L'autorité de TESS prend ensuite le
+    /// MAXIMUM de cette valeur et de sa propre marge.
+    pub fn marge_requise_db(&self) -> f64 {
+        self.reserve_crete_db + self.gain_positif_max_db
     }
 
-    fn preparer(&mut self, canaux: u16, cadence: u32) -> Result<(), ErreurTraitement> {
-        verifier_format(canaux, cadence)?;
-        self.canaux = usize::from(canaux);
-        self.rampe.preparer(cadence);
-        self.rampe.sauter();
-        Ok(())
-    }
-
-    fn traiter(&mut self, tampon: &mut [f64], trames: usize) {
-        if self.rampe.unite_au_repos() || self.canaux == 0 {
-            return;
-        }
-        for t in tampon[..trames * self.canaux].chunks_exact_mut(self.canaux) {
-            let g = self.rampe.avancer();
-            t.iter_mut().for_each(|x| *x *= g);
-        }
-    }
-
-    fn reinitialiser(&mut self) {}
-
-    fn activer(&mut self, actif: bool) {
-        self.actif = actif;
-        let g = if actif && self.reserve_db > 0.0 {
-            lineaire(-self.reserve_db)
-        } else {
-            1.0
-        };
-        self.rampe.viser(g);
-    }
-
-    fn sauter(&mut self) {
-        self.rampe.sauter();
-    }
-
-    fn actif(&self) -> bool {
-        self.actif
-    }
-
-    fn est_neutre(&self) -> bool {
-        self.rampe.unite_au_repos()
+    pub fn est_vide(&self) -> bool {
+        self.marge_requise_db() == 0.0
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::essais::*;
+    use super::super::lineaire;
     use super::*;
     use tune_core::audio::crete_vraie::CreteVraie;
 
     #[test]
     fn reserve_calee_sur_la_crete_vraie() {
-        assert!((Reserve::new(1.2, 0.3).reserve_db() - 1.5).abs() < 1e-12);
-        assert_eq!(Reserve::new(-2.0, 0.3).reserve_db(), 0.0);
-        assert_eq!(Reserve::new(12.0, 0.3).reserve_db(), RESERVE_MAX_DB);
-        assert_eq!(Reserve::new(f64::NEG_INFINITY, 0.3).reserve_db(), 0.0);
+        assert!((reserve_pour_la_crete(Some(1.2), 0.3) - 1.5).abs() < 1e-12);
+        assert_eq!(reserve_pour_la_crete(Some(-2.0), 0.3), 0.0);
+        assert_eq!(reserve_pour_la_crete(Some(12.0), 0.3), RESERVE_MAX_DB);
+        assert_eq!(reserve_pour_la_crete(None, 0.3), 0.0);
+        assert_eq!(reserve_pour_la_crete(Some(f64::NAN), 0.3), 0.0);
     }
 
     #[test]
-    fn plus_aucun_over_inter_echantillons_apres_la_reserve() {
+    fn la_reserve_exportee_supprime_l_over_inter_echantillons() {
         // fs/4 déphasé de 45° : échantillons à ±0,707·A, crête vraie A.
-        // A = 1,3 : crête d'échantillon −0,75 dBFS, crête vraie +2,28 dBTP.
+        // A = 1,3 : crête d'échantillon −0,75 dBFS, crête vraie ≈ +2,3 dBTP.
         let fs = 44_100usize;
         let a = 1.3;
         let mut entree = Vec::with_capacity(fs * 2);
@@ -123,12 +87,12 @@ mod tests {
         cv.nourrir(&entree);
         let crete_dbtp = 20.0 * cv.crete().log10();
         assert!(crete_dbtp > 2.0, "crête vraie {crete_dbtp}");
-
-        let mut t = Reserve::new(crete_dbtp, MARGE_PAR_DEFAUT_DB);
-        t.preparer(2, fs as u32).unwrap();
-        t.activer(true);
-        t.sauter();
-        let sortie = par_blocs(&mut t, &entree, 2, 512);
+        // L'autorité de TESS applique la réserve demandée.
+        let g = lineaire(-reserve_pour_la_crete(
+            Some(crete_dbtp),
+            MARGE_PAR_DEFAUT_DB,
+        ));
+        let sortie: Vec<f64> = entree.iter().map(|x| x * g).collect();
         let mut apres = CreteVraie::new(fs, 2);
         apres.nourrir(&sortie);
         let db = 20.0 * apres.crete().log10();
@@ -139,22 +103,13 @@ mod tests {
     }
 
     #[test]
-    fn master_sous_le_seuil_n_est_pas_touche() {
-        let mut t = Reserve::new(-1.0, MARGE_PAR_DEFAUT_DB);
-        t.preparer(2, 44_100).unwrap();
-        t.activer(true);
-        assert!(t.est_neutre());
-        let entree = bruit(2_000, 2, 0.9, 9);
-        assert_eq!(par_blocs(&mut t, &entree, 2, 64), entree);
-    }
-
-    #[test]
-    fn identite_inactif() {
-        assert_identite_inactif(&mut Reserve::new(2.0, 0.3), 2, 44_100);
-    }
-
-    #[test]
-    fn fondu_sans_saut() {
-        assert_fondus_sans_saut(&mut Reserve::new(3.0, 0.3), 2, 44_100);
+    fn marge_requise_additionne_crete_et_gain_positif() {
+        let c = ContrainteDeMarge {
+            crete_vraie_dbtp: Some(0.9),
+            reserve_crete_db: 1.2,
+            gain_positif_max_db: 3.0,
+        };
+        assert!((c.marge_requise_db() - 4.2).abs() < 1e-12);
+        assert!(ContrainteDeMarge::default().est_vide());
     }
 }

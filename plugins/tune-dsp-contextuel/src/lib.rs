@@ -14,6 +14,7 @@
 //! Contrat : `coordination/dsp-contextuels/contrat-moteur.md`.
 
 pub mod analyse;
+pub mod hausses;
 pub mod iso226;
 pub mod profil;
 pub mod tess;

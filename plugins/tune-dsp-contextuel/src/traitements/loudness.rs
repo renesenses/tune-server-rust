@@ -13,6 +13,23 @@
 //! chacune bornée à `[0, plafond]`. Écart à la courbe : ≤ 2,5 dB jusqu'à
 //! 20 dB sous la référence.
 //!
+//! **Plafond** (décision de Bertrand, 25/11) : 3 dB par défaut, palier à
+//! 6 dB, 12 dB en mode expert seulement ([`PalierLoudness`]). La réponse ne
+//! dépasse jamais le plafond, à aucune fréquence ni à aucun volume (testé) :
+//! c'est ce gain positif que la marge de TESS doit couvrir
+//! ([`super::reserve::ContrainteDeMarge`]).
+//!
+//! **Volume logiciel seulement** : le loudness n'a de sens que si Tune
+//! connaît le volume, c'est-à-dire en volume LOGICIEL. Volume matériel, DAC,
+//! lecteur réseau ou volume fixe : la résolution le rend NEUTRE et le dit
+//! (`dsp_contextuel.raison.loudness_sans_volume_logiciel`) ; l'étage n'est
+//! pas construit.
+//!
+//! **Hausses** : allumer le loudness monte les graves et les aigus — hausse
+//! déclarée (`hausse_si`). Baisser le volume monte la compensation, mais
+//! toujours MOINS que la baisse du volume (pente < 1 dB/dB, testée) : le
+//! niveau net baisse, aucune hausse à déclarer.
+//!
 //! Le volume se pose HORS TEMPS RÉEL ([`Traitement::definir_volume_db`]) et
 //! change les coefficients entre deux blocs, états gardés : les gestes de
 //! volume étant progressifs, l'écart entre deux réglages voisins est faible.
@@ -24,8 +41,28 @@ use super::{ErreurTraitement, GenreTraitement, Traitement, verifier_format};
 use crate::iso226;
 
 pub const REFERENCE_PHON: f64 = 80.0;
-pub const PLAFOND_PAR_DEFAUT_DB: f64 = 3.0;
-pub const PLAFOND_MAX_DB: f64 = 12.0;
+/// Les paliers du plafond de compensation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PalierLoudness {
+    /// 3 dB : le garde-fou des corrections douces.
+    #[default]
+    Standard,
+    /// 6 dB.
+    Eleve,
+    /// 12 dB, mode expert seulement.
+    Expert,
+}
+
+impl PalierLoudness {
+    pub fn plafond_db(self) -> f64 {
+        match self {
+            Self::Standard => 3.0,
+            Self::Eleve => 6.0,
+            Self::Expert => 12.0,
+        }
+    }
+}
 pub const ETAGERE_BASSE_HZ: f64 = 150.0;
 pub const ETAGERE_HAUTE_HZ: f64 = 10_000.0;
 const PENTE_BASSE: f64 = 1.09;
@@ -47,7 +84,7 @@ pub fn gains_etageres(volume_db: f64, reference_phon: f64, plafond_db: f64) -> (
 
 pub struct Loudness {
     reference_phon: f64,
-    plafond_db: f64,
+    palier: PalierLoudness,
     volume_db: f64,
     cadence: u32,
     socle: FiltreAvecFondu,
@@ -58,18 +95,14 @@ pub struct Loudness {
 }
 
 impl Loudness {
-    pub fn new(reference_phon: f64, plafond_db: f64) -> Self {
+    pub fn new(reference_phon: f64, palier: PalierLoudness) -> Self {
         Self {
             reference_phon: if reference_phon.is_finite() {
                 reference_phon.clamp(60.0, 100.0)
             } else {
                 REFERENCE_PHON
             },
-            plafond_db: if plafond_db.is_finite() {
-                plafond_db.clamp(0.0, PLAFOND_MAX_DB)
-            } else {
-                PLAFOND_PAR_DEFAUT_DB
-            },
+            palier,
             volume_db: 0.0,
             cadence: 0,
             socle: FiltreAvecFondu::default(),
@@ -99,7 +132,11 @@ impl Loudness {
     }
 
     fn recaler(&mut self) {
-        self.gains = gains_etageres(self.volume_db, self.reference_phon, self.plafond_db);
+        self.gains = gains_etageres(
+            self.volume_db,
+            self.reference_phon,
+            self.palier.plafond_db(),
+        );
         if self.cadence > 0 {
             let s = self.sections();
             self.socle.filtre.changer_coefs(&s);
@@ -116,7 +153,11 @@ impl Traitement for Loudness {
     fn preparer(&mut self, canaux: u16, cadence: u32) -> Result<(), ErreurTraitement> {
         verifier_format(canaux, cadence)?;
         self.cadence = cadence;
-        self.gains = gains_etageres(self.volume_db, self.reference_phon, self.plafond_db);
+        self.gains = gains_etageres(
+            self.volume_db,
+            self.reference_phon,
+            self.palier.plafond_db(),
+        );
         let s = self.sections().to_vec();
         self.socle.preparer(s, usize::from(canaux), cadence);
         self.socle.fondu.viser(self.demande && !self.sans_effet());
@@ -149,6 +190,19 @@ impl Traitement for Loudness {
         self.socle.fondu.eteint_au_repos()
     }
 
+    fn hausse_si(&self, actif: bool) -> f64 {
+        if actif && !self.socle.fondu.actif() && !self.sans_effet() {
+            let fs = f64::from(self.cadence);
+            super::hausse_spectrale_db(
+                self.cadence,
+                |_| 0.0,
+                |f| self.socle.filtre.reponse_db(f, fs),
+            )
+        } else {
+            0.0
+        }
+    }
+
     fn definir_volume_db(&mut self, volume_db: f64) {
         self.volume_db = volume_db;
         self.recaler();
@@ -162,7 +216,7 @@ mod tests {
 
     #[test]
     fn neutre_au_volume_de_reference() {
-        let mut t = Loudness::new(REFERENCE_PHON, PLAFOND_MAX_DB);
+        let mut t = Loudness::new(REFERENCE_PHON, PalierLoudness::Expert);
         t.preparer(2, 44_100).unwrap();
         t.activer(true);
         t.definir_volume_db(0.0);
@@ -174,7 +228,7 @@ mod tests {
 
     #[test]
     fn suit_la_courbe_iso_226_a_moins_20_db() {
-        let mut t = Loudness::new(REFERENCE_PHON, PLAFOND_MAX_DB);
+        let mut t = Loudness::new(REFERENCE_PHON, PalierLoudness::Expert);
         t.preparer(2, 48_000).unwrap();
         t.activer(true);
         t.definir_volume_db(-20.0);
@@ -194,19 +248,19 @@ mod tests {
     fn plus_le_volume_baisse_plus_les_graves_montent_jusqu_au_plafond() {
         let mut avant = 0.0;
         for v in [-5.0, -10.0, -20.0, -30.0] {
-            let (bas, _) = gains_etageres(v, REFERENCE_PHON, PLAFOND_MAX_DB);
+            let (bas, _) = gains_etageres(v, REFERENCE_PHON, 12.0);
             assert!(bas > avant);
             avant = bas;
         }
-        let (bas, haut) = gains_etageres(-60.0, REFERENCE_PHON, PLAFOND_PAR_DEFAUT_DB);
-        assert_eq!(bas, PLAFOND_PAR_DEFAUT_DB);
-        assert!(haut <= PLAFOND_PAR_DEFAUT_DB);
+        let (bas, haut) = gains_etageres(-60.0, REFERENCE_PHON, 3.0);
+        assert_eq!(bas, 3.0);
+        assert!(haut <= 3.0);
     }
 
     #[test]
     fn mesure_temporelle_des_graves() {
         let fs = 48_000.0;
-        let mut t = Loudness::new(REFERENCE_PHON, PLAFOND_MAX_DB);
+        let mut t = Loudness::new(REFERENCE_PHON, PalierLoudness::Expert);
         t.preparer(2, 48_000).unwrap();
         t.activer(true);
         t.definir_volume_db(-20.0);
@@ -219,15 +273,99 @@ mod tests {
 
     #[test]
     fn identite_inactif() {
-        let mut t = Loudness::new(REFERENCE_PHON, PLAFOND_PAR_DEFAUT_DB);
+        let mut t = Loudness::new(REFERENCE_PHON, PalierLoudness::Standard);
         t.definir_volume_db(-30.0);
         assert_identite_inactif(&mut t, 2, 44_100);
     }
 
     #[test]
     fn fondu_sans_saut() {
-        let mut t = Loudness::new(REFERENCE_PHON, PLAFOND_PAR_DEFAUT_DB);
+        let mut t = Loudness::new(REFERENCE_PHON, PalierLoudness::Standard);
         t.definir_volume_db(-30.0);
         assert_fondus_sans_saut(&mut t, 2, 44_100);
+    }
+
+    /// Aucune fréquence, aucun volume, aucun palier ne dépasse le plafond :
+    /// la marge exportée (le plafond) couvre toujours le gain positif.
+    #[test]
+    fn la_reponse_ne_depasse_jamais_le_plafond() {
+        for palier in [
+            PalierLoudness::Standard,
+            PalierLoudness::Eleve,
+            PalierLoudness::Expert,
+        ] {
+            for cadence in [44_100u32, 48_000, 96_000] {
+                let mut t = Loudness::new(REFERENCE_PHON, palier);
+                t.preparer(2, cadence).unwrap();
+                t.activer(true);
+                for v in 0..=80 {
+                    t.definir_volume_db(-f64::from(v));
+                    let mut f = 10.0;
+                    while f < 0.49 * f64::from(cadence) {
+                        let r = t.reponse_db(f);
+                        assert!(
+                            r <= palier.plafond_db() + 1e-9,
+                            "{palier:?} {cadence} −{v} dB, {f} Hz : {r}"
+                        );
+                        f *= 1.05;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sinusoïdes à 0 dBFS, volume très bas, palier standard : après la
+    /// marge exportée (3 dB), plus rien ne dépasse la pleine échelle.
+    #[test]
+    fn a_0_dbfs_la_marge_du_plafond_suffit() {
+        let fs = 48_000.0;
+        let marge = super::super::lineaire(-PalierLoudness::Standard.plafond_db());
+        for f in [
+            31.5, 40.0, 63.0, 100.0, 1_000.0, 8_000.0, 12_500.0, 16_000.0,
+        ] {
+            let mut t = Loudness::new(REFERENCE_PHON, PalierLoudness::Standard);
+            t.preparer(2, 48_000).unwrap();
+            t.activer(true);
+            t.definir_volume_db(-50.0);
+            t.sauter();
+            let trames = 96_000;
+            let sortie = par_blocs(&mut t, &sinus(f, fs, 1.0, trames, 2), 2, 480);
+            let crete = sortie[trames..].iter().fold(0.0f64, |m, x| m.max(x.abs()));
+            assert!(
+                crete > 1.0 || f == 1_000.0,
+                "{f} Hz : le loudness doit amplifier ({crete})"
+            );
+            assert!(
+                crete * marge <= 1.0 + 1e-9,
+                "{f} Hz : {crete} × marge > 0 dBFS"
+            );
+        }
+    }
+
+    /// Baisser le volume d'1 dB ne monte jamais la compensation d'1 dB ou
+    /// plus : le niveau net baisse, aucune hausse à confier à TESS.
+    #[test]
+    fn baisser_le_volume_baisse_toujours_le_niveau_net() {
+        for v in 0..80 {
+            let (b0, h0) = gains_etageres(-f64::from(v), REFERENCE_PHON, 12.0);
+            let (b1, h1) = gains_etageres(-f64::from(v) - 1.0, REFERENCE_PHON, 12.0);
+            assert!(
+                b1 - b0 < 1.0 && h1 - h0 < 1.0,
+                "−{v} dB : +{} / +{}",
+                b1 - b0,
+                h1 - h0
+            );
+        }
+    }
+
+    #[test]
+    fn allumer_declare_la_hausse_couper_non() {
+        let mut t = Loudness::new(REFERENCE_PHON, PalierLoudness::Standard);
+        t.definir_volume_db(-40.0);
+        t.preparer(2, 44_100).unwrap();
+        let h = t.hausse_si(true);
+        assert!(h > 2.5 && h <= 3.0 + 1e-9, "{h}");
+        t.activer(true);
+        assert_eq!(t.hausse_si(false), 0.0);
     }
 }

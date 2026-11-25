@@ -5,6 +5,9 @@
 
 use super::{ErreurTraitement, Fondu, GenreTraitement, Traitement, verifier_format};
 
+/// Hausse déclarée quand on coupe le mono (voir `hausse_si`).
+pub const HAUSSE_EN_COUPANT_DB: f64 = 3.010_299_956_639_812;
+
 #[derive(Default)]
 pub struct Mono {
     fondu: Fondu,
@@ -53,6 +56,18 @@ impl Traitement for Mono {
 
     fn actif(&self) -> bool {
         self.fondu.actif()
+    }
+
+    /// Allumer ne fait jamais monter l'énergie totale :
+    /// `2·E((L+R)/2) = (E_L + E_R + 2C)/2 ≤ E_L + E_R` (Cauchy-Schwarz).
+    /// Couper la rend : au plus ×2 (+3,01 dB) pour un programme à
+    /// corrélation positive, le seul sur lequel la règle propose le mono.
+    fn hausse_si(&self, actif: bool) -> f64 {
+        if self.canaux == 2 && self.fondu.actif() && !actif {
+            HAUSSE_EN_COUPANT_DB
+        } else {
+            0.0
+        }
     }
 
     fn est_neutre(&self) -> bool {

@@ -86,6 +86,7 @@ pub struct Desaccentuation {
     filtre: Cascade,
     fondu: Fondu,
     canaux: usize,
+    cadence: u32,
 }
 
 impl Desaccentuation {
@@ -94,6 +95,7 @@ impl Desaccentuation {
             filtre: Cascade::default(),
             fondu: Fondu::default(),
             canaux: 0,
+            cadence: 0,
         }
     }
 
@@ -116,6 +118,7 @@ impl Traitement for Desaccentuation {
     fn preparer(&mut self, canaux: u16, cadence: u32) -> Result<(), ErreurTraitement> {
         verifier_format(canaux, cadence)?;
         self.canaux = usize::from(canaux);
+        self.cadence = cadence;
         self.filtre = Cascade::new(vec![coefficients(cadence)], self.canaux);
         self.fondu.preparer(cadence);
         self.fondu.sauter();
@@ -152,6 +155,17 @@ impl Traitement for Desaccentuation {
 
     fn est_neutre(&self) -> bool {
         self.fondu.eteint_au_repos()
+    }
+
+    /// Allumer ne fait que baisser les aigus ; couper les rend (jusqu'à
+    /// ~9,5 dB à 20 kHz sous 44,1 kHz).
+    fn hausse_si(&self, actif: bool) -> f64 {
+        if self.fondu.actif() && !actif {
+            let fs = f64::from(self.cadence);
+            super::hausse_spectrale_db(self.cadence, |f| self.filtre.reponse_db(f, fs), |_| 0.0)
+        } else {
+            0.0
+        }
     }
 }
 

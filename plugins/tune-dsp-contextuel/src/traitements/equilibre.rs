@@ -86,6 +86,16 @@ impl Traitement for Equilibre {
         self.actif
     }
 
+    /// Couper rend au canal fort son niveau : une hausse égale à la
+    /// correction. Allumer est une baisse.
+    fn hausse_si(&self, actif: bool) -> f64 {
+        if !actif && self.rampe.cible() < 1.0 {
+            -20.0 * self.rampe.cible().log10()
+        } else {
+            0.0
+        }
+    }
+
     fn est_neutre(&self) -> bool {
         self.canaux != 2 || self.rampe.unite_au_repos()
     }

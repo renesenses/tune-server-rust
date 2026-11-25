@@ -90,6 +90,10 @@ impl Traitement for Ultrasonique {
         self.socle.fondu.actif()
     }
 
+    fn hausse_si(&self, actif: bool) -> f64 {
+        self.socle.hausse_si(actif)
+    }
+
     fn est_neutre(&self) -> bool {
         self.sans_objet || self.socle.fondu.eteint_au_repos()
     }

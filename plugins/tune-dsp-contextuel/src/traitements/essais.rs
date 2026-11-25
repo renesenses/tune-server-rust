@@ -132,3 +132,18 @@ pub fn assert_fondus_sans_saut(t: &mut dyn Traitement, canaux: u16, cadence: u32
         }
     }
 }
+
+/// Bruit rose déterministe (filtre de Paul Kellet sur le bruit blanc de
+/// [`bruit`]), un canal, ≈ −20 dBFS RMS.
+pub fn rose(trames: usize, graine: u64) -> Vec<f64> {
+    let (mut b0, mut b1, mut b2) = (0.0, 0.0, 0.0);
+    bruit(trames, 1, 1.0, graine)
+        .into_iter()
+        .map(|w| {
+            b0 = 0.99765 * b0 + w * 0.099_046_0;
+            b1 = 0.963 * b1 + w * 0.296_516_4;
+            b2 = 0.57 * b2 + w * 1.052_691_3;
+            0.05 * (b0 + b1 + b2 + w * 0.1848)
+        })
+        .collect()
+}

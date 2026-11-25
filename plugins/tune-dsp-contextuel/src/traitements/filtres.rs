@@ -191,15 +191,29 @@ pub struct FiltreAvecFondu {
     pub filtre: Cascade,
     pub fondu: super::Fondu,
     pub canaux: usize,
+    pub cadence: u32,
 }
 
 impl FiltreAvecFondu {
     /// HORS TEMPS RÉEL.
     pub fn preparer(&mut self, sections: Vec<Coefs>, canaux: usize, cadence: u32) {
         self.canaux = canaux;
+        self.cadence = cadence;
         self.filtre = Cascade::new(sections, canaux);
         self.fondu.preparer(cadence);
         self.fondu.sauter();
+    }
+
+    /// La hausse que causerait le passage à `actif` (voir
+    /// `Traitement::hausse_si`) : couper rend les bandes que le filtre
+    /// atténuait, allumer rend ce qu'il amplifie.
+    pub fn hausse_si(&self, actif: bool) -> f64 {
+        let reponse = |f: f64| self.filtre.reponse_db(f, f64::from(self.cadence));
+        match (self.fondu.actif(), actif) {
+            (true, false) => super::hausse_spectrale_db(self.cadence, reponse, |_| 0.0),
+            (false, true) => super::hausse_spectrale_db(self.cadence, |_| 0.0, reponse),
+            _ => 0.0,
+        }
     }
 
     pub fn traiter(&mut self, tampon: &mut [f64], trames: usize) {
