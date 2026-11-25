@@ -571,7 +571,9 @@ fn l_etalonnage_du_micro_est_depose_puis_applique() {
     assert!(e.unwrap_err().contains("introuvable"));
 }
 
-/// Une entrée qui ne capte pas à 48 kHz est refusée avant tout.
+/// Une entrée à une fréquence que la mesure ne prend pas en charge (rc14 :
+/// 44,1 à 192 kHz le sont, voir `tests/mesure_frequences.rs`) est refusée
+/// avant tout, avec la liste des fréquences acceptées.
 #[test]
 fn une_entree_a_la_mauvaise_cadence_est_refusee() {
     let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
@@ -580,7 +582,7 @@ fn une_entree_a_la_mauvaise_cadence_est_refusee() {
     let hote = HoteSimule::new(fournisseur.clone(), boucle.clone(), Some(30.0));
     let micro: Arc<dyn Peripheriques> = Arc::new(MicroSimule {
         nom: MICRO.into(),
-        frequence: 44_100,
+        frequence: 32_000,
         boucle,
         demarrages: Default::default(),
     });
@@ -592,7 +594,11 @@ fn une_entree_a_la_mauvaise_cadence_est_refusee() {
         dossier.path().to_path_buf(),
     );
     let e = c.lancer(demande(2)).unwrap_err();
-    assert!(e.contains("44100"), "{e}");
+    assert!(e.contains("32000"), "{e}");
+    assert!(
+        e.contains("44100, 48000, 88200, 96000, 176400, 192000"),
+        "{e}"
+    );
     assert!(hote.journal().volumes.is_empty());
 }
 

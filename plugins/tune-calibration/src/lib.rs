@@ -9,6 +9,7 @@
 //!        │                             armé le temps d'une mesure seulement
 //! hote.rs        HoteZone : volume lu / forcé / restauré, file + play, stop
 //! mesure.rs      Controleur : salves → LevelPolicy → balayage → analyse
+//!        │       cadence.rs : capture à la fréquence du micro, analyse à 48 kHz
 //!        │       capture par tune-entree-audio::tampon (cpal, vers tampon)
 //! correction.rs  C2 : cible, zone bornée, égaliseur qui ne fait que couper,
 //!        │       profil de pièce de la zone (appliqué par la route existante)
@@ -32,6 +33,7 @@
 //! (tune-server), l'écran web, le micro du téléphone (C1-bis), l'installation
 //! du FIR dans la zone (route `room-correction/ir/upload` du serveur).
 
+pub mod cadence;
 pub mod correction;
 pub mod correction_fir;
 pub mod fournisseur;

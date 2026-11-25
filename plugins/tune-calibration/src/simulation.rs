@@ -39,6 +39,9 @@ use tune_entree_audio::peripheriques::{Arret, CaptureDemarree, DescriptionEntree
 use crate::fournisseur::FournisseurBalayage;
 use crate::hote::{ElementBalayage, HoteZone, TraitementsDeZone};
 
+/// rc14 — un micro à une autre fréquence que la zone, et à son horloge.
+pub mod micro_a_cadence;
+
 /// La pièce, échantillon par échantillon.
 pub struct PieceEnDirect {
     ligne: VecDeque<f64>,
