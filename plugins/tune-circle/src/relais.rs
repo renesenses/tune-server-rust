@@ -118,6 +118,14 @@ impl Relais {
             .await
     }
 
+    /// #9337 — une session est-elle ouverte (jeton présent, et pas refusée
+    /// par le site, #8238) ? Ce que [`Self::lire_image`] exige avant tout
+    /// appel ; une copie gardée ne sort pas à moins.
+    pub fn session_ouverte(&self) -> bool {
+        let settings = self.reglages();
+        lire(&settings, "mozaik_access_token").is_some()
+            && !tune_core::cloud::sso::reconnexion_requise(&settings)
+    }
     /// #6521 : `GET /api/v1/circle/{segments…}` d'une IMAGE, avec
     /// l'`If-None-Match` du client. Même session, même rafraîchissement unique
     /// sur un 401 que [`Self::appeler_avec`].

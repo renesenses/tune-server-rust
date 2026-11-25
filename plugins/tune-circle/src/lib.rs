@@ -47,6 +47,7 @@ pub mod routes;
 pub mod sans_email;
 pub mod suivi;
 pub mod vignettes;
+pub mod vignettes_gardees;
 
 use std::sync::Arc;
 
