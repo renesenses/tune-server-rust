@@ -305,8 +305,10 @@ pub async fn regler_le_casque(
     };
 
     let cat = catalogue.clone();
+    // rc14 (#9518) — même règle DSD qu'un PUT de la chaîne.
+    let capacites = state.orchestrator.capacites_dsd_de_zone(id).await;
     let resultat = tokio::task::spawn_blocking(move || {
-        appliquer_le_put(&settings, id, &corps_put, premium, &cat)
+        appliquer_le_put(&settings, id, &corps_put, premium, &cat, Some(&capacites))
     })
     .await;
     let (lecture, cles) = match resultat {
