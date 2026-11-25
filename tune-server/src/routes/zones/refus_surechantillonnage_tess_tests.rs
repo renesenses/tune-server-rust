@@ -204,7 +204,10 @@ fn chaque_refus_de_la_sortie_a_une_phrase_dans_chaque_langue() {
     let fr = super::description_du_refus_surechantillonnage(REFUS_WASAPI);
     assert!(fr.contains("mélangeur") && fr.contains("Windows"), "{fr}");
     let geste = super::description_du_refus_surechantillonnage("output_path_not_supported");
-    assert!(geste.contains("exclusif") && geste.contains("ASIO"), "{geste}");
+    assert!(
+        geste.contains("exclusif") && geste.contains("ASIO"),
+        "{geste}"
+    );
 }
 
 // ── Rémi (fil 3097) : la convolution sautée à cette cadence ─────────
@@ -296,7 +299,10 @@ fn l_ecran_tess_eteint_la_convolution_sautee() {
     }];
     super::refus_surechantillonnage_tess::avec_la_raison_de_la_convolution(
         etapes.iter_mut(),
-        &chaine_avec(&[("convolution", serde_json::json!({"ir_path": "/ir/salon-384k.wav"}))]),
+        &chaine_avec(&[(
+            "convolution",
+            serde_json::json!({"ir_path": "/ir/salon-384k.wav"}),
+        )]),
         Some(("rate_mismatch", "inactive à cette fréquence")),
     );
     assert!(!etapes[0].effective);
@@ -343,7 +349,10 @@ fn la_correction_par_egaliseur_reste_active_quand_la_convolution_saute() {
             "room-correction",
             serde_json::json!({"bands": [{"freq": 63.0, "gain": -4.0, "q": 2.0}]}),
         ),
-        ("convolution", serde_json::json!({"ir_path": "/ir/salon-384k.wav"})),
+        (
+            "convolution",
+            serde_json::json!({"ir_path": "/ir/salon-384k.wav"}),
+        ),
     ]);
     let mut etapes = [etape("room-correction"), etape("convolution")];
     super::refus_surechantillonnage_tess::avec_la_raison_de_la_convolution(
@@ -351,7 +360,11 @@ fn la_correction_par_egaliseur_reste_active_quand_la_convolution_saute() {
         &chaine,
         Some(("rate_mismatch", "inactive à cette fréquence")),
     );
-    assert!(etapes[0].effective, "correction par égaliseur : {:?}", etapes[0]);
+    assert!(
+        etapes[0].effective,
+        "correction par égaliseur : {:?}",
+        etapes[0]
+    );
     assert_eq!(etapes[0].reason, None);
     assert!(!etapes[1].effective, "la convolution, elle, saute");
 
@@ -418,8 +431,14 @@ fn les_textes_suivent_la_plateforme_et_nomment_le_geste() {
     let win = fr(cle("output_path_not_supported", "windows"));
     assert!(win.contains("ASIO"), "{win}");
     let test = fr(cle("machine_test_missing", "windows"));
-    assert!(test.contains("page du greffon Suréchantillonnage"), "{test}");
+    assert!(
+        test.contains("page du greffon Suréchantillonnage"),
+        "{test}"
+    );
     let egal = fr(cle("shared_mixer_rate_not_above_source", "windows"));
-    assert!(egal.contains("supérieure") && !egal.contains("pas un multiple"), "{egal}");
+    assert!(
+        egal.contains("supérieure") && !egal.contains("pas un multiple"),
+        "{egal}"
+    );
     assert!(fr(cle(REFUS_WASAPI, "windows")).contains("multiple"));
 }

@@ -110,8 +110,7 @@ pub(crate) fn avec_la_raison_de_la_convolution<'a>(
     };
     for e in etapes {
         let du_convolueur = e.code == CodeEtape::Plugin
-            && e
-                .plugin_id
+            && e.plugin_id
                 .as_deref()
                 .is_some_and(|id| porte_par_le_convolueur(chaine, id));
         if du_convolueur && eteignable(e) {

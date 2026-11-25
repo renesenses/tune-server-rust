@@ -385,9 +385,10 @@ pub(super) async fn reponse_de_zone(
     // Rémi (fil 3097) — une convolution que le convolueur saute à la cadence
     // du flux (filtre 384 kHz, radio 48 kHz) ne se dit plus active. Lue
     // avant le contexte, qui ne traverse pas un `await`.
-    let convolution =
-        super::refus_surechantillonnage_tess::raison_de_la_convolution_en_cours(state, zone_id, &etat)
-            .await;
+    let convolution = super::refus_surechantillonnage_tess::raison_de_la_convolution_en_cours(
+        state, zone_id, &etat,
+    )
+    .await;
     // T12b — famille UPnP : la voie de la chaîne vers ce lecteur (relais
     // progressif LPCM, transcodage, ou aucune), établie par la même sonde et
     // les mêmes réglages que la lecture. `None` hors famille UPnP. Avant le
