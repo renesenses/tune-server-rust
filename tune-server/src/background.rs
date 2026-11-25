@@ -3337,7 +3337,8 @@ fn spawn_replaygain_analysis(state: &AppState) {
 /// bouton. Cette ligne est ce qui manquait — sans elle, le cœur reste du code
 /// que rien n'atteint, exactement comme `spawn_scan_scheduler` avant #2469.
 ///
-/// Ne fait rien tant que `lyrics_lrclib_enabled` n'est pas activé, s'efface
+/// Ne fait rien tant que `lyrics_lrclib_enabled` n'est pas activé (posé à
+/// la naissance d'une base neuve depuis la rc14), s'efface
 /// devant toute zone qui joue, et ne demande jamais plus de `LOT_DE_FOND`
 /// paroles d'affilée.
 #[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]

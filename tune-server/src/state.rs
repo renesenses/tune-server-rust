@@ -495,6 +495,29 @@ impl AppState {
     }
 
     pub fn new(db_path: &str, port: u16, tune_config: TuneConfig) -> Result<Self, String> {
+        Self::construire(db_path, port, tune_config, false)
+    }
+
+    /// Comme [`AppState::new`], catalogue de radios livré COMPRIS : une base
+    /// SQLite neuve ne reçoit plus de stations d'office depuis la rc14 (retour
+    /// de Rémi). Réservé aux bancs d'essai qui travaillent sur ce catalogue
+    /// (recherche, annuaire, logos FIP, validation des adresses semées) ; le
+    /// serveur ne l'appelle jamais.
+    #[doc(hidden)]
+    pub fn new_avec_catalogue_de_radios(
+        db_path: &str,
+        port: u16,
+        tune_config: TuneConfig,
+    ) -> Result<Self, String> {
+        Self::construire(db_path, port, tune_config, true)
+    }
+
+    fn construire(
+        db_path: &str,
+        port: u16,
+        tune_config: TuneConfig,
+        avec_catalogue_de_radios: bool,
+    ) -> Result<Self, String> {
         // #5467 — en build de test, les chemins relatifs de la configuration
         // (`tune.db`, `artwork_cache`) ne se résolvent plus depuis le répertoire
         // courant, c'est-à-dire l'arbre source. Sans effet en production.
@@ -522,7 +545,11 @@ impl AppState {
             Engine::Sqlite => {
                 let db = SqliteDb::open(db_path)?;
                 db.init_schema()?;
-                tune_core::db::migrations::run_migrations(&db)?;
+                if avec_catalogue_de_radios {
+                    tune_core::db::migrations::run_migrations_avec_le_catalogue_de_radios(&db)?;
+                } else {
+                    tune_core::db::migrations::run_migrations(&db)?;
+                }
                 Some(db)
             }
             Engine::Postgres => None,
@@ -1076,7 +1103,8 @@ mod relay_slot_tests {
     fn construire_un_etat_n_efface_pas_les_transcodages_du_compte_5142() {
         let source = include_str!("state.rs");
         let corps = source
-            .split("pub fn new(db_path: &str, port: u16, tune_config: TuneConfig)")
+            // rc14 : `new` délègue à `construire`, qui porte le corps.
+            .split("    fn construire(\n")
             .nth(1)
             // Le corps s'arrête à la première accolade fermante de niveau
             // `impl` : les blocs internes sont plus indentés.

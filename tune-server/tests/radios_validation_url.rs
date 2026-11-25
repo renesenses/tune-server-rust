@@ -21,7 +21,12 @@ use tower::ServiceExt;
 use tune_core::db::radio_repo::{RadioRepo, RadioStation};
 
 fn app_et_etat() -> (axum::Router, tune_server::state::AppState) {
-    let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    let state = tune_server::state::AppState::new_avec_catalogue_de_radios(
+        ":memory:",
+        0,
+        Default::default(),
+    )
+    .unwrap();
     let router = tune_server::routes::router(state.clone());
     (router, state)
 }
