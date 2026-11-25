@@ -166,6 +166,9 @@ mod miroirs_de_qualite_7694_tests;
 mod notes_et_repartitions_7849_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
+/// Retour de Rémi sur la rc13 : installation neuve sans radios, LRCLIB actif.
+#[cfg(test)]
+mod premier_lancement_rc14_tests;
 #[cfg(test)]
 mod recherche_debut_de_mot_7619_tests;
 /// Discussion #8280 — « À découvrir » varie ses raisons : les requêtes des

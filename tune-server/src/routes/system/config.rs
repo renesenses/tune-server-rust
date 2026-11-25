@@ -465,9 +465,12 @@ async fn lire_la_config(
         //
         // La clé vient de la CONSTANTE, pas d'un littéral recopié : c'est la
         // même que celle que lisent les deux routes paroles et la passe de fond.
+        //
+        // Retour de Rémi sur la rc13 : un réglage jamais posé vaut ACTIVÉ
+        // (`LRCLIB_DEFAUT`), le même défaut que le lecteur de `tune-core`.
         (
             tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED,
-            json!(false),
+            json!(tune_core::library::lyrics_pass::LRCLIB_DEFAUT),
         ),
         // Le mode PURE impose-t-il le volume à 100 % ? Inactif par défaut :
         // cocher « Audiophile » ne doit pas changer le niveau sans prévenir.
@@ -7549,9 +7552,11 @@ mod instantane_reglages_7343_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let value = corps(response).await;
         assert_eq!(value[tune_core::metadata::ecriture_fichiers::CLE], false);
+        // Retour de Rémi sur la rc13 : les paroles en ligne sont ACTIVÉES
+        // tant que personne ne les a décochées.
         assert_eq!(
             value[tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED],
-            false
+            true
         );
     }
 

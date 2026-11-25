@@ -4295,7 +4295,39 @@ pub(crate) const TRACKS_ALBUM_COLLECTIONS_INDEX: &str =
      ON tracks(album_id, format, sample_rate, bit_depth, year, genre, file_mtime);
      CREATE INDEX IF NOT EXISTS idx_tracks_album_path ON tracks(album_id, file_path);";
 
+/// Les migrations SQLite qui SÈMENT des stations dans « Mes radios » :
+/// `seed_default_radios` (33), `semis_radios_annuaire_mozaiklabs` (90),
+/// `semis_radios_paradise_annuaire_2026_09_09` (98).
+///
+/// Retour de Rémi sur la rc13 : une trentaine de radios d'office dans « Mes
+/// radios » noie l'installation neuve ; l'écran Radios ouvre désormais
+/// l'annuaire quand la liste est vide. Ces migrations sont SAUTÉES sur une
+/// base qui naît (aucune ligne dans `_migrations`) ; une base existante les a
+/// jouées depuis longtemps et garde ses stations.
+pub(crate) const SEMIS_DE_RADIOS_SQLITE: [i32; 3] = [33, 90, 98];
+
+/// Les jumelles PostgreSQL : 42 (même fichier que la 90) et 54 (même fichier
+/// que la 98). Sur une base PG neuve, elles ne posent que leur marque.
+#[cfg(feature = "postgres")]
+pub(crate) const SEMIS_DE_RADIOS_PG: [i32; 2] = [42, 54];
+
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
+    executer_les_migrations(db, false)
+}
+
+/// Les migrations, catalogue de radios COMPRIS même sur une base neuve — le
+/// comportement d'avant la rc14.
+///
+/// Réservé aux bancs d'essai qui vérifient le catalogue livré (forme, pays,
+/// adresses, logos) ou qui ont besoin de stations : ils ouvrent une base
+/// neuve, que [`run_migrations`] laisse désormais sans radio. Le serveur ne
+/// l'appelle jamais.
+#[doc(hidden)]
+pub fn run_migrations_avec_le_catalogue_de_radios(db: &SqliteDb) -> Result<(), String> {
+    executer_les_migrations(db, true)
+}
+
+fn executer_les_migrations(db: &SqliteDb, semer_meme_sur_base_neuve: bool) -> Result<(), String> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
             version INTEGER PRIMARY KEY,
@@ -4324,6 +4356,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         .map_err(|e| e.to_string())?
             > 0
     };
+
+    // Retour de Rémi sur la rc13 : une installation NEUVE ne reçoit plus de
+    // radios d'office. `current_version == 0` : aucune migration n'a jamais été
+    // notée dans cette base — elle naît maintenant. Une base existante a noté
+    // ses semis depuis longtemps ; elle n'est ni relue ni touchée.
+    let installation_neuve = current_version == 0 && !semer_meme_sur_base_neuve;
 
     if tables_exist && current_version == 0 {
         db.execute(
@@ -4378,7 +4416,16 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         migration_status::advance(migration.name, done);
         let step_started = std::time::Instant::now();
 
-        if !migration.up.is_empty() {
+        if installation_neuve && SEMIS_DE_RADIOS_SQLITE.contains(&migration.version) {
+            // Rien à semer sur une base neuve : « Mes radios » commence vide
+            // et l'écran ouvre l'annuaire. La migration est quand même notée,
+            // pour ne jamais être rejouée plus tard.
+            info!(
+                version = migration.version,
+                name = migration.name,
+                "semis_de_radios_saute_installation_neuve"
+            );
+        } else if !migration.up.is_empty() {
             db.execute_batch(migration.up)?;
         }
 
@@ -6575,6 +6622,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
              version plus recente de Tune. Aucune migration inverse n'existe."
         );
     }
+    // Base PG neuve : aucune migration notée. Une conversion SQLite → PG
+    // passe aussi par ici, et ses stations arrivent ensuite par la copie des
+    // données : rien n'est retiré, rien n'est semé en double.
+    let installation_neuve = current == 0;
     let pending = PG_MIGRATIONS
         .iter()
         .filter(|&&(v, _, _)| v > current)
@@ -6606,12 +6657,28 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
         migration_status::advance(name, done);
         let step_started = std::time::Instant::now();
 
-        // Each migration file manages its own BEGIN/COMMIT, so we
-        // execute the raw SQL directly.
-        sqlx::raw_sql(sql)
+        if installation_neuve && SEMIS_DE_RADIOS_PG.contains(&version) {
+            // Base neuve : aucune radio d'office (retour de Rémi, rc13). La
+            // marque est posée quand même, pour que le semis ne soit jamais
+            // rejoué — la 54 posait la sienne dans son propre texte.
+            sqlx::query(
+                "INSERT INTO schema_version (version, name) VALUES ($1, $2) \
+                 ON CONFLICT (version) DO NOTHING",
+            )
+            .bind(version)
+            .bind(name)
             .execute(pool)
             .await
             .map_err(|e| format!("pg migration {version} ({name}): {e}"))?;
+            info!(version, name, "semis_de_radios_saute_installation_neuve");
+        } else {
+            // Each migration file manages its own BEGIN/COMMIT, so we
+            // execute the raw SQL directly.
+            sqlx::raw_sql(sql)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("pg migration {version} ({name}): {e}"))?;
+        }
 
         done += 1;
         info!(
@@ -7715,7 +7782,7 @@ mod tests {
     fn le_catalogue_livre_a_une_forme_valide() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        run_migrations(&db).unwrap();
+        run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
 
         let stations: Vec<(String, String, String, String)> = {
             let conn = db.connection().lock().unwrap();
@@ -7808,7 +7875,7 @@ mod tests {
 
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        run_migrations(&db).unwrap();
+        run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
 
         let stations: Vec<(String, String)> = {
             let conn = db.connection().lock().unwrap();
@@ -7931,7 +7998,7 @@ mod tests {
         ];
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        run_migrations(&db).unwrap();
+        run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
 
         let compte = |url: &str| {
             let conn = db.connection().lock().unwrap();
@@ -8148,7 +8215,7 @@ mod tests {
     fn le_catalogue_livre_couvre_plusieurs_pays() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        run_migrations(&db).unwrap();
+        run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
 
         let stations: Vec<(String, String)> = {
             let conn = db.connection().lock().unwrap();
@@ -11781,7 +11848,7 @@ mod tests_pure_classix_8119 {
     fn une_base_neuve_a_pure_classix_avec_un_x_8119() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        run_migrations(&db).unwrap();
+        run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
         assert_eq!(
             fiche(&db),
             vec![(
@@ -11800,7 +11867,7 @@ mod tests_pure_classix_8119 {
     fn une_fiche_retouchee_par_l_utilisateur_n_est_pas_reecrite_8119() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        run_migrations(&db).unwrap();
+        run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
         db.execute_batch(&format!(
             "UPDATE radio_stations SET name = 'Ma radio du matin', country = 'France', \
              genre = 'Jazz' WHERE url = '{FLUX}';"

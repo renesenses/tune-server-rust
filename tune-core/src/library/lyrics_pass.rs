@@ -505,7 +505,8 @@ pub async fn fetch_for_pass(
 pub enum FillStatus {
     /// Plus aucune candidate : la bibliothèque est à jour.
     Done,
-    /// `lyrics_lrclib_enabled` ne vaut pas `"true"`. **Aucune requête émise.**
+    /// `lyrics_lrclib_enabled` refusé (voir [`lrclib_consent_given`]).
+    /// **Aucune requête émise.**
     Refused,
     /// Plafond [`FillOptions::max_requests`] atteint : il reste du travail,
     /// relancer reprendra là où on s'est arrêté.
@@ -607,10 +608,28 @@ impl FillOptions<'static> {
     }
 }
 
+/// Valeur d'un réglage LRCLIB JAMAIS posé : activé.
+///
+/// Retour de Rémi sur la rc13 (GO de Bertrand) : une installation neuve doit
+/// montrer tout de suite ce que Tune sait faire, paroles comprises. Seul un
+/// réglage ABSENT prend ce défaut ; un `"false"` écrit par l'interface — un
+/// utilisateur qui a décoché la case — reste un refus, et rien n'est réécrit
+/// en base.
+pub const LRCLIB_DEFAUT: bool = true;
+
+/// Lecture pure du réglage : absent → [`LRCLIB_DEFAUT`], `"true"` → oui,
+/// toute autre valeur posée → non (le doute penche du côté qui n'envoie rien).
+pub fn lrclib_consentement_depuis(brut: Option<&str>) -> bool {
+    match brut {
+        None => LRCLIB_DEFAUT,
+        Some(v) => v == "true",
+    }
+}
+
 /// Le consentement, lu là où il est stocké. Rendu public pour que la route
 /// puisse répondre « refusé » sans dupliquer la règle.
 pub fn lrclib_consent_given(db: &Arc<dyn DbBackend>) -> bool {
-    setting(db, SETTING_LRCLIB_ENABLED).as_deref() == Some("true")
+    lrclib_consentement_depuis(setting(db, SETTING_LRCLIB_ENABLED).as_deref())
 }
 
 /// Un réglage, lu là où il vit. Un seul lecteur pour les deux consentements —
@@ -856,11 +875,10 @@ pub async fn rattraper_un_lot(db: &Arc<dyn DbBackend>, http: &reqwest::Client) -
 
 /// La boucle de fond. Miroir de `audio::replaygain::spawn`.
 ///
-/// Elle ne fait rien tant que `lyrics_lrclib_enabled` ne vaut pas `"true"` :
-/// interroger un service tiers gratuit pour toute une bibliothèque reste un
-/// geste que l'utilisateur pose, pas un défaut. Ce que ce spawn change, c'est
-/// qu'une fois ce geste posé **une** fois, il n'a plus à le reposer à chaque
-/// nouveau lot d'albums importés.
+/// Elle ne fait rien quand `lyrics_lrclib_enabled` est refusé. Depuis la
+/// rc14 (retour de Rémi), un réglage jamais posé vaut accord
+/// ([`LRCLIB_DEFAUT`]) : seule une case décochée l'arrête. L'accord vaut
+/// pour chaque nouveau lot d'albums importés, sans geste à reposer.
 pub fn spawn(backend: Arc<dyn DbBackend>, http: reqwest::Client) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(DELAI_DE_DEMARRAGE_SECS)).await;

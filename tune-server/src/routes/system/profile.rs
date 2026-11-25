@@ -69,7 +69,9 @@ pub(super) const SUPPORT_SETTING_KEYS: &[ReglageExpose] = &[
     // pas trancher entre « rien à trouver » et « recherche en ligne éteinte ».
     //
     // Non sensible : un booléen de consentement, comme les huit au-dessus.
-    ("lyrics_lrclib_enabled", || json!(false)),
+    ("lyrics_lrclib_enabled", || {
+        json!(tune_core::library::lyrics_pass::LRCLIB_DEFAUT)
+    }),
     // #7307 — « mon choix d'écrire dans les fichiers est revenu au défaut ».
     // La fiche portait le consentement des paroles, pas celui-ci : un rapport
     // ne pouvait donc pas dire si la valeur était encore en base (affichage
@@ -334,9 +336,12 @@ mod tests {
                 .any(|(k, _)| *k == "lyrics_lrclib_enabled"),
             "sans cette cle, un ticket « panneau Paroles vide » reste indecidable"
         );
-        // Absent du store = eteint, exactement la regle du serveur :
-        // `settings.get(...).as_deref() == Some("true")`.
+        // Absent du store = ACTIVE depuis le retour de Remi sur la rc13,
+        // exactement la regle du serveur (`lrclib_consentement_depuis`).
         let out = support_settings(|_| None);
+        assert_eq!(out["lyrics_lrclib_enabled"], json!(true));
+        // Un refus pose reste un refus.
+        let out = support_settings(|k| (k == "lyrics_lrclib_enabled").then(|| "false".to_string()));
         assert_eq!(out["lyrics_lrclib_enabled"], json!(false));
         // Et la valeur persistee est rendue telle quelle, re-typee.
         let out = support_settings(|k| (k == "lyrics_lrclib_enabled").then(|| "true".to_string()));
