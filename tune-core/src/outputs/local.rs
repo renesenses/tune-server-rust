@@ -2421,6 +2421,12 @@ impl LocalOutput {
         enceintes_de_sortie::poser(&self.pure_bypass, reglages);
     }
 
+    /// rc14 — les voies qu'a vues le réglage des enceintes de cette sortie au
+    /// dernier bloc (après adaptation des voies) ; `None` si rien n'a joué.
+    pub fn voies_vues_par_le_reglage_des_enceintes(&self) -> Option<u16> {
+        enceintes_de_sortie::voies_vues(&self.pure_bypass)
+    }
+
     /// rc14 — le réglage des enceintes touche-t-il le signal de cette sortie ?
     pub fn reglage_enceintes_actif(&self) -> bool {
         enceintes_de_sortie::agit(&self.pure_bypass, self.dop_active.load(Ordering::Relaxed))
@@ -5577,7 +5583,12 @@ fn prepare_windows_native_pcm(
         });
     }
     let samples = if bit_perfect {
-        pcm_bytes_to_native_i32(bytes, bit_depth)
+        let mots = pcm_bytes_to_native_i32(bytes, bit_depth);
+        // rc14 — la ligne à retard du réglage des enceintes est alimentée
+        // même ici (aucun mot n'est touché) : un réglage qui s'allume trouve
+        // un historique plein. Rien sur un porteur DoP.
+        enceintes_de_sortie::alimenter(pure_bypass, &mots, channels, cadence, dop);
+        mots
     } else {
         // TESS T03 — décodé en `f64`, traité par l'exécuteur ; la frontière
         // `f32` reste celle de l'adaptation des voies et du volume d'avant

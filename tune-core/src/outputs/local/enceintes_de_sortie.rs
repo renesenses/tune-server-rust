@@ -44,27 +44,56 @@ fn creneau(cle: &AtomicBool) -> Option<Creneau> {
 }
 
 /// Pose (ou retire, `None`) le réglage de la sortie dont `cle` est le drapeau
-/// PURE. Hors temps réel. Une sortie qui joue passe au nouveau réglage par le
-/// fondu du processeur ; retirer un réglage actif passe par un fondu vers le
-/// neutre (le créneau reste, au repos il ne touche plus rien).
+/// PURE. Hors temps réel.
+///
+/// Le créneau est créé dès le PREMIER appel, réglage neutre compris (la
+/// lecture en pose un à chaque démarrage) : sa ligne à retard est alors
+/// alimentée en permanence, et un réglage posé plus tard trouve un historique
+/// plein. Un créneau neuf part du neutre ; tout changement passe par le
+/// fondu du processeur, retrait compris.
 pub(crate) fn poser(cle: &AtomicBool, reglages: Option<ReglagesEnceintes>) {
-    let existant = creneau(cle);
-    match (existant, reglages) {
-        (Some(c), r) => {
-            if let Ok(mut p) = c.lock() {
-                p.definir(r.unwrap_or_default());
-            }
+    let r = reglages.unwrap_or_default();
+    if let Some(c) = creneau(cle) {
+        if let Ok(mut p) = c.lock() {
+            p.definir(r);
         }
-        (None, Some(r)) if !r.est_neutre_partout() => {
-            if let Ok(mut t) = table().write() {
-                t.insert(
-                    adresse(cle),
-                    Arc::new(Mutex::new(ProcesseurEnceintes::new(r))),
-                );
-                POSES.store(t.len(), Ordering::Release);
-            }
+        return;
+    }
+    if let Ok(mut t) = table().write() {
+        t.entry(adresse(cle))
+            .or_insert_with(|| Arc::new(Mutex::new(ProcesseurEnceintes::au_neutre(r))));
+        POSES.store(t.len(), Ordering::Release);
+    }
+}
+
+/// Le nombre de voies qu'a vues le réglage des enceintes de cette sortie
+/// (après adaptation des voies), au dernier bloc ; `None` si rien n'a joué.
+pub(crate) fn voies_vues(cle: &AtomicBool) -> Option<u16> {
+    creneau(cle).and_then(|c| c.lock().ok().and_then(|p| p.format_vu().map(|(n, _)| n)))
+}
+
+/// Temps réel, branche BRUTE (bit-perfect) d'un bras natif : alimente la
+/// ligne à retard sans toucher les mots. Sous PURE, c'est un contournement
+/// (historique remis à zéro à l'entrée). Rien sur un porteur DoP.
+pub(crate) fn alimenter<T: Echantillon>(
+    cle: &AtomicBool,
+    mots: &[T],
+    canaux: u16,
+    cadence: u32,
+    dop: bool,
+) {
+    if dop {
+        return;
+    }
+    let Some(c) = creneau(cle) else {
+        return;
+    };
+    if let Ok(mut p) = c.lock() {
+        if cle.load(Ordering::Relaxed) {
+            p.contourner(mots, canaux, cadence);
+        } else {
+            p.alimenter(mots, canaux, cadence);
         }
-        (None, _) => {}
     }
 }
 
@@ -96,8 +125,9 @@ pub(crate) fn reglages(cle: &AtomicBool) -> Option<ReglagesEnceintes> {
 }
 
 /// Temps réel : traite `mots` (entrelacés, `canaux` voies à `cadence` Hz) en
-/// place. Rien sous PURE (`cle` levé) ni sur un porteur DoP. Rend `true` si un
-/// échantillon a pu changer.
+/// place. Sous PURE (`cle` levé), rien n'est touché mais la ligne à retard
+/// est alimentée (remise à zéro à l'entrée en PURE). Rien sur un porteur DoP.
+/// Rend `true` si un échantillon a pu changer.
 pub(crate) fn traiter<T: Echantillon>(
     cle: &AtomicBool,
     mots: &mut [T],
@@ -105,134 +135,25 @@ pub(crate) fn traiter<T: Echantillon>(
     cadence: u32,
     dop: bool,
 ) -> bool {
-    if dop || cle.load(Ordering::Relaxed) {
+    if dop {
         return false;
     }
     let Some(c) = creneau(cle) else {
         return false;
     };
+    let pure = cle.load(Ordering::Relaxed);
     c.lock()
-        .map(|mut p| p.traiter(mots, canaux, cadence))
+        .map(|mut p| {
+            if pure {
+                p.contourner(mots, canaux, cadence);
+                false
+            } else {
+                p.traiter(mots, canaux, cadence)
+            }
+        })
         .unwrap_or(false)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::audio::reglage_enceintes::VoieEnceinte;
-
-    fn deux_voies(distance_droite: f64, gain_droite: f64) -> ReglagesEnceintes {
-        ReglagesEnceintes {
-            channels: vec![
-                VoieEnceinte::default(),
-                VoieEnceinte {
-                    distance_cm: distance_droite,
-                    gain_db: gain_droite,
-                    invert: false,
-                },
-            ],
-            invert_all: false,
-        }
-    }
-
-    #[test]
-    fn une_sortie_sans_reglage_n_est_pas_touchee() {
-        let pure = AtomicBool::new(false);
-        let mut t = vec![0.5_f32; 64];
-        assert!(!traiter(&pure, &mut t, 2, 44_100, false));
-        assert!(!agit(&pure, false));
-        // Un réglage neutre ne crée même pas de créneau.
-        poser(&pure, Some(ReglagesEnceintes::default()));
-        assert!(reglages(&pure).is_none());
-        assert!(t.iter().all(|x| *x == 0.5));
-    }
-
-    #[test]
-    fn le_reglage_est_propre_a_chaque_sortie_et_coupe_sous_pure() {
-        let a = AtomicBool::new(false);
-        let b = AtomicBool::new(false);
-        poser(&a, Some(deux_voies(300.0, -6.0)));
-        assert!(agit(&a, false));
-        assert!(!agit(&b, false), "l'autre sortie n'a rien");
-        assert!(!agit(&a, true), "jamais sur un porteur DoP");
-        let mut t = vec![0.5_f32; 64];
-        assert!(traiter(&a, &mut t, 2, 44_100, false));
-        assert_eq!(t[0], 0.5);
-        assert!(t[1] < 0.5);
-        // PURE : coupé tout de suite, rien n'est touché.
-        a.store(true, Ordering::Relaxed);
-        let mut t = vec![0.5_f32; 64];
-        assert!(!traiter(&a, &mut t, 2, 44_100, false));
-        assert!(t.iter().all(|x| *x == 0.5));
-        assert!(!agit(&a, false));
-        a.store(false, Ordering::Relaxed);
-        // Retiré : fondu vers le neutre, puis plus rien.
-        poser(&a, None);
-        let mut t = vec![0.5_f32; 2 * 4_410];
-        traiter(&a, &mut t, 2, 44_100, false);
-        assert_eq!(*t.last().unwrap(), 0.5);
-        assert!(!agit(&a, false));
-        oublier(&a);
-        assert!(reglages(&a).is_none());
-    }
-
-    /// Le bras natif (ALSA natif, WASAPI, ASIO) : un réglage actif fait
-    /// prendre la branche flottante et décale la voie au mot près ; sans
-    /// réglage (ou neutre), les mots partent bruts, bit-perfect.
-    #[test]
-    fn le_bras_natif_applique_le_reglage_et_reste_bit_perfect_sans() {
-        use crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
-        let eq = std::sync::Mutex::new(None);
-        let conv = std::sync::Mutex::new(None);
-        let cf = std::sync::Mutex::new(None);
-        let mono = AtomicBool::new(false);
-        let pure = AtomicBool::new(false);
-        // 16 bits stéréo, 200 trames : une rampe, gauche ≠ droite.
-        let mut octets = Vec::new();
-        for n in 0..200i16 {
-            octets.extend_from_slice(&(n * 100).to_le_bytes());
-            octets.extend_from_slice(&(-n * 50).to_le_bytes());
-        }
-        let preparer = || {
-            super::super::prepare_windows_native_pcm(
-                &octets,
-                16,
-                2,
-                2,
-                false,
-                false,
-                UNITE_DU_GAIN_DE_RENDU,
-                &eq,
-                &conv,
-                &cf,
-                &pure,
-                &mono,
-                None,
-                44_100,
-            )
-            .unwrap()
-        };
-        let brut = preparer();
-        assert!(brut.bit_perfect, "sans réglage : mots bruts");
-        // La voie droite 100 cm plus près : 129 trames de retard à 44,1 kHz
-        // (128,57 arrondi) ; la gauche, plus lointaine, n'a rien.
-        poser(&pure, Some(deux_voies(300.0 - 100.0, 0.0)));
-        let traite = preparer();
-        assert!(!traite.bit_perfect);
-        for n in 0..200 {
-            assert_eq!(traite.samples[n * 2], brut.samples[n * 2], "gauche {n}");
-            let attendu = if n < 129 {
-                0
-            } else {
-                brut.samples[(n - 129) * 2 + 1]
-            };
-            assert_eq!(traite.samples[n * 2 + 1], attendu, "droite {n}");
-        }
-        // PURE : de nouveau bit-perfect.
-        pure.store(true, Ordering::Relaxed);
-        assert!(preparer().bit_perfect);
-        pure.store(false, Ordering::Relaxed);
-        oublier(&pure);
-        assert!(preparer().bit_perfect);
-    }
-}
+#[path = "enceintes_de_sortie_tests.rs"]
+mod tests;

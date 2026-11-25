@@ -372,6 +372,37 @@ async fn sait_regler_le_volume(state: &AppState, zone: &Zone) -> Option<bool> {
     tune_core::orchestrator::volume_reglable_retenu(device, lu)
 }
 
+/// rc14 — les voies que le réglage des enceintes de la zone traite : celles
+/// que la sortie a ouvertes, après adaptation (une source mono sur une sortie
+/// stéréo : 2) ; sans lecture, celles qu'il a vues au dernier bloc sur la
+/// sortie locale. `None` si rien n'est connu.
+async fn voies_de_sortie(
+    state: &AppState,
+    zone: &Zone,
+    etat: &tune_core::playback::ZoneState,
+) -> Option<u16> {
+    if let Some(t) = etat.transformations_reelles.as_ref() {
+        return Some(t.ouvert().canaux);
+    }
+    #[cfg(feature = "local-audio")]
+    {
+        let device = zone.output_device_id.as_deref()?;
+        if !device.starts_with("local:") {
+            return None;
+        }
+        let sortie = { state.outputs.lock().await.get(device) }?;
+        let s = sortie.try_lock().ok()?;
+        s.as_any()
+            .downcast_ref::<tune_core::outputs::local::LocalOutput>()?
+            .voies_vues_par_le_reglage_des_enceintes()
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        let _ = (state, zone);
+        None
+    }
+}
+
 /// La réponse de la zone, à partir de sa chaîne lue (T02).
 pub(super) async fn reponse_de_zone(
     state: &AppState,
@@ -391,6 +422,7 @@ pub(super) async fn reponse_de_zone(
     let piste = piste_en_cours(&etat);
     let lecteur = state.orchestrator.faits_upnp_de_zone(zone_id, &piste).await;
     let disponible = |id: &str| greffon_disponible(&settings, id);
+    let voies_de_sortie = voies_de_sortie(state, zone, &etat).await;
     let ctx = ContexteExecution {
         transport: TransportZone::depuis_type_de_sortie(zone.output_type.as_deref()),
         source: source_de(&etat, &lecture.dsd_mode),
@@ -406,6 +438,7 @@ pub(super) async fn reponse_de_zone(
                 .abs()
                 > 1e-6
         }),
+        voies_de_sortie,
     };
     // « ACTIVE » seulement si le préréglage existe encore (un marqueur resté
     // après une suppression ou un import ne s'affiche pas).

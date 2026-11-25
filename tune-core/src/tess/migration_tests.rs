@@ -1296,6 +1296,7 @@ fn contexte_gratuit(dispo: &dyn Fn(&str) -> bool) -> ContexteExecution<'_> {
             db: 0.0,
         },
         replaygain_actif: false,
+        voies_de_sortie: None,
     }
 }
 

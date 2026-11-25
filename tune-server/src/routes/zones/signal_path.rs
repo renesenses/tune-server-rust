@@ -1564,6 +1564,17 @@ pub fn build_signal_path_lang(
         runtime_signal_path,
         wire,
     );
+    // rc14 — le réglage des enceintes traite les voies OUVERTES par la sortie
+    // (après adaptation : une source mono sur une sortie stéréo en a 2).
+    traitements.enceintes_step = zone_enceintes_step_lang(
+        lang,
+        backend,
+        zone.id.unwrap_or(0),
+        output_type,
+        transformations_reelles
+            .map(|t| t.ouvert().canaux)
+            .or(np.channels),
+    );
     traitements.reaffectation_step = zone_reaffectation_step_lang(
         lang,
         backend,
@@ -3929,7 +3940,7 @@ fn relever_les_traitements_lang(
     // vraie transformation — elle réécrit chaque échantillon — donc elle porte
     // une étape et fait tomber le verdict bit-perfect, comme le ReplayGain.
     let mono_downmix_step = zone_mono_downmix_step_lang(lang, &backend, zid, output_type);
-    let enceintes_step = zone_enceintes_step_lang(lang, &backend, zid, output_type, np.channels);
+    let enceintes_step = zone_enceintes_step_lang(lang, backend, zid, output_type, np.channels);
 
     // #5071 — la compensation de niveau d'une zone RÉSEAU multiplie chaque
     // échantillon du flux : une étape, et le verdict en tient compte.

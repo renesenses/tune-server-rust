@@ -395,6 +395,7 @@ mod tests {
                 db: 0.0,
             },
             replaygain_actif: false,
+            voies_de_sortie: None,
         }
     }
 
@@ -604,6 +605,7 @@ mod tests {
                 db: 0.0,
             },
             replaygain_actif: false,
+            voies_de_sortie: None,
         };
         let mut up = chaine(&[]);
         up.fixed.upsampling = Upsampling::Pcm {
@@ -683,6 +685,7 @@ mod tests {
                 pure: false,
                 volume,
                 replaygain_actif: false,
+                voies_de_sortie: None,
             };
             let mut c = chaine(&[]);
             c.fixed.upsampling = Upsampling::Dsd {

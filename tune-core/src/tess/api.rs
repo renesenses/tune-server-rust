@@ -660,6 +660,7 @@ mod tests {
                 db: -18.0,
             },
             replaygain_actif: false,
+            voies_de_sortie: None,
         }
     }
 

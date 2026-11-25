@@ -2072,6 +2072,11 @@ struct StreamingDsp {
     /// étage de l'exécuteur), avant la compensation. `None` : réglage absent,
     /// neutre pour ce flux, PURE ou « Bypass all ».
     enceintes: Option<crate::audio::reglage_enceintes::ProcesseurEnceintes>,
+    /// rc14 — la zone dont ce flux porte le réglage des enceintes : à la fin
+    /// complète du flux, la ligne à retard est GARDÉE pour la piste suivante
+    /// de la zone (`chaine_reseau_tess::reprendre_les_enceintes`), sans blanc
+    /// ni perte de la queue. `None` : rien n'est gardé.
+    zone_enceintes: Option<i64>,
     /// #4407 — la cadence du PCM que ce porteur voit : de quoi rebâtir un
     /// égaliseur relevé en vol aux bons coefficients.
     sample_rate: u32,
@@ -2219,6 +2224,11 @@ impl StreamingDsp {
     /// latence du convolveur retenait encore, passées par les étages qui le
     /// suivent. Vide sans convolveur.
     fn terminer_flux(&mut self, bit_depth: u16) -> Vec<u8> {
+        // rc14 — fin COMPLÈTE du flux : la ligne à retard du réglage des
+        // enceintes passe à la piste suivante de la zone.
+        if let (Some(zone), Some(p)) = (self.zone_enceintes, self.enceintes.take()) {
+            chaine_reseau_tess::garder_les_enceintes(zone, p);
+        }
         let Some(conv) = self.convolver.as_ref() else {
             return Vec::new();
         };

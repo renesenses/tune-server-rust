@@ -616,11 +616,11 @@ fn le_reglage_des_enceintes_decale_une_voie_au_mot_pres_rc14() {
     let reglages = ReglagesEnceintes {
         channels: vec![
             VoieEnceinte {
-                distance_cm: 343.0 / 2.0, // 5 ms plus près : 240 trames à 48 kHz
+                distance_cm: Some(343.0 / 2.0), // 5 ms plus près : 240 trames à 48 kHz
                 ..VoieEnceinte::default()
             },
             VoieEnceinte {
-                distance_cm: 343.0,
+                distance_cm: Some(343.0),
                 ..VoieEnceinte::default()
             },
         ],
@@ -670,4 +670,86 @@ fn le_reglage_des_enceintes_decale_une_voie_au_mot_pres_rc14() {
     let mut pcm = src.clone();
     vide.process(&mut pcm, 16);
     assert_eq!(pcm, src);
+}
+
+/// rc14 (relecture de #9523, m2) — deux pistes enchaînées SANS BLANC sur un
+/// relais réseau : la ligne à retard de la première passe à la seconde. La
+/// suite des deux flux est exactement le traitement continu des deux pistes
+/// mises bout à bout : la queue de la voie retardée n'est pas perdue (elle
+/// sort en tête de la piste 2), la piste 2 ne commence pas par des zéros, et
+/// chaque piste garde sa longueur. Sinus de 50 Hz, amplitude 0,8.
+#[test]
+fn deux_pistes_s_enchainent_sans_blanc_ni_perte_rc14() {
+    use super::{garder_les_enceintes, reprendre_les_enceintes};
+    use crate::audio::reglage_enceintes::{ProcesseurEnceintes, ReglagesEnceintes, VoieEnceinte};
+    const ZONE: i64 = 9_523_002;
+    let reglages = ReglagesEnceintes {
+        channels: vec![
+            VoieEnceinte {
+                distance_cm: Some(343.0),
+                ..VoieEnceinte::default()
+            },
+            VoieEnceinte {
+                distance_cm: Some(0.0), // 10 ms : 480 trames à 48 kHz
+                ..VoieEnceinte::default()
+            },
+        ],
+        invert_all: false,
+    };
+    let piste = |debut: usize, n: usize| -> Vec<u8> {
+        let mut o = Vec::new();
+        for i in debut..debut + n {
+            let x = 0.8 * (2.0 * std::f64::consts::PI * 50.0 * i as f64 / 48_000.0).sin();
+            let v = (x * 8_388_607.0).round() as i32;
+            for _ in 0..2 {
+                o.extend_from_slice(&v.to_le_bytes()[..3]);
+            }
+        }
+        o
+    };
+    let (p1, p2) = (piste(0, 9_000), piste(9_000, 7_000));
+    let jouer = |pcm: &[u8], fin: bool| -> Vec<u8> {
+        let mut dsp = StreamingDsp {
+            enceintes: reprendre_les_enceintes(ZONE, Some(reglages.clone()), 2, 48_000),
+            zone_enceintes: Some(ZONE),
+            ..porteur(None)
+        };
+        let mut servi = Vec::new();
+        for bloc in pcm.chunks(1_000 * 6) {
+            let mut b = bloc.to_vec();
+            dsp.process_flux(&mut b, 24);
+            assert_eq!(b.len(), bloc.len(), "longueur conservée");
+            servi.extend(b);
+        }
+        if fin {
+            assert!(dsp.terminer_flux(24).is_empty(), "rien après la piste");
+        }
+        servi
+    };
+    let s1 = jouer(&p1, true);
+    let s2 = jouer(&p2, true);
+    // Référence : un seul processeur sur les deux pistes bout à bout.
+    let mut tout: Vec<f64> = lire(&p1, 24);
+    tout.extend(lire(&p2, 24));
+    let mut p = ProcesseurEnceintes::new(reglages.clone());
+    p.traiter(&mut tout, 2, 48_000);
+    let mut servi = lire(&s1, 24);
+    servi.extend(lire(&s2, 24));
+    assert_eq!(servi.len(), tout.len());
+    for (i, (a, b)) in servi.iter().zip(&tout).enumerate() {
+        assert_eq!(a.to_bits(), b.to_bits(), "échantillon {i}");
+    }
+    // La tête de la voie retardée de la piste 2 porte la queue de la piste 1.
+    assert_ne!(servi[9_000 * 2 + 1], 0.0, "pas de zéros en tête");
+    // Contre-épreuve : une piste interrompue (pas de fin complète) ne laisse
+    // rien ; la suivante repart d'un historique vide.
+    let _ = jouer(&p1, false);
+    assert!(
+        reprendre_les_enceintes(ZONE, Some(reglages.clone()), 2, 48_000)
+            .is_some_and(|p| p.format_vu().is_none()),
+        "processeur neuf"
+    );
+    garder_les_enceintes(ZONE, ProcesseurEnceintes::new(reglages));
+    // Greffon coupé entre deux pistes : rien n'est repris.
+    assert!(reprendre_les_enceintes(ZONE, None, 2, 48_000).is_none());
 }

@@ -248,6 +248,12 @@ pub struct ContexteExecution<'a> {
     /// transport hors TESS, il fait passer la piste par le flux traité, comme
     /// l'égaliseur. Faux sans piste.
     pub replaygain_actif: bool,
+    /// rc14 — les voies qui arrivent au réglage des enceintes, vues par la
+    /// sortie APRÈS l'adaptation des voies (une source mono sur une sortie
+    /// stéréo : 2). `None` : inconnues (rien n'a joué, sortie réseau) ; la
+    /// résolution prend alors les sorties d'une réaffectation cochée, sinon
+    /// les voies de la source.
+    pub voies_de_sortie: Option<u16>,
 }
 
 /// Une étape du chemin du signal, résolue.
@@ -709,20 +715,40 @@ impl ChaineTess {
             return;
         };
         let mut e = greffons.remove(i);
-        // Les voies qui lui arrivent : celles de la source, sauf si une
-        // réaffectation effective les change (nombre alors inconnu ici).
-        let reaffectees = greffons.iter().any(|g| {
-            g.effective
-                && g.plugin_id
-                    .as_deref()
-                    .and_then(|id| catalogue.get(id))
-                    .is_some_and(|d| d.placement.channels == Canaux::Remaps)
+        // Les voies qui lui arrivent : celles que la sortie a vues (après
+        // adaptation) ; sinon les sorties d'une réaffectation effective ;
+        // sinon celles de la source.
+        let reaffectation = greffons
+            .iter()
+            .find(|g| {
+                g.effective
+                    && g.plugin_id
+                        .as_deref()
+                        .and_then(|id| catalogue.get(id))
+                        .is_some_and(|d| d.placement.channels == Canaux::Remaps)
+            })
+            .and_then(|g| g.plugin_id.clone());
+        let sorties_reaffectees = reaffectation.as_deref().map(|id| {
+            self.plugins
+                .iter()
+                .find(|m| m.id == id)
+                .and_then(|m| {
+                    serde_json::from_value::<
+                        crate::audio::reaffectation_canaux::ChannelRemapSettings,
+                    >(m.settings.clone())
+                    .ok()
+                })
+                .map(|s| usize::from(s.outputs))
+                .filter(|n| *n > 0)
         });
-        let canaux = ctx
-            .source
-            .and_then(|s| s.canaux())
-            .filter(|_| !reaffectees)
-            .map(usize::from);
+        let canaux =
+            ctx.voies_de_sortie
+                .map(usize::from)
+                .filter(|n| *n > 0)
+                .or(match sorties_reaffectees {
+                    Some(sorties) => sorties,
+                    None => ctx.source.and_then(|s| s.canaux()).map(usize::from),
+                });
         let reglages = self
             .plugins
             .iter()
@@ -756,6 +782,10 @@ impl ChaineTess {
                     json!(reglages.retards_en_echantillons(n, sample_rate_hz));
             }
             e.params = Some(params);
+        } else if let Some(n) = canaux {
+            // Éteint (neutre, PURE…) : l'écran affiche tout de même une
+            // ligne par voie qui arrive.
+            e.params = Some(json!({ "channels": n }));
         }
         greffons.push(e);
     }
@@ -860,6 +890,7 @@ mod tests {
                 db: -18.0,
             },
             replaygain_actif: false,
+            voies_de_sortie: None,
         }
     }
 
@@ -1458,5 +1489,58 @@ mod tests {
         let e = greffon(&resoudre(&contourne, &x), "speaker-setup").clone();
         assert!(!e.effective);
         assert_eq!(e.reason, Some(MotifEtape::BypassAll));
+    }
+
+    /// rc14 (relecture de #9523, m1 et m4) — les voies qui arrivent au
+    /// réglage des enceintes sont celles de la SORTIE : une source mono
+    /// ouverte en stéréo en donne 2 (le greffon n'est pas « neutre ») ; sous
+    /// réaffectation, ce sont ses sorties, pas la longueur de la liste.
+    #[test]
+    fn les_voies_du_reglage_des_enceintes_sont_celles_de_la_sortie_rc14() {
+        let enceintes = MaillonGreffon {
+            id: "speaker-setup".into(),
+            enabled: true,
+            settings: json!({ "channels": [{ "distance_cm": 343 }, { "distance_cm": 0 }] }),
+        };
+        let mono = SourceFlux::Pcm {
+            sample_rate_hz: 48_000,
+            bits: 16,
+            channels: 1,
+        };
+        let c = ChaineTess {
+            plugins: vec![enceintes.clone()],
+            ..ChaineTess::default()
+        };
+        let mut x = ctx(TransportZone::Local);
+        x.source = Some(mono);
+        // Sans le savoir : la source (1 voie) — rien à aligner.
+        let e = greffon(&resoudre(&c, &x), "speaker-setup").clone();
+        assert_eq!(e.reason, Some(MotifEtape::NeutralSettings));
+        assert_eq!(e.params, Some(json!({ "channels": 1 })));
+        // La sortie a ouvert 2 voies : le délai agit.
+        x.voies_de_sortie = Some(2);
+        let r = resoudre(&c, &x);
+        let e = greffon(&r, "speaker-setup");
+        assert!(e.effective, "{e:?}");
+        assert_eq!(e.params.as_ref().unwrap()["channels"], json!(2));
+        assert_eq!(e.latency_frames, Some(480));
+        assert_ne!(r.badge, Badge::BitPerfect);
+
+        // Réaffectation 2 → 4 cochée : 4 voies, quelle que soit la liste.
+        let c = ChaineTess {
+            plugins: vec![
+                MaillonGreffon {
+                    id: "channel-remap".into(),
+                    enabled: true,
+                    settings: json!({ "inputs": 2, "outputs": 4,
+                        "gains_db": [[0.0, null], [null, 0.0], [null, null], [null, null]] }),
+                },
+                enceintes,
+            ],
+            ..ChaineTess::default()
+        };
+        let x = ctx(TransportZone::Local);
+        let e = greffon(&resoudre(&c, &x), "speaker-setup").clone();
+        assert_eq!(e.params.as_ref().unwrap()["channels"], json!(4));
     }
 }

@@ -112,6 +112,7 @@ impl ChaineRadio {
             .clone()
             .filter(|r| !r.est_neutre(usize::from(channels)))
             .map(crate::audio::reglage_enceintes::ProcesseurEnceintes::new);
+        // Une radio est un flux continu : rien à reprendre ni à garder.
         StreamingDsp {
             convolver,
             crossfeed,

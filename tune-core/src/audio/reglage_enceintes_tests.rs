@@ -5,7 +5,7 @@ use serde_json::json;
 
 fn voie(distance_cm: f64, gain_db: f64, invert: bool) -> VoieEnceinte {
     VoieEnceinte {
-        distance_cm,
+        distance_cm: Some(distance_cm),
         gain_db,
         invert,
     }

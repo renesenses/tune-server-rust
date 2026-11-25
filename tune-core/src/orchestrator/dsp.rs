@@ -2191,8 +2191,16 @@ impl PlaybackOrchestrator {
             crossfeed: self.load_crossfeed_processor(zone_id, sample_rate),
             channels,
             compensation: None,
-            // rc14 — le réglage des enceintes, s'il touche ce flux.
-            enceintes: self.load_reglage_enceintes(zone_id, channels),
+            // rc14 — le réglage des enceintes, s'il touche ce flux ; la ligne
+            // à retard de la piste précédente de la zone, si elle vient de
+            // finir (enchaînement sans blanc).
+            enceintes: super::chaine_reseau_tess::reprendre_les_enceintes(
+                zone_id,
+                self.zone_reglage_enceintes(zone_id),
+                channels,
+                sample_rate,
+            ),
+            zone_enceintes: Some(zone_id),
             sample_rate,
             en_vol: None,
             convolveur_reste_a_jeter: None,
@@ -3295,18 +3303,6 @@ impl PlaybackOrchestrator {
     pub(super) fn zone_has_active_enceintes(&self, zone_id: i64) -> bool {
         self.zone_reglage_enceintes(zone_id)
             .is_some_and(|r| !r.est_neutre_partout())
-    }
-
-    /// rc14 — le processeur du réglage des enceintes d'un flux de `channels`
-    /// voies que Tune fabrique ; `None` s'il ne toucherait rien.
-    pub(super) fn load_reglage_enceintes(
-        &self,
-        zone_id: i64,
-        channels: u16,
-    ) -> Option<crate::audio::reglage_enceintes::ProcesseurEnceintes> {
-        self.zone_reglage_enceintes(zone_id)
-            .filter(|r| !r.est_neutre(usize::from(channels)))
-            .map(crate::audio::reglage_enceintes::ProcesseurEnceintes::new)
     }
 
     /// rc14 — reposer le réglage des enceintes sur la sortie locale qui joue,
