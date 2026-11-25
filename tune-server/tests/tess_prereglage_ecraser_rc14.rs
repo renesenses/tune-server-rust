@@ -76,7 +76,11 @@ impl Banc {
 
     async fn put_chaine(&self, zone: i64, corps: Value) {
         let (s, v) = self
-            .brut(Method::PUT, &format!("/api/v1/zones/{zone}/tess"), Some(corps))
+            .brut(
+                Method::PUT,
+                &format!("/api/v1/zones/{zone}/tess"),
+                Some(corps),
+            )
             .await;
         assert_eq!(s, StatusCode::OK, "{v}");
     }
@@ -91,8 +95,12 @@ impl Banc {
     }
 
     async fn ecraser(&self, id: &str, corps: Value) -> (StatusCode, Value) {
-        self.brut(Method::PUT, &format!("/api/v1/tess/presets/{id}"), Some(corps))
-            .await
+        self.brut(
+            Method::PUT,
+            &format!("/api/v1/tess/presets/{id}"),
+            Some(corps),
+        )
+        .await
     }
 
     async fn preset(&self, id: &str) -> Value {
@@ -132,7 +140,10 @@ async fn retoucher_marque_modifie_puis_enregistrer_ecrase_sans_nouvelle_ligne_rc
     let z = b.zone(b.zone).await;
     assert_eq!(z["active_preset"], json!("casque"));
     assert_eq!(z["base_preset"], json!("casque"));
-    assert!(z.get("preset_modified").is_none(), "non modifié : champ absent");
+    assert!(
+        z.get("preset_modified").is_none(),
+        "non modifié : champ absent"
+    );
 
     // Une retouche : plus « ACTIVE », mais l'origine reste, « modifié ».
     b.put_chaine(b.zone, crossfeed(0.7)).await;
@@ -149,7 +160,11 @@ async fn retoucher_marque_modifie_puis_enregistrer_ecrase_sans_nouvelle_ligne_rc
     assert_eq!(v["name"], json!("Casque"));
     assert_eq!(amount(&v["chain"]), 0.7);
     let (_, l) = b.brut(Method::GET, "/api/v1/tess/presets", None).await;
-    assert_eq!(l["presets"].as_array().unwrap().len(), 2, "pure + casque, sans doublon");
+    assert_eq!(
+        l["presets"].as_array().unwrap().len(),
+        2,
+        "pure + casque, sans doublon"
+    );
     let z = b.zone(b.zone).await;
     assert_eq!(z["active_preset"], json!("casque"));
     assert!(z.get("preset_modified").is_none());
@@ -238,7 +253,12 @@ async fn les_refus_de_l_ecrasement_et_les_autres_zones_rc14() {
         .await;
     assert_eq!(s, StatusCode::OK);
     for (id, corps, statut, code) in [
-        ("inconnu", json!({"zone_id": b.zone}), 404, "preset_not_found"),
+        (
+            "inconnu",
+            json!({"zone_id": b.zone}),
+            404,
+            "preset_not_found",
+        ),
         ("casque", json!({}), 400, "invalid_body"),
         (
             "casque",
