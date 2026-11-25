@@ -1543,7 +1543,12 @@ async fn revue_9520_ancien_client_eteint_l_egaliseur() {
     let avant = b.chaine();
     let uri = format!("/api/v1/zones/{}/eq", b.zone);
     let (s, eq) = b
-        .brut(Method::POST, &uri, Some(json!({"enabled": false}).to_string()), None)
+        .brut(
+            Method::POST,
+            &uri,
+            Some(json!({"enabled": false}).to_string()),
+            None,
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{eq}");
     let c = b.chaine();
@@ -1563,7 +1568,12 @@ async fn revue_9520_ancien_client_eteint_l_egaliseur() {
     }
 
     let (s, eq) = b
-        .brut(Method::POST, &uri, Some(json!({"enabled": true}).to_string()), None)
+        .brut(
+            Method::POST,
+            &uri,
+            Some(json!({"enabled": true}).to_string()),
+            None,
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{eq}");
     let apres = b.chaine();

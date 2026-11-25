@@ -167,7 +167,11 @@ fn une_seule_marge_rc14() {
     let mut sans = c.clone();
     sans.reserve_imposee_db = None;
     let attendu = (-4.5f64).min(pre(&sans));
-    assert!((pre(&c) - attendu).abs() < 1e-12, "{} vs {attendu}", pre(&c));
+    assert!(
+        (pre(&c) - attendu).abs() < 1e-12,
+        "{} vs {attendu}",
+        pre(&c)
+    );
     // Un manuel plus fort que la réserve : c'est lui.
     let mut fort = c.clone();
     fort.reserve_imposee_db = Some(pre(&sans) - 3.0);

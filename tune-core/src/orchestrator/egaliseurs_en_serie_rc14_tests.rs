@@ -296,7 +296,7 @@ async fn une_zone_d_avant_joue_comme_avant_rc14() {
     let avant = serde_json::to_value(o.load_eq_profile(z).unwrap()).unwrap();
     assert_eq!(avant, serde_json::from_str::<Value>(&brut).unwrap());
     migrer_zone(&settings(&o), z).unwrap();
-    assert!(crate::tess::egaliseurs_en_serie::egaliseurs_de_zone(&settings(&o), z).is_none());
+    assert!(crate::tess::egaliseurs_en_serie::egaliseurs_de_zone(&settings(&o), z, true).is_none());
     assert_eq!(
         serde_json::to_value(o.load_eq_profile(z).unwrap()).unwrap(),
         avant
@@ -405,13 +405,20 @@ async fn le_headroom_manuel_sans_egaliseur_est_un_gain_fixe_9520() {
 fn une_serie_soustractive_n_a_pas_de_falaise_9520() {
     let creux = |g: f64| EqProfile {
         enabled: true,
-        bands: vec![bande(1000.0, -20.0, 8.0, "peak"), bande(4000.0, g, 1.0, "peak")],
+        bands: vec![
+            bande(1000.0, -20.0, 8.0, "peak"),
+            bande(4000.0, g, 1.0, "peak"),
+        ],
         ..Default::default()
     };
     let serie = |g: f64| {
         crate::tess::egaliseurs_en_serie::combiner_en_serie(&[creux(g), parametrique()]).unwrap()
     };
-    let pre = |p: &EqProfile| crate::audio::eq::EqProcessor::new(p, SR, 2).preamp_db(0).unwrap();
+    let pre = |p: &EqProfile| {
+        crate::audio::eq::EqProcessor::new(p, SR, 2)
+            .preamp_db(0)
+            .unwrap()
+    };
     let (a, b) = (pre(&serie(-0.01)), pre(&serie(0.01)));
     assert!((a - b).abs() < 0.05, "falaise : {a} → {b}");
 }

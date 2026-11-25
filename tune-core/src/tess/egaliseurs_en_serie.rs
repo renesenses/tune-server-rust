@@ -131,7 +131,10 @@ fn sans_marques(v: &Value) -> Value {
 /// un profil posé par une ancienne route ou un préréglage d'avant ces bornes
 /// (jusqu'à ±24 dB, ce que le moteur prenait) se garde et se charge tel quel.
 /// Les bornes ne valent que pour une NOUVELLE édition.
-pub fn verifier_les_gains(chaine: &ChaineTess, connues: &[&ChaineTess]) -> Result<(), ErreurChaine> {
+pub fn verifier_les_gains(
+    chaine: &ChaineTess,
+    connues: &[&ChaineTess],
+) -> Result<(), ErreurChaine> {
     for m in &chaine.plugins {
         let Some((min, max)) = bornes_de_gain(&m.id) else {
             continue;

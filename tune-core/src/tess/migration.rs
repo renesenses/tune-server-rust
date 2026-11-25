@@ -1202,8 +1202,8 @@ pub fn normaliser_les_egaliseurs(chaine: &mut ChaineTess, premium: bool) -> bool
             .get(MARQUE_REMPLACE)
             .and_then(Value::as_str)
             .is_some_and(|g| FACADES_EQ.contains(&g));
-        let demande_le_premium = m.id == ID_EQ_PARAMETRIQUE
-            || (m.id == ID_CORRECTION_PIECE && !correction_estimee(m));
+        let demande_le_premium =
+            m.id == ID_EQ_PARAMETRIQUE || (m.id == ID_CORRECTION_PIECE && !correction_estimee(m));
         if ecartee
             && (premium || !demande_le_premium)
             && let Value::Object(s) = &mut m.settings
