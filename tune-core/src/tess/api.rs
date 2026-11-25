@@ -427,9 +427,6 @@ pub fn schema_json() -> Value {
                     "applicability": { "$ref": "#/$defs/applicability" },
                     "chain": { "$ref": "#/$defs/chain" },
                     "active_preset": texte_ou_null,
-                    // Facultatifs (rc14) : le préréglage d'origine et sa retouche.
-                    "base_preset": { "type": "string" },
-                    "preset_modified": { "type": "boolean" },
                     "headroom_db": { "type": "number" },
                     "volume": { "$ref": "#/$defs/volume" },
                     "badge": enumere(&["bit_perfect", "processed_by_tess", "outside_tess",
@@ -482,6 +479,11 @@ pub fn schema_json() -> Value {
             }
         }
     });
+    // Facultatifs (rc14, Rémi) : le préréglage d'origine et sa retouche.
+    // Posés hors de `json!` : la macro est à sa limite de récursion.
+    schema["$defs"]["zone_response"]["properties"]["base_preset"] = json!({ "type": "string" });
+    schema["$defs"]["zone_response"]["properties"]["preset_modified"] =
+        json!({ "type": "boolean" });
     schema["$defs"]["delivery"] = delivery;
     schema["$defs"]["zone_response"]["properties"]["delivery"] =
         json!({ "$ref": "#/$defs/delivery" });
