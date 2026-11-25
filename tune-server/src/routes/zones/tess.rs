@@ -417,6 +417,13 @@ pub(super) async fn reponse_de_zone(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let etat = state.playback.get_state(zone_id).await;
     let volume = volume_de(state, zone).await;
+    // Rémi (fil 3097) — une convolution que le convolueur saute à la cadence
+    // du flux (filtre 384 kHz, radio 48 kHz) ne se dit plus active. Lue
+    // avant le contexte, qui ne traverse pas un `await`.
+    let convolution = super::refus_surechantillonnage_tess::raison_de_la_convolution_en_cours(
+        state, zone_id, &etat,
+    )
+    .await;
     // T12b — famille UPnP : la voie de la chaîne vers ce lecteur (relais
     // progressif LPCM, transcodage, ou aucune), établie par la même sonde et
     // les mêmes réglages que la lecture. `None` hors famille UPnP. Avant le
@@ -468,6 +475,22 @@ pub(super) async fn reponse_de_zone(
     // pilote), reporté sur le chemin résolu.
     .avec_capacites_dsd(capacites_dsd);
     preciser_les_paquets_a_installer(&mut reponse, &settings);
+
+    // rc14 (rc13.91) — la sortie locale a refusé de suréchantillonner la
+    // piste en cours : l'étape ne se dit plus active, et dit pourquoi.
+    super::refus_surechantillonnage_tess::avec_le_refus_du_surechantillonneur(
+        reponse.signal_path.iter_mut(),
+        &reponse.chain,
+        super::refus_surechantillonnage_tess::refus_de_la_sortie_locale(
+            zone.output_type.as_deref(),
+            &etat,
+        ),
+    );
+    super::refus_surechantillonnage_tess::avec_la_raison_de_la_convolution(
+        reponse.signal_path.iter_mut(),
+        &reponse.chain,
+        convolution.as_ref().map(|(c, t)| (*c, t.as_str())),
+    );
     reponse
 }
 

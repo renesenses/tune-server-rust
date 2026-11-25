@@ -489,6 +489,9 @@ pub struct TrackImporter {
     types_de_sortie_poses: HashSet<i64>,
     /// Section « Live » — même marque pour les types SECONDAIRES de la balise.
     types_secondaires_poses: HashSet<i64>,
+    /// [rc14] Albums dont le code-barres de la balise a déjà été posé pendant
+    /// ce scan : un seul `UPDATE` réussi par album.
+    codes_barres_poses: HashSet<i64>,
     /// #5837 — les lignes album déjà tenues par une clé de `album_cache`
     /// pendant ce scan. Une ligne reprise pour une clé ne l'est jamais pour
     /// une autre : ce serait fondre deux parutions en une.
@@ -646,6 +649,7 @@ impl TrackImporter {
             albums_reclasses: HashSet::new(),
             types_de_sortie_poses: HashSet::new(),
             types_secondaires_poses: HashSet::new(),
+            codes_barres_poses: HashSet::new(),
             albums_en_cache: HashSet::new(),
             albums_gardes_sous_leur_artiste: HashSet::new(),
             qualites_par_dossier: HashMap::new(),
@@ -2055,6 +2059,24 @@ impl TrackImporter {
                 .poser_types_secondaires_si_vides(aid, secondaires)
             {
                 tracing::warn!(album_id = aid, error = %e, "types_secondaires_balise_non_poses");
+            }
+        }
+
+        // [rc14] Le code-barres de la balise (`BARCODE`, `UPC`, `EAN`, déjà
+        // validé à la lecture) remplit `albums.barcode` s'il est VIDE ; une
+        // valeur connue n'est jamais écrasée. `reidentify` le lisait déjà, le
+        // scan ne le posait pas. Une piste sans code-barres ne marque pas
+        // l'album : la suivante peut encore le porter.
+        if let (Some(aid), Some(code)) = (album_id, meta.barcode.as_deref())
+            && !self.codes_barres_poses.contains(&aid)
+        {
+            match self.album_repo.poser_code_barres_si_vide(aid, code) {
+                Ok(_) => {
+                    self.codes_barres_poses.insert(aid);
+                }
+                Err(e) => {
+                    tracing::warn!(album_id = aid, error = %e, "code_barres_balise_non_pose");
+                }
             }
         }
 
@@ -4179,3 +4201,7 @@ mod artistes_piste_tests_3179;
 #[cfg(test)]
 #[path = "scan_import_artiste_garde_tests_6459.rs"]
 mod artiste_garde_tests_6459;
+
+#[cfg(test)]
+#[path = "scan_import_code_barres_tests.rs"]
+mod code_barres_tests;
