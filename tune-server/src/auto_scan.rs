@@ -424,6 +424,10 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let mut skipped_by_ext = list_result.skipped_by_ext;
         let mut skipped_reasons = list_result.skipped_reasons;
         let mut skipped_unsupported_paths = list_result.skipped_paths;
+        // Les ISO SACD en DST écartés (fil 3047) — mêmes clés que le scan
+        // manuel (`ChiffresDeFinDeScan`).
+        let isos_sacd_dst = list_result.isos_sacd_dst;
+        let isos_sacd_dst_total = list_result.isos_sacd_dst_total;
         // Les feuilles CUE, relues après le parcours (#1763) — mêmes clés que
         // le scan manuel. Les deux scans écrivent le MÊME fichier
         // `<db>-scan-report.json` : une clé posée d'un seul côté ferait
@@ -1533,6 +1537,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // manuel (`ChiffresDeFinDeScan::rapport`).
             "matroska_admitted": stats.matroska_admis,
             "matroska_rejected": stats.matroska_ecartes,
+            // Les ISO SACD en DST écartés (fil 3047) — même compteur que le
+            // scan manuel (`ChiffresDeFinDeScan::rapport`).
+            "sacd_dst_unsupported": isos_sacd_dst_total,
             "skipped_unsupported_by_ext": skipped_by_ext,
             "skipped_unsupported_reasons": skipped_reasons,
             // Ce que les feuilles CUE décrivent (#1763) — mêmes clés que
@@ -1567,6 +1574,10 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             serde_json::json!(inventaire_cue.chemins_ecartes);
         // LESQUELS sont vides (#2060) — même clé que le scan manuel.
         report_fichier["skipped_empty_file_paths"] = serde_json::json!(stats.empty_file_paths);
+        // TOUS les ISO SACD en DST et leur message (fil 3047) — même
+        // construction que le scan manuel.
+        report_fichier["sacd_dst"] =
+            crate::routes::system::scan::rapport_isos_sacd_dst(isos_sacd_dst_total, &isos_sacd_dst);
         report_fichier["skipped_paths_truncated"] = serde_json::json!(
             [
                 skipped_unsupported_paths.len(),
