@@ -161,6 +161,15 @@ impl CorrectionPiece {
     }
 }
 
+/// Une cadence en kHz, lisible : 384000 → « 384 », 44100 → « 44.1 ».
+fn khz_lisible(hz: u32) -> String {
+    if hz.is_multiple_of(1000) {
+        (hz / 1000).to_string()
+    } else {
+        format!("{:.1}", f64::from(hz) / 1000.0)
+    }
+}
+
 /// Latence du convolueur partitionné : un bloc de 1024 trames (codé en dur
 /// dans `load_convolver`), en millisecondes à la cadence du flux.
 fn latence_convolueur_ms(sample_rate: u32) -> f64 {
@@ -273,7 +282,8 @@ pub(super) fn zone_correction_piece_lang(
             description: fs(
                 lang,
                 "correction_piece_cadence",
-                &[&ir.to_string(), &fil.to_string()],
+                // Rémi (fil 3097) — « filtre 384 kHz, flux 48 kHz ».
+                &[&khz_lisible(ir), &khz_lisible(fil)],
             ),
             reason: Some(format!("ir_sample_rate {ir} != stream_sample_rate {fil}")),
             ir_sample_rate: ir_sr,
@@ -1966,6 +1976,22 @@ pub(super) fn etat_du_surechantillonneur_lang(
 
 /// #8259 — codes observés, sans déduire une cause du seul réglage actuel.
 fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
+    cle_du_refus_selon_la_plateforme(raison, std::env::consts::OS)
+}
+
+/// rc14 (rc13.91) — la clé du texte d'un refus, pour la plateforme `os`
+/// (`std::env::consts::OS`) : le geste n'est pas le même partout. Paramètre
+/// et non `cfg!`, pour que chaque plateforme s'éprouve depuis n'importe où.
+pub(super) fn cle_du_refus_selon_la_plateforme(raison: &str, os: &str) -> &'static str {
+    match (raison, os) {
+        // Sous Windows, aucune sortie `hw:` : la liste n'est jamais mesurée,
+        // et sans cadence de mélangeur connue il n'y a rien à viser.
+        ("rates_not_measured", "windows") => return "upsampling_rates_not_measured_windows",
+        // Sous macOS, le chemin exclusif est le mode hog de CoreAudio : pas
+        // d'ASIO.
+        ("output_path_not_supported", "macos") => return "upsampling_output_path_macos",
+        _ => {}
+    }
     match raison {
         "fixed_rate" => "upsampling_fixed_rate",
         "pure" => "upsampling_pure",
@@ -1975,6 +2001,9 @@ fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
         "premium_required" => "upsampling_premium_required",
         "machine_test_missing" => "upsampling_machine_test_missing",
         "rates_not_measured" => "upsampling_rates_not_measured",
+        // rc14 — WASAPI partagé : le mélangeur n'est pas un multiple de la source.
+        "shared_mixer_rate_not_a_multiple" => "upsampling_shared_mixer_rate",
+        "shared_mixer_rate_not_above_source" => "upsampling_shared_mixer_rate_not_above",
         "no_candidate_rate_accepted_by_device" => "upsampling_device_rates",
         "machine_test_rejects_accepted_rates" => "upsampling_machine_rates",
         "settings_caps_exclude_admitted_rates" => "upsampling_settings_caps",
@@ -1989,6 +2018,17 @@ fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
         "output_rate_open_failed" | "filter_initialization_failed" => "upsampling_opening_failed",
         _ => "upsampling_not_applied",
     }
+}
+
+/// rc14 (rc13.91) — la raison, en clair et dans la langue de la requête,
+/// pour laquelle la sortie locale n'a pas suréchantillonné la piste. Sert à
+/// la page du greffon (`GET /upsampler/zones/{id}`), qui ne voyait que les
+/// refus de réglage (licence, PURE…) et jamais ceux du périphérique.
+pub(crate) fn description_du_refus_surechantillonnage(raison: &str) -> &'static str {
+    ts(
+        super::textes_signal::langue_courante(),
+        texte_du_refus_surechantillonnage(raison),
+    )
 }
 
 /// #6946 — pose la raison du plafond de librespot sur l'étape Source et la

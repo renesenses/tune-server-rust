@@ -174,6 +174,7 @@ async fn forme_de_zone(
     } else {
         portee.map_or("now", applies_at)
     };
+    let observe = refus_observe(state, zone_id).await;
     json!({
         "zone_id": zone_id,
         "settings": reglages,
@@ -183,7 +184,42 @@ async fn forme_de_zone(
         }),
         "applies_at": quand,
         "restart": portee == Some(tune_core::orchestrator::PorteeDuReglage::Relance),
+        // rc14 (rc13.91) — ce que la sortie a refusé à la piste en cours.
+        "observed_refusal": observe,
     })
+}
+
+/// rc14 (rc13.91) — pourquoi la sortie locale n'a pas suréchantillonné la
+/// piste qui joue, en clair : `{reason, description}`, ou `null`.
+///
+/// `constraint` ne dit que ce qui se juge sur les réglages (licence, PURE,
+/// test de la machine, zone réseau…). Un refus du PÉRIPHÉRIQUE (cadences non
+/// mesurées, mélangeur de Windows, mode exclusif…) ne se sait qu'à
+/// l'ouverture : la page restait muette (Xavier, Windows, 25/11).
+async fn refus_observe(state: &AppState, zone_id: i64) -> Value {
+    let etat = state.playback.get_state(zone_id).await;
+    let type_de_sortie = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_type);
+    forme_du_refus(
+        crate::routes::zones::refus_surechantillonnage_tess::refus_de_la_sortie_locale(
+            type_de_sortie.as_deref(),
+            &etat,
+        ),
+    )
+}
+
+/// `{reason, description}` d'un refus observé ; `null` sans refus.
+pub(crate) fn forme_du_refus(refus: Option<&str>) -> Value {
+    match refus.filter(|r| !r.is_empty()) {
+        Some(raison) => json!({
+            "reason": raison,
+            "description": crate::routes::zones::description_du_refus_surechantillonnage(raison),
+        }),
+        None => Value::Null,
+    }
 }
 
 async fn lire_zone(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
