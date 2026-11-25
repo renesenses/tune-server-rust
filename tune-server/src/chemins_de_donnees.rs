@@ -298,7 +298,10 @@ pub fn cache_de_pochettes_sans_variable(
     etat: impl Fn(&Path) -> EtatDuDossier,
 ) -> (PathBuf, OrigineDuCache) {
     if par_defaut.is_absolute() {
-        return (par_defaut.to_path_buf(), OrigineDuCache::DefautDeLaPlateforme);
+        return (
+            par_defaut.to_path_buf(),
+            OrigineDuCache::DefautDeLaPlateforme,
+        );
     }
     let ancien = cwd.join(par_defaut);
     let neuf = donnees.join("artwork_cache");
@@ -928,7 +931,12 @@ mod tests {
     #[test]
     fn installation_neuve_relancee_d_ailleurs_retrouve_ses_pochettes() {
         assert_eq!(
-            neuves("/tmp/ailleurs", "/srv/tune", true, &["/srv/tune/artwork_cache"]),
+            neuves(
+                "/tmp/ailleurs",
+                "/srv/tune",
+                true,
+                &["/srv/tune/artwork_cache"]
+            ),
             (
                 PathBuf::from("/srv/tune/artwork_cache"),
                 OrigineDuCache::SousLesDonnees
@@ -1078,7 +1086,12 @@ mod tests {
         assert_eq!(a.code, CACHE_RELATIF_AU_DOSSIER_COURANT);
         assert!(a.message.contains("TUNE_ARTWORK_DIR=/home/a/artwork_cache"));
         assert_eq!(
-            avertissement_du_cache(d, OrigineDuCache::AncienRelatifAuDossierCourant, true, Ok(())),
+            avertissement_du_cache(
+                d,
+                OrigineDuCache::AncienRelatifAuDossierCourant,
+                true,
+                Ok(())
+            ),
             None
         );
         for origine in [
@@ -1109,7 +1122,10 @@ mod tests {
         let base = donnees.join("tune.db");
         std::fs::write(&base, b"SQLite format 3\0").unwrap();
         // Ce que la base référence : des condensats (#1444), pas des chemins.
-        let condensats = ["0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"];
+        let condensats = [
+            "0123456789abcdef0123456789abcdef",
+            "fedcba9876543210fedcba9876543210",
+        ];
         std::fs::create_dir_all(habituel.join("artwork_cache")).unwrap();
         for c in condensats {
             std::fs::write(habituel.join(format!("artwork_cache/{c}.jpg")), b"jpg").unwrap();
@@ -1159,7 +1175,11 @@ mod tests {
         std::fs::write(racine.path().join("tune.db"), b"").unwrap();
         assert!(installation_existante("tune.db", false, racine.path()));
         let absolue = racine.path().join("tune.db");
-        assert!(installation_existante(absolue.to_str().unwrap(), false, Path::new("/")));
+        assert!(installation_existante(
+            absolue.to_str().unwrap(),
+            false,
+            Path::new("/")
+        ));
         assert!(installation_existante("absente.db", true, racine.path()));
         assert!(!installation_existante(":memory:", false, racine.path()));
     }
