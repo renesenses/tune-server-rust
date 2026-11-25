@@ -52,17 +52,15 @@ fn le_healthcheck_des_dockerfile_vise_une_route_publique() {
             chemin.starts_with("/api/v1/"),
             "{nom} : la sonde vise {chemin}, hors de /api/v1"
         );
-        // Les deux graphies : selon l'imbrication d'axum, le middleware voit
-        // le chemin avec ou sans le préfixe.
-        let court = chemin.strip_prefix("/api/v1").unwrap();
-        for vu in [chemin.as_str(), court] {
-            assert!(
-                est_route_publique(&Method::GET, vu),
-                "{nom} : le HEALTHCHECK appelle {chemin}, qui demande un jeton \
-                 quand l'authentification est active — Docker déclarerait le \
-                 conteneur « unhealthy »"
-            );
-        }
+        // Le chemin tel que la couche le voit : axum a retiré `/api/v1`.
+        // L'épreuve sur le vrai routeur, plus bas, tient l'autre bout.
+        let vu = chemin.strip_prefix("/api/v1").unwrap();
+        assert!(
+            est_route_publique(&Method::GET, vu),
+            "{nom} : le HEALTHCHECK appelle {chemin}, qui demande un jeton \
+             quand l'authentification est active — Docker déclarerait le \
+             conteneur « unhealthy »"
+        );
     }
 }
 

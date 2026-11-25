@@ -212,30 +212,27 @@ pub(crate) const LISTE_PUBLIQUE: &[(&str, &[&str])] = &[
     ("/auth/activation", &["GET"]),
 ];
 
-/// Le chemin tel que la liste publique l'écrit : sans le préfixe `/api/v1`.
-///
-/// Les deux graphies arrivent ici, parce que cette couche enveloppe le
-/// routeur `api`, lui-même imbriqué sous `/api/v1` : que le préfixe soit
-/// encore sur l'URI dépend des rouages d'imbrication d'axum, et le contrôle
-/// ne doit pas cesser de mordre en silence si cela change.
-fn chemin_sans_prefixe_api(path: &str) -> &str {
-    match path.strip_prefix("/api/v1") {
-        Some(reste) if reste.starts_with('/') => reste,
-        _ => path,
-    }
-}
-
 /// La route `(method, path)` passe-t-elle la couche d'authentification sans
 /// jeton ? Voir [`LISTE_PUBLIQUE`].
+///
+/// `path` est le chemin **tel que la couche le voit** : elle enveloppe le
+/// routeur `api`, imbriqué sous `/api/v1`, et axum retire le préfixe avant de
+/// l'appeler. Un chemin qui commence encore par `/api/v1` ici vient donc d'un
+/// préfixe doublé (`/api/v1/api/v1/…`) : il n'est jamais public. Si axum
+/// cessait un jour de retirer le préfixe, les épreuves sur le vrai routeur
+/// (`auth_liste_publique_tests`) rougiraient — la liste se fermerait, elle ne
+/// s'ouvrirait pas.
 ///
 /// Sortie du middleware pour qu'une épreuve puisse la confronter aux sondes
 /// qui vivent hors du code Rust — le `HEALTHCHECK` des images Docker en tête.
 pub(crate) fn est_route_publique(method: &axum::http::Method, path: &str) -> bool {
-    let chemin = chemin_sans_prefixe_api(path);
+    if path == "/api/v1" || path.starts_with("/api/v1/") {
+        return false;
+    }
     let lecture = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
     LISTE_PUBLIQUE
         .iter()
-        .any(|(public, methodes)| *public == chemin && methodes.contains(&method.as_str()))
+        .any(|(public, methodes)| *public == path && methodes.contains(&method.as_str()))
         // #8189 — la passerelle des sources réseau : un renderer n'a pas
         // de session. Le gestionnaire exige le jeton signé, propre au
         // fichier et de courte durée ; GET et HEAD seulement. Forme exacte
@@ -2483,35 +2480,36 @@ mod tests {
     #[test]
     fn only_handshake_auth_routes_are_public() {
         // Public: login, logout, and the read-only config status (GET).
-        assert!(est_route_publique(&Method::POST, "/api/v1/auth/login"));
-        assert!(est_route_publique(&Method::POST, "/api/v1/auth/logout"));
-        assert!(est_route_publique(&Method::GET, "/api/v1/auth/config"));
-        // Nesting may strip the /api/v1 prefix — both spellings must hold.
         assert!(est_route_publique(&Method::POST, "/auth/login"));
+        assert!(est_route_publique(&Method::POST, "/auth/logout"));
+        assert!(est_route_publique(&Method::GET, "/auth/config"));
+        // The layer sees the path with /api/v1 already stripped by axum: a
+        // path still carrying it here comes from a doubled prefix.
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/login"));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/system/health"));
     }
 
     #[test]
     fn privileged_auth_routes_are_never_public() {
         // The P0: these must never be reachable without a token.
-        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/config"));
+        assert!(!est_route_publique(&Method::POST, "/auth/config"));
         // Sécurité : l'inscription n'est plus publique sous authentification.
-        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/register"));
         assert!(!est_route_publique(&Method::POST, "/auth/register"));
-        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/token"));
-        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/token"));
-        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/api-key"));
-        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/api-key"));
-        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/me"));
+        assert!(!est_route_publique(&Method::POST, "/auth/token"));
+        assert!(!est_route_publique(&Method::GET, "/auth/token"));
+        assert!(!est_route_publique(&Method::POST, "/auth/api-key"));
+        assert!(!est_route_publique(&Method::GET, "/auth/api-key"));
+        assert!(!est_route_publique(&Method::GET, "/auth/me"));
         assert!(!est_route_publique(
             &Method::POST,
-            "/api/v1/system/audio/asio-warm-scan/rearm"
+            "/system/audio/asio-warm-scan/rearm"
         ));
     }
 
     #[test]
     fn unrelated_paths_are_not_matched() {
-        assert!(!est_route_publique(&Method::GET, "/api/v1/library/albums"));
-        assert!(!est_route_publique(&Method::POST, "/api/v1/system/restart"));
+        assert!(!est_route_publique(&Method::GET, "/library/albums"));
+        assert!(!est_route_publique(&Method::POST, "/system/restart"));
     }
 }
 
