@@ -1241,7 +1241,10 @@ fn chaine_tess(ids: &[&str]) -> ChaineTess {
 fn crossfeed_puis_egaliseur_par_canal_suit_l_ordre_affiche_rc14() {
     use EtageLocal::*;
     let inverse = OrdreLocal::depuis_chaine(&chaine_tess(&["crossfeed", "equalizer-parametric"]));
-    assert_eq!(inverse.etages(), [Crossfeed, Egaliseur, Convolution, RepliMono]);
+    assert_eq!(
+        inverse.etages(),
+        [Crossfeed, Egaliseur, Convolution, RepliMono]
+    );
     let source = octets(&mots(8_000, 24), 24);
     let sortie = |ordre: OrdreLocal| {
         let c = Chaine::avec(Some(egaliseur_gauche()), None, Some(crossfeed()), false);

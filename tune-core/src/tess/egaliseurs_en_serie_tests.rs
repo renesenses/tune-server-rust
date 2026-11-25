@@ -267,7 +267,9 @@ fn l_ordre_des_familles_ne_change_qu_au_deplacement_rc14() {
         ..ChaineTess::default()
     };
     let defaut = ordre_des_coches(&c(&[("equalizer-graphic", true), ("crossfeed", true)]));
-    assert_eq!(defaut, [0, 1, 2]);
+    // Sans convolution cochée, sa place ne compte pas (aucun moteur) :
+    // même règle que `OrdreLocal::depuis_ids`.
+    assert_eq!(defaut, [0, 2, 1]);
     assert_eq!(
         ordre_des_coches(&c(&[
             ("equalizer-graphic", true),
@@ -277,7 +279,7 @@ fn l_ordre_des_familles_ne_change_qu_au_deplacement_rc14() {
         ])),
         defaut
     );
-    assert_eq!(ordre_des_coches(&c(&[("crossfeed", false)])), defaut);
+    assert_eq!(ordre_des_coches(&c(&[("crossfeed", false)])), [0, 1, 2]);
     assert_eq!(
         ordre_des_coches(&c(&[("crossfeed", true), ("equalizer-graphic", true)])),
         [2, 0, 1]

@@ -96,7 +96,9 @@ impl OrdreLocal {
             let e = match id {
                 // rc14 — la correction de pièce est une façade de l'égaliseur
                 // (`zone_{id}_eq_profile`, D1) : elle vit dans son moteur.
-                "equalizer-graphic" | "equalizer-parametric" | "equalizer-headphone"
+                "equalizer-graphic"
+                | "equalizer-parametric"
+                | "equalizer-headphone"
                 | "room-correction" => EtageLocal::Egaliseur,
                 "convolution" => EtageLocal::Convolution,
                 "crossfeed" | "crosstalk" => EtageLocal::Crossfeed,
