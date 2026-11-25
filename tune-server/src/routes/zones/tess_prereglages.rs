@@ -845,7 +845,10 @@ async fn apres_le_rafraichissement(state: &AppState, zone_id: i64, cles: &[Strin
     }
     // La clé de l'égaliseur principal, ou la chaîne elle-même : avec les
     // égaliseurs en série (#9520), « coupé » se lit sur le profil du moteur
-    // (toutes les façades cochées), pas sur la seule `zone_{id}_eq_profile`.
+    // (toutes les façades cochées), pas sur la seule clé de l'égaliseur
+    // principal. Ce module n'écrit jamais cette clé lui-même : l'écriture
+    // passe par `appliquer_le_put` et le rafraîchissement de l'égaliseur par
+    // `tess::rafraichir` (voir `appliquer_selon_le_mode`).
     if cles.contains(&tune_core::tess::migration::Partie::Egaliseur.cle(zone_id))
         || cles.contains(&tune_core::tess::cle_chaine_zone(zone_id))
     {
@@ -926,7 +929,11 @@ mod reprise_rc14_tests {
             .create("Salon", Some("local"), Some("local:Realtek HD"))
             .unwrap();
         spawn_application_au_demarrage(&state);
-        ajouter_en_attente(zone, vec![format!("zone_{zone}_crossfeed")]);
+        // La clé du crossfeed par sa `Partie`, comme la route qui l'écrit.
+        ajouter_en_attente(
+            zone,
+            vec![tune_core::tess::migration::Partie::Crossfeed.cle(zone)],
+        );
         // La pause ne sert rien.
         state.playback.pause(zone).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
