@@ -482,13 +482,39 @@ impl ProducteurDsd {
     /// brut (`audio::dsd_brut::entete`).
     pub fn entete(&self, duree_ms: Option<u64>) -> Vec<u8> {
         match self.plan.transport {
-            TransportModulation::Dop => crate::audio::wav::build_wav_header_with_duration(
-                self.plan.voies,
-                self.plan.cadence_du_porteur(),
-                24,
-                duree_ms,
-            )
-            .to_vec(),
+            TransportModulation::Dop => {
+                let voies = self.plan.voies;
+                let cadence = self.plan.cadence_du_porteur();
+                let indetermine = duree_ms.is_none_or(|d| d == 0)
+                    || crate::audio::wav::wav_stream_needs_indeterminate_length(
+                        voies, cadence, 24, duree_ms,
+                    );
+                if indetermine {
+                    // Sentinelle de longueur inconnue, ou en-tête de flux
+                    // continu pour une durée hors de portée du WAV.
+                    crate::audio::wav::build_wav_header_with_duration(voies, cadence, 24, duree_ms)
+                        .to_vec()
+                } else {
+                    // Longueur alignée sur une PAIRE de trames DoP : la sortie
+                    // coupe à cette borne sans jamais garder un reliquat de
+                    // trame, et le compte de trames reste pair.
+                    let paire = 2 * 3 * u64::from(voies);
+                    let octets = crate::audio::wav::octets_pcm_attendus(
+                        duree_ms.unwrap_or(0),
+                        cadence,
+                        voies,
+                        24,
+                    );
+                    let octets = octets - octets % paire;
+                    crate::audio::wav::build_wav_header_with_data_size(
+                        voies,
+                        cadence,
+                        24,
+                        octets as u32,
+                    )
+                    .to_vec()
+                }
+            }
             TransportModulation::Native => {
                 crate::audio::dsd_brut::entete(self.plan.cadence_dsd, self.plan.voies).to_vec()
             }
@@ -623,9 +649,11 @@ pub const RELAIS_PAR_ZONE: usize = 4;
 /// Relais gardés au plus, toutes zones.
 pub const RELAIS_MAX: usize = 64;
 
-/// Un relais plus vieux que ceci est orphelin (piste de 30 min au plus
-/// entre son ouverture et la reprise de son état) : retiré.
-const RELAIS_PERIME: Duration = Duration::from_secs(1_800);
+/// Un relais SANS ACTIVITÉ depuis ceci est orphelin : retiré. L'âge se
+/// mesure depuis le dernier signe de vie (bloc envoyé, dépôt, abandon), pas
+/// depuis l'ouverture : une piste longue (concert, opéra, mix) garde son
+/// relais tant que son producteur avance.
+pub const RELAIS_PERIME: Duration = Duration::from_secs(1_800);
 
 /// Plafond absolu d'une attente (une piste en pause très longue).
 const ATTENTE_MAX: Duration = Duration::from_secs(1_800);
@@ -640,7 +668,7 @@ fn plus_ancien(r: &TableDesRelais, zone: Option<i64>) -> Option<String> {
 
 fn purger(r: &mut TableDesRelais, zone_id: i64) {
     r.par_session
-        .retain(|_, x| x.ouvert.elapsed() < RELAIS_PERIME);
+        .retain(|_, x| x.avance.elapsed() < RELAIS_PERIME);
     r.annonces
         .retain(|_, (_, _, t)| t.elapsed() < ANNONCE_VALABLE);
     while r
@@ -664,6 +692,18 @@ fn purger(r: &mut TableDesRelais, zone_id: i64) {
             }
             None => break,
         }
+    }
+}
+
+/// Témoins : recule l'ouverture d'un relais (piste ouverte depuis
+/// longtemps), sans toucher à son dernier signe de vie.
+#[cfg(test)]
+pub(crate) fn vieillir_l_ouverture(session: &str, de: Duration) {
+    let mut r = relais().0.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(x) = r.par_session.get_mut(session)
+        && let Some(t) = x.ouvert.checked_sub(de)
+    {
+        x.ouvert = t;
     }
 }
 
@@ -724,6 +764,7 @@ pub fn deposer_au_relais(session: &str, producteur: ProducteurDsd) {
     let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(x) = r.par_session.get_mut(session) {
         x.etat = EtatDuRelais::Depose(Box::new(producteur));
+        x.avance = Instant::now();
     }
     c.notify_all();
 }
@@ -735,6 +776,7 @@ pub fn abandonner_le_relais(session: &str) {
     let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(x) = r.par_session.get_mut(session) {
         x.etat = EtatDuRelais::Abandonne;
+        x.avance = Instant::now();
     }
     c.notify_all();
 }
@@ -914,6 +956,11 @@ pub fn rafraichir_reglages_de_volume(
     db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
     zone_id: i64,
 ) {
+    // Lecture ET publication sous un même verrou : une écriture concurrente
+    // (dont le crochet de `SettingsRepo` relit APRÈS son écriture) passe
+    // toujours après une lecture plus ancienne, jamais avant.
+    static SERIE: Mutex<()> = Mutex::new(());
+    let _serie = SERIE.lock().unwrap_or_else(|e| e.into_inner());
     let trim = crate::orchestrator::gain_trim_db_enregistre(db, zone_id);
     let verrou = crate::audio::audiophile::effective_volume(db, zone_id, 0.0) >= 1.0;
     publier_reglages_de_volume(zone_id, trim, verrou);

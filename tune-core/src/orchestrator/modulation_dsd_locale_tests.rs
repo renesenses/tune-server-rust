@@ -504,3 +504,17 @@ async fn capacites_de_la_zone() {
         Some(MotifDsdRefuse::RateAboveZoneMax)
     );
 }
+
+/// v4 D2 : les sentinelles de longueur inconnue ne bornent pas le flux (une
+/// longue piste de durée inconnue n'est jamais coupée) ; une vraie longueur
+/// le borne.
+#[test]
+fn les_sentinelles_de_longueur_ne_bornent_rien() {
+    for sentinelle in [u32::MAX, 0x7FFF_FFFF - 36, 0] {
+        let e = crate::audio::wav::build_wav_header_with_data_size(2, 176_400, 24, sentinelle);
+        assert_eq!(super::longueur_annoncee(&e), None, "{sentinelle:#x}");
+    }
+    let e = crate::audio::wav::build_wav_header_with_data_size(2, 176_400, 24, 1_200);
+    assert_eq!(super::longueur_annoncee(&e), Some(1_200));
+    assert_eq!(super::longueur_annoncee(b"TUNEDSD1________"), None);
+}

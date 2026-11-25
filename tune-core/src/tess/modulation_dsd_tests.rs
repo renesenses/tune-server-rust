@@ -851,3 +851,42 @@ fn l_attente_suit_l_avance_de_la_precedente() {
         "pré-armée et non lue : elle attend le dépôt"
     );
 }
+
+/// v4 D1 : une piste longue (ouverte depuis plus de `RELAIS_PERIME`, pauses
+/// comprises) dont le producteur avance garde son relais : la suivante
+/// pré-armée reprend bien son état, même après une purge.
+#[test]
+fn une_piste_longue_garde_son_relais() {
+    let zone = 9_430_970;
+    let pl = plan(TransportModulation::Dop, TauxDsd::Dsd64, 44_100);
+    ouvrir_le_relais(zone, "v4-a", pl);
+    vieillir_l_ouverture("v4-a", RELAIS_PERIME + Duration::from_secs(60));
+    signaler_l_avance("v4-a");
+    // Une autre ouverture déclenche la purge.
+    ouvrir_le_relais(9_430_971, "v4-autre", pl);
+    annoncer_la_suivante(zone, 2, "v4-a");
+    let lien = prendre_le_lien(zone, Some(2), pl).expect("le relais de A est toujours là");
+    deposer_au_relais("v4-a", ProducteurDsd::new(pl).unwrap());
+    assert!(attendre_le_relais(&lien, pl, Duration::from_secs(2), &|| false).is_some());
+}
+
+/// v4 D2 : la longueur annoncée d'un flux DoP modulé est alignée sur une
+/// PAIRE de trames (la sortie coupe sans reliquat de trame à la jonction).
+#[test]
+fn la_longueur_dop_annoncee_est_alignee_sur_une_paire_de_trames() {
+    let p = ProducteurDsd::new(plan(TransportModulation::Dop, TauxDsd::Dsd64, 44_100)).unwrap();
+    for ms in [1, 999, 1_001, 123_457, 600_007] {
+        let e = p.entete(Some(ms));
+        let n = u32::from_le_bytes(e[40..44].try_into().unwrap());
+        assert_eq!(n % 12, 0, "{ms} ms : {n}");
+        assert!(n > 0);
+    }
+    // Une heure de DoP DSD64 (3,8 Go) dépasse le WAV : en-tête de flux
+    // continu, sans borne.
+    let e = p.entete(Some(3_600_007));
+    assert_eq!(u32::from_le_bytes(e[40..44].try_into().unwrap()), u32::MAX);
+    // Durée inconnue : la sentinelle, jamais une borne.
+    let e = p.entete(None);
+    let n = u32::from_le_bytes(e[40..44].try_into().unwrap());
+    assert!(n == 0x7FFF_FFFF - 36 || n == u32::MAX, "{n:#x}");
+}

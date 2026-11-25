@@ -163,7 +163,9 @@ fn longueur_annoncee(entete: &[u8]) -> Option<u64> {
         return None;
     }
     let n = u32::from_le_bytes(entete[40..44].try_into().ok()?);
-    (n != 0 && n != u32::MAX).then_some(u64::from(n))
+    // Les sentinelles de longueur inconnue (`u32::MAX`, `0x7FFF_FFFF − 36`)
+    // ne bornent rien : même règle que `borner_donnees_wav` de la sortie.
+    (n != 0 && n != u32::MAX && n != 0x7FFF_FFFF - 36).then_some(u64::from(n))
 }
 
 /// Le fil du producteur : en-tête, état de la piste précédente s'il y a un
@@ -511,12 +513,31 @@ impl PlaybackOrchestrator {
     pub async fn relancer_apres_rupture_dsd(&self, zone_id: i64, constat: String) {
         let etat = self.playback.get_state(zone_id).await;
         let position = super::dsp::position_a_reprendre(&etat);
+        let session = etat
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.clone());
         warn!(zone_id, position, "tess_dsd_porteur_refuse_relance_en_pcm");
         let resultat =
             Box::pin(self.replay_zone_at_position(zone_id, position, "tess_dsd_porteur_refuse"))
                 .await;
         if let Err(e) = resultat {
             warn!(zone_id, error = %e, constat = %constat, "tess_dsd_relance_apres_rupture_refusee");
+            // Rien à dire si l'utilisateur a arrêté ou changé de piste
+            // entre-temps : l'échec ne concerne que la piste rompue, encore
+            // dans sa session.
+            let maintenant = self.playback.get_state(zone_id).await;
+            let meme_flux = maintenant.state != crate::playback::PlayState::Stopped
+                && session.is_some()
+                && maintenant
+                    .now_playing
+                    .as_ref()
+                    .and_then(|np| np.stream_id.clone())
+                    == session;
+            if !meme_flux {
+                info!(zone_id, "tess_dsd_relance_echouee_zone_deja_ailleurs");
+                return;
+            }
             if let Some(bus) = &self.event_bus {
                 bus.emit(
                     "zone.playback_error",
