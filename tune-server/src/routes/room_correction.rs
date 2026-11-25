@@ -258,25 +258,35 @@ async fn apply_profile_handler(
     // `room_profile_{id}`). Même verrou qu'un `PUT /zones/{id}/tess`. Une zone
     // sans identifiant numérique, ou une chaîne d'une version plus récente,
     // garde l'écriture directe d'avant.
-    let par_la_chaine = match zone_id.parse::<i64>() {
+    let pose = match zone_id.parse::<i64>() {
         Ok(id) => {
             let verrou = super::zones::tess::verrou_des_put(id);
             let _garde = verrou.lock().await;
-            match tune_core::tess::migration::poser_la_correction_de_piece(
-                &settings,
-                id,
-                &eq_profile,
-            ) {
-                Ok(_) => true,
+            let backend = state.backend.clone();
+            let profil = eq_profile.clone();
+            let resultat = tokio::task::spawn_blocking(move || {
+                tune_core::tess::migration::poser_la_correction_de_piece(
+                    &SettingsRepo::with_backend(backend),
+                    id,
+                    &profil,
+                )
+            })
+            .await;
+            match resultat {
+                Ok(Ok(p)) => Some((id, p)),
+                Ok(Err(e)) => {
+                    tracing::warn!(zone_id = id, erreur = %e, "correction_piece_hors_chaine_tess");
+                    None
+                }
                 Err(e) => {
                     tracing::warn!(zone_id = id, erreur = %e, "correction_piece_hors_chaine_tess");
-                    false
+                    None
                 }
             }
         }
-        Err(_) => false,
+        Err(_) => None,
     };
-    if !par_la_chaine {
+    if pose.is_none() {
         settings
             .set(
                 &format!("zone_{zone_id}_eq_profile"),
@@ -284,6 +294,26 @@ async fn apply_profile_handler(
                     .map_err(|e| AppError::internal(e.to_string()))?,
             )
             .map_err(AppError::internal)?;
+    }
+
+    // rc14 — après l'écriture de la chaîne, comme un `PUT /zones/{id}/tess` :
+    // l'ordre des étages de la sortie locale suit, et un préréglage TESS qui
+    // ne décrit plus la chaîne n'est plus marqué « ACTIVE » (T17).
+    let mut avertissements: Vec<String> = Vec::new();
+    if let Some((id, p)) = &pose {
+        if p
+            .bilan
+            .cles_modifiees
+            .contains(&tune_core::tess::egaliseurs_en_serie::cle_ordre_tess(*id))
+        {
+            state.orchestrator.appliquer_ordre_tess(*id).await;
+        }
+        avertissements.extend(super::zones::tess_prereglages::oublier_le_prereglage_s_il_differe(
+            &state, *id, &p.chaine,
+        ));
+        if !p.en_serie.is_empty() {
+            avertissements.push("other_equalizers_in_series".to_owned());
+        }
     }
 
     // Persister ne suffit pas : sans ceci la correction n'atteint le son qu'a
@@ -307,6 +337,12 @@ async fn apply_profile_handler(
         "applied_live": applique_a_chaud,
         // #4680 — quand il s'entend ; voir `POST /zones/{id}/eq`.
         "portee": portee.map(|p| p.code()),
+        // rc14 (égaliseurs en série) — les autres égaliseurs cochés de la
+        // chaîne TESS, qui jouent en série avec la correction, et la façade
+        // qu'elle a remplacée (une ancienne correction devenue paramétrique).
+        "in_series_with": pose.as_ref().map(|(_, p)| p.en_serie.clone()).unwrap_or_default(),
+        "replaced": pose.as_ref().and_then(|(_, p)| p.remplacee.clone()),
+        "warnings": avertissements,
     }))
     .into_response())
 }

@@ -829,14 +829,17 @@ pub fn facade_d_une_ancienne_ecriture(
     )
 }
 
-/// rc14 — répare une chaîne abîmée en rc13.90 : une correction de pièce
-/// devenue « Égaliseur paramétrique » (reclassée après le remplacement de son
-/// profil de pièce) redevient `room-correction` quand ses bandes sont celles
-/// du profil de pièce de la zone. Les deux façades demandent le Premium (sauf
-/// une estimation sans micro, Free, qui est bien une correction de pièce).
-/// Le graphique n'est jamais touché : pour un compte gratuit, c'est aussi la
-/// vue convertie (D1). Rien n'est fait si la chaîne porte déjà une
-/// correction de pièce. Rend `true` si la chaîne a changé.
+/// rc14 — répare à la LECTURE une chaîne abîmée en rc13.90 : un
+/// « Égaliseur paramétrique » dont les bandes sont celles du profil de pièce
+/// ACTUEL de la zone redevient `room-correction` (les deux demandent le
+/// Premium, sauf une estimation sans micro, Free, qui est bien une
+/// correction de pièce). Une correction reclassée parce que son profil a été
+/// REMPLACÉ depuis (ses bandes sont celles de l'ancien profil) n'est pas
+/// reconnue ici : elle l'est à l'application du nouveau profil
+/// ([`poser_la_correction_de_piece`], qui la remplace). Le graphique n'est
+/// jamais touché : pour un compte gratuit, c'est aussi la vue convertie
+/// (D1). Rien n'est fait si la chaîne porte déjà une correction de pièce.
+/// Rend `true` si la chaîne a changé.
 pub fn reparer_la_correction_de_piece(chaine: &mut ChaineTess, piece: Option<&EqProfile>) -> bool {
     let Some(piece) = piece.filter(|p| !p.bands.is_empty()) else {
         return false;
@@ -854,19 +857,72 @@ pub fn reparer_la_correction_de_piece(chaine: &mut ChaineTess, piece: Option<&Eq
     true
 }
 
+/// rc14 — la clé qui garde les bandes de la dernière correction de pièce
+/// APPLIQUÉE à la zone ([`poser_la_correction_de_piece`]) : une correction
+/// reclassée plus tard en paramétrique reste reconnaissable.
+pub fn cle_correction_appliquee(zone_id: i64) -> String {
+    format!("zone_{zone_id}_room_correction_applied")
+}
+
+/// Ce que l'application d'un profil de pièce a fait à la chaîne.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PoseDeLaCorrection {
+    pub bilan: BilanEcriture,
+    /// La chaîne enregistrée après l'écriture.
+    pub chaine: ChaineTess,
+    /// L'id de la façade remplacée par la correction (un paramétrique qui
+    /// était une ancienne correction de pièce), s'il y en a une.
+    pub remplacee: Option<String>,
+    /// Les AUTRES égaliseurs cochés, qui jouent en série avec la correction.
+    pub en_serie: Vec<String>,
+}
+
+/// Les bandes des anciennes corrections de pièce de la zone que l'on sait
+/// retrouver : la dernière appliquée ([`cle_correction_appliquee`]) et
+/// l'égaliseur d'avant TESS ([`cle_sauvegarde_eq`]), quand il ressemble à
+/// une correction (bandes sans canal, posées par une route `apply`).
+fn anciennes_corrections(settings: &SettingsRepo, zone_id: i64) -> Vec<Vec<EqBandSpec>> {
+    let lire = |cle: String| {
+        settings
+            .get(&cle)
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_str::<EqProfile>(&b).ok())
+            .map(|p| p.bands)
+            .filter(|b| !b.is_empty())
+    };
+    let mut v = Vec::new();
+    v.extend(lire(cle_correction_appliquee(zone_id)));
+    v.extend(
+        lire(cle_sauvegarde_eq(zone_id))
+            .filter(|b| b.iter().all(|x| x.channel.is_none()) && !est_courbe_graphique(b)),
+    );
+    v
+}
+
 /// rc14 (égaliseurs en série) — `POST /room-correction/profiles/{zone}/apply`
 /// : pose le maillon `room-correction` de la chaîne avec les bandes de
-/// `profil`, coché, et l'enregistre par [`ecrire_chaine`]. Les autres façades
-/// de la série ne sont pas touchées (ni décochées, ni supprimées) ;
+/// `profil`, coché, et l'enregistre par [`ecrire_chaine`].
+///
+/// - un maillon `room-correction` déjà présent est mis à jour sur place ;
+/// - sinon, un « Égaliseur paramétrique » qui ÉTAIT une correction de pièce
+///   (ses bandes sont celles du profil actuel ou d'une ancienne correction
+///   de la zone, [`anciennes_corrections`] : reclassé en rc13.90 après le
+///   remplacement de son profil) est REMPLACÉ, pour qu'il ne reste qu'une
+///   correction ;
+/// - sinon, la correction est ajoutée à la suite des égaliseurs.
+///
+/// Les autres façades ne sont pas touchées ; [`PoseDeLaCorrection::en_serie`]
+/// dit lesquelles, cochées, jouent en série avec elle.
 /// `zone_{id}_eq_profile` reste l'égaliseur principal (la première façade
-/// cochée). Un maillon `room-correction` déjà présent est mis à jour sur
-/// place, sinon il est ajouté à la suite des égaliseurs.
+/// cochée).
 pub fn poser_la_correction_de_piece(
     settings: &SettingsRepo,
     zone_id: i64,
     profil: &EqProfile,
-) -> Result<BilanEcriture, ErreurMigration> {
-    let mut chaine = lire_zone(settings, zone_id, true)?.chaine;
+) -> Result<PoseDeLaCorrection, ErreurMigration> {
+    let lecture = lire_zone(settings, zone_id, true)?;
+    let mut chaine = lecture.chaine;
     if chaine.version > VERSION_CHAINE {
         return Err(ErreurMigration::VersionPlusRecente {
             trouvee: chaine.version,
@@ -881,8 +937,44 @@ pub fn poser_la_correction_de_piece(
             });
         }
     };
+    let mut remplacee = None;
+    if !chaine.plugins.iter().any(|m| m.id == ID_CORRECTION_PIECE) {
+        let mut connues = anciennes_corrections(settings, zone_id);
+        connues.push(profil.bands.clone());
+        let synchronisees = lecture
+            .ombre
+            .get(&Partie::Egaliseur.nom())
+            .and_then(|o| o.as_deref())
+            .and_then(|b| serde_json::from_str::<EqProfile>(b).ok())
+            .map(|p| p.bands);
+        if let Some(m) = chaine.plugins.iter_mut().find(|m| {
+            m.id == ID_EQ_PARAMETRIQUE
+                && bandes_du_maillon(m, synchronisees.as_deref())
+                    .is_some_and(|b| connues.iter().any(|c| memes_bandes(c, &b)))
+        }) {
+            remplacee = Some(m.id.clone());
+            m.id = ID_CORRECTION_PIECE.to_owned();
+        }
+    }
     poser(&mut chaine, ID_CORRECTION_PIECE, true, reglages);
-    ecrire_chaine(settings, zone_id, &chaine)
+    let en_serie = chaine
+        .plugins
+        .iter()
+        .filter(|m| m.enabled && m.id != ID_CORRECTION_PIECE && FACADES_EQ.contains(&m.id.as_str()))
+        .map(|m| m.id.clone())
+        .collect();
+    let bilan = ecrire_chaine(settings, zone_id, &chaine)?;
+    stockage(settings.set(
+        &cle_correction_appliquee(zone_id),
+        &serde_json::to_string(profil).map_err(|e| ErreurMigration::Stockage(e.to_string()))?,
+    ))?;
+    let chaine = lire_zone(settings, zone_id, true)?.chaine;
+    Ok(PoseDeLaCorrection {
+        bilan,
+        chaine,
+        remplacee,
+        en_serie,
+    })
 }
 
 fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, ctx: &ContexteZone) {

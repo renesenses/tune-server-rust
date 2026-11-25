@@ -2845,7 +2845,9 @@ fn appliquer_un_profil_de_piece_garde_les_autres_egaliseurs_de_la_serie() {
     // on remet la clé du graphique, seul le profil de pièce compte ici.
     ecrire_ancienne_cle(&s, z, &profil(true, g.clone()));
     let nouveau = crate::room_correction::profil_eq_de_correction(&filtres_de_piece());
-    poser_la_correction_de_piece(&s, z, &nouveau).unwrap();
+    let pose = poser_la_correction_de_piece(&s, z, &nouveau).unwrap();
+    assert_eq!(pose.en_serie, vec![ID_EQ_GRAPHIQUE.to_owned()]);
+    assert_eq!(pose.remplacee, None);
 
     let l = lire_zone(&s, z, true).unwrap();
     assert_eq!(
@@ -2887,4 +2889,74 @@ fn la_facade_d_une_ancienne_ecriture_suit_la_lecture_de_la_chaine() {
         facade_d_une_ancienne_ecriture(&s, z, &autre),
         ID_EQ_PARAMETRIQUE
     );
+}
+
+/// rc14 (revue de #9534, M1) — `[paramétrique R1 coché]`, où R1 est une
+/// ancienne correction de pièce reclassée en rc13.90 après le remplacement
+/// de son profil : appliquer R2 REMPLACE R1 (une seule correction joue). R1
+/// est reconnue par la dernière correction appliquée, ou par l'égaliseur
+/// d'avant TESS. Contre-épreuve : un paramétrique de l'utilisateur reste, et
+/// il est dit en série.
+#[test]
+fn appliquer_un_profil_remplace_une_ancienne_correction_devenue_parametrique() {
+    let (_b, s) = base();
+    let r1 = vec![
+        bande(52.0, -6.5, 4.0, "peak", None),
+        bande(118.0, -3.0, 2.5, "peak", None),
+    ];
+    let r2 = crate::room_correction::profil_eq_de_correction(&filtres_de_piece());
+    let p_autre = vec![bande(1000.0, 2.0, 1.0, "peak", None)];
+    for (z, source) in [(51, "appliquee"), (52, "avant_tess"), (53, "aucune")] {
+        let mut c = ChaineTess::default();
+        let bandes = if source == "aucune" {
+            p_autre.clone()
+        } else {
+            r1.clone()
+        };
+        c.plugins.push(maillon_eq(ID_EQ_PARAMETRIQUE, true, bandes));
+        ecrire_chaine(&s, z, &c).unwrap();
+        let cle = match source {
+            "appliquee" => Some(cle_correction_appliquee(z)),
+            "avant_tess" => Some(cle_sauvegarde_eq(z)),
+            _ => None,
+        };
+        if let Some(cle) = cle {
+            s.set(&cle, &serde_json::to_string(&profil(true, r1.clone())).unwrap())
+                .unwrap();
+        }
+        poser_la_piece(&s, z, "Calibration xyz", None);
+        // `poser_la_piece` écrit `eq_profile` comme l'ancienne route : on
+        // remet la clé que la chaîne porte, seul le profil de pièce compte.
+        let c2: ChaineTess =
+            serde_json::from_str(&s.get(&cle_chaine_zone(z)).unwrap().unwrap()).unwrap();
+        ecrire_chaine(&s, z, &c2).unwrap();
+        let ombre = s.get(&cle_ombre_zone(z)).unwrap().unwrap();
+        let o: BTreeMap<String, Option<String>> = serde_json::from_str(&ombre).unwrap();
+        s.set(
+            &format!("zone_{z}_eq_profile"),
+            o["eq_profile"].as_deref().unwrap(),
+        )
+        .unwrap();
+
+        let pose = poser_la_correction_de_piece(&s, z, &r2).unwrap();
+        let l = lire_zone(&s, z, true).unwrap();
+        if source == "aucune" {
+            assert_eq!(
+                ids(&l.chaine),
+                vec![(ID_EQ_PARAMETRIQUE, true), (ID_CORRECTION_PIECE, true)],
+                "{source}"
+            );
+            assert_eq!(pose.en_serie, vec![ID_EQ_PARAMETRIQUE.to_owned()]);
+            assert_eq!(pose.remplacee, None);
+        } else {
+            assert_eq!(ids(&l.chaine), vec![(ID_CORRECTION_PIECE, true)], "{source}");
+            assert!(pose.en_serie.is_empty(), "{source}");
+            assert_eq!(pose.remplacee.as_deref(), Some(ID_EQ_PARAMETRIQUE));
+            let b: Vec<EqBandSpec> = serde_json::from_value(
+                maillon(&l.chaine, ID_CORRECTION_PIECE).settings["bands"].clone(),
+            )
+            .unwrap();
+            assert!(memes_bandes(&b, &r2.bands), "{source}");
+        }
+    }
 }

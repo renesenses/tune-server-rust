@@ -315,6 +315,9 @@ async fn appliquer_un_profil_garde_le_graphique_de_la_serie() {
     assert!(status.is_success(), "{status} {c}");
     let (status, c) = appel(&app, "POST", &format!("{chemin}/apply"), None).await;
     assert_eq!(status, StatusCode::OK, "{c}");
+    // L'écran peut dire que le graphique joue aussi.
+    assert_eq!(c["in_series_with"], json!(["equalizer-graphic"]), "{c}");
+    assert_eq!(c["warnings"], json!(["other_equalizers_in_series"]), "{c}");
 
     let (status, v) = appel(&app, "GET", &tess, None).await;
     assert_eq!(status, StatusCode::OK, "{v}");
