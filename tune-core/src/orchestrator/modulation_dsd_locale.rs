@@ -674,7 +674,13 @@ impl PlaybackOrchestrator {
                 .etapes
                 .iter()
                 .any(|e| e.code == CodeEtape::Upsampling && e.effective);
-            (effective, r.headroom_db.min(0.0))
+            // La marge propre du modulateur (−3 dB), indépendante du
+            // headroom automatique de la chaîne PCM ; un manuel plus fort
+            // l'emporte, jamais un plus faible.
+            (
+                effective,
+                modulation::headroom_avant_le_modulateur(r.headroom_db),
+            )
         };
         if !effective {
             modulation::oublier(zone_id, piste);

@@ -431,8 +431,11 @@ async fn le_volume_s_applique_avant_le_modulateur() {
 
 /// Point 10 de la relecture : un master chaud (crête intersample à +3 dB)
 /// par la CHAÎNE COMPLÈTE (décodage, greffons, headroom, volume,
-/// modulateur). Headroom automatique (−3 dB) : le limiteur n'est jamais
-/// atteint. Contre-épreuve, headroom manuel à 0 dB : il l'est.
+/// modulateur). La marge propre du modulateur (−3 dB) s'applique quel que
+/// soit le headroom de la chaîne : automatique, ou manuel à 0 dB, le
+/// limiteur n'est jamais atteint ; manuel à −6 dB, la marge est de 6 dB.
+/// (La contre-épreuve, sans marge, est celle du producteur :
+/// `le_headroom_garde_les_cretes_intersample_sous_le_limiteur`.)
 #[tokio::test]
 async fn crete_intersample_par_la_chaine_complete() {
     let b = banc(true, "dop").await;
@@ -449,9 +452,10 @@ async fn crete_intersample_par_la_chaine_complete() {
     std::fs::write(wav.path(), &w).unwrap();
     let chemin = wav.path().to_string_lossy().to_string();
     let id = piste(&b, &chemin, "wav", 2);
-    for (headroom, ecrete) in [
-        (Headroom::Auto {}, false),
-        (Headroom::Manual { db: 0.0 }, true),
+    for (headroom, marge) in [
+        (Headroom::Auto {}, -3.0),
+        (Headroom::Manual { db: 0.0 }, -3.0),
+        (Headroom::Manual { db: -6.0 }, -6.0),
     ] {
         chaine(&b, Some(dsd(TauxDsd::Dsd64)), headroom);
         let j = jouer(&b, id).await;
@@ -466,7 +470,11 @@ async fn crete_intersample_par_la_chaine_complete() {
         }
         let bilan = bilan.expect("bilan du flux");
         assert_eq!(bilan.reinitialisations, 0, "{headroom:?}");
-        assert_eq!(bilan.ecretages > 0, ecrete, "{headroom:?} : {bilan:?}");
+        assert_eq!(bilan.ecretages, 0, "{headroom:?} : {bilan:?}");
+        match j.etat(&b) {
+            Some(EtatModulation::EnService(m)) => assert_eq!(m.headroom_db, marge, "{headroom:?}"),
+            autre => panic!("état {autre:?}"),
+        }
     }
 }
 

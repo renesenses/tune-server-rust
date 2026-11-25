@@ -8,7 +8,7 @@
 //! ```text
 //! fichier PCM → décodage (entiers 32 bits, mono dupliqué en stéréo)
 //!   → greffons de la zone (f64, une quantification 32 bits, ~−186 dBFS) → f64
-//!   → headroom TESS et préampli gardé (gain fixe) → volume de la zone (rampe
+//!   → marge du modulateur (−3 dB au moins) et préampli gardé (gain fixe) → volume de la zone (rampe
 //!     10 ms, Q9) → ModulateurDsd (T11b : 0 dBFS = 50 % de modulation, soit
 //!     0 dB SACD ; limiteur à 60 %)
 //!   → DoP (WAV 24 bits, marqueurs 0x05/0xFA)  ┐ session du streamer,
@@ -51,7 +51,7 @@
 //!
 //! Un repli en PCM joue au niveau du PCM : environ +6 dB par rapport au
 //! même passage modulé (0 dBFS = 0 dB SACD = 50 % de modulation), +9 dB avec
-//! le headroom automatique. Compensation possible, NON appliquée : atténuer
+//! la marge du modulateur. Compensation possible, NON appliquée : atténuer
 //! de 6 dB (9 dB) au rendu une piste repliée d'une zone vers le DSD.
 //!
 //! # Enchaînements
@@ -82,6 +82,24 @@ use super::chaine::TauxDsd;
 
 /// Ordre de la boucle sigma-delta publiée au chemin du signal.
 pub const ORDRE_DU_MODULATEUR: usize = tune_plugin_audio_support::modulateur_dsd::ORDRE;
+
+/// La marge PROPRE de l'étage de modulation, en dB : appliquée en headroom
+/// automatique, et plancher d'un headroom manuel (jamais moins de 3 dB de
+/// marge avant le modulateur). Indépendante de `HEADROOM_AUTO_DB` de la
+/// chaîne PCM : une crête intersample à +3 dB d'un master chaud ne doit
+/// jamais atteindre le limiteur de sécurité à ±60 % (+1,6 dB au-dessus du
+/// 0 dB SACD).
+pub const MARGE_DU_MODULATEUR_DB: f64 = -3.0;
+
+/// Le headroom appliqué avant le modulateur : celui de la chaîne (auto ou
+/// manuel), jamais au-dessus de [`MARGE_DU_MODULATEUR_DB`].
+pub fn headroom_avant_le_modulateur(headroom_de_la_chaine_db: f64) -> f64 {
+    if headroom_de_la_chaine_db.is_finite() {
+        headroom_de_la_chaine_db.min(MARGE_DU_MODULATEUR_DB)
+    } else {
+        MARGE_DU_MODULATEUR_DB
+    }
+}
 
 /// Modulation portée par 0 dBFS PCM : 50 %, le « 0 dB SACD » (T11b).
 pub const MODULATION_A_0_DBFS: f64 = NIVEAU_REFERENCE;
@@ -439,7 +457,7 @@ pub struct ProducteurDsd {
     /// DoP : octets DSD d'une trame DoP impaire, qui attendent la suivante
     /// (chaque piste émet un nombre pair de trames).
     en_attente: Vec<u8>,
-    /// Gain fixe avant le volume : headroom TESS, préampli gardé (≤ 1).
+    /// Gain fixe avant le volume : marge du modulateur, préampli gardé (≤ 1).
     gain_fixe: f64,
     tampon: Vec<f64>,
 }
@@ -1203,7 +1221,8 @@ pub struct ModulationEnService {
     /// Les greffons de la zone sont-ils appliqués dans le flux (égaliseur,
     /// convolution, crossfeed, repli mono) ?
     pub plugins_in_stream: bool,
-    /// Headroom TESS appliqué avant le modulateur (dB ≤ 0).
+    /// Headroom appliqué avant le modulateur (dB ≤ −3 : la marge propre du
+    /// modulateur, ou un headroom manuel plus fort).
     pub headroom_db: f64,
     /// Le flux continue l'état de la piste précédente (enchaînement).
     pub continued: bool,

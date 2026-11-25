@@ -436,8 +436,8 @@ pub(super) fn intersample(trames: usize) -> Vec<f64> {
 }
 
 /// Q9 et le headroom de TESS : un master chaud (crête intersample à +3 dB)
-/// atteint le limiteur à ±60 % SANS headroom ; avec les −3 dB automatiques
-/// appliqués avant le modulateur, jamais.
+/// atteint le limiteur à ±60 % SANS marge ; avec la marge propre du
+/// modulateur (−3 dB) appliquée avant lui, jamais.
 #[test]
 fn le_headroom_garde_les_cretes_intersample_sous_le_limiteur() {
     for taux in [TauxDsd::Dsd64, TauxDsd::Dsd256] {
@@ -447,7 +447,7 @@ fn le_headroom_garde_les_cretes_intersample_sous_le_limiteur() {
         sans.moduler(&pcm, &mut sortie).unwrap();
         assert!(sans.ecretages() > 0, "{taux:?} : contre-épreuve");
         let mut avec = ProducteurDsd::new(plan(TransportModulation::Native, taux, 44_100)).unwrap();
-        avec.definir_gain_fixe(10f64.powf(crate::tess::chaine::HEADROOM_AUTO_DB / 20.0));
+        avec.definir_gain_fixe(10f64.powf(MARGE_DU_MODULATEUR_DB / 20.0));
         sortie.clear();
         avec.moduler(&pcm, &mut sortie).unwrap();
         assert_eq!(avec.ecretages(), 0, "{taux:?}");
@@ -889,4 +889,14 @@ fn la_longueur_dop_annoncee_est_alignee_sur_une_paire_de_trames() {
     let e = p.entete(None);
     let n = u32::from_le_bytes(e[40..44].try_into().unwrap());
     assert!(n == 0x7FFF_FFFF - 36 || n == u32::MAX, "{n:#x}");
+}
+
+/// La marge du modulateur ne dépend PAS du headroom automatique de la chaîne
+/// PCM (qui peut valoir 0 dB) : −3 dB au moins, un manuel plus fort gardé.
+#[test]
+fn la_marge_du_modulateur_est_la_sienne() {
+    assert_eq!(headroom_avant_le_modulateur(0.0), -3.0);
+    assert_eq!(headroom_avant_le_modulateur(-1.0), -3.0);
+    assert_eq!(headroom_avant_le_modulateur(-6.0), -6.0);
+    assert_eq!(headroom_avant_le_modulateur(f64::NAN), -3.0);
 }

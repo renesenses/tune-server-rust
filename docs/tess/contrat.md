@@ -570,8 +570,11 @@ en tâche de fond, en cache) :
   lecture seulement : `source_rate_not_modulable`, `channels_not_supported`,
   `modulator_failed`.
 - **Niveau** : 0 dBFS PCM = 50 % de modulation = 0 dB SACD (T11b), limiteur
-  de sécurité à 60 %. Le headroom de TESS (−3 dB en automatique) s'applique
-  avant le modulateur : une crête intersample à +3 dB n'atteint pas le
+  de sécurité à 60 %. L'étage de modulation a SA marge, −3 dB
+  (`MARGE_DU_MODULATEUR_DB`), indépendante du headroom automatique de la
+  chaîne PCM : appliquée en automatique, et plancher d'un headroom manuel
+  (un manuel plus fort, −6 dB, est gardé ; un plus faible, 0 dB, ne descend
+  pas sous −3 dB). Une crête intersample à +3 dB n'atteint jamais le
   limiteur.
 - **`status`** : `unknown` tant que la sortie de la zone n'a jamais pu être
   lue (sortie occupée, nom du périphérique jamais vu) : `targets` est alors
@@ -589,8 +592,8 @@ en tâche de fond, en cache) :
   des fichiers DSD. Proposé, non appliqué : un anneau réduit en mode modulé
   (≈ 0,5 s) ramènerait la réponse vers 1 s, à mesurer sur Pi (famine).
 - **Repli en PCM** (file mixte, refus) : la piste joue au niveau PCM, soit
-  environ +6 dB au-dessus du même passage modulé (+9 dB avec le headroom
-  automatique). Compensation simple possible, non appliquée : atténuer de 6
+  environ +6 dB au-dessus du même passage modulé (+9 dB avec la marge du
+  modulateur). Compensation simple possible, non appliquée : atténuer de 6
   (ou 9) dB au rendu une piste repliée d'une zone vers le DSD.
 - **Rupture à l'ouverture** : si la sortie ouvre le périphérique à une autre
   cadence que le porteur DoP (les marqueurs seraient détruits), la piste est
