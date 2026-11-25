@@ -206,6 +206,18 @@ async fn le_code_est_dans_le_fichier_journal_et_nulle_part_ailleurs() {
         1,
         "une seule ligne porte le code :\n{texte}"
     );
+    // 1 bis. Fil 3002 (Linux de bureau, macOS) : le fichier qui porte le code
+    //        n'est lisible que par le compte de Tune.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&journal).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "le fichier journal qui porte le code est lisible par d'autres comptes : {mode:o}"
+        );
+    }
 
     // 2. Aucune route qui sert le journal ne le rend.
     for (m, chemin) in [
