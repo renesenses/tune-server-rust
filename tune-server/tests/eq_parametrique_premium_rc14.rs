@@ -459,11 +459,10 @@ async fn les_bandes_du_profil_de_piece_ne_sont_pas_du_parametrique() {
     refus_parametrique(s, &v);
 }
 
-/// Une chaîne laissée par l'exclusivité du 24/11 (paramétrique DÉCOCHÉ et
-/// marqué `replaced_in_group` par le serveur) : la marque n'est pas un
-/// réglage du paramétrique, le `PUT` Free qui la renvoie passe, et sans le
-/// droit le paramétrique n'est pas recoché (#9520 : égaliseurs combinables,
-/// recochage Premium seulement).
+/// Une chaîne enregistrée avant l'exclusivité des égaliseurs (graphique ET
+/// paramétrique cochés) est normalisée au `PUT` : la marque
+/// `replaced_in_group` posée par le serveur ne compte pas comme un nouveau
+/// réglage du paramétrique, et le `PUT` Free passe.
 #[tokio::test]
 async fn tess_marque_replaced_in_group_n_est_pas_un_reglage() {
     let b = Banc::nouveau(false).await;
@@ -471,15 +470,11 @@ async fn tess_marque_replaced_in_group_n_est_pas_un_reglage() {
     graphique.as_object_mut().unwrap().remove("enabled");
     let mut parametrique = profil(bandes_parametriques(), true);
     parametrique.as_object_mut().unwrap().remove("enabled");
-    parametrique.as_object_mut().unwrap().insert(
-        tune_core::tess::migration::MARQUE_REMPLACE.into(),
-        json!("equalizer-graphic"),
-    );
     let ancienne: tune_core::tess::ChaineTess = serde_json::from_value(json!({
         "version": 1,
         "plugins": [
             {"id": "equalizer-graphic", "enabled": true, "settings": graphique},
-            {"id": "equalizer-parametric", "enabled": false, "settings": parametrique}
+            {"id": "equalizer-parametric", "enabled": true, "settings": parametrique}
         ]
     }))
     .unwrap();
@@ -488,20 +483,24 @@ async fn tess_marque_replaced_in_group_n_est_pas_un_reglage() {
     let (s, v) = b.appel(Method::GET, &uri, None).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let chaine = v["chain"].clone();
-    let p = |c: &Value| {
-        c["plugins"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|m| m["id"] == json!("equalizer-parametric"))
-            .cloned()
-            .unwrap()
-    };
-    assert_eq!(p(&chaine)["enabled"], json!(false), "{chaine}");
-    assert_eq!(p(&chaine)["settings"]["replaced_in_group"], json!("equalizer-graphic"), "{chaine}");
+    let coches = chaine["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["enabled"] == json!(true))
+        .count();
+    assert_eq!(
+        coches, 2,
+        "l'ancienne chaîne coche deux égaliseurs : {chaine}"
+    );
     let (s, v) = b.appel(Method::PUT, &uri, Some(chaine)).await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    let apres = p(&v["chain"]);
-    assert_eq!(apres["enabled"], json!(false), "{apres}");
-    assert_eq!(apres["settings"]["replaced_in_group"], json!("equalizer-graphic"), "{apres}");
+    let p = v["chain"]["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == json!("equalizer-parametric"))
+        .cloned()
+        .unwrap();
+    assert_eq!(p["enabled"], json!(false), "{p}");
 }
