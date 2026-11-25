@@ -74,6 +74,7 @@ pub(crate) fn en_service_d_apres_le_chemin(sp: &Value, volume_logiciel: bool) ->
         || steps.iter().any(|e| {
             (a_le_nom(e, "DSP") || a_le_nom(e, "Mono") || a_le_code(e, "crossfeed")) && altere(e)
                 || a_le_code(e, "channel_remap")
+                || a_le_code(e, "speaker_setup")
         });
     let mut hors_service = Vec::new();
     if sp
@@ -267,6 +268,12 @@ pub(crate) fn chemin_tess_de_la_zone(
             (tune_core::audio::replaygain::facteur_de_zone(backend, zid, np.piste_rg()) - 1.0).abs()
                 > 1e-6
         }),
+        // rc14 — les voies que la sortie a ouvertes (après adaptation) : celles
+        // que le réglage des enceintes traite.
+        voies_de_sortie: ps
+            .transformations_reelles
+            .as_ref()
+            .map(|t| t.ouvert().canaux),
     };
     let resolution = lecture.chaine.resoudre(&catalogue, &ctx);
     let mut en_service = en_service_d_apres_le_chemin(sp, volume_logiciel);

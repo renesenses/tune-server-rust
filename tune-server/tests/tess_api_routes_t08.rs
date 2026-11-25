@@ -1608,3 +1608,82 @@ async fn revue_9520_ancien_client_eteint_l_egaliseur() {
     let (_, eq) = b.brut(Method::GET, &uri, None, None).await;
     assert_eq!(eq["enabled"], json!(true), "{eq}");
 }
+
+/// rc14 — le réglage des enceintes (`speaker-setup`) par l'API : publié au
+/// catalogue (gratuit, avant l'upsampling, bornes du schéma), accepté APRÈS
+/// la réaffectation sans Premium, recopié dans `zone_{id}_speaker_setup`,
+/// résolu juste avant l'upsampling ; hors bornes : 409 `invalid_settings`.
+#[tokio::test]
+async fn le_reglage_des_enceintes_par_l_api_rc14() {
+    let b = Banc::nouveau(false).await;
+    let (s, cat) = b
+        .brut(Method::GET, "/api/v1/tess/catalog", None, None)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{cat}");
+    conforme_au_schema("catalog_response", &cat).unwrap_or_else(|e| panic!("{e} : {cat}"));
+    let d = cat["catalog"]["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == json!("speaker-setup"))
+        .expect("speaker-setup au catalogue")
+        .clone();
+    assert_eq!(d["entitlement"], json!("free"));
+    assert_eq!(d["placement"]["position"], json!("before_upsampling"));
+    let voie = &d["settings_schema"]["properties"]["channels"]["items"]["properties"];
+    assert_eq!(voie["gain_db"]["minimum"], json!(-20.0));
+    assert_eq!(voie["gain_db"]["maximum"], json!(10.0));
+    assert_eq!(voie["distance_cm"]["maximum"], json!(2000.0));
+
+    let reglages = json!({ "channels": [
+        { "distance_cm": 343, "gain_db": 0, "invert": false },
+        { "distance_cm": 0, "gain_db": -3, "invert": true }
+    ], "invert_all": false });
+    let (s, v) = b
+        .put(json!({ "version": 1, "plugins": [
+            { "id": "channel-remap", "enabled": false, "settings": null },
+            { "id": "speaker-setup", "enabled": true, "settings": reglages.clone() }
+        ] }))
+        .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "compte gratuit, après la réaffectation : {v}"
+    );
+    conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{e} : {v}"));
+    let cle: Value = serde_json::from_str(
+        &b.settings()
+            .get(&format!("zone_{}_speaker_setup", b.zone))
+            .unwrap()
+            .expect("clé de zone écrite"),
+    )
+    .unwrap();
+    assert_eq!(cle["enabled"], json!(true));
+    assert_eq!(cle["channels"], reglages["channels"]);
+    // Résolu juste avant l'upsampling.
+    let chemin = v["signal_path"].as_array().unwrap();
+    let i = chemin
+        .iter()
+        .position(|e| e["code"] == json!("upsampling"))
+        .unwrap();
+    assert_eq!(chemin[i - 1]["plugin_id"], json!("speaker-setup"));
+    assert_eq!(etape(&v, "speaker-setup")["requested"], json!(true));
+
+    // Hors bornes : refusé, la clé ne bouge pas.
+    let (s, v) = b
+        .put(json!({ "version": 1, "plugins": [
+            { "id": "speaker-setup", "enabled": true,
+              "settings": { "channels": [{ "gain_db": 12 }] } }
+        ] }))
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("invalid_settings"), "{v}");
+    let apres: Value = serde_json::from_str(
+        &b.settings()
+            .get(&format!("zone_{}_speaker_setup", b.zone))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(apres, cle);
+}

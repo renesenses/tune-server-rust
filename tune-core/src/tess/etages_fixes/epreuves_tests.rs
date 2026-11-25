@@ -51,6 +51,7 @@ fn ctx(volume_db: f64, pure: bool) -> ContexteExecution<'static> {
             db: volume_db,
         },
         replaygain_actif: false,
+        voies_de_sortie: None,
     }
 }
 

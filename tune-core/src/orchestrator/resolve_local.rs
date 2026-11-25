@@ -2216,7 +2216,8 @@ impl PlaybackOrchestrator {
                 // le relais progressif (`load_streaming_dsp`) les porte déjà.
                 etage_casque: super::regles::sortie_tess_qui_tire_le_flux(
                     zone_output_type.as_deref(),
-                ) && self.zone_has_active_crossfeed(req.zone_id),
+                ) && (self.zone_has_active_crossfeed(req.zone_id)
+                    || self.zone_has_active_enceintes(req.zone_id)),
             }
         } else {
             TraitementsDeZone::default()
@@ -2254,7 +2255,11 @@ impl PlaybackOrchestrator {
             // `is_network_output &&` d'abord : sans lui, une zone LOCALE
             // paierait une lecture de réglages par piste pour un drapeau que
             // `cible_wav_pour_traitement` va de toute façon annuler.
-            let crossfeed_reseau = is_network_output && self.zone_has_active_crossfeed(req.zone_id);
+            // rc14 — le réglage des enceintes vit au même étage du relais
+            // progressif (dernier de `StreamingDsp`) : même règle.
+            let crossfeed_reseau = is_network_output
+                && (self.zone_has_active_crossfeed(req.zone_id)
+                    || self.zone_has_active_enceintes(req.zone_id));
             let traitement = eq_forces_transcode || crossfeed_reseau;
             // #2742 (24/09) — un crossfeed SEUL vaut consentement au WAV
             // progressif : `crossfeed_bibliotheque_reseau`, cas 2.

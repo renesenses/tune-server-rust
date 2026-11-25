@@ -699,6 +699,7 @@ fn le_chemin_natif_rend_les_mots_d_avant() {
                 &c.pure,
                 &c.mono,
                 None,
+                44_100,
             )
             .expect("bloc préparé");
             let a = Chaine::new(false, false, cf, false);

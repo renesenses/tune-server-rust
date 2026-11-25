@@ -436,6 +436,9 @@ impl Drop for LocalOutput {
     fn drop(&mut self) {
         // rc14 — l'ordre TESS posé pour cette sortie part avec elle.
         OrdreLocal::oublier_la_sortie(&self.pure_bypass);
+        // rc14 — le réglage des enceintes est rangé par l'adresse du drapeau
+        // PURE de la sortie : il part avec elle.
+        enceintes_de_sortie::oublier(&self.pure_bypass);
         let fil = self
             .play_thread
             .get_mut()
@@ -607,6 +610,9 @@ mod sortie_double_locale;
 // #3208 — la période demandée au pilote, et la garde de préchargement qui s'en
 // déduit. `cpal::BufferSize` n'est plus écrit à la main nulle part ailleurs
 // dans ce fichier ni dans ses modules.
+/// rc14 — le réglage des enceintes (greffon TESS `speaker-setup`) de chaque
+/// sortie : délai, gain et phase par voie, juste avant le suréchantillonneur.
+pub(crate) mod enceintes_de_sortie;
 mod periode;
 /// #6044 — la réaffectation des canaux (greffon `channel-remap`).
 mod reaffectation;
@@ -2427,6 +2433,41 @@ impl LocalOutput {
     /// ne peut pas claquer.
     pub fn set_mono_downmix(&self, mono: bool) {
         self.mono_downmix.store(mono, Ordering::Relaxed);
+    }
+
+    /// rc14 — changer À CHAUD le réglage des enceintes de la zone (greffon
+    /// TESS `speaker-setup`) : fondu de `reglage_enceintes::RAMPE_MS`, ni saut
+    /// de délai ni marche de gain. `None` sous PURE ou « Bypass all »
+    /// (l'orchestrateur ne le charge pas). `dans_la_chaine` : le greffon est
+    /// dans la chaîne de la zone (sinon aucun créneau n'est créé).
+    pub fn set_reglage_enceintes(
+        &self,
+        dans_la_chaine: bool,
+        reglages: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
+    ) {
+        enceintes_de_sortie::poser(&self.pure_bypass, dans_la_chaine, reglages);
+    }
+
+    /// rc14 — une NOUVELLE lecture démarre (lancement, reprise, seek, piste
+    /// hors enchaînement) : l'historique du réglage des enceintes est vidé, et
+    /// le créneau retiré si le greffon n'est pas dans la chaîne de la zone.
+    pub fn demarrer_reglage_enceintes(
+        &self,
+        dans_la_chaine: bool,
+        reglages: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
+    ) {
+        enceintes_de_sortie::nouvelle_lecture(&self.pure_bypass, dans_la_chaine, reglages);
+    }
+
+    /// rc14 — les voies qu'a vues le réglage des enceintes de cette sortie au
+    /// dernier bloc (après adaptation des voies) ; `None` si rien n'a joué.
+    pub fn voies_vues_par_le_reglage_des_enceintes(&self) -> Option<u16> {
+        enceintes_de_sortie::voies_vues(&self.pure_bypass)
+    }
+
+    /// rc14 — le réglage des enceintes touche-t-il le signal de cette sortie ?
+    pub fn reglage_enceintes_actif(&self) -> bool {
+        enceintes_de_sortie::agit(&self.pure_bypass, self.dop_active.load(Ordering::Relaxed))
     }
 
     /// #6044 — poser (ou retirer) la matrice de réaffectation des canaux de
@@ -5505,6 +5546,7 @@ fn prepare_windows_native_pcm_a_voies_egales(
         pure_bypass,
         mono_downmix,
         adaptation,
+        44_100,
     )
 }
 
@@ -5537,6 +5579,9 @@ fn prepare_windows_native_pcm(
     pure_bypass: &AtomicBool,
     mono_downmix: &AtomicBool,
     adaptation: Option<AdaptationNative<'_>>,
+    // rc14 — la cadence de la source : le réglage des enceintes y compte ses
+    // délais en échantillons.
+    cadence: u32,
 ) -> Option<PreparedNativePcm> {
     let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
     if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
@@ -5562,6 +5607,7 @@ fn prepare_windows_native_pcm(
     let bit_perfect = dop
         || (volume_units == UNITE_DU_GAIN_DE_RENDU
             && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass, mono_downmix)
+            && !enceintes_de_sortie::agit(pure_bypass, false)
             && !canaux_adaptes);
     if dop && sortie != channels {
         let trames = bytes.len() / (usize::from(channels.max(1)) * usize::from(bit_depth / 8));
@@ -5576,7 +5622,12 @@ fn prepare_windows_native_pcm(
         });
     }
     let samples = if bit_perfect {
-        pcm_bytes_to_native_i32(bytes, bit_depth)
+        let mots = pcm_bytes_to_native_i32(bytes, bit_depth);
+        // rc14 — la ligne à retard du réglage des enceintes est alimentée
+        // même ici (aucun mot n'est touché) : un réglage qui s'allume trouve
+        // un historique plein. Rien sur un porteur DoP.
+        enceintes_de_sortie::alimenter(pure_bypass, &mots, channels, cadence, dop);
+        mots
     } else {
         // TESS T03 — décodé en `f64`, traité par l'exécuteur ; la frontière
         // `f32` reste celle de l'adaptation des voies et du volume d'avant
@@ -5598,6 +5649,9 @@ fn prepare_windows_native_pcm(
                 declaree.as_deref(),
             );
         }
+        // rc14 — le réglage des enceintes, sur les voies ouvertes, avant le
+        // volume.
+        enceintes_de_sortie::traiter(pure_bypass, &mut float, sortie, cadence, false);
         let volume = volume_units as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
         if volume != 1.0 {
             for sample in &mut float {
@@ -5998,6 +6052,16 @@ impl EtageDeConversion<'_> {
             // gardes #3233 et REF-7 lisent ici, même refus en silence.
             mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
         }
+        // rc14 — le réglage des enceintes : sur les voies qui partent vers les
+        // enceintes (après l'adaptation), avant le suréchantillonneur et le
+        // rééchantillonnage, à la cadence de la source.
+        enceintes_de_sortie::traiter(
+            self.pcm.pure_bypass,
+            &mut mots,
+            self.sortie.canaux,
+            self.spec.cadence(),
+            self.pcm.dop_active.load(Ordering::Relaxed),
+        );
         if let Some(etage) = self
             .surechantillonneur
             .as_mut()
@@ -6039,6 +6103,9 @@ impl EtageDeConversion<'_> {
             self.pcm.convolver,
             self.pcm.crossfeed,
             self.pcm.mono_downmix,
+        ) || enceintes_de_sortie::agit(
+            self.pcm.pure_bypass,
+            self.pcm.dop_active.load(Ordering::Relaxed),
         ) || (!self.pcm.dop_active.load(Ordering::Relaxed)
             && !self.pcm.pure_bypass.load(Ordering::Relaxed)
             && self
@@ -9572,6 +9639,8 @@ impl OutputTarget for LocalOutput {
         // `current_format()` decrirait encore la piste precedente et on
         // rebatirait un EqProcessor pour un flux mort (#1725).
         self.current_format.store(0, Ordering::Relaxed);
+        // rc14 — l'historique du réglage des enceintes ne survit pas à l'arrêt.
+        enceintes_de_sortie::vider(&self.pure_bypass);
         // Immediately silence the cpal callback so no audio leaks while
         // we wait for the playback thread to exit.  This flag is also
         // checked by the I/O read loop and feed_ring, causing the thread

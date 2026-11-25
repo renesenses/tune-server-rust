@@ -351,6 +351,7 @@ mod tests {
                 db: 0.0,
             },
             replaygain_actif: false,
+            voies_de_sortie: None,
         };
         let r = p.chain.resoudre(&catalogue_de_reference(), &ctx);
         assert_eq!(r.badge, Badge::BitPerfect);

@@ -312,7 +312,7 @@ pub fn schema_json() -> Value {
         "plugin_unavailable", "premium_required", "stereo_only", "replaced_in_group",
         "nothing_to_protect", "volume_not_software", "nothing_to_quantize", "not_in_service",
         "renderer_without_lpcm", "not_applied_on_transport", "plugin_not_installed",
-        "no_filter_selected", "dsd_not_supported_by_output", null] });
+        "no_filter_selected", "dsd_not_supported_by_output", "neutral_settings", null] });
     let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://mozaiklabs.fr/schemas/tess/contract-1.json",
@@ -383,7 +383,7 @@ pub fn schema_json() -> Value {
                 "type": "object", "required": ["channels", "position", "exclusive_group"],
                 "properties": {
                     "channels": enumere(&["any", "stereo_only", "remaps"]),
-                    "position": enumere(&["free", "last_plugin"]),
+                    "position": enumere(&["free", "last_plugin", "before_upsampling"]),
                     "exclusive_group": { "$ref": "#/$defs/exclusive_group" }
                 },
                 "additionalProperties": false
@@ -782,6 +782,7 @@ mod tests {
                 db: -18.0,
             },
             replaygain_actif: false,
+            voies_de_sortie: None,
         }
     }
 

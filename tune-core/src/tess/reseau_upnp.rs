@@ -168,6 +168,11 @@ enum Famille {
     /// ne les applique sur aucune voie ; [`appliquer`] les publie éteints
     /// (`not_applied_on_transport`).
     HorsRelais,
+    /// rc14 — le réglage des enceintes : dernier étage de `StreamingDsp`,
+    /// porté par le relais progressif LPCM (il y consent comme l'étage
+    /// casque), mais PAS par le transcodage de fichier : sur toute autre voie,
+    /// [`appliquer`] le publie éteint (`not_applied_on_transport`).
+    RelaisSeulement,
 }
 
 fn famille(id: &str) -> Famille {
@@ -178,6 +183,7 @@ fn famille(id: &str) -> Famille {
         | "convolution"
         | "room-correction" => Famille::Reencodage,
         "mono-downmix" | "channel-remap" => Famille::HorsRelais,
+        crate::audio::reglage_enceintes::ID_GREFFON => Famille::RelaisSeulement,
         _ => Famille::Casque,
     }
 }
@@ -194,8 +200,12 @@ pub fn acheminer(r: &Resolution, f: &FaitsUpnp) -> AcheminementUpnp {
     let reencodage = f.replaygain_actif
         || greffons_effectifs(r)
             .any(|e| famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::Reencodage);
-    let casque = greffons_effectifs(r)
-        .any(|e| famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::Casque);
+    let casque = greffons_effectifs(r).any(|e| {
+        matches!(
+            famille(e.plugin_id.as_deref().unwrap_or("")),
+            Famille::Casque | Famille::RelaisSeulement
+        )
+    });
     let lpcm = f.lpcm == LpcmDuLecteur::Accepted;
     // Une source DSD qui atteint la chaîne est forcément convertie en PCM
     // (natif et DoP l'éteignent dans la résolution) : la conversion est
@@ -316,9 +326,11 @@ pub fn appliquer(r: &mut Resolution, a: &AcheminementUpnp) {
         e.effective
             && match e.code {
                 CodeEtape::Upsampling | CodeEtape::Headroom | CodeEtape::DsdModulator => true,
-                CodeEtape::Plugin => {
-                    famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::HorsRelais
-                }
+                CodeEtape::Plugin => match famille(e.plugin_id.as_deref().unwrap_or("")) {
+                    Famille::HorsRelais => true,
+                    Famille::RelaisSeulement => a.route != VoieUpnp::ProgressiveLpcm,
+                    _ => false,
+                },
                 _ => false,
             }
     }) {
@@ -383,6 +395,7 @@ mod tests {
                 db: 0.0,
             },
             replaygain_actif: false,
+            voies_de_sortie: None,
         }
     }
 
@@ -592,6 +605,7 @@ mod tests {
                 db: 0.0,
             },
             replaygain_actif: false,
+            voies_de_sortie: None,
         };
         let mut up = chaine(&[]);
         up.fixed.upsampling = Upsampling::Pcm {
@@ -671,6 +685,7 @@ mod tests {
                 pure: false,
                 volume,
                 replaygain_actif: false,
+                voies_de_sortie: None,
             };
             let mut c = chaine(&[]);
             c.fixed.upsampling = Upsampling::Dsd {

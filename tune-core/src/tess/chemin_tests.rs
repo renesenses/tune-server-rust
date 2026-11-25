@@ -29,6 +29,7 @@ fn ctx(transport: TransportZone, pure: bool, volume_db: f64) -> ContexteExecutio
             db: volume_db,
         },
         replaygain_actif: false,
+        voies_de_sortie: None,
     }
 }
 
