@@ -666,7 +666,7 @@ pub async fn appliquer_prereglage(
 
 /// Après un `PUT` à la main : la zone ne marque plus « ACTIVE » un préréglage
 /// qui ne décrit plus sa chaîne (comparées sans les champs du serveur).
-pub(super) fn oublier_le_prereglage_s_il_differe(
+pub(crate) fn oublier_le_prereglage_s_il_differe(
     state: &AppState,
     zone_id: i64,
     chaine: &ChaineTess,
