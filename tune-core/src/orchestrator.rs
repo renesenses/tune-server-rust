@@ -2573,6 +2573,9 @@ mod crossfeed_bibliotheque_reseau;
 mod compensation_reseau_5071_tests;
 #[cfg(test)]
 mod convolveur_en_flux_7642_tests;
+// rc14 — égaliseurs en série, « Bypass all » complet (retours de Rémi).
+#[cfg(test)]
+mod egaliseurs_en_serie_rc14_tests;
 
 // #4354 — repli à 176,4 kHz d'un DSD décimé qui manque son pré-tampon.
 #[cfg(test)]

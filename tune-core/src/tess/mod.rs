@@ -30,6 +30,8 @@ pub mod api;
 pub mod chaine;
 /// Chemin du signal TESS, rapproché du réel (lot T16).
 pub mod chemin;
+/// rc14 — égaliseurs combinables en série, « Bypass all » complet, bornes de gain.
+pub mod egaliseurs_en_serie;
 pub mod etage;
 pub mod executeur;
 pub mod greffon;

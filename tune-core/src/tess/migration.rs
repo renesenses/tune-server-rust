@@ -578,13 +578,7 @@ fn marques_par_le_serveur(reference: Option<&ChaineTess>, chaine: &ChaineTess) -
                 || valeur
                     .as_str()
                     .is_some_and(|g| coches.iter().any(|id| id == g));
-            // rc14 — la marque d'une façade de l'égaliseur écartée au profit
-            // d'une autre façade cochée est posée par le serveur lui-même
-            // ([`normaliser_les_egaliseurs`]) : elle est gardée.
-            let marque_egaliseur = marque == MARQUE_REMPLACE
-                && FACADES_EQ.contains(&m.id.as_str())
-                && valeur.as_str().is_some_and(|g| FACADES_EQ.contains(&g));
-            if (m.enabled || !(deja_posee || marque_egaliseur) || !gagnant_coche)
+            if (m.enabled || !deja_posee || !gagnant_coche)
                 && let Value::Object(s) = &mut m.settings
             {
                 s.remove(marque);
@@ -1063,6 +1057,9 @@ pub fn lire_zone(
     }
 
     exclusivite_du_groupe(&mut chaine, &|id| membre_en_service(settings, id));
+    // rc14 — les égaliseurs écartés par l'exclusivité du 24/11 reprennent
+    // leur place : ils sont combinables.
+    normaliser_les_egaliseurs(&mut chaine);
     // D2 (18/11 soir) : la zone est passée d'une sortie locale au réseau
     // depuis la dernière synchronisation, et l'interrupteur mono n'a pas
     // bougé : même règle qu'à la migration, le mono est décoché d'office
@@ -1147,56 +1144,31 @@ fn membre_en_service(settings: &SettingsRepo, id: &str) -> bool {
     }
 }
 
-/// rc14 (GO du 24/11) — les façades de l'égaliseur sont exclusives. Une
-/// chaîne ENREGISTRÉE avant cette règle (testeurs, préréglages) peut en
-/// cocher plusieurs : on garde la PREMIÈRE cochée (celle que le moteur
-/// applique, [`egaliseur_principal`]) et on décoche les autres, réglages
-/// gardés. Une façade décochée qui a des réglages porte la marque
-/// [`MARQUE_REMPLACE`] (« Replaced by … » dans le chemin du signal) ; sans
-/// réglages (`null`), elle est seulement décochée (la marque seule ne serait
-/// pas un profil valide). Rend `true` si la chaîne a changé.
+/// rc14 (retours de Rémi, GO du 25/11) — les façades de l'égaliseur sont
+/// COMBINABLES et s'appliquent en série ([`super::egaliseurs_en_serie`]).
+/// L'exclusivité posée la veille (#9512) décochait, dans une chaîne ou un
+/// préréglage enregistrés, chaque façade cochée après la première, avec la
+/// marque [`MARQUE_REMPLACE`] vers elle. Ces façades sont RECOCHÉES (c'était
+/// le choix de l'auditeur) et la marque retirée. Une façade décochée sans
+/// cette marque ne bouge pas. Rend `true` si la chaîne a changé.
 pub fn normaliser_les_egaliseurs(chaine: &mut ChaineTess) -> bool {
-    let coches: Vec<usize> = chaine
-        .plugins
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.enabled && FACADES_EQ.contains(&m.id.as_str()))
-        .map(|(i, _)| i)
-        .collect();
-    let Some((&premier, autres)) = coches.split_first() else {
-        return false;
-    };
-    if autres.is_empty() {
-        return false;
-    }
-    let gagnant = chaine.plugins[premier].id.clone();
-    for &i in autres {
-        let m = &mut chaine.plugins[i];
-        m.enabled = false;
-        if let Value::Object(s) = &mut m.settings {
-            s.insert(MARQUE_REMPLACE.into(), Value::String(gagnant.clone()));
+    let mut change = false;
+    for m in &mut chaine.plugins {
+        if !FACADES_EQ.contains(&m.id.as_str()) {
+            continue;
+        }
+        let ecartee = m
+            .settings
+            .get(MARQUE_REMPLACE)
+            .and_then(Value::as_str)
+            .is_some_and(|g| FACADES_EQ.contains(&g));
+        if ecartee && let Value::Object(s) = &mut m.settings {
+            s.remove(MARQUE_REMPLACE);
+            m.enabled = true;
+            change = true;
         }
     }
-    true
-}
-
-/// Le corps d'un `PUT` coche-t-il lui-même deux façades de l'égaliseur ou
-/// plus, dont au moins une change d'état par rapport à `enregistree` ? C'est
-/// le seul cas refusé (409 `mutually_exclusive`) ; sinon la chaîne est
-/// normalisée ([`normaliser_les_egaliseurs`]).
-pub fn corps_coche_deux_egaliseurs(corps: &ChaineTess, enregistree: &ChaineTess) -> bool {
-    let coches: Vec<&MaillonGreffon> = corps
-        .plugins
-        .iter()
-        .filter(|m| m.enabled && FACADES_EQ.contains(&m.id.as_str()))
-        .collect();
-    coches.len() >= 2
-        && coches.iter().any(|m| {
-            !enregistree
-                .plugins
-                .iter()
-                .any(|e| e.id == m.id && e.enabled)
-        })
+    change
 }
 
 /// Décision B : une chaîne ne coche qu'un membre du groupe crossfeed. Quand
@@ -1796,6 +1768,22 @@ fn ecrire_chaine_avec(
             Ecriture::Rien => continue,
         }
         bilan.cles_modifiees.push(cle);
+    }
+    // rc14 — le moteur lit aussi la chaîne : un égaliseur en série (2ᵉ façade
+    // cochée, réglée ou déplacée) ou un headroom manuel changé change le son
+    // sans toucher `eq_profile` ; « Bypass all » change tout sans toucher
+    // aucune ancienne clé. La route qui écrit rafraîchit d'après ces clés
+    // (l'égaliseur, et la chaîne elle-même pour « Bypass all »).
+    if let Some(r) = &reference {
+        let cle_eq = Partie::Egaliseur.cle(zone_id);
+        if super::egaliseurs_en_serie::signature(r) != super::egaliseurs_en_serie::signature(chaine)
+            && !bilan.cles_modifiees.contains(&cle_eq)
+        {
+            bilan.cles_modifiees.push(cle_eq);
+        }
+        if r.bypass_all != chaine.bypass_all {
+            bilan.cles_modifiees.push(super::cle_chaine_zone(zone_id));
+        }
     }
 
     entre();

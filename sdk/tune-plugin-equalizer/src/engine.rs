@@ -58,7 +58,25 @@ pub struct EqProfile {
         deserialize_with = "HeadroomMode::lire"
     )]
     pub headroom_mode: HeadroomMode,
+    /// rc14 — la marge IMPOSÉE par l'étape Headroom de TESS (manuelle, en
+    /// dB, ≤ 0), qui REMPLACE la réserve calculée ([`Self::reserve_db_at`]) :
+    /// une seule marge, jamais deux qui se cumulent. Posée par l'hôte au
+    /// chargement d'une chaîne TESS, jamais enregistrée ni lue en JSON (le
+    /// profil d'une zone s'écrit et se relit à l'octet près comme avant).
+    /// Avec elle, le limiteur de sécurité doux est armé : une marge choisie
+    /// trop petite ne fait jamais écrêter durement.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schemas", schemars(skip))]
+    pub reserve_imposee_db: Option<f64>,
 }
+
+/// rc14 — bornes du gain d'une bande appliquées par le moteur, en dB. La
+/// borne basse descend à −30 dB (atténuations profondes : résonances de
+/// pièce, pics de casque) ; la haute reste à +24 dB, comme avant, pour qu'un
+/// profil enregistré ne change pas de son. L'API publie une plage d'usage
+/// plus étroite côté hausse (TESS : −30 / +15 dB).
+pub const GAIN_BANDE_MIN_DB: f64 = -30.0;
+pub const GAIN_BANDE_MAX_DB: f64 = 24.0;
 
 /// Réserve anti-saturation de l'égaliseur, au choix de l'utilisateur (#5171).
 #[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
@@ -289,7 +307,7 @@ impl EqBandSpec {
         // Clamp to sane, stable ranges (mirrors the /eq router validation).
         let freq = self.freq.clamp(10.0, sample_rate * 0.45);
         let q = self.q.clamp(0.1, 30.0);
-        let gain = self.gain.clamp(-24.0, 24.0);
+        let gain = self.gain.clamp(GAIN_BANDE_MIN_DB, GAIN_BANDE_MAX_DB);
         match self.band_type.as_str() {
             "low_shelf" => low_shelf(freq, gain, sample_rate),
             "high_shelf" => high_shelf(freq, gain, sample_rate),
@@ -313,6 +331,7 @@ impl Default for EqProfile {
             treble_gain_db: 0.0,
             bands: Vec::new(),
             headroom_mode: HeadroomMode::Safe,
+            reserve_imposee_db: None,
         }
     }
 }
@@ -483,6 +502,10 @@ impl EqProfile {
     /// quelle : rien d'autre n'est calculé, le résultat est le même au bit
     /// près qu'avant #5171.
     pub fn reserve_db_at(&self, channel: u16, sample_rate: f64) -> f64 {
+        // rc14 — la marge de l'étape Headroom de TESS remplace la réserve.
+        if let Some(db) = self.reserve_imposee_db.filter(|d| d.is_finite()) {
+            return db.min(0.0);
+        }
         match self.headroom_mode {
             HeadroomMode::Safe => self.automatic_headroom_db_at(channel, sample_rate),
             HeadroomMode::Realistic => self.reserve_realiste_db_at(channel, sample_rate),
@@ -1230,7 +1253,9 @@ impl EqProcessor {
             channels,
             enabled,
             headroom_mode: profile.headroom_mode,
-            limiteur: (enabled && profile.headroom_mode == HeadroomMode::Realistic)
+            limiteur: (enabled
+                && (profile.headroom_mode == HeadroomMode::Realistic
+                    || profile.reserve_imposee_db.is_some()))
                 .then(|| tune_plugin_audio_support::limiteur::Limiteur::new(sample_rate)),
             trame: vec![0.0; usize::from(channels.max(1))],
             limiteur_premier_dit: false,

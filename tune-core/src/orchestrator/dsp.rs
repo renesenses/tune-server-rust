@@ -2344,6 +2344,14 @@ impl PlaybackOrchestrator {
             return None;
         }
         let settings = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
+        // rc14 — plusieurs égaliseurs cochés dans la chaîne TESS (ou un
+        // headroom manuel) : tous, en série, dans l'ordre de la chaîne.
+        // Sinon, `zone_{id}_eq_profile` comme avant.
+        if let Some(chaine) =
+            crate::tess::egaliseurs_en_serie::egaliseurs_de_zone(&settings, zone_id)
+        {
+            return chaine;
+        }
         let key = format!("zone_{zone_id}_eq_profile");
         let profile: crate::audio::eq::EqProfile = settings
             .get(&key)

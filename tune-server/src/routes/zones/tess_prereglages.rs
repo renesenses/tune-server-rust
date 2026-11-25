@@ -210,8 +210,8 @@ pub async fn enregistrer_prereglage(State(state): State<AppState>, corps: Bytes)
             attendue: tune_core::tess::VERSION_CHAINE,
         });
     }
-    // rc14 — jamais un préréglage qu'on ne pourrait pas charger : une zone
-    // enregistrée avec deux égaliseurs cochés est normalisée.
+    // rc14 — égaliseurs combinables : une façade écartée par l'exclusivité
+    // du 24/11 (marque `replaced_in_group`) est recochée.
     let mut chaine = chaine;
     tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine);
     let mut liste = match prereglages::lire(&settings) {
@@ -558,9 +558,8 @@ pub async fn appliquer_prereglage(
     let Some(p) = liste.get(&preset_id).cloned() else {
         return introuvable(&preset_id);
     };
-    // rc14 — un préréglage enregistré avant l'exclusivité des égaliseurs
-    // peut en cocher plusieurs : chargé normalisé (la première façade
-    // cochée), jamais refusé.
+    // rc14 — égaliseurs combinables : un préréglage enregistré sous
+    // l'exclusivité du 24/11 retrouve les façades qu'elle avait décochées.
     let mut chaine_du_prereglage = p.chain.clone();
     tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine_du_prereglage);
     let corps = match serde_json::to_vec(&chaine_du_prereglage) {

@@ -115,6 +115,7 @@ pub fn profil_eq_de_correction(filters: &[CorrectionFilter]) -> crate::audio::eq
             })
             .collect(),
         headroom_mode: HeadroomMode::Safe,
+        reserve_imposee_db: None,
     }
 }
 

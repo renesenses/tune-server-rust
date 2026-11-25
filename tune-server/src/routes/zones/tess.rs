@@ -55,8 +55,7 @@ use tune_core::tess::greffon::{
 use tune_core::tess::migration::{
     ErreurMigration, ID_CONVOLUTION, ID_CORRECTION_PIECE, ID_CROSSFEED, ID_EQ_CASQUE,
     ID_EQ_GRAPHIQUE, ID_EQ_PARAMETRIQUE, ID_MONO, ID_REAFFECTATION, LectureZone, Partie,
-    corps_coche_deux_egaliseurs, correction_estimee, ecrire_chaine, lecture_dsd, lire_zone,
-    origines_par_le_serveur,
+    correction_estimee, ecrire_chaine, lecture_dsd, lire_zone, origines_par_le_serveur,
 };
 use tune_core::tess::resolution::{
     CodeEtape, ContexteExecution, ControleVolume, LectureDsd, MotifEtape, SourceFlux, VolumeZone,
@@ -150,6 +149,11 @@ pub fn catalogue_tess(paquets_charges: &[String]) -> Catalogue {
     for d in &mut c.plugins {
         if let Some(brut) = schema_de_reference(&d.id) {
             d.settings_schema = schema_de_maillon(brut);
+            // rc14 — les bornes de gain d'une bande, que l'interface suit.
+            tune_core::tess::egaliseurs_en_serie::borner_le_schema(
+                &d.id,
+                &mut d.settings_schema,
+            );
         }
     }
     for id in paquets_charges {
@@ -647,7 +651,7 @@ pub(super) fn appliquer_le_put(
     })?;
     // Lecture stricte du corps tel qu'envoyé : 400 sur tout champ ou valeur
     // inconnus, avant toute fusion.
-    let corps_lu = ChaineTess::depuis_corps(texte).map_err(|e| refus(&e))?;
+    ChaineTess::depuis_corps(texte).map_err(|e| refus(&e))?;
     let brut: Value = serde_json::from_str(texte)
         .map_err(|e| refus(&ErreurChaine::CorpsIllisible(e.to_string())))?;
 
@@ -672,12 +676,12 @@ pub(super) fn appliquer_le_put(
     }
     // D1 : l'origine d'une correction de pièce vient de `room_profile_{id}`,
     // jamais du corps ; `ecrire_chaine` la réécrit de même.
-    // rc14 — égaliseurs exclusifs : une chaîne enregistrée avant la règle
-    // (deux façades cochées) est NORMALISÉE, pas refusée ; seul un corps qui
-    // coche lui-même une seconde façade reçoit le 409.
-    if !corps_coche_deux_egaliseurs(&corps_lu, &enregistree) {
-        tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine);
-    }
+    // rc14 — égaliseurs combinables : une façade écartée par l'exclusivité du
+    // 24/11 est recochée ; le gain d'une bande modifiée reste dans les bornes
+    // publiées (−30 / +15 dB, ±12 dB au graphique).
+    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine);
+    tune_core::tess::egaliseurs_en_serie::verifier_les_gains(&chaine, &enregistree)
+        .map_err(|e| refus(&e))?;
     let chaine = origines_par_le_serveur(settings, zone_id, &chaine);
     valider_le_put(&chaine, &enregistree, catalogue, premium).map_err(|e| refus(&e))?;
     let chaine = chaine.mettre_a_niveau();
@@ -719,8 +723,11 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     if est(Partie::Convolution) {
         rafraichir_le_convolueur(state, zone).await;
     }
-    // rc14 — le mode PURE basculé par un préréglage (« Pure » l'allume).
-    if cles.contains(&cle_mode_pure(id)) {
+    // rc14 — le mode PURE basculé par un préréglage (« Pure » l'allume), ou
+    // « Bypass all » basculé (`ecrire_chaine` rend alors la clé de la chaîne) :
+    // même garde dans le moteur (`traitements_contournes`), même bascule.
+    if cles.contains(&cle_mode_pure(id)) || cles.contains(&tune_core::tess::cle_chaine_zone(id))
+    {
         let _ = state.orchestrator.apply_audiophile_change_portee(id).await;
     }
 }

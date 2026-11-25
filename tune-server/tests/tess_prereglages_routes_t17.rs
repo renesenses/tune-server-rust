@@ -1189,11 +1189,11 @@ fn egaliseur<'a>(c: &'a ChaineTess, id: &str) -> &'a tune_core::tess::chaine::Ma
     c.plugins.iter().find(|m| m.id == id).unwrap()
 }
 
-/// Zone enregistrée avec deux égaliseurs, puis PUT qui ne touche que
-/// `fixed` : 200, le second est décoché et marqué. Un PUT qui coche
-/// lui-même un second égaliseur : 409.
+/// rc14 (GO du 25/11) — zone enregistrée avec deux égaliseurs, puis PUT
+/// qui ne touche que `fixed` : 200, les deux restent cochés et effectifs.
+/// Un PUT qui coche lui-même les deux : 200 aussi (combinables).
 #[tokio::test]
-async fn deux_egaliseurs_enregistres_sont_normalises_au_put_rc14() {
+async fn deux_egaliseurs_enregistres_restent_coches_au_put_rc14() {
     let b = Banc::nouveau(true).await;
     tune_core::tess::migration::ecrire_chaine(&b.settings(), b.zone, &chaine_a_deux_egaliseurs())
         .unwrap();
@@ -1205,8 +1205,8 @@ async fn deux_egaliseurs_enregistres_sont_normalises_au_put_rc14() {
     let c = b.chaine();
     assert!(egaliseur(&c, "equalizer-graphic").enabled);
     let p = egaliseur(&c, "equalizer-parametric");
-    assert!(!p.enabled);
-    assert_eq!(p.settings["replaced_in_group"], json!("equalizer-graphic"));
+    assert!(p.enabled);
+    assert!(p.settings.get("replaced_in_group").is_none());
     let e = v["signal_path"]
         .as_array()
         .unwrap()
@@ -1214,52 +1214,61 @@ async fn deux_egaliseurs_enregistres_sont_normalises_au_put_rc14() {
         .find(|e| e["plugin_id"] == json!("equalizer-parametric"))
         .unwrap()
         .clone();
-    assert_eq!(e["reason"], json!("replaced_in_group"), "{e}");
+    assert_eq!(e["effective"], json!(true), "{e}");
 
-    // Contre-épreuve : le corps coche lui-même un second égaliseur ⇒ 409.
     let (s, v) = b
         .put_chaine(json!({"version": 1, "plugins": [graphique(), parametrique()]}))
         .await;
-    assert_eq!(s, StatusCode::CONFLICT, "{v}");
-    assert_eq!(v["code"], json!("mutually_exclusive"));
-    assert_eq!(v["plugin_id"], json!("equalizer-parametric"));
+    assert_eq!(s, StatusCode::OK, "{v}");
 }
 
-/// Préréglage ancien à deux égaliseurs : chargé, normalisé ; et un
-/// préréglage enregistré depuis une zone à deux égaliseurs l'est aussi.
+/// Préréglage à deux égaliseurs : chargé tel quel ; un préréglage normalisé
+/// par l'exclusivité du 24/11 (second décoché, marqué) retrouve son second
+/// égaliseur ; un préréglage enregistré depuis une zone à deux égaliseurs
+/// les garde tous les deux.
 #[tokio::test]
-async fn prereglage_ancien_a_deux_egaliseurs_charge_normalise_rc14() {
+async fn prereglage_a_deux_egaliseurs_charge_les_deux_rc14() {
     let b = Banc::nouveau(true).await;
+    let mut normalise = chaine_a_deux_egaliseurs();
+    for m in &mut normalise.plugins {
+        if m.id == "equalizer-parametric" {
+            m.enabled = false;
+            m.settings["replaced_in_group"] = json!("equalizer-graphic");
+        }
+    }
     let mut liste = tune_core::tess::prereglages::lire(&b.settings()).unwrap();
-    liste
-        .presets
-        .push(tune_core::tess::prereglages::PreReglage {
-            id: "ancien".into(),
-            name: "Ancien".into(),
+    for (id, chain) in [("ancien", chaine_a_deux_egaliseurs()), ("normalise", normalise)] {
+        liste.presets.push(tune_core::tess::prereglages::PreReglage {
+            id: id.into(),
+            name: id.into(),
             builtin: false,
-            chain: chaine_a_deux_egaliseurs(),
+            chain,
         });
+    }
     b.settings()
         .set(
             tune_core::tess::prereglages::CLE_PREREGLAGES,
             &serde_json::to_string(&liste).unwrap(),
         )
         .unwrap();
-    let (s, v) = b.appliquer("ancien").await;
-    assert_eq!(s, StatusCode::OK, "{v}");
-    let c = b.chaine();
-    assert!(egaliseur(&c, "equalizer-graphic").enabled);
-    assert!(!egaliseur(&c, "equalizer-parametric").enabled);
-    assert_eq!(v["zone"]["active_preset"], json!("ancien"), "{v}");
+    for id in ["ancien", "normalise"] {
+        let (s, v) = b.appliquer(id).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let c = b.chaine();
+        assert!(egaliseur(&c, "equalizer-graphic").enabled, "{id}");
+        let p = egaliseur(&c, "equalizer-parametric");
+        assert!(p.enabled, "{id}");
+        assert!(p.settings.get("replaced_in_group").is_none(), "{id}");
+        assert_eq!(v["zone"]["active_preset"], json!(id), "{v}");
+    }
 
-    // Enregistrer depuis une zone à deux égaliseurs : normalisé.
     tune_core::tess::migration::ecrire_chaine(&b.settings(), b.zone, &chaine_a_deux_egaliseurs())
         .unwrap();
     let (s, v) = b.enregistrer("Depuis la zone").await;
     assert_eq!(s, StatusCode::CREATED, "{v}");
     let enregistre: ChaineTess = serde_json::from_value(v["chain"].clone()).unwrap();
     assert!(egaliseur(&enregistre, "equalizer-graphic").enabled);
-    assert!(!egaliseur(&enregistre, "equalizer-parametric").enabled);
+    assert!(egaliseur(&enregistre, "equalizer-parametric").enabled);
     let (s, v) = b.appliquer(v["id"].as_str().unwrap()).await;
     assert_eq!(s, StatusCode::OK, "{v}");
 }

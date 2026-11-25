@@ -26,7 +26,14 @@ pub fn sortie_compatible(type_sortie: &str) -> bool {
 
 /// Le choix reste mémorisé sous PURE/strict, sans transformer le flux.
 pub fn demandee_active(db: &Arc<dyn DbBackend>, id: i64) -> Option<u32> {
-    if super::audiophile::zone_enabled(db, id) || super::bitperfect_strict::zone_enabled(db, id) {
+    // rc14 — ni sous « Bypass all » : aucun traitement, rééchantillonnage compris.
+    if super::audiophile::zone_enabled(db, id)
+        || super::bitperfect_strict::zone_enabled(db, id)
+        || crate::tess::egaliseurs_en_serie::bypass_all_de_zone(
+            &SettingsRepo::with_backend(db.clone()),
+            id,
+        )
+    {
         return None;
     }
     let zone = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
