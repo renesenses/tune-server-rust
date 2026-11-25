@@ -150,7 +150,14 @@ async fn appliance_et_conteneur() {
     let (st, v) = appel(&state, "172.17.0.1:50000", Method::POST, &[], Some(CORPS)).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
     // Autorisé, mais `Host` à un seul label donné par un mandataire : refus.
-    let (st, v) = appel(&state, "172.17.0.5:50000", Method::POST, &[("host", "tune:8888")], Some(CORPS)).await;
+    let (st, v) = appel(
+        &state,
+        "172.17.0.5:50000",
+        Method::POST,
+        &[("host", "tune:8888")],
+        Some(CORPS),
+    )
+    .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
     assert!(!active(&state));
     // Passerelle illisible dans un conteneur : refus.

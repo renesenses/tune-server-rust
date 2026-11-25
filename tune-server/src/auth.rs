@@ -2815,8 +2815,8 @@ async fn activer_l_authentification(
         let _place = place;
         hash_password(&mot_de_passe)
     })
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()))
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()))
     {
         Ok(h) => h,
         Err(e) => {

@@ -311,12 +311,11 @@ pub fn hote_a_un_seul_label_etranger(hote: &str, machine: Option<&str>) -> bool 
 /// Le `Host` de la requête est-il un nom à un seul label étranger à cette
 /// machine ([`hote_a_un_seul_label_etranger`]) ? Absent : non.
 pub fn hote_de_la_requete_a_un_seul_label_etranger(entetes: &HeaderMap) -> bool {
-    entetes
-        .get(axum::http::header::HOST)
-        .is_some_and(|v| {
-            v.to_str()
-                .map_or(true, |h| hote_a_un_seul_label_etranger(h, Some(nom_de_la_machine())))
+    entetes.get(axum::http::header::HOST).is_some_and(|v| {
+        v.to_str().map_or(true, |h| {
+            hote_a_un_seul_label_etranger(h, Some(nom_de_la_machine()))
         })
+    })
 }
 
 /// L'en-tête `Host` de la requête est-il absent ou accepté ?

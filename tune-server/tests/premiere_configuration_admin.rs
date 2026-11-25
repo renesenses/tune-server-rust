@@ -667,7 +667,13 @@ async fn le_patch_generique_ne_rouvre_pas_la_fenetre() {
 async fn refus_d_un_hote_a_un_seul_label_etranger() {
     // Un nom donné par un tiers (réseau de conteneurs, mandataire).
     let state = installation_neuve();
-    let (st, v) = creer(&state, HOTE_DU_LAN, &[("host", "tune-mandataire-x:8888")], "intrus-1234").await;
+    let (st, v) = creer(
+        &state,
+        HOTE_DU_LAN,
+        &[("host", "tune-mandataire-x:8888")],
+        "intrus-1234",
+    )
+    .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
     rien_n_a_change(&state);
 }
