@@ -3955,8 +3955,23 @@ impl PlaybackOrchestrator {
             }
             // #8813 — une baisse pendant la pause doit recréer le flux en
             // PCM, sans avoir relancé la lecture au moment du réglage.
+            // rc14 (retour de Rémi sur la rc13.90, TESS) — la chaîne de la
+            // zone a changé depuis que ce flux réseau a été fabriqué (réglage
+            // fait en pause, ou « Appliquer : à la prochaine lecture ») : une
+            // reprise compte comme une prochaine lecture. Le flux est refait
+            // avec la nouvelle chaîne, à la position ; une radio reprend le
+            // direct. Une reprise sur place rejouait l'ancien traitement
+            // jusqu'à relancer la station depuis Radios.
+            let chaine_changee = self.flux_reseau_perime(zone_id, np);
+            if chaine_changee {
+                info!(
+                    zone_id,
+                    position_ms, est_radio, "reprise_par_nouveau_flux_chaine_tess_changee"
+                );
+            }
             let peripherique_rendu = peripherique_rendu
                 || memoire_du_lecteur_douteuse
+                || chaine_changee
                 || self.dop_actif_a_proteger(zone_id).await;
             let decision = reprise_de_session(
                 est_radio,

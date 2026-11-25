@@ -2667,6 +2667,10 @@ mod pure_reaffectation_6780_tests;
 // 19/11/2026 — un réglage du suréchantillonneur relance le flux tout de suite.
 #[cfg(all(test, feature = "local-audio"))]
 mod surechantillonnage_immediat_tests;
+// rc14 (retour de Rémi, rc13.90) — un changement de chaîne TESS atteint le son
+// à la volée : désactivation effective, reprise = prochaine lecture.
+#[cfg(all(test, feature = "local-audio"))]
+mod tess_a_la_volee_rc14_tests;
 // #7932 — PURE contourne aussi la réaffectation des canaux de l'album joué.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_album_7932_tests;

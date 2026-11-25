@@ -252,6 +252,13 @@ impl EqEnVol {
         tracing::info!(sample_rate, channels, actif, "eq_en_vol_releve");
     }
 
+    /// rc14 (TESS) — le dernier dépôt rend-il le signal SEC (préampli gardé
+    /// libéré) ? Témoins seulement.
+    #[cfg(test)]
+    pub(crate) fn vers_le_sec_en_attente(&self) -> bool {
+        self.vers_le_sec.load(Ordering::SeqCst)
+    }
+
     /// Combien de profils ont été déposés.
     pub(crate) fn poses(&self) -> u64 {
         self.poses.load(Ordering::Relaxed)

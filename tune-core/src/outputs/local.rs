@@ -1926,6 +1926,24 @@ impl LocalOutput {
         }
     }
 
+    /// rc14 (TESS) — fait passer UN bloc entrelacé par la chaîne DSP de la
+    /// sortie (`apply_local_dsp`, au nombre de canaux du format déclaré) et le
+    /// rend traité : les témoins comparent la sortie à l'entrée au bit près.
+    #[cfg(test)]
+    pub(crate) fn traiter_un_bloc_pour_test(&self, pcm: &mut [f32]) {
+        let (_, canaux) = self.current_format().expect("format déclaré");
+        apply_local_dsp(
+            pcm,
+            &self.eq,
+            &self.convolver,
+            &self.crossfeed,
+            &self.pure_bypass,
+            &self.mono_downmix,
+            canaux,
+            false,
+        );
+    }
+
     /// Lecture du drapeau PURE, pour les tests : c'est lui que `apply_local_dsp`
     /// consulte, donc lui qui dit si l'égaliseur installé travaille encore.
     #[cfg(test)]

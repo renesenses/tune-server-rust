@@ -63,10 +63,16 @@ impl RaisonDeRelance {
     }
 
     /// Trop tôt après la relance précédente : abandonner (le réglage prendra
-    /// effet à la piste suivante) ou attendre la fin du plancher ? Seul le
-    /// suréchantillonneur attend : sa réponse a dit « appliqué ».
+    /// effet à la piste suivante) ou attendre la fin du plancher ?
+    ///
+    /// rc14 (retour de Rémi sur la rc13.90, TESS) : un réglage ATTEND aussi.
+    /// L'abandon rendait la désactivation d'un greffon sans effet quand elle
+    /// suivait son activation de moins de 5 s (l'activation avait relancé le
+    /// flux, la désactivation tombait sous le plancher et se perdait) : la
+    /// dernière demande l'emporte toujours, au plus tard à la fin du
+    /// plancher. Seule la bascule PURE garde l'abandon.
     pub(crate) fn differe_sous_le_plancher(self) -> bool {
-        self == Self::Surechantillonnage
+        self != Self::BasculePure
     }
 }
 
@@ -1473,6 +1479,123 @@ impl PlaybackOrchestrator {
             .get(&zone_id)
             .and_then(|notes| notes.iter().find(|(s, _)| s == sid).map(|(_, e)| e.clone()));
         servi.is_some_and(|e| e == self.empreinte_du_traitement(zone_id, np.piste_rg()))
+    }
+
+    /// rc14 (retour de Rémi sur la rc13.90, TESS) — le flux RÉSEAU que la
+    /// zone joue a-t-il été fabriqué avec un autre traitement que celui
+    /// qu'elle demande maintenant ?
+    ///
+    /// Vrai seulement quand on le SAIT : sortie réseau (une sortie locale
+    /// traite elle-même, à chaud), flux identifié, traitement noté à sa
+    /// résolution (ou à la dernière relève en vol), et empreinte différente.
+    /// Inconnu ⇒ `false` : rien n'est refabriqué sur une supposition (une
+    /// reprise ou une relance de trop couperait le son pour rien).
+    ///
+    /// Sert la reprise après pause (« appliquer à la prochaine lecture »
+    /// compte une reprise comme une lecture, radio comprise) et le
+    /// changement de chaîne TESS en mode immédiat (convolution, crossfeed,
+    /// greffons natifs : seul l'égaliseur savait relancer).
+    pub(crate) fn flux_reseau_perime(
+        &self,
+        zone_id: i64,
+        np: &crate::playback::NowPlaying,
+    ) -> bool {
+        let reseau = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .is_some_and(|z| match z.output_device_id.as_deref() {
+                Some(d) => !d.starts_with("local:"),
+                None => z.output_type.as_deref().is_some_and(|t| t != "local"),
+            });
+        if !reseau {
+            return false;
+        }
+        let Some(ref sid) = np.stream_id else {
+            return false;
+        };
+        let servi = self
+            .traitement_des_flux
+            .lock()
+            .unwrap()
+            .get(&zone_id)
+            .and_then(|notes| notes.iter().find(|(s, _)| s == sid).map(|(_, e)| e.clone()));
+        servi.is_some_and(|e| e != self.empreinte_du_traitement(zone_id, np.piste_rg()))
+    }
+
+    /// rc14 (TESS, mode « Appliquer : immédiatement ») — la chaîne de la zone
+    /// vient de changer : un flux réseau qui JOUE et ne la porte plus est
+    /// relancé à sa position (une radio : le direct est repris), par la même
+    /// relance anti-rebondie que l'égaliseur. Avant, seul l'égaliseur le
+    /// faisait : une convolution, un crossfeed ou un greffon natif changés
+    /// (activés comme désactivés) n'agissaient qu'à la piste suivante, donc
+    /// jamais sur une radio. Une zone en pause n'est pas relancée (#7556) :
+    /// sa reprise refabrique le flux ([`Self::flux_reseau_perime`]).
+    ///
+    /// Rend `true` quand une relance a été programmée.
+    pub async fn relancer_si_flux_reseau_perime(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        let etat = self.playback.get_state(zone_id).await;
+        if etat.state != crate::playback::PlayState::Playing {
+            return false;
+        }
+        let Some(np) = etat.now_playing.as_ref() else {
+            return false;
+        };
+        if !self.flux_reseau_perime(zone_id, np) {
+            return false;
+        }
+        let programmee = self.schedule_replay_pour(zone_id, RaisonDeRelance::Reglage);
+        info!(zone_id, programmee, "tess_flux_reseau_perime_relance");
+        programmee
+    }
+
+    /// rc14 (retour de Rémi sur la rc13.90) — l'égaliseur vient d'être
+    /// DÉCOCHÉ dans TESS : décocher est le geste explicite qui rend le niveau.
+    /// Le préampli que l'égaliseur coupé garde (décision du 10/10, #6741 :
+    /// pour toujours si le volume a monté pendant qu'il jouait) remonte
+    /// jusqu'au signal sec, par rampe, sans marche ; la sortie redevient
+    /// l'entrée au bit près.
+    ///
+    /// - sortie locale : « Rendre le niveau » (#6524) ;
+    /// - flux réseau dont l'égaliseur vient d'être relevé en vol : la relève
+    ///   « vers le sec » de l'entrée en PURE (#8422) ;
+    /// - flux refabriqué (relance) : il repart sans égaliseur, donc sec.
+    ///
+    /// Sans effet si l'égaliseur est actif, ou en PURE. Rend `true` quand un
+    /// préampli gardé a été libéré.
+    pub async fn rendre_le_sec_si_egaliseur_coupe(&self, zone_id: i64) -> bool {
+        if self.zone_audiophile(zone_id) || self.eq_profile_configure(zone_id).is_some() {
+            return false;
+        }
+        if self.rendre_le_niveau_garde(zone_id).await {
+            info!(zone_id, "tess_egaliseur_coupe_niveau_rendu_local");
+            return true;
+        }
+        let np = self.playback.get_state(zone_id).await.now_playing;
+        let Some(np) = np else {
+            return false;
+        };
+        let Some(sid) = np.stream_id.as_deref() else {
+            return false;
+        };
+        // Le flux porte déjà « sans égaliseur » : la relève en vol vient
+        // d'avoir lieu (une relance, elle, laisse l'ancienne empreinte).
+        if !self.flux_porte_deja_ce_traitement(zone_id, &np) {
+            return false;
+        }
+        let Some(poste) = self.poste_eq_en_vol(zone_id, sid) else {
+            return false;
+        };
+        if std::sync::Arc::strong_count(&poste) < 2 {
+            return false;
+        }
+        poste.poser_vers_le_sec();
+        info!(
+            zone_id,
+            stream_id = sid,
+            "tess_egaliseur_coupe_niveau_rendu_en_vol"
+        );
+        true
     }
 
     /// LA trace qui tranche, à l'activation de l'égaliseur (#3479).

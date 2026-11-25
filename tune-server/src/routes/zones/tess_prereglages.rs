@@ -35,6 +35,11 @@
 //!   lecture. Les anciennes clés sont écrites, donc le prochain flux réseau
 //!   part avec ; sur une sortie locale, ce qui reste à rafraîchir l'est au
 //!   prochain démarrage de lecture de la zone ([`spawn_application_au_demarrage`]).
+//!   rc14 (retour de Rémi, rc13.90) : une REPRISE après pause compte comme
+//!   une prochaine lecture, radio comprise, pour les comparaisons rapides —
+//!   la sortie locale est rafraîchie à la reprise, et l'orchestrateur refait
+//!   à la reprise le flux réseau fabriqué avec l'ancienne chaîne
+//!   (`flux_reseau_perime`).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -751,6 +756,7 @@ pub(super) async fn appliquer_selon_le_mode(
             }
         }
         rafraichir(state, zone, &toutes).await;
+        apres_le_rafraichissement(state, id, &toutes).await;
     } else {
         ajouter_en_attente(id, cles);
     }
@@ -806,8 +812,33 @@ async fn servir_l_attente(state: &AppState, zone_id: i64, toutes_sorties: bool) 
             .entry(zone_id)
             .or_default() += 1;
         rafraichir(state, &zone, &cles).await;
+        apres_le_rafraichissement(state, zone_id, &cles).await;
     }
     info!(zone_id, cles = ?cles, locale, "tess_applique_au_demarrage");
+}
+
+/// rc14 (retour de Rémi sur la rc13.90) — ce que la chaîne réécrite doit
+/// encore à la sortie vivante, après [`rafraichir`] :
+/// - un égaliseur DÉCOCHÉ rend son préampli gardé, jusqu'au signal sec
+///   (désactiver à la volée : la sortie redevient l'entrée) ;
+/// - un flux RÉSEAU qui joue et ne porte plus la chaîne (convolution,
+///   crossfeed, greffon natif : seul l'égaliseur savait se relever ou
+///   relancer) est relancé à sa position ; une radio reprend le direct. En
+///   pause, c'est la reprise qui le refait.
+async fn apres_le_rafraichissement(state: &AppState, zone_id: i64, cles: &[String]) {
+    if cles.is_empty() {
+        return;
+    }
+    if cles.contains(&tune_core::tess::migration::Partie::Egaliseur.cle(zone_id)) {
+        state
+            .orchestrator
+            .rendre_le_sec_si_egaliseur_coupe(zone_id)
+            .await;
+    }
+    state
+        .orchestrator
+        .relancer_si_flux_reseau_perime(zone_id)
+        .await;
 }
 
 /// La zone sort-elle sur une sortie locale ? Lu dans `output_type` (absent =
@@ -817,7 +848,15 @@ pub fn sortie_locale(zone: &Zone) -> bool {
     zone.output_type.as_deref().unwrap_or("local") == "local"
 }
 
-/// Écoute les démarrages de lecture (`started`) pour le mode
+/// Les événements de lecture qui valent « prochaine lecture » pour le mode
+/// `at_next_playback` : un démarrage (`started`) et, depuis la rc14 (retour de
+/// Rémi), une reprise après pause (`resumed`) — sur une radio comme sur une
+/// piste, une pause puis une reprise sert à comparer deux réglages.
+pub fn est_une_prochaine_lecture(evenement: &str) -> bool {
+    matches!(evenement, "started" | "resumed")
+}
+
+/// Écoute les démarrages et les reprises de lecture pour le mode
 /// `at_next_playback`. Appelée une fois au lancement (`background.rs`).
 pub fn spawn_application_au_demarrage(state: &AppState) {
     let mut rx = state.playback.subscribe();
@@ -830,9 +869,59 @@ pub fn spawn_application_au_demarrage(state: &AppState) {
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             };
-            if ev.event == "started" && !cles_en_attente(ev.zone_id).is_empty() {
+            if est_une_prochaine_lecture(&ev.event) && !cles_en_attente(ev.zone_id).is_empty() {
                 appliquer_a_la_lecture(&state, ev.zone_id).await;
             }
         }
     });
+}
+
+#[cfg(test)]
+mod reprise_rc14_tests {
+    //! rc14 (retour de Rémi sur la rc13.90) — « Appliquer : à la prochaine
+    //! lecture » : une pause suivie d'une reprise compte comme une prochaine
+    //! lecture (comparaisons rapides, radio comprise). Avant, seul un
+    //! démarrage (`started`) servait la file : la reprise rejouait l'ancienne
+    //! chaîne jusqu'à relancer la station depuis Radios.
+    use super::*;
+
+    #[test]
+    fn une_reprise_est_une_prochaine_lecture() {
+        assert!(est_une_prochaine_lecture("started"));
+        assert!(est_une_prochaine_lecture("resumed"));
+        // Contre-épreuve : une pause n'applique rien.
+        assert!(!est_une_prochaine_lecture("paused"));
+        assert!(!est_une_prochaine_lecture("stopped"));
+    }
+
+    #[tokio::test]
+    async fn la_reprise_sert_la_file_d_attente() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        // Numéro de zone propre au test : la file est commune au processus.
+        for i in 0..120 {
+            repo.create(&format!("Avant {i}"), Some("local"), None)
+                .unwrap();
+        }
+        let zone = repo
+            .create("Salon", Some("local"), Some("local:Realtek HD"))
+            .unwrap();
+        spawn_application_au_demarrage(&state);
+        ajouter_en_attente(zone, vec![format!("zone_{zone}_crossfeed")]);
+        // La pause ne sert rien.
+        state.playback.pause(zone).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!cles_en_attente(zone).is_empty(), "servi à la pause");
+        // La reprise sert la file.
+        state.playback.resume(zone).await;
+        let mut servie = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if cles_en_attente(zone).is_empty() {
+                servie = true;
+                break;
+            }
+        }
+        assert!(servie, "la reprise doit appliquer ce qui attendait");
+    }
 }
