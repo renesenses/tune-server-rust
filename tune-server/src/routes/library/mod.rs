@@ -69,6 +69,9 @@ pub(crate) mod identification_lot;
 // horloge donnée, contre un faux MusicBrainz.
 #[doc(hidden)]
 pub use identification_lot::nuit::{Horloge, un_tour_de_veille_avec};
+/// Fil forum 3050 — toutes les images du dossier d'un album (scans du
+/// livret, dos, disque), par identifiant.
+mod images_album;
 mod ingest;
 /// `GET /library/labels` et les logos Qobuz des labels (#6736).
 mod labels;
@@ -697,6 +700,12 @@ pub fn router() -> Router<AppState> {
         .route("/apports-qobuz/passe", post(apports_qobuz::passe))
         .route("/albums/{id}/booklets", get(livrets::livrets_album))
         .route("/albums/{id}/booklets/{name}", get(livrets::livret_album))
+        // Fil forum 3050 — les images du dossier de l'album, et l'image.
+        .route("/albums/{id}/images", get(images_album::images_album))
+        .route(
+            "/albums/{id}/images/{image_id}",
+            get(images_album::image_album),
+        )
         .route(
             "/tracks/{id}/credits/enrich",
             post(credits::enrich_track_credits),
