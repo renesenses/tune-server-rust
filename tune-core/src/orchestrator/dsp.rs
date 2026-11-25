@@ -1553,10 +1553,10 @@ impl PlaybackOrchestrator {
     /// DÉCOCHÉ dans TESS : décocher est le geste explicite qui rend le niveau.
     /// Le préampli que l'égaliseur coupé garde (décision du 10/10, #6741 :
     /// pour toujours si le volume a monté pendant qu'il jouait) remonte
-    /// jusqu'au signal sec, par rampe, sans marche ; la sortie redevient
-    /// l'entrée au bit près.
+    /// jusqu'au signal sec en moins de 0,5 s (décision du 25/11, A/B), par
+    /// rampe, sans marche ; la sortie redevient l'entrée au bit près.
     ///
-    /// - sortie locale : « Rendre le niveau » (#6524) ;
+    /// - sortie locale : retour rapide au sec (`rendre_le_sec_vite`) ;
     /// - flux réseau dont l'égaliseur vient d'être relevé en vol : la relève
     ///   « vers le sec » de l'entrée en PURE (#8422) ;
     /// - flux refabriqué (relance) : il repart sans égaliseur, donc sec.
@@ -1567,7 +1567,7 @@ impl PlaybackOrchestrator {
         if self.zone_audiophile(zone_id) || self.eq_profile_configure(zone_id).is_some() {
             return false;
         }
-        if self.rendre_le_niveau_garde(zone_id).await {
+        if self.rendre_le_sec_vite_en_local(zone_id).await {
             info!(zone_id, "tess_egaliseur_coupe_niveau_rendu_local");
             return true;
         }
@@ -1589,13 +1589,43 @@ impl PlaybackOrchestrator {
         if std::sync::Arc::strong_count(&poste) < 2 {
             return false;
         }
-        poste.poser_vers_le_sec();
+        poste.poser_vers_le_sec_rapide();
         info!(
             zone_id,
             stream_id = sid,
             "tess_egaliseur_coupe_niveau_rendu_en_vol"
         );
         true
+    }
+
+    /// rc14 (décision du 25/11) — la sortie locale de la zone porte un
+    /// égaliseur coupé qui garde un préampli : retour RAPIDE au sec
+    /// (`EqProcessor::rendre_le_sec_vite`). `false` sinon.
+    async fn rendre_le_sec_vite_en_local(&self, zone_id: i64) -> bool {
+        #[cfg(feature = "local-audio")]
+        {
+            let device = self.peripherique_de_la_zone(zone_id);
+            let Some(sortie) = ({ self.outputs.lock().await.get(&device) }) else {
+                return false;
+            };
+            let sortie = sortie.lock().await;
+            let Some(locale) = sortie
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            if locale.preampli_garde().is_none() {
+                return false;
+            }
+            locale.rendre_le_sec_vite();
+            true
+        }
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
     }
 
     /// LA trace qui tranche, à l'activation de l'égaliseur (#3479).

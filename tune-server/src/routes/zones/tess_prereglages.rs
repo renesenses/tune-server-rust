@@ -829,7 +829,12 @@ async fn apres_le_rafraichissement(state: &AppState, zone_id: i64, cles: &[Strin
     if cles.is_empty() {
         return;
     }
-    if cles.contains(&tune_core::tess::migration::Partie::Egaliseur.cle(zone_id)) {
+    // La clé de l'égaliseur principal, ou la chaîne elle-même : avec les
+    // égaliseurs en série (#9520), « coupé » se lit sur le profil du moteur
+    // (toutes les façades cochées), pas sur la seule `zone_{id}_eq_profile`.
+    if cles.contains(&tune_core::tess::migration::Partie::Egaliseur.cle(zone_id))
+        || cles.contains(&tune_core::tess::cle_chaine_zone(zone_id))
+    {
         state
             .orchestrator
             .rendre_le_sec_si_egaliseur_coupe(zone_id)

@@ -1664,6 +1664,15 @@ impl LocalOutput {
     /// remonte, progressivement, jusqu'au niveau sans égaliseur, sans la borne
     /// de volume de #6741 (voir `EqProcessor::liberer_le_gain_garde`). Sans
     /// effet si la chaîne ne porte pas d'égaliseur coupé.
+    pub fn rendre_le_sec_vite(&self) {
+        // rc14 (TESS) — voir `EqProcessor::rendre_le_sec_vite`.
+        if let Ok(mut eq) = self.eq.lock()
+            && let Some(p) = eq.as_mut()
+        {
+            p.rendre_le_sec_vite();
+        }
+    }
+
     pub fn liberer_le_preampli_garde(&self) {
         if let Ok(mut eq) = self.eq.lock()
             && let Some(p) = eq.as_mut()

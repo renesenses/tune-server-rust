@@ -273,20 +273,34 @@ async fn desactiver_l_egaliseur_dans_tess_rend_l_entree_au_bit_pres() {
 
     regler_l_egaliseur(&orch, zone_id, false);
     changement_d_egaliseur_tess(&orch, zone_id).await;
-    // Pendant le fondu (300 ms), aucune marche : la plus grande variation
-    // entre deux échantillons reste celle d'un sinus de 40 Hz.
+    // Décision de Bertrand du 25/11 (A/B) : le signal sec revient en
+    // 0,6 s au plus, sans marche. Blocs de 10 ms : on relève l'instant où la
+    // sortie redevient l'entrée au bit près, et la plus grande variation
+    // entre deux échantillons (un sinus de 40 Hz nu en fait ≈ 0,0026).
     let mut tout = Vec::new();
-    for _ in 0..5 {
-        let (_, s) = jouer(&orch, &mut trame, 0.1).await;
-        tout.extend(s.chunks(2).map(|t| t[0]));
+    let mut sec_a_ms: Option<u32> = None;
+    for bloc in 1..=100u32 {
+        let entree = sinus(&mut trame, (TAUX / 100) as usize);
+        let mut sortie = entree.clone();
+        avec_la_sortie_locale(&orch, |l| l.traiter_un_bloc_pour_test(&mut sortie)).await;
+        tout.extend(sortie.chunks(2).map(|t| t[0]));
+        if identiques_au_bit_pres(&entree, &sortie) {
+            sec_a_ms.get_or_insert(bloc * 10);
+        } else {
+            assert!(sec_a_ms.is_none(), "le sec ne doit pas repartir ({bloc})");
+        }
     }
     let marche = tout
         .windows(2)
         .map(|w| (w[1] - w[0]).abs())
         .fold(0.0_f32, f32::max);
     assert!(marche <= 0.01, "marche de {marche} à la désactivation");
-    // Fondu de la courbe, puis remontée de 12 dB à 2 dB/s : 7 s suffisent.
-    let (entree, sortie) = jouer(&orch, &mut trame, 7.5).await;
+    let sec_a_ms = sec_a_ms.expect("la sortie doit redevenir l'entrée au bit près");
+    assert!(
+        sec_a_ms <= 600,
+        "le signal sec revient en {sec_a_ms} ms, attendu ≤ 600 ms"
+    );
+    let (entree, sortie) = jouer(&orch, &mut trame, 1.0).await;
     assert!(
         identiques_au_bit_pres(&entree, &sortie),
         "désactivé dans TESS, la sortie doit être l'entrée au bit près"
