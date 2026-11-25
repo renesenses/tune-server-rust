@@ -210,6 +210,48 @@ impl SettingsRepo {
         }
     }
 
+    /// La base derrière ce dépôt (pour lire d'autres tables sur la même).
+    pub fn backend(&self) -> &Arc<dyn DbBackend> {
+        &self.db
+    }
+
+    /// Les réglages dont la clé commence par `prefixe`, triés par clé : une
+    /// requête `LIKE` échappée, sans parcourir toute la table (TESS T02).
+    pub fn par_prefixe(&self, prefixe: &str) -> Result<Vec<(String, String)>, String> {
+        let motif = format!(
+            "{}%",
+            prefixe
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let sql = self.dialect_sql(
+            |d| {
+                format!(
+                    "SELECT key, value FROM settings WHERE key LIKE {} ESCAPE '\\' ORDER BY key",
+                    d.placeholder(1)
+                )
+            },
+            |d| {
+                format!(
+                    "SELECT key, value FROM settings WHERE key LIKE {} ESCAPE '\\' ORDER BY key",
+                    d.placeholder(1)
+                )
+            },
+        );
+        let params: [&dyn ToSqlValue; 1] = [&motif];
+        let rows = self.db.query_many_strong(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                let k = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
+                let v = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+                (k, v)
+            })
+            .filter(|(k, _)| k.starts_with(prefixe))
+            .collect())
+    }
+
     pub fn all(&self) -> Result<Vec<(String, String)>, String> {
         // Use query_many_strong for the same WAL snapshot reason as get().
         let rows = self.db.query_many_strong(sql::list_all(), &[])?;

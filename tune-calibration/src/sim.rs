@@ -219,6 +219,32 @@ impl RoomSim {
         y
     }
 
+    /// La même pièce vue d'une autre place du micro (C4, mesure à plusieurs
+    /// positions). `u` ∈ [−1, 1] : 0 est la place d'écoute, ±1 le bord de
+    /// la zone d'écoute (~60 cm de part et d'autre).
+    ///
+    /// Ce qui bouge avec la place, comme dans une vraie pièce :
+    /// * la réflexion du mur arrière (+0,6, forte : canapé contre le mur),
+    ///   dont le retard va de 3,5 à 8,5 ms : ses annulations (creux en
+    ///   peigne, −8 dB) glissent de 59 à 143 Hz et au-delà ;
+    /// * une réflexion latérale (+0,35) entre 8 et 14 ms ;
+    /// * le gain des modes, qui suit la pression modale (ventre ou nœud).
+    ///
+    /// Ce qui ne bouge pas : la fréquence des modes, le son direct, la queue.
+    /// C'est pourquoi la moyenne garde les modes et comble les creux.
+    pub fn a_la_position(&self, u: f64) -> Self {
+        let u = u.clamp(-1.0, 1.0);
+        let mut s = self.clone();
+        s.reflections.push((0.006 + 0.0025 * u, 0.6));
+        s.reflections.push((0.011 - 0.003 * u, 0.35));
+        for (k, m) in s.modes.iter_mut().enumerate() {
+            // Pression modale : un mode sur deux croît vers un bord, l'autre décroît.
+            let sens = if k % 2 == 0 { 1.0 } else { -1.0 };
+            m.gain_db *= 1.0 + 0.35 * sens * u - 0.25 * u * u;
+        }
+        s
+    }
+
     /// Les modes exprimés comme bandes (sert à comparer avec l'égaliseur trouvé).
     pub fn modes_as_bands(&self) -> Vec<Band> {
         self.modes
@@ -233,6 +259,10 @@ impl RoomSim {
             .collect()
     }
 }
+
+/// Places du micro des sessions simulées : la centrale d'abord, puis de
+/// part et d'autre (index k → `POSITIONS_SIMULEES[k]`).
+pub const POSITIONS_SIMULEES: [f64; 9] = [0.0, 0.5, -0.5, 1.0, -1.0, 0.75, -0.75, 0.25, -0.25];
 
 /// Filtrage IIR forme directe I (f64).
 pub fn filter_biquad(b: &Biquad, x: &[f64]) -> Vec<f64> {

@@ -1449,7 +1449,42 @@ impl PlaybackOrchestrator {
                     "non_lance_source_sans_sonde"
                 },
             );
-            if advance_source != "local" && advance_source != "radio" {
+            // #9450 — la session adoptée est une session mandataire dont la
+            // prise a été garée à la préparation : la sonde lit ce que le
+            // renderer a tiré et tire encore, sans nouvelle connexion au CDN.
+            // Une prise garée morte (débranchée à son plafond) n'est pas
+            // rendue : on branche alors un lecteur neuf sur la session, recalé
+            // à la position courante, plutôt que de rouvrir le CDN.
+            let garee = advance_stream_id
+                .as_deref()
+                .and_then(crate::http::prise_des_niveaux_9450::reprendre);
+            let mandataire = match advance_stream_id.as_deref() {
+                Some(sid) if garee.is_none() && self.streamer.est_mandataire(sid).await => {
+                    Some(sid.to_string())
+                }
+                _ => None,
+            };
+            if let Some(lecteur) = garee {
+                spawn_proxy_levels_probe_task(
+                    self.playback.clone(),
+                    bus,
+                    zone_id,
+                    super::SourceDesNiveaux::Garee(lecteur),
+                    String::new(),
+                    play_seq,
+                )
+                .await;
+            } else if let Some(sid) = mandataire {
+                spawn_proxy_levels_probe_task(
+                    self.playback.clone(),
+                    bus,
+                    zone_id,
+                    super::SourceDesNiveaux::Prise(self.streamer.clone(), sid),
+                    String::new(),
+                    play_seq,
+                )
+                .await;
+            } else if advance_source != "local" && advance_source != "radio" {
                 let services = self.services.clone();
                 let playback = self.playback.clone();
                 let db = self.db.clone();
@@ -1496,8 +1531,14 @@ impl PlaybackOrchestrator {
                         );
                     } else {
                         spawn_proxy_levels_probe_task(
-                            playback, bus, zone_id, data.url, codec, play_seq,
-                        );
+                            playback,
+                            bus,
+                            zone_id,
+                            super::SourceDesNiveaux::Url(data.url),
+                            codec,
+                            play_seq,
+                        )
+                        .await;
                     }
                 });
             }

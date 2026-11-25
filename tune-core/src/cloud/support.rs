@@ -202,24 +202,23 @@ fn champs_de_diagnostic_nettoyes(fields: Vec<(String, String)>) -> Vec<(String, 
         .collect()
 }
 
-/// Extensions d'une pièce jointe lue comme du texte, et nettoyée comme un
-/// journal avant de partir.
-const PIECES_TEXTE: &[&str] = &["log", "txt", "md", "json", "csv", "xml"];
-
 /// Une pièce jointe texte (journal, fiche exportée) passe par le même
-/// nettoyage que le champ `logs` ; une image ou une archive part telle quelle.
-fn piece_nettoyee(mut file: AttachmentUpload) -> AttachmentUpload {
-    let ext = file
-        .file_name
-        .rsplit_once('.')
-        .map(|(_, e)| e.to_ascii_lowercase())
-        .unwrap_or_default();
-    if PIECES_TEXTE.contains(&ext.as_str())
-        && let Ok(texte) = std::str::from_utf8(&file.bytes)
-    {
-        file.bytes = crate::confidentialite::anonymiser_champ(texte).into_bytes();
-    }
-    file
+/// nettoyage que le champ `logs` ; une image ou une archive part telle quelle
+/// ([`crate::confidentialite::piece_texte_nettoyee`]).
+/// Une pièce texte illisible (UTF-16 mal formé…) est refusée : on ne sait pas
+/// la nettoyer.
+fn piece_nettoyee(mut file: AttachmentUpload) -> Result<AttachmentUpload, (u16, Value)> {
+    file.bytes = crate::confidentialite::piece_texte_nettoyee(&file.file_name, file.bytes)
+        .map_err(|_| {
+            (
+                400u16,
+                json!({
+                    "error": "attachment_unreadable",
+                    "detail": format!("\"{}\" is not readable text (UTF-8 or UTF-16).", file.file_name),
+                }),
+            )
+        })?;
+    Ok(file)
 }
 
 /// Complète un formulaire sortant : les champs texte tels quels, puis chaque
@@ -238,7 +237,8 @@ fn multipart_form(
         form = form.text(name, value);
     }
 
-    for file in files.into_iter().map(piece_nettoyee) {
+    for file in files {
+        let file = piece_nettoyee(file)?;
         let part = reqwest::multipart::Part::bytes(file.bytes)
             .file_name(file.file_name)
             .mime_str(&file.content_type)
@@ -835,14 +835,16 @@ mod tests {
             file_name: "tune.LOG".into(),
             content_type: "text/plain".into(),
             bytes: format!("WARN relay server_id={sid} {lien}").into_bytes(),
-        });
+        })
+        .unwrap();
         let texte = String::from_utf8(piece.bytes).unwrap();
         assert!(!texte.contains(sid) && !texte.contains(jeton), "{texte}");
         let image = piece_nettoyee(AttachmentUpload {
             file_name: "capture.png".into(),
             content_type: "image/png".into(),
             bytes: sid.as_bytes().to_vec(),
-        });
+        })
+        .unwrap();
         assert_eq!(image.bytes, sid.as_bytes(), "une image ne se réécrit pas");
     }
 }

@@ -569,6 +569,10 @@ impl RelayClient {
                     .and_then(|b| b.as_str())
                     .map(|s| s.to_string());
                 let headers = v.get("headers").and_then(|h| h.as_object()).cloned();
+                // Diagnostic rc14 (#8963) : le téléphone parle-t-il encore au
+                // serveur par le pont ?
+                super::activite_du_relais::noter_requete_relayee();
+                let commande = commande_de_zone_a_journaliser(method, path);
 
                 // Le chemin est normalisé, PUIS jugé : il doit rester une
                 // route de l'API de CE serveur. Le serveur applique ensuite
@@ -622,7 +626,9 @@ impl RelayClient {
                 let ws_vrac = self.ws_vrac.clone();
                 let places = self.places_de_requetes.clone();
                 let id_clone = id.clone();
+                let methode = method.to_string();
                 tokio::spawn(async move {
+                    let debut = std::time::Instant::now();
                     // #7799 — la place est prise pour la lecture LOCALE
                     // seulement, et rendue avant l'émission : une liaison
                     // montante lente ne retient pas les places des requêtes
@@ -639,6 +645,15 @@ impl RelayClient {
                             Err(e) => Err(e),
                         }
                     };
+                    if let Some(chemin) = commande.as_deref() {
+                        journaliser_commande_de_zone(
+                            &methode,
+                            chemin,
+                            lue.as_ref().map(|(s, _, _)| *s).unwrap_or(502),
+                            lue.as_ref().map(|(_, _, o)| o.len()).unwrap_or(0),
+                            debut.elapsed(),
+                        );
+                    }
                     let resp = match lue {
                         Ok((status, hdrs, octets)) => {
                             emettre_reponse_dapi(&ws_tx, &ws_vrac, &id_clone, status, hdrs, octets)
@@ -698,6 +713,16 @@ impl RelayClient {
                     emettre_vers_le_relais(&self.ws_tx, refus.to_string()).await;
                     return;
                 }
+                // Diagnostic rc14 (#8963) : le pont a-t-il demandé un flux, et
+                // lequel ? À rapprocher de `stream_request` (route locale) et
+                // de `lecture_sans_destination_abandonnee`.
+                super::activite_du_relais::noter_demande_de_flux_relayee(&stream_id);
+                info!(
+                    flux = %super::activite_du_relais::identifiant_court(&stream_id),
+                    range = range.as_deref().unwrap_or("-"),
+                    agent = user_agent.is_some(),
+                    "relay_demande_de_flux_recue"
+                );
                 let url = format!("http://127.0.0.1:{}/stream/{}", self.local_port, stream_id);
                 let ws_tx = self.ws_tx.clone();
                 let ws_vrac = self.ws_vrac.clone();
@@ -713,6 +738,88 @@ impl RelayClient {
             _ => {}
         }
     }
+}
+
+/// Diagnostic rc14 (#7398, #9273) : le chemin d'une commande de zone relayée
+/// à journaliser, sans sa requête (`?…`), ou `None`.
+///
+/// Seules les écritures sous `/api/v1/zones/` comptent : `next`, `play`,
+/// `browser-next`… Les positions que le téléphone envoie toutes les 5 s
+/// (`browser-playing`) et le volume (un curseur en envoie des dizaines) en
+/// sont exclus : ils noieraient le reste.
+pub(crate) fn commande_de_zone_a_journaliser(methode: &str, chemin: &str) -> Option<String> {
+    if methode.eq_ignore_ascii_case("GET") || methode.eq_ignore_ascii_case("HEAD") {
+        return None;
+    }
+    let sans_requete = chemin.split('?').next().unwrap_or(chemin);
+    if !sans_requete.starts_with("/api/v1/zones/")
+        || sans_requete.ends_with("/browser-playing")
+        || sans_requete.ends_with("/volume")
+    {
+        return None;
+    }
+    Some(crate::confidentialite::masquer_url(sans_requete))
+}
+
+/// Une ligne par commande de zone relayée : ce que le serveur a répondu, la
+/// taille du corps tel qu'il part au pont (compressé quand le téléphone
+/// l'accepte, #7602 : c'est la taille que montre le journal d'accès du pont),
+/// et le temps passé en local.
+pub(crate) fn journaliser_commande_de_zone(
+    methode: &str,
+    chemin: &str,
+    statut: u16,
+    octets: usize,
+    duree: Duration,
+) {
+    info!(
+        methode,
+        chemin,
+        statut,
+        octets,
+        duree_ms = duree.as_millis() as u64,
+        "relay_commande_de_zone"
+    );
+}
+
+/// Diagnostic rc14 (#9174, #8963) : le bilan d'un flux poussé au pont.
+///
+/// `premier_octet_ms` mesure le serveur local (ouverture de la piste,
+/// conversion) ; `attente_relais_ms` le temps passé à attendre de la place
+/// vers le pont (liaison montante, pont, téléphone qui ne lit plus).
+/// `debit_kbit_s` se compare au débit du format servi (`stream_request …
+/// format=`) : un débit inférieur dit une liaison trop étroite pour ce format.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn journaliser_bilan_du_flux(
+    url: &str,
+    statut: u16,
+    range: Option<&str>,
+    octets: u64,
+    premier_octet: Option<Duration>,
+    duree: Duration,
+    attente_relais: Duration,
+    fin: &str,
+) {
+    let flux = url
+        .split('?')
+        .next()
+        .and_then(|c| c.rsplit('/').next())
+        .map(super::activite_du_relais::identifiant_court)
+        .unwrap_or_default();
+    let duree_ms = duree.as_millis() as u64;
+    let debit_kbit_s = (octets * 8).checked_div(duree_ms).unwrap_or(0);
+    info!(
+        flux = %flux,
+        statut,
+        range = range.unwrap_or("-"),
+        octets,
+        premier_octet_ms = ?premier_octet.map(|d| d.as_millis() as u64),
+        duree_ms,
+        attente_relais_ms = attente_relais.as_millis() as u64,
+        debit_kbit_s,
+        fin,
+        "relay_flux_bilan"
+    );
 }
 
 /// L'URL locale d'un `relay.request`, si le chemin désigne bien une route de
@@ -921,6 +1028,8 @@ pub(crate) async fn pomper_le_flux(
     ws_tx: &CanalVersLeRelais,
     ws_vrac: &CanalVersLeRelais,
 ) -> BilanDuFlux {
+    let debut = std::time::Instant::now();
+    let range_demande = range.clone();
     let mut req = flux.http.get(url);
     if let Some(r) = range {
         req = req.header("range", r);
@@ -965,6 +1074,9 @@ pub(crate) async fn pomper_le_flux(
 
             let mut octets: u64 = 0;
             let mut seq: u64 = 0;
+            let mut premier_octet = None;
+            let mut attente_relais = Duration::ZERO;
+            let mut fin = "complet";
             use futures_util::StreamExt;
             let mut stream = resp.bytes_stream();
             loop {
@@ -980,17 +1092,20 @@ pub(crate) async fn pomper_le_flux(
                             patience_s = flux.patience.as_secs(),
                             "relay stream idle timeout"
                         );
+                        fin = "serveur_local_muet";
                         break;
                     }
                 };
                 match chunk {
                     Ok(bytes) => {
+                        premier_octet.get_or_insert_with(|| debut.elapsed());
                         octets += bytes.len() as u64;
+                        let avant_l_envoi = std::time::Instant::now();
                         // C'est ICI que la liaison lente se fait sentir : ce
                         // `send` attend que le relais ait de la place. Il
                         // attend sans le verrou, sinon le `relay.pong` ne
                         // partirait plus et la session entiere serait coupee.
-                        emettre_en_vrac(
+                        let emis = emettre_en_vrac(
                             ws_tx,
                             ws_vrac,
                             Trame::Morceau {
@@ -1000,14 +1115,29 @@ pub(crate) async fn pomper_le_flux(
                             },
                         )
                         .await;
+                        attente_relais += avant_l_envoi.elapsed();
+                        if !emis {
+                            fin = "relais_ferme";
+                        }
                         seq += 1;
                     }
                     Err(e) => {
                         warn!(id = %id, error = %e, "stream chunk error");
+                        fin = "erreur_de_lecture_locale";
                         break;
                     }
                 }
             }
+            journaliser_bilan_du_flux(
+                url,
+                status,
+                range_demande.as_deref(),
+                octets,
+                premier_octet,
+                debut.elapsed(),
+                attente_relais,
+                fin,
+            );
 
             // Par le vrac : derrière le dernier morceau, jamais devant (#7799).
             let end_msg = serde_json::json!({"type": "relay.stream_end", "id": id});
@@ -1019,6 +1149,16 @@ pub(crate) async fn pomper_le_flux(
         }
         Err(e) => {
             warn!(id = %id, error = %e, "relay stream request failed");
+            journaliser_bilan_du_flux(
+                url,
+                502,
+                range_demande.as_deref(),
+                0,
+                None,
+                debut.elapsed(),
+                Duration::ZERO,
+                "serveur_local_injoignable",
+            );
             let resp = serde_json::json!({
                 "type": "relay.stream_start",
                 "id": id,
@@ -1785,6 +1925,10 @@ mod renouvellement_tests;
 #[cfg(test)]
 #[path = "relay_compression_7602_tests.rs"]
 mod compression_7602_tests;
+
+#[cfg(test)]
+#[path = "relay_diagnostic_rc14_tests.rs"]
+mod diagnostic_rc14_tests;
 
 #[cfg(test)]
 #[path = "relay_file_prioritaire_7799_tests.rs"]

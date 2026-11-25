@@ -17,7 +17,7 @@
 //! **Quand il est pris** — et seulement alors ([`chemin_natif_s32`] puis
 //! [`BackendAlsaNatif::tenter`]) : source PCM **entière 32 bits**, volume
 //! effectif à l'unité, DSP neutre (ou PURE), aucune voie pilotée par une
-//! grille, aucun fondu enchaîné, hôte ALSA, PCM
+//! grille, aucun fondu enchaîné, aucune sortie double (#9187), hôte ALSA, PCM
 //! `hw:` sans repli, et le périphérique **annonce** S32 à la cadence et aux
 //! voies de la source. Tout le reste garde le chemin partagé, tel quel, et
 //! le verdict honnête de #6743 (pas de « bit-perfect » au-delà de 24 bits).
@@ -70,6 +70,9 @@ pub(super) struct ConditionsDuNatif {
     /// porterait ce flux sur le chemin partagé
     /// (`diagnostic_surechantillonnage_8259::greffon_avant_le_natif`).
     pub(super) surechantillonnage_voulu: bool,
+    /// #9187 — la zone recopie vers des sorties suiveuses (#6132). Seul le
+    /// chemin partagé les branche (`brancher_les_secondes_sorties`).
+    pub(super) sortie_double: bool,
 }
 
 /// Pourquoi le chemin natif S32 n'est pas pris — journalisé tel quel.
@@ -90,6 +93,11 @@ pub(super) enum MotifDuCheminPartage {
     /// partagé porte son étage. Sans ce motif, une source S32 au volume unité
     /// partait en natif et le greffon était ignoré en silence.
     SurechantillonnageDemande,
+    /// #9187 — la zone a une sortie double (#6132) : seul le chemin partagé
+    /// branche les sorties suiveuses. Sans ce motif, une source S32 au volume
+    /// unité partait en natif et les suiveuses restaient muettes, sans un mot
+    /// au journal.
+    SortieDouble,
 }
 
 impl MotifDuCheminPartage {
@@ -101,6 +109,7 @@ impl MotifDuCheminPartage {
             Self::VoiesPilotees => "voies_pilotees",
             Self::FonduEnchaine => "fondu_enchaine",
             Self::SurechantillonnageDemande => "surechantillonnage_demande",
+            Self::SortieDouble => "sortie_double",
         }
     }
 }
@@ -121,6 +130,9 @@ pub(super) fn chemin_natif_s32(c: &ConditionsDuNatif) -> Result<(), MotifDuChemi
     }
     if c.surechantillonnage_voulu {
         return Err(MotifDuCheminPartage::SurechantillonnageDemande);
+    }
+    if c.sortie_double {
+        return Err(MotifDuCheminPartage::SortieDouble);
     }
     if c.voies_pilotees {
         return Err(MotifDuCheminPartage::VoiesPilotees);

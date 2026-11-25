@@ -1,15 +1,27 @@
-//! Compatibility adapter for Tune's existing byte/f32 producer stages. All
-//! native instances and scratch space are prepared before processing. Device
-//! callbacks remain outside this adapter. State persists across block splits.
+//! Compatibility adapter for Tune's existing byte/f32 producer stages, and the
+//! `f64` entry of TESS (T05). All native instances and scratch space are
+//! prepared before processing. Device callbacks remain outside this adapter.
+//! State persists across block splits.
+//!
+//! F64 negotiation (ABI 1 unchanged): a plugin whose manifest requests
+//! [`tune_plugin_sdk::manifest::AUDIO_F64`] gets a fifth, `F64` instance and
+//! [`Stage::process_f64`] hands it the host's `f64` samples as they are. Any
+//! other plugin keeps exactly its four historical instances; `process_f64`
+//! then converts at the plugin boundary (`f64` -> `f32`, the `F32` instance,
+//! `f32` -> `f64`), so an existing `F32` package runs unchanged.
 use crate::{Library, NativeProcessor};
 use std::sync::Arc;
 use tune_plugin_sdk::{Error, Settings, audio::*};
 const FRAMES: usize = 4096;
+/// Index of the native `F64` instance, after F32, S16, S24Le and S32.
+const F64_INDEX: usize = 4;
 pub struct Stage {
     processors: Vec<NativeProcessor>,
     channels: u16,
     sample_rate: u32,
     floats: Vec<f32>,
+    /// Scratch of the native `F64` instance; empty without one.
+    doubles: Vec<f64>,
     shorts: Vec<i16>,
     integers: Vec<i32>,
     bytes: Vec<u8>,
@@ -43,6 +55,23 @@ impl Stage {
                 settings,
             )?);
         }
+        // T05: only a plugin that asked for F64 is ever given F64. One that
+        // asked and refuses it is refused here too, with its real settings.
+        let native_f64 = library.manifest.declares_f64();
+        if native_f64 {
+            processors.push(
+                library
+                    .prepare(
+                        AudioFormat::new(sample_rate, layout, SampleEncoding::F64)?,
+                        FRAMES,
+                        settings,
+                    )
+                    .map_err(|e| match e {
+                        Error::UnsupportedFormat | Error::InvalidFormat => Error::CapabilityMissing,
+                        other => other,
+                    })?,
+            );
+        }
         let count = FRAMES * usize::from(channels);
         let info = processors[0].diagnostics();
         Ok(Self {
@@ -51,6 +80,11 @@ impl Stage {
             channels,
             sample_rate,
             floats: vec![0.0; count],
+            doubles: if native_f64 {
+                vec![0.0; count]
+            } else {
+                Vec::new()
+            },
             shorts: vec![0; count],
             integers: vec![0; count],
             bytes: vec![0; count * 3],
@@ -112,6 +146,63 @@ impl Stage {
             total.non_finite_samples += report.non_finite_samples;
         }
         self.last = 0;
+        total.clipping = self.report.clipping;
+        Ok(total)
+    }
+    /// TESS T05 — the plugin itself processes `F64` (it requested
+    /// `audio-f64`); `false` means [`Self::process_f64`] converts through
+    /// `f32` at its boundary.
+    pub fn processes_f64_natively(&self) -> bool {
+        self.processors.len() > F64_INDEX
+    }
+    /// TESS T05 — process interleaved `f64` samples, full scale ±1.0.
+    /// Natively for a plugin that requested `audio-f64`; otherwise through
+    /// its `F32` instance, converted at the boundary. On error the samples of
+    /// the failing block are left untouched, as with [`Self::process_f32`].
+    pub fn process_f64(&mut self, samples: &mut [f64]) -> Result<ProcessReport, Error> {
+        if !samples.len().is_multiple_of(usize::from(self.channels)) {
+            return Err(Error::IncompleteFrame);
+        }
+        let native = self.processes_f64_natively();
+        let index = if native { F64_INDEX } else { 0 };
+        let mut total = ProcessReport::default();
+        for chunk in samples.chunks_mut(self.floats.len()) {
+            let context = BlockContext {
+                zone_id: 0,
+                generation: 0,
+                position_frames: self.samples_seen / u64::from(self.channels),
+            };
+            let p = &mut self.processors[index];
+            let f = p.format;
+            let report = if native {
+                let scratch = &mut self.doubles[..chunk.len()];
+                scratch.copy_from_slice(chunk);
+                let report = p.process(
+                    &mut AudioBlock::new(f, SamplesMut::F64(scratch), FRAMES)?,
+                    context,
+                )?;
+                chunk.copy_from_slice(scratch);
+                report
+            } else {
+                let scratch = &mut self.floats[..chunk.len()];
+                for (s, d) in scratch.iter_mut().zip(chunk.iter()) {
+                    *s = *d as f32;
+                }
+                let report = p.process(
+                    &mut AudioBlock::new(f, SamplesMut::F32(scratch), FRAMES)?,
+                    context,
+                )?;
+                for (d, s) in chunk.iter_mut().zip(scratch.iter()) {
+                    *d = f64::from(*s);
+                }
+                report
+            };
+            self.accumulate(report, chunk.len());
+            total.changed |= report.changed;
+            total.clipped_samples += report.clipped_samples;
+            total.non_finite_samples += report.non_finite_samples;
+        }
+        self.last = index;
         total.clipping = self.report.clipping;
         Ok(total)
     }

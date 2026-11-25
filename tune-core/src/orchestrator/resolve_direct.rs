@@ -589,7 +589,16 @@ impl PlaybackOrchestrator {
             .filter(|u| est_une_url_http(u))
             .map(str::to_string);
         let url_indexee = if url_nommee.is_none() && source_apparente == "upnp" {
-            req.track_id.and_then(|id| self.url_de_lecture_indexee(id))
+            // #9336 — reportée sur l'emplacement ACTUEL du serveur (par son
+            // UDN, au registre) : l'instantané garde l'adresse de
+            // l'indexation, morte si le serveur a changé d'IP depuis.
+            match req
+                .track_id
+                .and_then(|id| self.url_de_lecture_indexee(id).map(|url| (id, url)))
+            {
+                Some((id, url)) => Some(self.url_sur_l_emplacement_actuel(id, url).await),
+                None => None,
+            }
         } else {
             None
         };
@@ -1159,16 +1168,38 @@ impl PlaybackOrchestrator {
             ..Default::default()
         };
 
+        // #9346 — OAAT consomme le WAV de Tune tel quel : la chaîne de la
+        // zone (convolution, crossfeed) y est cuite, comme sur DLNA. La
+        // sortie locale applique la sienne elle-même.
+        let chaine = (!is_local_output)
+            .then(|| self.preparer_la_chaine_radio(req.zone_id))
+            .flatten();
+        let wav_info = StreamInfo {
+            crossfeed: chaine.as_ref().is_some_and(|c| c.crossfeed_prevu()),
+            compensation_db: chaine.as_ref().and_then(|c| c.compensation_prevue_db()),
+            ..wav_info
+        };
         let (session_id, tx, data_ready, session) =
             self.streamer.create_radio_session(wav_info, 256).await;
         retenir_le_codec_de_la_station(&self.db, &session, req.source_id.as_deref());
         // #4407 — OAAT consomme le WAV égalisé par Tune : un changement
         // d'égaliseur s'y relève en vol. La sortie locale égalise elle-même.
         let en_vol = (!is_local_output).then(|| {
-            let poste = super::eq_en_vol::EqEnVol::pour_la_radio();
+            let poste = match chaine.as_ref() {
+                Some(c) => super::eq_en_vol::EqEnVol::pour_la_radio_avec_chaine(
+                    c.compensation_prevue_db().is_some(),
+                ),
+                None => super::eq_en_vol::EqEnVol::pour_la_radio(),
+            };
             self.noter_eq_en_vol(req.zone_id, &session_id, poste.clone());
             poste
         });
+        let tx = match chaine {
+            Some(c) => {
+                super::chaine_radio_9346::relayer_par_la_chaine_radio(c, session.clone(), tx)
+            }
+            None => tx,
+        };
 
         info!(
             hote = %hote_pour_le_journal(audio_url),
@@ -2103,6 +2134,11 @@ impl PlaybackOrchestrator {
     /// DLNA n'ouvre souvent pas le HTTPS d'un hébergeur, le mandataire si.
     /// Aucun transcodage : les octets passent verbatim, le conteneur suit
     /// l'URL et le MIME annoncé.
+    ///
+    /// #9316 — `sample_rate` et `bit_depth` sont ceux que l'appelant CONNAÎT.
+    /// Inconnus, ils restent à 0 (« inconnu » pour le chemin du signal, qui
+    /// ne retient que des valeurs renseignées) : le repli 44 100 Hz / 16 bits
+    /// d'avant affichait un épisode AAC 48 kHz en « 44kHz/16bit ».
     pub async fn relayer_un_flux_distant(
         &self,
         audio_url: &str,
@@ -2115,11 +2151,14 @@ impl PlaybackOrchestrator {
         let info = StreamInfo {
             format: conteneur.to_string(),
             mime_type: mime_type.to_string(),
-            sample_rate: sample_rate.unwrap_or(44_100),
-            bit_depth: bit_depth.unwrap_or(16),
+            sample_rate: sample_rate.unwrap_or(0),
+            bit_depth: bit_depth.unwrap_or(0),
             channels: 2,
             file_size: None,
             duration_ms: duration_ms.map(|d| d as u64),
+            // #9331 — relayé verbatim : le chemin du signal n'y affiche aucun
+            // traitement.
+            relaye_tel_quel: true,
             ..Default::default()
         };
         let session_id = self
@@ -2397,7 +2436,11 @@ impl PlaybackOrchestrator {
             || is_browser_output
             || !reliable_ext
             || crate::audio::frequence_fixe::active(&self.db, req.zone_id).is_some();
-        let needs_proxy = proxy_sans_egaliseur || radio_eq_profile.is_some();
+        // #9346 — la convolution, le crossfeed (et leurs greffons tiers)
+        // interdisent le passage direct comme l'égaliseur : les octets
+        // compressés de la station les contourneraient tous.
+        let chaine = self.preparer_la_chaine_radio(req.zone_id);
+        let needs_proxy = proxy_sans_egaliseur || radio_eq_profile.is_some() || chaine.is_some();
 
         if needs_proxy {
             let wav_info = StreamInfo {
@@ -2408,6 +2451,9 @@ impl PlaybackOrchestrator {
                 channels: 2,
                 file_size: None,
                 duration_ms: None,
+                // #9346 — ce que le flux cuit, pour le chemin du signal (#5114).
+                crossfeed: chaine.as_ref().is_some_and(|c| c.crossfeed_prevu()),
+                compensation_db: chaine.as_ref().and_then(|c| c.compensation_prevue_db()),
                 ..Default::default()
             };
             let (session_id, tx, data_ready, session) =
@@ -2416,12 +2462,24 @@ impl PlaybackOrchestrator {
             info!(
                 hote = %hote_pour_le_journal(audio_url),
                 source = "radio",
+                chaine_de_zone = chaine.is_some(),
                 "radio_proxy_transcode_for_dlna"
             );
             // #4407 — le poste de relève : un changement d'égaliseur est posé
             // dans CE flux au paquet suivant, sans nouvelle session UPnP.
-            let en_vol = super::eq_en_vol::EqEnVol::pour_la_radio_servie(proxy_sans_egaliseur);
+            let en_vol = match chaine.as_ref() {
+                Some(c) => super::eq_en_vol::EqEnVol::pour_la_radio_avec_chaine(
+                    c.compensation_prevue_db().is_some(),
+                ),
+                None => super::eq_en_vol::EqEnVol::pour_la_radio_servie(proxy_sans_egaliseur),
+            };
             self.noter_eq_en_vol(req.zone_id, &session_id, en_vol.clone());
+            let tx = match chaine {
+                Some(c) => {
+                    super::chaine_radio_9346::relayer_par_la_chaine_radio(c, session.clone(), tx)
+                }
+                None => tx,
+            };
             let radio_url = audio_url.to_string();
             // VU-mètres sur radio (DLNA) : forwarder de niveaux alimenté
             // par le PCM décodé. Observateur pur, n'affecte pas le flux.

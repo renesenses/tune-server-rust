@@ -267,6 +267,10 @@ struct PatchZone {
     /// signal. Pris en compte à la lecture suivante.
     strict_bitperfect: Option<bool>,
 
+    /// #8813 — convertir le DoP local en PCM si le niveau logiciel doit
+    /// être atténué. Activé par défaut, sans effet sous PURE ou strict.
+    dsd_volume_protection: Option<bool>,
+
     /// #8869 — silence de verrouillage (ms, 0 à 2000) inséré devant le flux
     /// d'une sortie LOCALE quand son format change (cadence, canaux, PCM /
     /// DoP / DSD natif). Persisté en setting
@@ -460,6 +464,11 @@ fn inject_device_identity(
             backend, zone_id
         )),
     );
+    obj.insert(
+        "dsd_volume_protection".into(),
+        json!(tune_core::audio::dop_ecarte_7265::protection_du_niveau_active(backend, zone_id)),
+    );
+
     // #8869 — TOUJOURS publié : sa présence dit au client que ce serveur
     // connaît le réglage.
     obj.insert(
@@ -643,6 +652,16 @@ pub fn router() -> Router<AppState> {
         )
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
+        // TESS T08 — la chaîne de la zone, son état réel et le catalogue.
+        .route(
+            "/{id}/tess",
+            get(tess::get_zone_tess).put(tess::put_zone_tess),
+        )
+        // TESS T17 — charger un préréglage sur la zone (même voie que le PUT).
+        .route(
+            "/{id}/tess/presets/{preset_id}/apply",
+            post(tess_prereglages::appliquer_prereglage),
+        )
         .route("/{id}/eq/response", get(eq_response))
         .route("/{id}/convolver/response", get(convolver_response))
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
@@ -742,6 +761,11 @@ pub(crate) async fn zones_a_montrer(state: &AppState) -> Vec<Zone> {
 mod dsp;
 pub use dsp::*;
 
+// TESS T08 — `GET/PUT /zones/{id}/tess` et `GET /tess/catalog`.
+pub mod tess;
+// TESS T17 — préréglages de chaîne globaux et mode d'application.
+pub mod tess_prereglages;
+
 mod lecture;
 pub use lecture::*;
 mod presence;
@@ -799,6 +823,10 @@ mod zone_masquee_en_lecture_affichee_5077;
 mod zone_sans_appareil_guard;
 #[cfg(test)]
 mod zone_supprimee_en_pause_disparait_5322;
+
+// #8788 — un DSD porté par du DoP s'annonce en DSD dans la piste en cours.
+mod dsd_porte_par_le_dop_8788;
+pub(crate) use dsd_porte_par_le_dop_8788::inject_dsd_porte;
 
 // #7133 — une zone qui change d'appareil coupe celui qu'elle quitte.
 mod ancienne_sortie_coupee_7133;
@@ -1803,9 +1831,16 @@ mod signal_path;
 pub(crate) mod signal_path_groupe_8419;
 pub(crate) mod textes_signal;
 pub use signal_path::*;
+// TESS T16 — le bloc `tess` du chemin du signal (maquette A4).
+mod chemin_tess_t16;
+pub use chemin_tess_t16::avec_le_chemin_tess;
 
 mod ecriture;
 pub use ecriture::*;
+// Après `mod ecriture;` : le garde-fou eq_refresh_guard lit les 3 lignes
+// qui précèdent un `mod` pour reconnaître un module de test.
+#[cfg(test)]
+mod chemin_tess_t16_tests;
 
 mod peripheriques;
 mod preconfiguration;
@@ -1831,6 +1866,10 @@ pub mod relais_de_groupe_6155;
 
 #[cfg(test)]
 mod signal_path_tests;
+
+// #9316 — un podcast relayé n'affiche plus un 44,1 kHz / 16 bits inventé.
+#[cfg(test)]
+mod signal_path_podcast_relaye_9316_tests;
 
 // #5081 — l'ombre de la tête sur l'étape crossfeed du chemin du signal.
 #[cfg(test)]
@@ -1883,6 +1922,9 @@ mod signal_path_volume_non_reglable_8569_tests;
 // #8647 — un DSD servi en natif par OAAT se dit « DSD256 natif (OAAT) ».
 #[cfg(test)]
 mod signal_path_dsd_natif_oaat_8647_tests;
+// #9331 — la voie mandataire (podcast relayé tel quel) n'affiche aucun traitement.
+#[cfg(test)]
+mod signal_path_mandataire_9331_tests;
 
 /// #1499 — une zone qui « joue » sans destination doit le dire.
 ///

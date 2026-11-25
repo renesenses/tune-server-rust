@@ -1,0 +1,19 @@
+[package]
+workspace = ".."
+name = "tune-plugin-declick-live"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "TESS T13 : suppression des clics en temps réel (détection par erreur de prédiction AR, interpolation LSAR, anticipation bornée annoncée à l'hôte). Calcul interne en f64. Premium."
+
+# Aucune dépendance tierce. Le branchement dans l'hôte (chaîne, catalogue,
+# écran) est un lot à part : la caisse n'est pas encore dans `plugins.json`,
+# d'où `manifest.embedded.json` (même convention que le suréchantillonneur).
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tune-plugin-sdk.workspace = true
+
+[dev-dependencies]
+tune-plugin-testkit.workspace = true

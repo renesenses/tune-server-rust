@@ -135,12 +135,51 @@ def appliquer_corrections(entrees: list[dict]) -> list[dict]:
     return entrees
 
 
+def sans_commentaires(bloc: str) -> str:
+    """Le corps d'un type, commentaires `//` et `/* */` remplacés par un blanc.
+
+    🔴 Les commentaires d'un type sont de la PROSE, pas des déclarations. La doc
+    de `StreamingPlaylist.editable` dit « … (éditoriale, autre compte) ; absent :
+    le serveur ne le dit pas » : le `;` de la phrase coupait le bloc, et
+    « absent : le serveur… » devenait un champ OBLIGATOIRE de cinq routes et de
+    `GET /system/env` (carte du web a10e41183, #9362). Le serveur n'a jamais
+    rendu ce champ ; aucune liste de noms tolérés ne règle cela sans cacher de
+    vrais écarts — c'est la lecture qui était fausse.
+
+    Les chaînes sont recopiées telles quelles : `'http://x'` dans un type
+    littéral n'ouvre pas un commentaire. Le saut de ligne qui clôt un `//` est
+    gardé, puisqu'il sépare deux champs.
+    """
+    sortie, i = [], 0
+    while i < len(bloc):
+        car = bloc[i]
+        if car in "'\"`":
+            fin = i + 1
+            while fin < len(bloc) and bloc[fin] != car:
+                fin += 2 if bloc[fin] == "\\" else 1
+            sortie.append(bloc[i:fin + 1])
+            i = fin + 1
+        elif bloc.startswith("//", i):
+            fin = bloc.find("\n", i)
+            i = len(bloc) if fin < 0 else fin
+            sortie.append(" ")
+        elif bloc.startswith("/*", i):
+            fin = bloc.find("*/", i + 2)
+            i = len(bloc) if fin < 0 else fin + 2
+            sortie.append(" ")
+        else:
+            sortie.append(car)
+            i += 1
+    return "".join(sortie)
+
+
 def champs_du_bloc(bloc: str) -> tuple[list[str], list[str]]:
     """Champs de premier niveau d'un corps d'interface : (obligatoires, optionnels).
 
     Seule la profondeur 1 compte : un objet imbriqué décrit une sous-structure,
-    pas un champ de la réponse.
+    pas un champ de la réponse. Les commentaires ne comptent pas du tout.
     """
+    bloc = sans_commentaires(bloc)
     obligatoires, optionnels = [], []
     profondeur = 0
     ligne_courante = []
@@ -168,17 +207,40 @@ def champs_du_bloc(bloc: str) -> tuple[list[str], list[str]]:
 
 
 def corps_apres_accolade(texte: str, debut: int) -> str | None:
-    """Le contenu entre l'accolade ouvrante en `debut` et sa fermante."""
+    """Le contenu entre l'accolade ouvrante en `debut` et sa fermante.
+
+    Les accolades des commentaires et des chaînes ne comptent pas : un `}` dans
+    une JSDoc (« l'ancienne forme était `}` ») tronquait le type, et ses
+    champs suivants disparaissaient de la carte (relecture de #9435).
+    """
     if debut >= len(texte) or texte[debut] != "{":
         return None
-    profondeur = 0
-    for i in range(debut, len(texte)):
-        if texte[i] == "{":
+    profondeur, i = 0, debut
+    while i < len(texte):
+        car = texte[i]
+        if car in "'\"`":
+            fin = i + 1
+            while fin < len(texte) and texte[fin] != car and texte[fin] != "\n":
+                fin += 2 if texte[fin] == "\\" else 1
+            i = fin + 1
+            continue
+        if texte.startswith("//", i):
+            fin = texte.find("\n", i)
+            i = len(texte) if fin < 0 else fin
+            continue
+        if texte.startswith("/*", i):
+            fin = texte.find("*/", i + 2)
+            if fin < 0:
+                return None
+            i = fin + 2
+            continue
+        if car == "{":
             profondeur += 1
-        elif texte[i] == "}":
+        elif car == "}":
             profondeur -= 1
             if profondeur == 0:
                 return texte[debut + 1 : i]
+        i += 1
     return None
 
 
@@ -302,6 +364,61 @@ def suffixe_requete_conditionnel(expression: str) -> bool:
             and all(not b or b.startswith("?") for b in branches))
 
 
+# Le début de la fonction de l'appel : la constante doit y être déclarée.
+# Une méthode d'objet (`a(d) {`) et une fonction fléchée à corps (`=> {`)
+# bornent aussi : sans cela, la méthode `b()` lisait la constante de sa
+# voisine `a()` (relecture de #9435). Les mots-clés de contrôle (`if (…) {`,
+# `for`, `while`, `switch`, `catch`) ouvrent un bloc, pas une fonction.
+DEBUT_DE_FONCTION = re.compile(
+    r"^[ \t]*(?:export\s|(?:async\s+)?function[\s*]"
+    r"|(?:async\s+)?(?!(?:if|for|while|switch|catch|with|return|function)\b)"
+    r"[A-Za-z_$][\w$]*\s*\([^()\n]*\)\s*(?::[^{\n]*)?\{[ \t]*$)"
+    r"|=>[ \t]*\{[ \t]*$",
+    re.M,
+)
+
+# `const suite = dossier ? `?${…}` : '';` — une constante locale d'une ligne.
+MOTIF_CONSTANTE_LOCALE = r"\b(?:const|let)\s+{nom}\s*=\s*(?P<expr>[^\n]*?);[ \t]*(?://[^\n]*)?$"
+
+
+def sans_suffixe_de_requete_local(route: str, avant: str) -> str:
+    """Retire un `${nom}` final quand `nom` est une requête conditionnelle locale.
+
+    `getArtistTracks` écrit `…/tracks${suite}` avec, juste au-dessus,
+    `const suite = dossier ? `?${…}` : '';`. Sans cette lecture, la carte
+    nommait la route `/library/artists/{}/tracks{}`, que le serveur ne sert
+    pas, et le contrat de `/library/artists/{}/tracks` disparaissait (#9362).
+
+    On ne devine toujours pas la valeur d'une variable : on lit sa DÉCLARATION,
+    dans la fonction de l'appel (`avant`, borné à la déclaration exportée qui
+    le précède), et on ne la retire que si `suffixe_requete_conditionnel` la
+    reconnaît. Une constante qui peut changer le chemin, ou introuvable, garde
+    la notation historique `{}`.
+    """
+    m = re.search(r"\$\{\s*(?P<nom>[A-Za-z_$][\w$]*)\s*\}$", route)
+    if m is None or m.start() == 0 or route[m.start() - 1] == "/":
+        return route
+    bornes = list(DEBUT_DE_FONCTION.finditer(avant))
+    fonction = avant[bornes[-1].start():] if bornes else avant
+    motif = re.compile(MOTIF_CONSTANTE_LOCALE.format(nom=re.escape(m.group("nom"))), re.M)
+    declarations = list(motif.finditer(fonction))
+    if len(declarations) != 1:
+        return route  # absente, ou redéclarée : rien de sûr à lire
+    # Une RÉAFFECTATION (`q += '/extra'`, `q = '/x'`, `q++`) peut faire du
+    # suffixe un segment de chemin : on refuse dès qu'il y en a une hors de la
+    # déclaration (relecture de #9435). `==`, `===` et `=>` n'affectent rien.
+    affectation = re.compile(
+        r"(?<![\w$.])" + re.escape(m.group("nom"))
+        + r"\s*(?:(?:\+|-|\*|/|%|\*\*|<<|>>>?|&|\||\^|&&|\|\||\?\?)?=(?![=>])|\+\+|--)"
+    )
+    for a in affectation.finditer(fonction):
+        if not declarations[0].start() <= a.start() < declarations[0].end():
+            return route
+    if not suffixe_requete_conditionnel(declarations[0].group("expr")):
+        return route
+    return route[:m.start()]
+
+
 def normaliser_route(route: str) -> str:
     """Réduit les paramètres du chemin, puis retire la requête hors expression."""
     sortie, i = [], 0
@@ -370,6 +487,8 @@ def appels_types_par_le_retour(api_ts: str) -> list[tuple[str, str, str, bool, b
         # bornée que pour la forme typée.
         url = url_complete(apres, m_appel)
         route, fin_url = url if url is not None else (m_appel.group("route"), m_appel.end())
+        if url is not None:
+            route = sans_suffixe_de_requete_local(route, apres[:m_appel.start()])
         suite = apres[fin_url : fin_url + 400]
         m_meth = re.search(r"method:\s*['\"`](GET|POST|PUT|PATCH|DELETE)['\"`]", suite, re.I)
         trouves.append((
@@ -403,6 +522,8 @@ def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]
             suite = suite[:coupe]
         m_meth = re.search(r"method:\s*['\"`](GET|POST|PUT|PATCH|DELETE)['\"`]", suite, re.I)
         methode = m_meth.group(1).upper() if m_meth else "GET"
+        if url is not None:
+            route_brute = sans_suffixe_de_requete_local(route_brute, api_ts[:m.start()])
         route = normaliser_route(route_brute) if url is not None else ""
         if not route:
             non_resolus.append({

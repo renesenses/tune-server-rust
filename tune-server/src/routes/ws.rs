@@ -167,6 +167,15 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
             signal_path,
             output_capabilities.as_ref(),
         );
+        // TESS T16 — la vue TESS (A4), rapprochée de ce qui tourne.
+        let signal_path = crate::routes::zones::avec_le_chemin_tess(
+            &state.license,
+            &state.backend,
+            z,
+            &ps,
+            signal_path,
+        )
+        .await;
         // #3514 — la meme decision que celle que la route applique, calculee
         // par la meme fonction : ce n'est pas au client de la deviner.
         let peut_avancer = crate::routes::playback::can_skip_next_publie(state, zid, &ps).await;
@@ -237,6 +246,8 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
         // est un residu de la meme famille, ferme parce qu'il est ouvert.
         if let Some(obj) = snap.as_object_mut() {
             crate::routes::zones::injecter_reglages_renderer(obj, &zone_repo, zid);
+            // #8788 — le DSD porté par du DoP, comme dans les trois autres.
+            crate::routes::zones::inject_dsd_porte(obj, "now_playing", &ps);
         }
         zone_snaps.push(snap);
     }

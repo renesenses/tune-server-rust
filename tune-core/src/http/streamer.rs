@@ -137,13 +137,21 @@ pub struct StreamInfo {
     /// fait du flux, posé là où il est bâti, lu tel quel par le chemin du
     /// signal (« DST décompressé → DSF »). `false` partout ailleurs.
     pub dsd_reconstruit_depuis_dst: bool,
+    /// #9331 — le flux est une URL distante RELAYÉE telle quelle par le
+    /// mandataire (`relayer_un_flux_distant` : épisode de podcast vers un
+    /// renderer réseau, flux direct vers un onglet). Aucun étage ne touche
+    /// ses octets : ni égaliseur, ni correction de pièce, ni ReplayGain.
+    /// Même règle que [`Self::crossfeed`] : un fait du flux, posé là où il
+    /// est bâti, lu tel quel par le chemin du signal. `false` partout ailleurs.
+    pub relaye_tel_quel: bool,
 }
 
 /// #6221 — un fichier VIRTUEL servi par la branche fichier (`serve_file`) :
 /// taille connue d'avance, octets calculés à la demande pour une tranche
 /// quelconque — donc `Content-Length` exact et requêtes `Range` honorées.
-/// Producteurs : L16 depuis WAV (#8722) et DSF fabriqué depuis un DST
-/// (`audio::dsf_depuis_dst::DsfDepuisDst`).
+/// Producteurs : L16 depuis WAV (#8722), DSF fabriqué depuis un DST
+/// (`audio::dsf_depuis_dst::DsfDepuisDst`) et depuis une tranche d'ISO SACD
+/// (`audio::dsf_depuis_iso::DsfDepuisIso`, #9184).
 pub trait SourceVirtuelle: Send + Sync + std::fmt::Debug {
     /// Taille totale du fichier virtuel.
     fn total(&self) -> u64;
@@ -316,6 +324,8 @@ pub mod voie {
     pub const DEPART_NATIF: &str = "depart_natif_trames_intactes";
     /// #6221 — DSF fabriqué depuis un DST.
     pub const DSF_RECONSTRUIT: &str = "dsf_reconstruit";
+    /// #9184 — DSF fabriqué depuis une tranche d'ISO SACD.
+    pub const DSF_DEPUIS_ISO: &str = "dsf_depuis_iso";
     /// Fichier issu d'un décodage puis d'un ré-encodage (temporaire ou cache).
     pub const FICHIER_CONVERTI: &str = "fichier_converti";
     /// Session de fichier dont la résolution n'a rien noté.
@@ -355,6 +365,14 @@ pub mod voie {
 
 pub struct StreamSession {
     pub id: String,
+    /// #9450 — la prise des VU-mètres : le corps mandataire y recopie ce
+    /// qu'il relaie, la sonde de niveaux le décode sans ouvrir de seconde
+    /// connexion amont.
+    pub prise_des_niveaux: super::prise_des_niveaux_9450::PriseDesNiveaux,
+    /// #9450 — la sonde de longueur du HEAD a-t-elle déjà été tentée ? Une
+    /// seule fois par session : un amont lent ou en panne ne doit pas coûter
+    /// 3 s à chaque HEAD.
+    pub sonde_de_longueur_tentee: std::sync::atomic::AtomicBool,
     pub info: StreamInfo,
     detected_radio_source: std::sync::Mutex<Option<RadioSourceInfo>>,
     /// #5716 — appelé UNE fois, au premier codec de station que la sonde
@@ -507,6 +525,11 @@ pub struct StreamSession {
     /// par le sondeur, qui fait alors reprendre la zone par un NOUVEAU flux à
     /// la position mémorisée (voir `PlaybackOrchestrator::reprendre_apres_plage_hors_fichier`).
     plage_hors_fichier_a_ms: std::sync::atomic::AtomicU64,
+    /// #9315 — statut HTTP non 2xx que la SOURCE a rendu au mandataire avant
+    /// qu'un seul octet ait été servi ; `0` = aucun. Posé par
+    /// `tune-stream-http`, lu par le sondeur, qui arrête la zone avec un
+    /// bandeau au lieu de la laisser « démarrer » sur un flux mort.
+    erreur_amont: std::sync::atomic::AtomicU16,
     /// Comptabilité du ramasse-miettes — voir `cleanup_stale_sessions_with`.
     ///
     /// `bytes_sent` est monotone et alimenté par TOUS les chemins de sortie
@@ -807,11 +830,34 @@ impl StreamSession {
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// #9315 — la source a répondu `statut` (non 2xx) au mandataire.
+    pub fn signaler_erreur_amont(&self, statut: u16) {
+        self.erreur_amont
+            .store(statut, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #9315 — la source a de nouveau répondu 2xx : l'erreur notée ne vaut
+    /// plus (un renderer qui réessaie après un 502 et reçoit l'audio).
+    pub fn effacer_erreur_amont(&self) {
+        self.erreur_amont
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #9315 — le statut d'erreur de la source, s'il a été noté.
+    pub fn erreur_amont(&self) -> Option<u16> {
+        match self.erreur_amont.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            statut => Some(statut),
+        }
+    }
+
     pub fn new(id: String, info: StreamInfo, bit_perfect: bool, buffer_size: usize) -> Self {
         let (tx, rx) = mpsc::channel(buffer_size);
         let keep_alive = tx.clone();
         Self {
             id,
+            prise_des_niveaux: Default::default(),
+            sonde_de_longueur_tentee: std::sync::atomic::AtomicBool::new(false),
             info,
             detected_radio_source: std::sync::Mutex::new(None),
             au_premier_codec: std::sync::Mutex::new(None),
@@ -846,6 +892,7 @@ impl StreamSession {
             longueur_amont: std::sync::atomic::AtomicU64::new(0),
             requetes_mandataire: std::sync::atomic::AtomicU32::new(0),
             plage_hors_fichier_a_ms: std::sync::atomic::AtomicU64::new(0),
+            erreur_amont: std::sync::atomic::AtomicU16::new(0),
             gc_seen_bytes: std::sync::atomic::AtomicU64::new(0),
             gc_active_at_ms: std::sync::atomic::AtomicU64::new(0),
             fichiers_prepares: std::sync::atomic::AtomicU32::new(0),
@@ -1894,6 +1941,10 @@ const SESSIONS_ABANDONNEES_RETENUES: usize = 64;
 
 impl AudioStreamer {
     pub fn new(port: u16) -> Self {
+        // #9450 — l'origine de Tune, pour reconnaître ses propres flux.
+        if port != 0 {
+            crate::http::client::noter_le_port_du_flux(port);
+        }
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             port,
@@ -2014,6 +2065,12 @@ impl AudioStreamer {
     pub async fn age_plage_hors_fichier(&self, stream_id: &str) -> Option<std::time::Duration> {
         let sessions = self.sessions.lock().await;
         sessions.get(stream_id)?.age_plage_hors_fichier()
+    }
+
+    /// #9315 — le statut d'erreur que la source a rendu à cette session.
+    pub async fn erreur_amont(&self, stream_id: &str) -> Option<u16> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(stream_id)?.erreur_amont()
     }
 
     /// #6612 — oublie la plage hors fichier de cette session.
@@ -2318,7 +2375,10 @@ impl AudioStreamer {
             let sessions = self.sessions.lock().await;
             if let Some(session) = sessions.get(stream_id) {
                 session.close_sender().await;
+                // #9450 — la sonde de niveaux branchée lit la fin du flux.
+                session.prise_des_niveaux.couper();
             }
+            super::prise_des_niveaux_9450::oublier(stream_id);
         }
         let removed = self.sessions.lock().await.remove(stream_id);
         // Le registre des titres radio suit la vie de la session : sans ça il
@@ -2344,6 +2404,30 @@ impl AudioStreamer {
             }
         }
         info!(stream_id, "stream_session_removed");
+    }
+
+    /// #9450 — la session existe-t-elle, et relaie-t-elle un amont ?
+    pub async fn est_mandataire(&self, stream_id: &str) -> bool {
+        let session = self.sessions.lock().await.get(stream_id).cloned();
+        match session {
+            Some(s) => s.proxy_url.lock().await.is_some(),
+            None => false,
+        }
+    }
+
+    /// #9450 — branche la sonde de niveaux sur la prise d'une session
+    /// MANDATAIRE vivante. `None` si la session n'existe pas ou n'est pas
+    /// mandataire : l'appelant n'ouvre alors aucune connexion de plus.
+    pub async fn brancher_la_prise_des_niveaux(
+        &self,
+        stream_id: &str,
+        arret: Box<dyn Fn() -> bool + Send + Sync>,
+    ) -> Option<super::prise_des_niveaux_9450::LecteurDePrise> {
+        let session = self.sessions.lock().await.get(stream_id).cloned()?;
+        if session.proxy_url.lock().await.is_none() {
+            return None;
+        }
+        Some(session.prise_des_niveaux.brancher(arret))
     }
 
     pub fn get_stream_url(&self, stream_id: &str, server_ip: &str, ext: &str) -> String {
@@ -2587,6 +2671,10 @@ impl AudioStreamer {
             if s.is_radio {
                 radios_reprises.push(s.clone());
             }
+            // #9450 — comme `remove_session` : la sonde de niveaux lit la fin
+            // du flux, et une prise garée ne survit pas à sa session.
+            s.prise_des_niveaux.couper();
+            super::prise_des_niveaux_9450::oublier(id);
             false
         });
         let after = sessions.len();

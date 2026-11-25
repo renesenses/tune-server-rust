@@ -20,6 +20,26 @@
       ],
       "type": "object"
     },
+    "ExclusiveGroup": {
+      "additionalProperties": false,
+      "description": "TESS T05 — membership of a mutually exclusive group of DSP stages: a chain\nnever enables two members of one group (for example `crossfeed_crosstalk`).\nA larger `priority` wins when an old chain still enables several.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "priority": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "priority"
+      ],
+      "type": "object"
+    },
     "PluginKind": {
       "enum": [
         "dsp",
@@ -71,6 +91,17 @@
     "entitlement": {
       "description": "Entitlement identifier; the host maps it to existing subscription tiers.",
       "type": "string"
+    },
+    "exclusive_group": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExclusiveGroup"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "TESS T05 — optional exclusive group. Absent in every package published\nbefore T05; the host still recognises the `crossfeed-` prefix for them.\nIts id follows the identifier rules with `_` allowed\n(`crossfeed_crosstalk`)."
     },
     "id": {
       "type": "string"

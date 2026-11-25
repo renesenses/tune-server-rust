@@ -669,6 +669,17 @@ async fn handle_event(
 
             if is_new {
                 info!(id = %dev_id, name = %device.name, service = service_type, "mdns_device_discovered");
+                if device.device_type == OutputType::Airplay {
+                    journaliser_la_classification_airplay(
+                        &dev_id,
+                        service_type,
+                        info.get_property_val_str("features"),
+                        info.get_property_val_str("ft"),
+                        info.get_property_val_str("flags")
+                            .or_else(|| info.get_property_val_str("sf")),
+                        &device,
+                    );
+                }
                 let _ = event_tx.send(MdnsEvent::DeviceDiscovered(device)).await;
             } else {
                 debug!(id = %dev_id, "mdns_device_updated");
@@ -853,6 +864,15 @@ fn service_to_device(
         {
             caps.insert(
                 "airplay_requires_pairing".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            // #9379 — ce bit seul dit « appairage unique avec le code affiché
+            // par le récepteur » (owntone : `ONE_TIME_PAIRING_REQUIRED`,
+            // jamais de transitoire dans ce cas). `airplay_requires_pairing`
+            // ne le distingue pas : les bits de `features` le posent sur
+            // presque tout récepteur AirPlay 2, HomePod compris.
+            caps.insert(
+                CAP_AIRPLAY_CODE_A_L_ECRAN.to_string(),
                 serde_json::Value::Bool(true),
             );
         }
@@ -1104,6 +1124,20 @@ fn enrichir_appareil_airplay(d: &mut DiscoveredDevice, nouveau: &DiscoveredDevic
     let mut modifie = false;
     if d.airplay_version.as_deref() != Some("2") && nouveau.airplay_version.as_deref() == Some("2")
     {
+        // Diagnostic rc14 (#8988) : l'entrée `_raop` classée AirPlay 1 passe
+        // en AirPlay 2 sur la foi de la seconde annonce. C'est la double
+        // inscription `airplay` puis `airplay2` du même identifiant.
+        info!(
+            id = %d.id,
+            name = %d.name,
+            ancienne_version = d.airplay_version.as_deref().unwrap_or("?"),
+            features_de_la_seconde_annonce = nouveau
+                .capabilities
+                .get("airplay_features")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-"),
+            "mdns_airplay_version_relevee_par_une_seconde_annonce"
+        );
         d.airplay_version = nouveau.airplay_version.clone();
         modifie = true;
     }
@@ -1254,6 +1288,11 @@ fn detect_local_subnet() -> Option<String> {
 /// (RAOP/AirPlay `flags`, bit 9.)
 const AIRPLAY_FLAG_PIN_REQUIRED: u64 = 0x200;
 
+/// #9379 — capacité posée quand le TXT `flags`/`sf` porte le bit 9 : le
+/// récepteur (Apple TV, Mac…) n'accepte qu'un appairage unique avec le code
+/// qu'il affiche ; ni le transitoire ni le code par défaut `3939` ne passent.
+pub const CAP_AIRPLAY_CODE_A_L_ECRAN: &str = "airplay_code_a_l_ecran";
+
 // AirPlay feature bits relevant to whether pairing is mandatory. The `features`
 // value is a 64-bit mask; the low 32 bits are the first word and the high 32
 // bits the second (see the `features` TXT record used by RAOP/AirPlay 2).
@@ -1270,6 +1309,45 @@ const FT_BIT_COREUTILS_PAIR_ENC: u64 = 1 << 46;
 const FT_BIT_UNIFIED_PAIR_VERIFY: u64 = 1 << 51;
 
 /// Parse a single hex or decimal integer TXT value like `0x200` or `514`.
+/// Diagnostic rc14 (#8988) : pourquoi une annonce AirPlay est classée 1 ou 2.
+///
+/// Sur `_airplay._tcp`, la seule PRÉSENCE de la clé `features` vaut AirPlay 2,
+/// quels qu'en soient les bits ; sur `_raop._tcp`, il faut le bit 40 de `ft`.
+/// Une ancienne enceinte AirPlay 1 qui annonce aussi `_airplay._tcp` passerait
+/// donc en AirPlay 2 (appairage « M2 has wrong state value »). La ligne donne
+/// les masques bruts et le motif retenu, pour trancher sur le journal.
+fn journaliser_la_classification_airplay(
+    id: &str,
+    service: &str,
+    features: Option<&str>,
+    ft: Option<&str>,
+    flags: Option<&str>,
+    device: &DiscoveredDevice,
+) {
+    let bits = features.or(ft).and_then(parse_airplay_features);
+    let motif = match (features.is_some(), bits) {
+        (true, Some(b)) if airplay_is_v2(b) => "cle_features_bit_40",
+        (true, _) => "cle_features_presente_sans_bit_40",
+        (false, Some(b)) if airplay_is_v2(b) => "ft_bit_40",
+        (false, Some(_)) => "ft_sans_bit_40",
+        (false, None) => "sans_masque",
+    };
+    info!(
+        id = %id,
+        service,
+        version = device.airplay_version.as_deref().unwrap_or("?"),
+        motif,
+        features = features.or(ft).unwrap_or("-"),
+        flags = flags.unwrap_or("-"),
+        appairage_requis = device
+            .capabilities
+            .get("airplay_requires_pairing")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "mdns_airplay_classe"
+    );
+}
+
 fn parse_hex_u64(raw: &str) -> Option<u64> {
     let s = raw.trim();
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -1313,6 +1391,99 @@ pub fn airplay_requires_pairing(features: u64) -> bool {
             | FT_BIT_COREUTILS_PAIR_ENC
             | FT_BIT_UNIFIED_PAIR_VERIFY)
         != 0
+}
+
+#[cfg(test)]
+mod diagnostic_rc14_tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Journal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Journal;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #8988 — la classification d'une annonce et le relèvement en AirPlay 2
+    /// par une seconde annonce sont écrits, masques bruts compris.
+    #[test]
+    fn classification_et_releve_airplay_journalises_8988() {
+        crate::journal_de_test::fiabiliser_la_capture();
+        let journal = Journal::default();
+        let _garde = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(journal.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+        let mut raop = DiscoveredDevice::new(
+            "airplay-10.0.0.9-5000".into(),
+            "FREYA".into(),
+            OutputType::Airplay,
+            "10.0.0.9".into(),
+            5000,
+        );
+        raop.airplay_version = Some("1".into());
+        journaliser_la_classification_airplay(
+            &raop.id,
+            "_raop._tcp.local.",
+            None,
+            Some("0x5A7FFFF7,0x1E"),
+            Some("0x4"),
+            &raop,
+        );
+        let mut ap = raop.clone();
+        ap.airplay_version = Some("2".into());
+        ap.capabilities.insert(
+            "airplay_features".into(),
+            serde_json::Value::String("0x0000001E5A7FFFF7".into()),
+        );
+        journaliser_la_classification_airplay(
+            "airplay-aabbccddeeff",
+            "_airplay._tcp.local.",
+            Some("0x5A7FFFF7,0x1E"),
+            None,
+            None,
+            &ap,
+        );
+        assert!(enrichir_appareil_airplay(&mut raop, &ap));
+
+        let texte = String::from_utf8_lossy(&journal.0.lock().unwrap()).into_owned();
+        let classes: Vec<&str> = texte
+            .lines()
+            .filter(|l| l.contains("mdns_airplay_classe"))
+            .collect();
+        assert_eq!(classes.len(), 2, "{texte}");
+        assert!(
+            classes[0].contains("motif=\"ft_sans_bit_40\"")
+                && classes[0].contains("features=\"0x5A7FFFF7,0x1E\""),
+            "{}",
+            classes[0]
+        );
+        assert!(
+            classes[1].contains("motif=\"cle_features_presente_sans_bit_40\"")
+                && classes[1].contains("version=\"2\""),
+            "{}",
+            classes[1]
+        );
+        assert!(
+            texte.contains("mdns_airplay_version_relevee_par_une_seconde_annonce")
+                && texte.contains("features_de_la_seconde_annonce=\"0x0000001E5A7FFFF7\""),
+            "{texte}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1792,6 +1963,62 @@ mod tests {
             device.capabilities.get("airplay_requires_pairing"),
             Some(&serde_json::Value::Bool(true))
         );
+    }
+
+    /// #9379 — Apple TV 4K sondée le 19/08 (#1944) : `statusFlags 0x18644`,
+    /// bit 9 posé. Le TXT `flags` le répète : la capacité le dit.
+    #[test]
+    fn apple_tv_flags_bit_9_annonce_le_code_a_l_ecran_9379() {
+        let properties = [
+            ("deviceid", "2E:C8:42:93:79:01"),
+            ("features", "0x4A7FDFD5,0x3C177FDE"),
+            ("flags", "0x18644"),
+            ("model", "AppleTV14,1"),
+        ];
+        let svc = ServiceInfo::new(
+            AIRPLAY_SERVICE,
+            "salon",
+            "salon.local.",
+            "192.168.1.37",
+            7000,
+            &properties[..],
+        )
+        .expect("ServiceInfo Apple TV")
+        .as_resolved_service();
+        let device = service_to_device(&svc, OutputType::Airplay, 7000);
+        assert_eq!(
+            device.capabilities.get(CAP_AIRPLAY_CODE_A_L_ECRAN),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    /// Contre-épreuve : un HomePod (appairage transitoire) dont `flags`
+    /// n'a pas le bit 9 n'est pas marqué, même si `features` exige un
+    /// appairage HomeKit.
+    #[test]
+    fn homepod_sans_bit_9_n_annonce_pas_de_code_a_l_ecran_9379() {
+        let properties = [
+            ("deviceid", "D2:7C:CE:93:79:01"),
+            ("features", "0x4A7FDFD5,0x3C177FDE"),
+            ("flags", "0x18404"),
+            ("model", "AudioAccessory5,1"),
+        ];
+        let svc = ServiceInfo::new(
+            AIRPLAY_SERVICE,
+            "Zone 15",
+            "homepod.local.",
+            "192.168.1.45",
+            7000,
+            &properties[..],
+        )
+        .expect("ServiceInfo HomePod")
+        .as_resolved_service();
+        let device = service_to_device(&svc, OutputType::Airplay, 7000);
+        assert_eq!(
+            device.capabilities.get("airplay_requires_pairing"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(device.capabilities.get(CAP_AIRPLAY_CODE_A_L_ECRAN), None);
     }
 
     #[test]

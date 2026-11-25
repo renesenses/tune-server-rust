@@ -276,13 +276,17 @@ fn faux_hires(state: &AppState, id: i64) -> Result<Option<Value>, AppError> {
         return Ok(None);
     };
     let verdict = r.first().and_then(|v| v.as_string()).unwrap_or_default();
+    // #9472 — une ligne lue « non concluante » (dont une coupure basse rangée
+    // avant #9472, en attente de remesure) ne publie ni raison ni coupure :
+    // sinon la fiche dirait encore « coupé net vers 1,4 kHz ».
+    let non_concluant = verdict == "non_concluant";
     // #9035 — l'ancien `coupure_de_codec` se publie `coupure_spectrale`.
     let raison = r
         .get(1)
         .and_then(|v| v.as_string())
         .map(|c| tune_core::audio::faux_hires::raison_publiee(&c).to_string())
         // #9067 — un CD lu « conforme » n'a pas de raison de doute.
-        .filter(|_| verdict != "conforme");
+        .filter(|_| verdict != "conforme" && !non_concluant);
     // #6285 — tant que « douteux » est masqué, une piste douteuse se dit non
     // analysée, sans raison : même règle que `GET /library/albums/{id}/hires`.
     let visible = tune_core::audio::faux_hires_publie::douteux_visible(&state.backend);
@@ -294,7 +298,7 @@ fn faux_hires(state: &AppState, id: i64) -> Result<Option<Value>, AppError> {
     Ok(Some(json!({
         "verdict": verdict,
         "raison": raison,
-        "coupure_hz": r.get(2).and_then(|v| v.as_f64()),
+        "coupure_hz": r.get(2).and_then(|v| v.as_f64()).filter(|_| !non_concluant),
         "bits_effectifs": r.get(3).and_then(|v| v.as_i64()),
         "sample_rate": r.get(4).and_then(|v| v.as_i64()),
         "bits_declares": r.get(5).and_then(|v| v.as_i64()),

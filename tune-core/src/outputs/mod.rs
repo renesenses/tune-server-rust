@@ -121,6 +121,8 @@ pub mod slimproto;
 /// l'horloge du second asservie au premier. Hors `cfg` : la règle se juge par
 /// `cargo test` sous Linux, sur deux périphériques simulés.
 pub mod sortie_double;
+/// Forum rc14 — le refus « sortie tenue par une autre zone » porte son motif.
+pub mod sortie_tenue_par_une_autre_zone;
 pub mod squeezebox;
 /// #3967 — ce que le protocole permet de VÉRIFIER d'une suivante préparée,
 /// éprouvé contre un vrai serveur SOAP.

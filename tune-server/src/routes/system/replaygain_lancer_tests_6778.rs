@@ -195,6 +195,37 @@ async fn progression(state: &AppState) -> Value {
 /// plus aucune candidate.
 #[tokio::test]
 async fn une_campagne_ouverte_sans_personne_au_travail_n_est_pas_en_cours_7724() {
+    // Le mutex de ce module ne protège pas des autres bancs qui changent
+    // PAUSES, la campagne ou le rang. Un processus neuf possède ces états.
+    const ENFANT: &str = "TUNE_TEST_REPLAYGAIN_7724_ENFANT";
+    if std::env::var_os(ENFANT).is_none() {
+        let nom = concat!(
+            module_path!(),
+            "::une_campagne_ouverte_sans_personne_au_travail_n_est_pas_en_cours_7724"
+        );
+        let (_, nom) = nom.split_once("::").expect("nom sans préfixe de caisse");
+        let sortie = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([nom, "--exact", "--nocapture", "--test-threads=1"])
+            .env(ENFANT, std::process::id().to_string())
+            .output()
+            .expect("lancer le témoin ReplayGain isolé");
+        let stdout = String::from_utf8_lossy(&sortie.stdout);
+        let stderr = String::from_utf8_lossy(&sortie.stderr);
+        assert!(
+            sortie.status.success(),
+            "#7724 : témoin isolé en échec\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "#7724 : le processus enfant doit exécuter exactement le témoin\n{stdout}\n{stderr}"
+        );
+        return;
+    }
+    assert_ne!(
+        std::env::var(ENFANT).unwrap(),
+        std::process::id().to_string(),
+        "#7724 : les états globaux doivent appartenir à un autre processus"
+    );
     use tune_core::audio::replaygain as rg;
     use tune_core::taches_de_fond::ordre::{Rang, noter_rang_au_travail};
     let _garde = ETAT_GLOBAL.lock().await;
@@ -202,10 +233,10 @@ async fn une_campagne_ouverte_sans_personne_au_travail_n_est_pas_en_cours_7724()
     SettingsRepo::with_backend(state.backend.clone())
         .set(rg::MODE_KEY, "track")
         .unwrap();
-    if tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::ReplayGain) {
-        eprintln!("#7724 : pause tenue par un autre banc, témoin sauté");
-        return;
-    }
+    assert!(
+        !tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::ReplayGain),
+        "#7724 : un processus neuf ne doit pas hériter de la pause d'un autre banc"
+    );
     rg::progression::reinitialiser_pour_les_essais();
     // Une passe interrompue : campagne ouverte sur 3 pistes, puis la boucle a
     // cédé (lecture, chaleur, autre rang) sans la refermer.

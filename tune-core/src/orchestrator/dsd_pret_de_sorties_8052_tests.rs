@@ -339,6 +339,7 @@ async fn le_preteur_sert_en_dop_un_dsd_recu_par_la_facade() {
     for dsd_mode in ["dop", "native"] {
         let principal = serveur_principal().await;
         let (orch, zone_id) = preteur(dsd_mode);
+        orch.playback.set_volume(zone_id, 1.0).await; // transport DoP sans atténuation
         let resolu = orch
             .resolve_stream(&demande_de_la_facade(zone_id, &principal.url))
             .await
@@ -448,6 +449,7 @@ async fn le_preteur_convertit_en_pcm_quand_sa_sortie_ecarte_le_dop() {
         );
         let principal = serveur_principal().await;
         let (orch, zone_id) = preteur_sur(sortie, dsd_mode);
+        orch.playback.set_volume(zone_id, 1.0).await; // transport DoP sans atténuation
         let resolu = orch
             .resolve_stream(&demande_de_la_facade_sur(sortie, zone_id, &principal.url))
             .await
@@ -475,6 +477,7 @@ async fn le_preteur_ne_rend_pas_l_adresse_brute_d_un_dsd_a_l_entete_illisible() 
     abime[0..4].copy_from_slice(b"XXXX");
     let principal = serveur_principal_qui_sert(abime).await;
     let (orch, zone_id) = preteur("dop");
+    orch.playback.set_volume(zone_id, 1.0).await; // transport DoP sans atténuation
     let resolu = orch
         .resolve_stream(&demande_de_la_facade(zone_id, &principal.url))
         .await
@@ -506,6 +509,7 @@ async fn le_preteur_en_auto_ou_pcm_convertit_en_pcm_un_dsd_recu() {
     for dsd_mode in ["auto", "pcm"] {
         let principal = serveur_principal().await;
         let (orch, zone_id) = preteur(dsd_mode);
+        orch.playback.set_volume(zone_id, 1.0).await; // transport DoP sans atténuation
         let resolu = orch
             .resolve_stream(&demande_de_la_facade(zone_id, &principal.url))
             .await

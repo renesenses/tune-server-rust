@@ -599,40 +599,35 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         actual_bd = target_bd;
     }
 
-    // 1b. Apply ReplayGain BEFORE the tone controls, where a pre-amp belongs:
-    // the level normalisation is what the EQ then works on. A network renderer
-    // gets an already-encoded stream, so unlike a local DAC the gain has to be
-    // baked into the samples here or it never happens at all.
-    if let Some(factor) = replaygain {
-        crate::audio::replaygain::apply_gain_pcm(&mut pcm_bytes, actual_bd, factor);
-    }
-
-    // 1c. Apply EQ if enabled for this zone.
-    if let Some(mut eq) = eq {
-        eq.process_pcm(&mut pcm_bytes, actual_bd);
-    }
-
-    // 1d. Apply the room-correction FIR convolver (after EQ) if the zone has an
-    // uploaded impulse response. This is what brings room correction to network
-    // renderers (DLNA/UPnP/AirPlay): the local output has its own convolver, but
-    // a streamed zone only gets DSP that runs here, before encoding.
-    if let Some(mut conv) = convolver {
-        conv.process_pcm(&mut pcm_bytes, actual_bd);
-    }
-
-    // 1e. Le crossfeed EN DERNIER, comme `StreamingDsp::process` et la sortie
-    // locale : il élargit ou resserre l'image d'un signal déjà corrigé (#2742).
-    if let Some(mut cf) = crossfeed {
-        cf.process_pcm(&mut pcm_bytes, actual_bd, decoded_channels as u16);
-    }
-
-    // 1f. #5071 — la compensation de niveau APRÈS tous les étages. Le PCM de
-    // la piste ENTIÈRE est un seul bloc : le gain est constant, borné par la
-    // vraie crête de la piste traitée — aucun échantillon écrêté.
-    let compensation_appliquee_db = compensation.map(|mut comp| {
-        comp.process_pcm(&mut pcm_bytes, actual_bd);
-        (comp.gain_applique_db() * 100.0).round() / 100.0
-    });
+    // 1b à 1f. TESS T04 — la chaîne de la zone, en `f64`, avec UNE seule
+    // quantification (`chaine_reseau_tess`) : ReplayGain (avant les réglages
+    // de timbre, là où un préampli se place), égaliseur, convolveur FIR de
+    // correction de pièce (après l'égaliseur : c'est ce qui amène la
+    // correction de pièce aux renderers réseau), crossfeed EN DERNIER (#2742,
+    // il élargit ou resserre l'image d'un signal déjà corrigé), puis la
+    // compensation de niveau (#5071). Le renderer reçoit un flux déjà encodé :
+    // tout doit être cuit ici, sinon rien ne se passe.
+    //
+    // La piste ENTIÈRE est un seul bloc : le gain de la compensation est
+    // constant, borné par la vraie crête de la piste traitée. Avant ce lot,
+    // chaque étage relisait et réécrivait les octets (cinq requantifications
+    // au plus).
+    let mut chaine = super::StreamingDsp {
+        replaygain,
+        eq,
+        convolver,
+        crossfeed,
+        channels: decoded_channels as u16,
+        compensation,
+        sample_rate: decoded_sample_rate,
+        ..Default::default()
+    };
+    chaine.process(&mut pcm_bytes, actual_bd);
+    let compensation_appliquee_db = chaine
+        .compensation
+        .as_ref()
+        .map(|comp| (comp.gain_applique_db() * 100.0).round() / 100.0);
+    drop(chaine);
 
     let traitement_ms = chrono.elapsed().as_millis() as u64 - decode_ms;
     // 2. Encode to the target format.

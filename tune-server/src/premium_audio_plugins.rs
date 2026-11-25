@@ -38,10 +38,12 @@ impl TunePlugin for PremiumAudio {
     fn description(&self) -> &str {
         match self.id {
             "equalizer" => "Égaliseur : profil, graphique, paramétrique, presets et AutoEq",
-            "crossfeed" => "Crossfeed casque : intensité, retard et ombre de la tête, à chaud",
+            "crossfeed" => {
+                "Crossfeed casque : intensité, retard et ombre de la tête, à chaud ; sortie locale, et en réseau avec un autre traitement ou un lecteur qui accepte le PCM"
+            }
             "converter" => "Convertisseur audio : codecs de l'hôte, métadonnées et exports",
             "channel-remap" => {
-                "Réaffectation des canaux : matrice en dB par zone et par album (4.0, 5.1…)"
+                "Réaffectation des canaux : matrice en dB par zone et par album (4.0, 5.1…), sortie locale uniquement"
             }
             "upsampler" => {
                 "Suréchantillonnage : filtres polyphases vers la plus haute cadence du DAC, sortie locale"
@@ -521,6 +523,68 @@ pub(crate) mod tests {
             Some(r#"{"enabled":true,"bass_gain_db":4.0}"#),
             "le réglage doit rester intact"
         );
+    }
+
+    /// L'état d'un greffon dans `GET /api/v1/tess/catalog`.
+    async fn etat_tess(app: &axum::Router, id: &str) -> Value {
+        let (status, rep) = appel(app, "GET", "/api/v1/tess/catalog").await;
+        assert_eq!(status, StatusCode::OK, "{rep}");
+        tune_core::tess::api::conforme_au_schema("catalog_response", &rep)
+            .unwrap_or_else(|e| panic!("{e} : {rep}"));
+        rep["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .unwrap_or_else(|| panic!("{id} absent du catalogue TESS : {rep}"))
+            .clone()
+    }
+
+    /// rc14 — base neuve : l'égaliseur et la réaffectation des canaux,
+    /// facultatifs depuis la v0.9.156, ne sont pas installés. Le catalogue
+    /// TESS le dit (`plugin_not_installed`, avec le paquet à installer) au lieu
+    /// de `plugin_unavailable`, et la route d'installation que nomme
+    /// `install_package` les rend disponibles sans redémarrage.
+    #[tokio::test]
+    async fn base_neuve_le_catalogue_tess_propose_l_installation_et_l_installation_rend_disponible()
+    {
+        dossier_de_donnees_jetable();
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+        let app = crate::routes::router_with_plugins(state.clone(), routers).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
+        for (id, paquet) in [
+            ("equalizer-graphic", "equalizer"),
+            ("equalizer-headphone", "equalizer"),
+            ("channel-remap", "channel-remap"),
+        ] {
+            let e = etat_tess(&app, id).await;
+            assert_eq!(e["available"], false, "{e}");
+            assert_eq!(e["reason"], "plugin_not_installed", "{e}");
+            assert_eq!(e["install_package"], paquet, "{e}");
+        }
+        // Contre-épreuve : ce que l'hôte ne fait pas tourner reste
+        // indisponible, sans rien à installer.
+        let d = etat_tess(&app, "declick-live").await;
+        assert_eq!(d["reason"], "plugin_unavailable", "{d}");
+        assert!(d.get("install_package").is_none(), "{d}");
+
+        for paquet in ["equalizer", "channel-remap"] {
+            let (status, rep) =
+                appel(&app, "POST", &format!("/api/v1/plugins/{paquet}/install")).await;
+            assert_eq!(status, StatusCode::OK, "{paquet} : {rep}");
+        }
+        for id in ["equalizer-graphic", "equalizer-headphone", "channel-remap"] {
+            let e = etat_tess(&app, id).await;
+            assert_eq!(e["available"], true, "{e}");
+            assert!(e.get("install_package").is_none(), "{e}");
+            assert_ne!(e["reason"], "plugin_not_installed", "{e}");
+            assert_ne!(e["reason"], "plugin_unavailable", "{e}");
+        }
     }
 
     /// La fiche d'un greffon dans `GET /api/v1/plugins`.
@@ -1185,5 +1249,78 @@ pub(crate) mod tests {
         // Un nom libre n'est arrêté que par la signature.
         let (_, reponse) = appel(&app, "POST", "/api/v1/audio-plugins/greffon-libre/install").await;
         assert_eq!(reponse["detail"], "missing detached signature", "{reponse}");
+    }
+}
+
+/// #9180 — le catalogue dit sur quelles sorties agissent le crossfeed et la
+/// réaffectation des canaux, comme il le disait déjà du suréchantillonneur.
+#[cfg(test)]
+mod sorties_dans_le_catalogue_9180_tests {
+    use super::*;
+
+    fn table() -> Value {
+        serde_json::from_str(include_str!("i18n_server.json")).unwrap()
+    }
+
+    /// Le terme « sortie locale » d'une langue, tel que la description du
+    /// suréchantillonneur l'écrit déjà (son dernier segment).
+    fn sortie_locale(texte: &str) -> &str {
+        texte.rsplit([',', '，', '、']).next().unwrap().trim()
+    }
+
+    #[test]
+    fn crossfeed_et_reaffectation_nomment_la_sortie_locale_dans_chaque_langue_9180() {
+        let t = table();
+        let surech = t["plugin.description.upsampler"].as_object().unwrap();
+        for id in ["crossfeed", "channel-remap"] {
+            let descriptions = t[format!("plugin.description.{id}")].as_object().unwrap();
+            assert_eq!(
+                descriptions.len(),
+                surech.len(),
+                "{id} : toutes les langues du catalogue"
+            );
+            for (langue, reference) in surech {
+                let terme = sortie_locale(reference.as_str().unwrap());
+                let texte = descriptions[langue].as_str().unwrap();
+                assert!(
+                    texte.contains(terme),
+                    "#9180 {id} ({langue}) : « {terme} » manque dans « {texte} »"
+                );
+            }
+        }
+        // Le crossfeed agit aussi en réseau, sous condition : la phrase le dit.
+        assert!(
+            t["plugin.description.crossfeed"]["fr"]
+                .as_str()
+                .unwrap()
+                .contains("en réseau")
+        );
+        assert!(
+            t["plugin.description.channel-remap"]["fr"]
+                .as_str()
+                .unwrap()
+                .contains("sortie locale uniquement")
+        );
+    }
+
+    /// Le texte par défaut (français) du greffon est celui de la table.
+    #[test]
+    fn le_texte_par_defaut_suit_la_table_9180() {
+        let t = table();
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        for id in ["crossfeed", "channel-remap", "upsampler"] {
+            let greffon = PremiumAudio {
+                id,
+                backend: backend.clone(),
+            };
+            assert_eq!(
+                greffon.description(),
+                t[format!("plugin.description.{id}")]["fr"]
+                    .as_str()
+                    .unwrap(),
+                "{id}"
+            );
+        }
     }
 }

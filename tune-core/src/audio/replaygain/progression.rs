@@ -146,7 +146,22 @@ fn maintenant_epoch() -> u64 {
 pub fn ouvrir_si_besoin(compter_les_restants: impl FnOnce() -> i64) {
     // Lu AVANT de compter, et le verrou relâché : le `COUNT(*)` ne doit pas se
     // tenir sous le verrou que la route prend pour lire l'avancement.
-    if ETAT.lock().map(|e| e.actif).unwrap_or(false) {
+    let Ok((actif, epuise)) = ETAT.lock().map(|e| (e.actif, e.traitees >= e.total)) else {
+        return;
+    };
+    if actif {
+        // #9171 — le total figé à l'ouverture est épuisé alors que la passe
+        // continue : un scan a ajouté des pistes. Recompté ici, au lot
+        // suivant, et seulement dans ce cas ; sinon la jauge restait pleine
+        // pendant que le compteur montait.
+        if epuise {
+            let restants = compter_les_restants().max(0);
+            if let Ok(mut etat) = ETAT.lock()
+                && etat.actif
+            {
+                etat.total = etat.total.max(etat.traitees + restants);
+            }
+        }
         return;
     }
     let restants = compter_les_restants().max(0);

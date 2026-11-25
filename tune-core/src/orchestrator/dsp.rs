@@ -337,24 +337,46 @@ impl PlaybackOrchestrator {
         url: String,
         codec_hint: String,
     ) {
-        let Some(bus) = self
-            .event_bus
-            .clone()
-            .filter(|_| self.levels_attach_allowed(zone_id))
-        else {
+        let Some(bus) = self.event_bus.clone() else {
             return;
         };
+        if !self.levels_attach_allowed(zone_id) {
+            // #9450 — session PRÉ-ARMÉE (piste suivante d'une avance sans
+            // blanc) : pas de forwarder avant l'avance, mais la prise se
+            // branche dès maintenant — le renderer tire le début de la piste
+            // avant l'avance — et attend `advance_queue_metadata`.
+            if let Some(sid) = crate::http::streamer::stream_id_de_l_url(&url)
+                && let Some(lecteur) = self
+                    .streamer
+                    .brancher_la_prise_des_niveaux(sid, Box::new(|| false))
+                    .await
+            {
+                crate::http::prise_des_niveaux_9450::garer(sid, lecteur);
+            }
+            return;
+        }
         // Épinglé ICI, pas dans la tâche : c'est la piste dont on vient de
         // décider les niveaux (#1110).
         let play_seq = self.playback.current_play_seq(zone_id).await;
+        // #9450 — une session mandataire de Tune se lit par sa prise : la
+        // sonde n'ouvre plus de seconde connexion `/stream/<id>`, que le
+        // mandataire doublait d'une seconde connexion au CDN. Une autre
+        // adresse (épisode, Bandcamp) s'ouvre comme avant.
+        let source = match crate::http::streamer::stream_id_de_l_url(&url) {
+            Some(sid) if self.streamer.session_alive(sid).await => {
+                super::SourceDesNiveaux::Prise(self.streamer.clone(), sid.to_string())
+            }
+            _ => super::SourceDesNiveaux::Url(url),
+        };
         spawn_proxy_levels_probe_task(
             self.playback.clone(),
             bus,
             zone_id,
-            url,
+            source,
             codec_hint,
             play_seq,
-        );
+        )
+        .await;
     }
 
     /// Serve prefetched PCM data as a WAV stream session.
@@ -950,14 +972,17 @@ impl PlaybackOrchestrator {
                 remis_a_plat,
                 "zone_eq_refreshed_live"
             );
-            RapportEqAChaud {
+            let rapport = RapportEqAChaud {
                 device_id,
                 echec: None,
                 format: Some((taux, canaux)),
                 eq_actif: actif,
                 preamp_db,
                 preamp_db_droite,
-            }
+            };
+            drop(output);
+            let _ = self.proteger_le_dop_en_lecture(zone_id).await;
+            rapport
         }
     }
 
@@ -2167,6 +2192,7 @@ impl PlaybackOrchestrator {
             sample_rate,
             en_vol: None,
             convolveur_reste_a_jeter: None,
+            tess: Default::default(),
         };
         // #5071 — la compensation lit les étages RÉELLEMENT exécutés : un
         // crossfeed n'agit qu'en stéréo (`StreamingDsp::process`).
@@ -2235,6 +2261,27 @@ impl PlaybackOrchestrator {
     /// sonde — `load_crossfeed_processor` ne rend `None` que sur le mode PURE,
     /// la case décochée ou un `amount` nul, et aucun des trois ne dépend du
     /// taux ; seule la longueur de la ligne à retard en dépend.
+    /// TESS T12c (décision du 23/11) — sur une sortie hors TESS (HQPlayer et
+    /// l'autre transport), un traitement de zone conservé (égaliseur,
+    /// correction de pièce, ReplayGain) fait-il passer les pistes par le flux
+    /// traité de Tune ? Le crossfeed y est alors porté par le même relais.
+    /// Faux en PURE. Le ReplayGain est jugé à son réglage (il dépend aussi de
+    /// la piste) : la réponse reste un « peut s'appliquer ».
+    pub fn zone_traite_le_flux_hors_tess(&self, zone_id: i64) -> bool {
+        if self.zone_audiophile(zone_id) {
+            return false;
+        }
+        let replaygain = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
+            .get(crate::audio::replaygain::MODE_KEY)
+            .ok()
+            .flatten()
+            .is_some_and(|m| {
+                crate::audio::replaygain::ReplayGainMode::from_setting(&m)
+                    != crate::audio::replaygain::ReplayGainMode::Off
+            });
+        self.zone_has_active_eq(zone_id) || self.zone_has_active_ir(zone_id) || replaygain
+    }
+
     pub(super) fn zone_has_active_crossfeed(&self, zone_id: i64) -> bool {
         self.load_crossfeed_processor(zone_id, 44100).is_some()
     }
@@ -2572,7 +2619,7 @@ impl PlaybackOrchestrator {
             .get(&format!("ir_path_{zone_id}"))
             .ok()
             .flatten()
-            .filter(|p| !p.is_empty())
+            .filter(|p| !p.trim().is_empty())
     }
 
     /// Les octets de la réponse impulsionnelle, pour l'empreinte du cache de
@@ -3110,6 +3157,8 @@ impl PlaybackOrchestrator {
             self.playback
                 .brancher_le_gain_de_sortie(zone_id, local_output.gain_de_rendu());
             info!(zone_id, device_id = %device_id, rg, "zone_replaygain_refreshed_live");
+            drop(output);
+            let _ = self.proteger_le_dop_en_lecture(zone_id).await;
             true
         }
     }
@@ -4031,6 +4080,11 @@ impl PlaybackOrchestrator {
         };
         // La sortie est libre : la demande la plus récente peut partir.
         file.reveil.notify_waiters();
+        if issue.is_ok() {
+            self.proteger_le_dop_en_lecture(zone_id)
+                .await
+                .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
+        }
         issue
     }
     /// Arme le volume fixe : commande le plein volume au périphérique, **une
@@ -4176,3 +4230,7 @@ impl Drop for EtapeDePreparation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "sonde_niveaux_mandataire_9450_tests.rs"]
+mod sonde_niveaux_mandataire_9450_tests;

@@ -52,7 +52,7 @@ impl HttpRangeSource {
     /// refusée en 403 à qui ne rejoue pas son User-Agent). Liste vide ⇒
     /// requêtes identiques à `open`.
     pub fn open_avec_entetes(url: &str, entetes: &[(String, String)]) -> Result<Self, String> {
-        let client = crate::http::client::blocking_builder()
+        let client = crate::http::client::blocking_builder_pour(url, "plages")
             .timeout(None)
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
@@ -223,13 +223,17 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     struct RangeServer {
         url: String,
         requests: Arc<Mutex<Vec<String>>>,
         full_body_completed: Arc<AtomicBool>,
+        /// #8983 — nombre de requêtes `Range` dans le corps du fichier (ni à
+        /// l'octet 0, ni dans les 4 derniers Kio que lit la sonde) à refuser
+        /// (503), comme un CDN qui hoquette pendant la recherche d'un saut.
+        refus_hors_tete: Arc<AtomicUsize>,
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -248,9 +252,11 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let requests = Arc::new(Mutex::new(Vec::new()));
             let full_body_completed = Arc::new(AtomicBool::new(false));
+            let refus_hors_tete = Arc::new(AtomicUsize::new(0));
             let stop = Arc::new(AtomicBool::new(false));
             let requests_bg = requests.clone();
             let full_bg = full_body_completed.clone();
+            let refus_bg = refus_hors_tete.clone();
             let stop_bg = stop.clone();
             let thread = std::thread::spawn(move || {
                 while !stop_bg.load(Ordering::SeqCst) {
@@ -260,13 +266,14 @@ mod tests {
                     if stop_bg.load(Ordering::SeqCst) {
                         break;
                     }
-                    serve_range(stream, body, &requests_bg, &full_bg, pause);
+                    serve_range(stream, body, &requests_bg, &full_bg, &refus_bg, pause);
                 }
             });
             Self {
                 url: format!("http://{address}/test.m4a"),
                 requests,
                 full_body_completed,
+                refus_hors_tete,
                 stop,
                 thread: Some(thread),
             }
@@ -292,6 +299,7 @@ mod tests {
         body: &[u8],
         requests: &Mutex<Vec<String>>,
         full_body_completed: &AtomicBool,
+        refus_hors_tete: &AtomicUsize,
         pause: std::time::Duration,
     ) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -321,6 +329,20 @@ mod tests {
             end.parse::<usize>().unwrap().min(body.len() - 1)
         };
         let len = end - start + 1;
+        // La sonde du format lit la fin du fichier (étiquettes) : seules les
+        // requêtes du corps, celles de la recherche d'un saut, sont refusées.
+        if start != 0
+            && start + 4_096 < body.len()
+            && refus_hors_tete
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            return;
+        }
         write!(
             stream,
             "HTTP/1.1 206 Partial Content\r\nContent-Length: {len}\r\nContent-Range: bytes {start}-{end}/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
@@ -482,5 +504,92 @@ mod tests {
             octets_pcm > 44_100,
             "tout le FLAC decode: {octets_pcm} octets"
         );
+    }
+
+    /// #8983 — un saut dans une piste Qobuz (source `Range`) dont la
+    /// recherche échoue (le CDN refuse une requête) ne doit pas laisser
+    /// partir un flux qui ne commence pas à la position : la sortie locale le
+    /// croit pré-positionné, le son repartait ailleurs que la barre. Le
+    /// décodeur rend une erreur AVANT l'en-tête WAV, que l'orchestrateur sait
+    /// reprendre par le téléchargement complet (#5553).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn un_saut_refuse_par_le_cdn_ne_sert_aucun_octet_8983() {
+        static FLAC: &[u8] = include_bytes!("../../tests/fixtures/flac/ref_16_44100_stereo.flac");
+        let server = RangeServer::start(FLAC);
+        server.refus_hors_tete.store(1, Ordering::SeqCst);
+        let url = server.url.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let (levels_tx, _levels_rx) = tokio::sync::mpsc::unbounded_channel();
+        let decoder = tokio::task::spawn_blocking(move || {
+            let source = HttpRangeSource::open(&url).unwrap();
+            crate::audio::decode::decode_http_range_to_pcm_streaming_seeked(
+                source,
+                "flac",
+                Some(44_100),
+                Some(2),
+                Some(32),
+                tx,
+                1_024,
+                ready,
+                levels_tx,
+                0.2,
+            )
+        });
+        let mut octets = 0usize;
+        while let Some(bloc) = rx.recv().await {
+            octets += bloc.len();
+        }
+        let resultat = decoder.await.unwrap();
+        assert_eq!(
+            server.refus_hors_tete.load(Ordering::SeqCst),
+            0,
+            "le CDN factice doit avoir refusé une requête de la recherche; ranges={:?}",
+            server.requests.lock().unwrap()
+        );
+        assert_eq!(
+            octets, 0,
+            "saut refusé : aucun octet ne doit rejoindre la session ({resultat:?})"
+        );
+        let erreur = resultat.expect_err("un saut refusé doit être une erreur");
+        assert!(
+            crate::audio::decode::echec_avant_le_premier_octet(&erreur),
+            "l'orchestrateur doit pouvoir reprendre par le téléchargement : {erreur}"
+        );
+    }
+
+    /// #8983 — le même saut, sans refus du CDN : le flux part bien, et
+    /// commence à la position (moins de trames que la piste entière).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn un_saut_accepte_sert_la_suite_de_la_piste_8983() {
+        static FLAC: &[u8] = include_bytes!("../../tests/fixtures/flac/ref_16_44100_stereo.flac");
+        let server = RangeServer::start(FLAC);
+        let url = server.url.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let (levels_tx, _levels_rx) = tokio::sync::mpsc::unbounded_channel();
+        let decoder = tokio::task::spawn_blocking(move || {
+            let source = HttpRangeSource::open(&url).unwrap();
+            crate::audio::decode::decode_http_range_to_pcm_streaming_seeked(
+                source,
+                "flac",
+                Some(44_100),
+                Some(2),
+                Some(32),
+                tx,
+                1_024,
+                ready,
+                levels_tx,
+                0.2,
+            )
+        });
+        let mut octets = 0usize;
+        while let Some(bloc) = rx.recv().await {
+            octets += bloc.len();
+        }
+        assert_eq!(decoder.await.unwrap().unwrap(), (32, 44_100));
+        // 17 640 trames en tout (0,4 s) ; à partir de 0,2 s il en reste
+        // 8 820, soit 8 820 × 2 voies × 4 octets, plus l'en-tête.
+        assert_eq!(octets, 44 + 8_820 * 2 * 4);
     }
 }
