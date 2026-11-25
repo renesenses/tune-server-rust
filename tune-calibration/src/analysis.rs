@@ -259,9 +259,14 @@ pub struct BandRt60 {
     pub edt_s: f64,
     /// Pente −5 → −25 dB, ×3.
     pub t20_s: f64,
-    /// Pente −5 → −35 dB, ×2 (NaN si la dynamique manque).
+    /// Pente −5 → −35 dB, ×2.
+    ///
+    /// Chacun des trois temps vaut NaN quand la plage dynamique de la bande
+    /// ne couvre pas sa plage d'évaluation avec 10 dB de marge : la bande
+    /// est alors « non mesurable », pas mesurée à une valeur fausse.
     pub t30_s: f64,
-    /// Dynamique disponible (dB) entre le pic de la courbe de décroissance et le bruit.
+    /// Plage dynamique de la bande (dB) : crête de l'enveloppe d'énergie
+    /// au-dessus du bruit de fond. Toujours finie.
     pub dynamic_range_db: f64,
 }
 
@@ -293,8 +298,15 @@ pub fn bandpass_zero_phase(x: &[f64], sample_rate: u32, f_lo: f64, f_hi: f64) ->
     y
 }
 
-/// Courbe de décroissance de Schroeder (dB, max à 0) d'un segment, avec
-/// soustraction du bruit estimé sur les derniers 10 % (méthode de Chu).
+/// Courbe de décroissance de Schroeder (dB, max à 0) d'un segment, intégrée
+/// jusqu'au bout, avec soustraction du bruit estimé sur les derniers 10 %
+/// (méthode de Chu).
+///
+/// ⚠️ Sans troncature, cette courbe n'est fiable qu'avec un bruit de fond
+/// très bas : dès que le bruit dépasse quelques pour cent de l'énergie de la
+/// décroissance, sa part intégrée aplatit la courbe et la pente donne des
+/// RT60 de plusieurs secondes (voir les tests). [`rt60_by_band`] emploie
+/// [`schroeder_truncated`].
 pub fn schroeder_decay_db(h: &[f64]) -> Vec<f64> {
     let n = h.len();
     let tail_start = n - n / 10;
@@ -309,6 +321,161 @@ pub fn schroeder_decay_db(h: &[f64]) -> Vec<f64> {
     e.iter()
         .map(|v| 10.0 * (v / e0).max(1e-30).log10())
         .collect()
+}
+
+/// Bruit de fond et point de croisement d'une décroissance, estimés par la
+/// méthode itérative de Lundeby.
+///
+/// Réf. : A. Lundeby, T. E. Vigran, H. Bietz, M. Vorländer, « Uncertainties
+/// of Measurements in Room Acoustics », Acustica 81, 1995 ; ISO 3382-1:2009,
+/// annexe sur la troncature de l'intégrale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NoiseCrossing {
+    /// Puissance moyenne du bruit de fond, par échantillon (unités de h²).
+    pub noise_power: f64,
+    /// Rang où la droite de décroissance rejoint le bruit de fond.
+    pub crossing: usize,
+    /// Pente tardive de la décroissance (dB par échantillon, négative).
+    pub slope_db_per_sample: f64,
+    /// Écart (dB) entre la crête de l'enveloppe d'énergie et le bruit de fond.
+    pub peak_to_noise_db: f64,
+}
+
+fn mean(v: &[f64]) -> f64 {
+    v.iter().sum::<f64>() / v.len().max(1) as f64
+}
+
+fn power_db(p: f64) -> f64 {
+    10.0 * p.max(1e-300).log10()
+}
+
+/// Enveloppe d'énergie moyennée par blocs de `w` échantillons : (rang du
+/// milieu du bloc, niveau dB).
+fn block_envelope_db(e: &[f64], w: usize) -> Vec<(f64, f64)> {
+    let w = w.max(1);
+    e.chunks(w)
+        .enumerate()
+        .map(|(k, c)| ((k * w) as f64 + c.len() as f64 / 2.0, power_db(mean(c))))
+        .collect()
+}
+
+/// Droite des moindres carrés (pente, ordonnée à l'origine).
+fn linear_fit(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
+    if pts.len() < 2 {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
+    for &(x, y) in pts {
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        sxy += x * y;
+    }
+    let d = n * sxx - sx * sx;
+    if d.abs() < 1e-30 {
+        return None;
+    }
+    let slope = (n * sxy - sx * sy) / d;
+    Some((slope, (sy - slope * sx) / n))
+}
+
+/// Points de l'enveloppe, à partir de la crête, compris entre `hi` (inclus)
+/// et `lo` (exclu, premier point sous `lo` = fin de la plage).
+fn decay_points(env: &[(f64, f64)], from: usize, hi: f64, lo: f64) -> Vec<(f64, f64)> {
+    env[from..]
+        .iter()
+        .copied()
+        .skip_while(|&(_, l)| l > hi)
+        .take_while(|&(_, l)| l >= lo)
+        .collect()
+}
+
+/// Bruit de fond et point de croisement de l'énergie `e` (= h²) d'une bande.
+/// `None` quand la décroissance ne dépasse pas le bruit d'au moins 10 dB :
+/// aucune pente n'est alors mesurable.
+pub fn lundeby(e: &[f64], sample_rate: u32) -> Option<NoiseCrossing> {
+    let fs = sample_rate as f64;
+    let n = e.len();
+    if n < (0.05 * fs) as usize {
+        return None;
+    }
+    let tail = n - n / 10;
+    // 1. Enveloppe sur 10 ms, bruit sur les derniers 10 %.
+    let mut noise = mean(&e[tail..]);
+    let mut noise_db = power_db(noise);
+    let mut w = ((0.010 * fs) as usize).max(1);
+    let mut env = block_envelope_db(e, w);
+    let crete = |env: &[(f64, f64)]| {
+        env.iter()
+            .enumerate()
+            .fold((0usize, f64::NEG_INFINITY), |m, (i, &(_, l))| {
+                if l > m.1 { (i, l) } else { m }
+            })
+    };
+    let (mut imax, mut lmax) = crete(&env);
+    // 2. Première pente : de la crête jusqu'à 10 dB au-dessus du bruit.
+    let (mut slope, b) = linear_fit(&decay_points(&env, imax, lmax, noise_db + 10.0))?;
+    if slope >= 0.0 {
+        return None;
+    }
+    let mut tc = (noise_db - b) / slope;
+    // 3. Itérations : intervalle adapté à la pente (5 par 10 dB), bruit
+    //    relu 10 dB de décroissance après le croisement (au moins les
+    //    derniers 10 %), pente tardive entre bruit + 25 dB et bruit + 5 dB.
+    for _ in 0..5 {
+        let par_10_db = 10.0 / -slope;
+        w = ((par_10_db / 5.0) as usize).clamp((0.002 * fs) as usize, (0.050 * fs) as usize);
+        env = block_envelope_db(e, w);
+        (imax, lmax) = crete(&env);
+        let debut_bruit = ((tc + par_10_db).max(0.0) as usize).min(tail);
+        noise = mean(&e[debut_bruit..]);
+        noise_db = power_db(noise);
+        let hi = (noise_db + 25.0).min(lmax);
+        let Some((s, b)) = linear_fit(&decay_points(&env, imax, hi, noise_db + 5.0)) else {
+            break;
+        };
+        if s >= 0.0 {
+            break;
+        }
+        let tc_new = (noise_db - b) / s;
+        slope = s;
+        let converge = (tc_new - tc).abs() < w as f64;
+        tc = tc_new;
+        if converge {
+            break;
+        }
+    }
+    let debut = env[imax].0 as usize;
+    Some(NoiseCrossing {
+        noise_power: noise,
+        crossing: (tc.max(0.0) as usize).clamp(debut.min(n), n),
+        slope_db_per_sample: slope,
+        peak_to_noise_db: lmax - noise_db,
+    })
+}
+
+/// Courbe de décroissance de Schroeder tronquée au point de croisement avec
+/// le bruit (Lundeby), le bruit soustrait avant le croisement et l'énergie
+/// manquante au-delà compensée par la pente tardive. La courbe s'arrête au
+/// croisement : au-delà, elle ne décrirait que le bruit.
+pub fn schroeder_truncated(h: &[f64], sample_rate: u32) -> Option<(Vec<f64>, NoiseCrossing)> {
+    let e: Vec<f64> = h.iter().map(|v| v * v).collect();
+    let nc = lundeby(&e, sample_rate)?;
+    if nc.crossing < 2 {
+        return None;
+    }
+    // Énergie de la décroissance prolongée au-delà du croisement, où elle
+    // vaut le bruit : ∫ P·10^(s·k/10) dk = P·10 / (−s·ln 10).
+    let compensation = nc.noise_power * 10.0 / (-nc.slope_db_per_sample * std::f64::consts::LN_10);
+    let mut acc = compensation;
+    let mut s = vec![0.0; nc.crossing];
+    for i in (0..nc.crossing).rev() {
+        acc += e[i] - nc.noise_power;
+        s[i] = acc.max(1e-300);
+    }
+    let s0 = s[0];
+    Some((s.iter().map(|v| 10.0 * (v / s0).log10()).collect(), nc))
 }
 
 /// Régression linéaire de la courbe `decay_db` entre deux niveaux (dB,
@@ -340,8 +507,33 @@ fn decay_time(decay_db: &[f64], sample_rate: u32, from_db: f64, to_db: f64) -> f
     -60.0 / slope
 }
 
+/// Marge exigée entre le bas de la plage d'évaluation et le bruit de fond
+/// (ISO 3382-1 : au moins 10 dB). EDT (0 → −10 dB) demande donc 20 dB de
+/// crête au-dessus du bruit, T20 (−5 → −25 dB) 35 dB, T30 (−5 → −35 dB) 45 dB.
+pub const NOISE_MARGIN_DB: f64 = 10.0;
+
+/// Le temps tiré de la plage `from_db → to_db`, ou NaN si la plage
+/// dynamique de la bande ne la couvre pas avec la marge.
+fn decay_time_if_measurable(
+    decay_db: &[f64],
+    sample_rate: u32,
+    from_db: f64,
+    to_db: f64,
+    peak_to_noise_db: f64,
+) -> f64 {
+    if peak_to_noise_db < -to_db + NOISE_MARGIN_DB {
+        return f64::NAN;
+    }
+    decay_time(decay_db, sample_rate, from_db, to_db)
+}
+
 /// RT60 (EDT, T20, T30) par bande d'octave ou de tiers d'octave.
 /// `centers` : fréquences centrales ; `bandwidth_octaves` : 1.0 ou 1/3.
+///
+/// L'intégrale de Schroeder est tronquée au croisement avec le bruit de
+/// fond (Lundeby). Chaque grandeur n'est rendue que si la plage dynamique de
+/// la bande la permet ([`NOISE_MARGIN_DB`]) ; sinon NaN — « non mesurable »,
+/// jamais une valeur extrapolée du bruit.
 pub fn rt60_by_band(
     ir: &ImpulseResponse,
     centers: &[f64],
@@ -356,21 +548,42 @@ pub fn rt60_by_band(
         .iter()
         .map(|&fc| {
             let band = bandpass_zero_phase(h, ir.sample_rate, fc / half, fc * half);
-            let decay = schroeder_decay_db(&band);
-            let dynamic =
-                -decay
-                    .iter()
-                    .cloned()
-                    .fold(0.0f64, |m, v| if v.is_finite() { m.min(v) } else { m });
+            let Some((decay, nc)) = schroeder_truncated(&band, ir.sample_rate) else {
+                return BandRt60 {
+                    center_hz: fc,
+                    edt_s: f64::NAN,
+                    t20_s: f64::NAN,
+                    t30_s: f64::NAN,
+                    dynamic_range_db: peak_to_noise_db(&band, ir.sample_rate),
+                };
+            };
+            let d = nc.peak_to_noise_db;
             BandRt60 {
                 center_hz: fc,
-                edt_s: decay_time(&decay, ir.sample_rate, 0.0, -10.0),
-                t20_s: decay_time(&decay, ir.sample_rate, -5.0, -25.0),
-                t30_s: decay_time(&decay, ir.sample_rate, -5.0, -35.0),
-                dynamic_range_db: dynamic,
+                edt_s: decay_time_if_measurable(&decay, ir.sample_rate, 0.0, -10.0, d),
+                t20_s: decay_time_if_measurable(&decay, ir.sample_rate, -5.0, -25.0, d),
+                t30_s: decay_time_if_measurable(&decay, ir.sample_rate, -5.0, -35.0, d),
+                dynamic_range_db: d,
             }
         })
         .collect()
+}
+
+/// Crête de l'enveloppe (10 ms) au-dessus du bruit des derniers 10 %, quand
+/// Lundeby n'a pas trouvé de décroissance. Toujours finie (≥ 0).
+fn peak_to_noise_db(h: &[f64], sample_rate: u32) -> f64 {
+    let e: Vec<f64> = h.iter().map(|v| v * v).collect();
+    if e.is_empty() {
+        return 0.0;
+    }
+    let tail = e.len() - e.len() / 10;
+    let noise_db = power_db(mean(&e[tail..]));
+    let w = ((0.010 * sample_rate as f64) as usize).max(1);
+    let lmax = block_envelope_db(&e, w)
+        .iter()
+        .map(|p| p.1)
+        .fold(f64::NEG_INFINITY, f64::max);
+    (lmax - noise_db).max(0.0)
 }
 
 /// Fréquences centrales d'octave normalisées (CEI 61260) de 31,5 Hz à 16 kHz.
@@ -477,5 +690,165 @@ mod tests {
         let d = schroeder_decay_db(&h);
         let t30 = decay_time(&d, fs, -5.0, -35.0);
         assert!((t30 - rt).abs() / rt < 0.05, "T30 {t30} ≠ {rt}");
+    }
+
+    /// Réponse impulsionnelle synthétique : 0,15 s avant l'arrivée, 1,5 s
+    /// après (comme `ExtractSpec::default`), queue diffuse gaussienne de RT60
+    /// `rt` dans toutes les bandes, bruit de fond stationnaire `bruit_db` sous
+    /// le niveau efficace de la queue à son départ.
+    fn ri_bruitee(rt: f64, bruit_db: f64, graine: u64) -> ImpulseResponse {
+        let fs = 48_000u32;
+        let pre = (0.15 * fs as f64) as usize;
+        let n = pre + (1.5 * fs as f64) as usize;
+        let mut etat = graine.max(1);
+        let mut unif = move || {
+            etat ^= etat << 13;
+            etat ^= etat >> 7;
+            etat ^= etat << 17;
+            ((etat >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        let mut gauss = move || {
+            let (u1, u2) = (unif(), unif());
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        };
+        let sigma_bruit = 10f64.powf(bruit_db / 20.0);
+        let samples = (0..n)
+            .map(|i| {
+                let queue = if i >= pre {
+                    let t = (i - pre) as f64 / fs as f64;
+                    gauss() * 10f64.powf(-3.0 * t / rt)
+                } else {
+                    0.0
+                };
+                queue + sigma_bruit * gauss()
+            })
+            .collect();
+        ImpulseResponse {
+            sample_rate: fs,
+            samples,
+            peak_index: pre,
+            delay_samples: pre,
+        }
+    }
+
+    const BANDES: [f64; 6] = [125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0];
+
+    /// Le défaut vu chez un testeur (25/11, RSB faible) : l'intégrale de
+    /// Schroeder menée jusqu'au bout de la réponse, sans troncature, donne des
+    /// RT60 de 5 à 9 s pour une pièce à 0,5 s dès que le bruit de fond est à
+    /// −20 ou −30 dB (et un T30 de plus de 4 s encore à −40 dB).
+    #[test]
+    fn sans_troncature_le_bruit_gonfle_le_rt60() {
+        let rt = 0.5;
+        for (bruit, min_attendu) in [(-20.0, 2.5), (-30.0, 2.5)] {
+            let ir = ri_bruitee(rt, bruit, 7);
+            let start = ir.peak_index - 240;
+            let h = &ir.samples[start..];
+            for fc in [250.0, 500.0, 1000.0, 2000.0] {
+                let band =
+                    bandpass_zero_phase(h, ir.sample_rate, fc / 2f64.sqrt(), fc * 2f64.sqrt());
+                let d = schroeder_decay_db(&band);
+                let t20 = decay_time(&d, ir.sample_rate, -5.0, -25.0);
+                assert!(
+                    t20.is_finite() && t20 > min_attendu,
+                    "bruit {bruit} dB, {fc} Hz : T20 naïf {t20:.2} s, on attendait le défaut (> {min_attendu} s)"
+                );
+            }
+        }
+    }
+
+    /// Le correctif : tronqué au croisement avec le bruit, chaque temps rendu
+    /// est juste (±20 %) ; sinon il est NaN (« non mesurable »), jamais faux.
+    ///
+    /// L'EDT n'est jugé qu'à partir de 250 Hz : sur 80 ms, une octave grave
+    /// d'une queue aléatoire fluctue de ±30 % même sans aucun bruit.
+    #[test]
+    fn tronque_au_bruit_le_rt60_est_juste_ou_non_mesurable() {
+        let rt = 0.5;
+        for (bruit, graine) in [(-20.0, 3), (-30.0, 5), (-40.0, 11)] {
+            let ir = ri_bruitee(rt, bruit, graine);
+            let bandes = rt60_by_band(&ir, &BANDES, 1.0);
+            for b in &bandes {
+                assert!(b.dynamic_range_db.is_finite());
+                for (nom, v) in [("EDT", b.edt_s), ("T20", b.t20_s), ("T30", b.t30_s)] {
+                    if nom == "EDT" && b.center_hz < 250.0 {
+                        continue;
+                    }
+                    assert!(
+                        !v.is_finite() || (v - rt).abs() / rt < 0.2,
+                        "bruit {bruit} dB, {} Hz : {nom} {v:.2} s pour {rt} s (dyn {:.0} dB)",
+                        b.center_hz,
+                        b.dynamic_range_db
+                    );
+                }
+                // La plage dynamique suit le bruit de fond (à quelques dB près).
+                assert!(
+                    (b.dynamic_range_db + bruit).abs() < 6.0,
+                    "bruit {bruit} dB, {} Hz : dyn {:.1} dB",
+                    b.center_hz,
+                    b.dynamic_range_db
+                );
+                // 45 dB manquent partout : pas de T30.
+                assert!(b.t30_s.is_nan(), "{} Hz : T30 {:.2}", b.center_hz, b.t30_s);
+            }
+            // Ce qui reste mesurable l'est bien.
+            let mesurees =
+                |f: fn(&BandRt60) -> f64| bandes.iter().filter(|b| f(b).is_finite()).count();
+            match bruit as i32 {
+                -40 => {
+                    // 35 dB pour T20 : à −40 dB, la plupart des bandes y sont.
+                    assert_eq!(mesurees(|b| b.edt_s), BANDES.len());
+                    assert!(mesurees(|b| b.t20_s) >= 4);
+                }
+                -30 => {
+                    assert_eq!(mesurees(|b| b.edt_s), BANDES.len());
+                    assert_eq!(mesurees(|b| b.t20_s), 0);
+                }
+                _ => assert_eq!(mesurees(|b| b.t20_s), 0),
+            }
+        }
+    }
+
+    /// Sans bruit, la troncature ne change rien : même T30 que l'intégrale
+    /// complète (à 3 %), et à 10 % du RT60 simulé (fluctuation de la queue
+    /// aléatoire, la même pour les deux méthodes).
+    #[test]
+    fn sans_bruit_la_troncature_ne_change_rien() {
+        let rt = 0.5;
+        let ir = ri_bruitee(rt, -100.0, 13);
+        let start = ir.peak_index - 240;
+        let h = &ir.samples[start..];
+        for b in rt60_by_band(&ir, &BANDES, 1.0) {
+            let fc = b.center_hz;
+            let band = bandpass_zero_phase(h, ir.sample_rate, fc / 2f64.sqrt(), fc * 2f64.sqrt());
+            let complet = decay_time(&schroeder_decay_db(&band), ir.sample_rate, -5.0, -35.0);
+            assert!(
+                (b.t30_s - complet).abs() / complet < 0.03 && (b.t30_s - rt).abs() / rt < 0.1,
+                "{fc} Hz : T30 {:.3} s, intégrale complète {complet:.3} s (EDT {:.3}, T20 {:.3}, dyn {:.0} dB)",
+                b.t30_s,
+                b.edt_s,
+                b.t20_s,
+                b.dynamic_range_db
+            );
+        }
+    }
+
+    /// Du bruit seul : aucune décroissance, aucune valeur.
+    #[test]
+    fn du_bruit_seul_n_est_pas_mesurable() {
+        let mut ir = ri_bruitee(0.5, 0.0, 17);
+        let pre = ir.peak_index;
+        // On remplace la queue par du bruit de même niveau que l'avant.
+        let avant: Vec<f64> = ir.samples[..pre].to_vec();
+        for (i, v) in ir.samples.iter_mut().enumerate().skip(pre) {
+            *v = avant[i % pre];
+        }
+        for b in rt60_by_band(&ir, &BANDES, 1.0) {
+            assert!(
+                b.edt_s.is_nan() && b.t20_s.is_nan() && b.t30_s.is_nan(),
+                "{b:?}"
+            );
+            assert!(b.dynamic_range_db.is_finite());
+        }
     }
 }
