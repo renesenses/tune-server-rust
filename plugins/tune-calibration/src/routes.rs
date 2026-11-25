@@ -3,6 +3,11 @@
 //! * `GET  /microphones` — les entrées audio (micros) et les étalonnages déposés ;
 //! * `POST /microphones/etalonnages` — déposer un fichier d'étalonnage
 //!   (`{ "nom", "texte" }`, texte miniDSP ou REW `.cal`) ;
+//! * `POST /niveaux` — test de niveau du micro avant la mesure (rc14) :
+//!   `{ "mode": "signal" | "ecoute", "entree", "voie_micro", "zone_id",
+//!   "volume", "voies", "duree_s" }` (202, `{ "id" }`) ; `GET /niveaux/{id}`
+//!   — vumètre, bruit de fond, verdict ; `DELETE /niveaux/{id}` — annuler
+//!   (voir `niveau.rs`) ;
 //! * `POST /zones/{zone}/mesures` — lancer une mesure (202, `{ "id" }`) ;
 //! * `GET  /mesures` — toutes les mesures connues (avancement) ;
 //! * `GET  /mesures/{id}` — l'avancement d'une mesure ;
@@ -127,6 +132,11 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
     Router::new()
         .route("/microphones", get(microphones))
         .route("/microphones/etalonnages", post(deposer_etalonnage))
+        .route("/niveaux", post(crate::niveau::http::lancer))
+        .route(
+            "/niveaux/{id}",
+            get(crate::niveau::http::avancement).delete(crate::niveau::http::annuler),
+        )
         .route("/zones/{zone}/mesures", post(lancer))
         .route("/mesures", get(mesures))
         .route("/mesures/{id}", get(avancement).delete(annuler))
