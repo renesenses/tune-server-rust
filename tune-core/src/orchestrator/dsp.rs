@@ -2370,7 +2370,6 @@ impl PlaybackOrchestrator {
             .license
             .as_ref()
             .is_none_or(|license| license.premium_snapshot());
-        crate::tess::egaliseurs_en_serie::retenir_le_droit_du_moteur(premium);
         Self::eq_profile_configure_with(&self.db, zone_id, premium)
     }
 
@@ -2793,24 +2792,58 @@ impl PlaybackOrchestrator {
     ///   remettrait en lecture, #7556) ou position inconnue (#2595) ;
     /// - [`PorteeDuReglage::RienNeJoue`] : la prochaine lecture partira avec
     ///   ce réglage.
-    /// Revue #9520 v2 — « Bypass all » basculé : le suréchantillonneur et la
-    /// cadence fixe suivent. Comme [`Self::apply_upsampler_change_portee`],
-    /// et une cadence fixe réglée sur la zone relance aussi (elle est prise à
-    /// l'ouverture du flux). Même anti-rebond que toute relance de réglage
-    /// (`schedule_replay_pour`, génération par zone) : une bascule, une relance.
+    /// Revue #9520 — « Bypass all » basculé : le suréchantillonneur et la
+    /// cadence fixe suivent. Relance seulement si le choix du
+    /// suréchantillonneur change, ou si la cadence fixe s'applique hors
+    /// « Bypass all » (`demandee_active_hors_bypass` : jamais sous PURE, en
+    /// strict ou en AirPlay, où la bascule n'y change rien).
+    ///
+    /// La relance part comme une bascule PURE (`RaisonDeRelance::BasculePure`,
+    /// annonce #8422 comprise) avec la règle de plancher du suréchantillonneur.
+    /// Même anti-rebond que toute relance de réglage (`schedule_replay_pour`,
+    /// une génération par zone) : avec la relance de la bascule PURE réseau
+    /// (`apply_audiophile_change_portee`), une bascule ne rejoue qu'UNE fois, et
+    /// l'annonce PURE n'est pas perdue.
     pub async fn apply_bypass_all_portee(
         self: &std::sync::Arc<Self>,
         zone_id: i64,
     ) -> PorteeDuReglage {
         self.refresh_zone_upsampler(zone_id).await;
-        let change = match self.surechantillonneur_du_flux_et_choix(zone_id).await {
+        let choix_change = match self.surechantillonneur_du_flux_et_choix(zone_id).await {
             Some((du_flux, choix)) => du_flux != choix,
             None => false,
-        } || crate::audio::frequence_fixe::lire(&self.db, zone_id).is_some();
-        let portee = self
-            .portee_du_reglage_du_surechantillonneur(zone_id, change)
-            .await;
-        info!(zone_id, portee = ?portee, "tess_bypass_all_portee");
+        };
+        let cadence_change =
+            crate::audio::frequence_fixe::demandee_active_hors_bypass(&self.db, zone_id).is_some();
+        let etat = self.playback.get_state(zone_id).await;
+        let portee = if etat.now_playing.is_none()
+            || etat.state == crate::playback::PlayState::Stopped
+        {
+            PorteeDuReglage::RienNeJoue
+        } else if !(choix_change || cadence_change) {
+            PorteeDuReglage::Immediate
+        } else if etat.state != crate::playback::PlayState::Playing {
+            PorteeDuReglage::PisteSuivante
+        } else {
+            if choix_change {
+                self.surech_replay_en_attente
+                    .lock()
+                    .unwrap()
+                    .insert(zone_id);
+            }
+            if self.schedule_replay_pour(zone_id, RaisonDeRelance::BasculePure) {
+                PorteeDuReglage::Relance
+            } else {
+                PorteeDuReglage::PisteSuivante
+            }
+        };
+        info!(
+            zone_id,
+            choix_change,
+            cadence_change,
+            portee = ?portee,
+            "tess_bypass_all_portee"
+        );
         portee
     }
 

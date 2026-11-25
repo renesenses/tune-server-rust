@@ -6184,3 +6184,72 @@ fn dsd_brut_n_annonce_pas_de_replaygain_9177() {
     .unwrap();
     assert_eq!(step_desc(&sp, "ReplayGain"), None, "{sp}");
 }
+
+// ── Revue #9520 : le panneau historique suit le moteur (#1548) ──────
+
+fn egaliseur_tess(id: &str, enabled: bool, bandes: serde_json::Value) -> serde_json::Value {
+    let mut p = serde_json::to_value(tune_core::audio::eq::EqProfile {
+        enabled: true,
+        bands: serde_json::from_value(bandes).unwrap(),
+        ..Default::default()
+    })
+    .unwrap();
+    p.as_object_mut().unwrap().remove("enabled");
+    serde_json::json!({"id": id, "enabled": enabled, "settings": p})
+}
+
+/// Points 8 et 5 — la série d'égaliseurs TESS (graphique + paramétrique)
+/// est TOUTE lue par le panneau ; « Bypass all » l'éteint ; une façade
+/// Premium écartée par l'exclusivité du 24/11 ne compte qu'avec le droit
+/// Premium que l'appelant pose ([`avec_le_droit`], lu sur `state.license`).
+#[test]
+fn le_panneau_historique_suit_la_serie_le_bypass_et_le_droit_9520() {
+    let (backend, zone) = dlna_zone();
+    let z = zone.id.unwrap();
+    let settings = SettingsRepo::with_backend(backend.clone());
+    settings.set("plugin_equalizer_installed", "true").unwrap();
+    let graphique = egaliseur_tess(
+        "equalizer-graphic",
+        true,
+        serde_json::json!([{"freq": 1000.0, "gain": 3.0, "q": 1.0, "type": "peak"}]),
+    );
+    let parametrique = |enabled: bool| {
+        egaliseur_tess(
+            "equalizer-parametric",
+            enabled,
+            serde_json::json!([
+                {"freq": 3150.0, "gain": -12.0, "q": 4.0, "type": "peak"},
+                {"freq": 80.0, "gain": 2.0, "q": 0.7, "type": "low_shelf"}
+            ]),
+        )
+    };
+    let ecrire = |chaine: serde_json::Value| {
+        let c: tune_core::tess::ChaineTess = serde_json::from_value(chaine).unwrap();
+        tune_core::tess::migration::ecrire_chaine(&settings, z, &c).unwrap();
+    };
+    let bandes = |premium: bool| {
+        avec_le_droit(premium, || active_zone_eq_profile(&backend, z)).map(|p| p.bands.len())
+    };
+
+    // Point 8 : les deux égaliseurs de la série.
+    ecrire(serde_json::json!({"version": 1, "plugins": [graphique.clone(), parametrique(true)]}));
+    assert_eq!(bandes(false), Some(3));
+    assert!(zone_eq_alters_signal(&backend, z));
+    // « Bypass all » : rien.
+    ecrire(serde_json::json!({"version": 1, "bypass_all": true,
+                              "plugins": [graphique.clone(), parametrique(true)]}));
+    assert_eq!(bandes(true), None);
+    assert!(!zone_eq_alters_signal(&backend, z));
+
+    // Point 5 : paramétrique écarté par #9512 (chaîne brute), droit posé.
+    let mut p = parametrique(false);
+    p["settings"]["replaced_in_group"] = serde_json::json!("equalizer-graphic");
+    settings
+        .set(
+            &tune_core::tess::cle_chaine_zone(z),
+            &serde_json::json!({"version": 1, "plugins": [graphique, p]}).to_string(),
+        )
+        .unwrap();
+    assert_eq!(bandes(true), Some(3), "Premium : le paramétrique est recoché");
+    assert_eq!(bandes(false), Some(1), "Free : il ne l'est pas");
+}

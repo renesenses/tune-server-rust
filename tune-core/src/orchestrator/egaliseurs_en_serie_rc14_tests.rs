@@ -536,3 +536,45 @@ async fn l_empreinte_voit_le_headroom_manuel_9520() {
     ecrire_chaine(&settings(&o), z, &chaine).unwrap();
     assert_ne!(empreinte(&o), b);
 }
+
+/// Revue #9520 (point 6) — la bascule de « Bypass all » ne relance que si la
+/// cadence fixe s'applique vraiment hors Bypass all : jamais sous PURE ni en
+/// bit-perfect strict (aucune coupure inutile).
+#[tokio::test]
+async fn bypass_all_ne_relance_la_cadence_fixe_que_si_elle_s_applique_9520() {
+    use crate::audio::frequence_fixe::{cle_de_zone, demandee_active, demandee_active_hors_bypass};
+    let o = orchestrateur();
+    let z = zone(&o, "cadence-fixe");
+    let s = settings(&o);
+    s.set(&cle_de_zone(z), "96000").unwrap();
+    let mut chaine = ChaineTess {
+        plugins: vec![crossfeed()],
+        ..ChaineTess::default()
+    };
+    chaine.bypass_all = true;
+    ecrire_chaine(&s, z, &chaine).unwrap();
+    assert_eq!(demandee_active(&o.db, z), None, "Bypass all coupe la cadence fixe");
+    assert_eq!(
+        demandee_active_hors_bypass(&o.db, z),
+        Some(96_000),
+        "hors PURE : la bascule change la cadence, elle relance"
+    );
+    s.set(&format!("zone_{z}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+    assert_eq!(
+        demandee_active_hors_bypass(&o.db, z),
+        None,
+        "sous PURE, la bascule ne change rien : pas de relance"
+    );
+    s.set(&format!("zone_{z}_audiophile"), r#"{"enabled":false}"#)
+        .unwrap();
+    s.set(&crate::audio::bitperfect_strict::cle_de_zone(z), "true")
+        .unwrap();
+    assert_eq!(demandee_active_hors_bypass(&o.db, z), None, "strict");
+    // Rien ne joue : la portée le dit, aucune relance programmée.
+    let o = std::sync::Arc::new(o);
+    assert_eq!(
+        o.apply_bypass_all_portee(z).await,
+        crate::orchestrator::PorteeDuReglage::RienNeJoue
+    );
+}

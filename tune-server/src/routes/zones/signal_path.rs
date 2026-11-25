@@ -43,6 +43,24 @@ pub fn local_backend_status_value(_output_type: Option<&str>, _requested: &str) 
     None
 }
 
+thread_local! {
+    /// Revue #9520 — le droit Premium du compte pendant la construction du
+    /// chemin du signal (synchrone), posé par [`avec_le_droit`] depuis
+    /// `state.license`. Faux hors de lui (témoins).
+    static DROIT_PREMIUM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Construit le chemin du signal avec le droit Premium du compte, que
+/// l'appelant lit sur `state.license` à chaque requête : le panneau décrit la
+/// série d'égaliseurs que le moteur applique pour ce droit (une façade Premium
+/// écartée par l'exclusivité du 24/11 n'est recochée qu'en Premium).
+pub fn avec_le_droit<T>(premium: bool, construire: impl FnOnce() -> T) -> T {
+    let avant = DROIT_PREMIUM.replace(premium);
+    let r = construire();
+    DROIT_PREMIUM.set(avant);
+    r
+}
+
 /// Build the `signal_path` object for a zone's current playback.
 /// Returns `None` when the zone is not playing.
 ///
@@ -86,11 +104,11 @@ pub(super) fn active_zone_eq_profile(
     }
     // rc14 (revue #9520, règle #1548) — la même lecture que le moteur : tous
     // les égaliseurs cochés de la série, ou le headroom manuel, avec le droit
-    // que le moteur a lu (`droit_du_moteur`).
+    // Premium du compte ([`avec_le_droit`]).
     let profile = tune_core::tess::egaliseurs_en_serie::profil_du_moteur(
         &settings,
         zone_id,
-        tune_core::tess::egaliseurs_en_serie::droit_du_moteur(),
+        DROIT_PREMIUM.get(),
     )?;
     // 44100/2 n'est qu'une sonde : is_enabled() dépend des gains, pas du débit.
     tune_core::audio::eq::EqProcessor::new(&profile, 44100, 2)

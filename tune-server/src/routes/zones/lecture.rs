@@ -417,6 +417,8 @@ mod canaux_tests_5336 {
 }
 
 pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
+    // Revue #9520 — le droit Premium du compte, pour le panneau du signal.
+    let premium_du_compte = state.license.is_premium().await;
     let repo = ZoneRepo::with_backend(state.backend.clone());
     // #5077 — une zone masquée qui joue reste dans la liste.
     let zones = super::zones_a_montrer(&state).await;
@@ -555,26 +557,26 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 &devices,
                 &registered_output_ids,
             );
-            let signal_path = build_signal_path(
+            let signal_path = avec_le_droit(premium_du_compte, || build_signal_path(
                 &ps,
                 z,
                 &state.backend,
                 renderer_label,
                 audio_backend_de_la_zone,
                 wire.as_ref(),
-            );
+            ));
             // #7084 — composant AirPlay 2 absent : la zone le dit.
             super::composant_airplay2_7084::injecter_composant_airplay2_manquant(obj, z);
             let signal_path = signal_path_sous_licence(
                 &state.license,
-                build_signal_path(
+                avec_le_droit(premium_du_compte, || build_signal_path(
                     &ps,
                     z,
                     &state.backend,
                     renderer_label,
                     audio_backend_de_la_zone,
                     wire.as_ref(),
-                ),
+                )),
             )
             .await;
             // #8569 — sortie au volume non réglable : pas d'étape Volume.
@@ -710,6 +712,8 @@ pub(crate) async fn get_zone(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
+    // Revue #9520 — le droit Premium du compte, pour le panneau du signal.
+    let premium_du_compte = state.license.is_premium().await;
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let audio_backend_pref = state.display_audio_backend();
     #[cfg(feature = "local-audio")]
@@ -821,25 +825,25 @@ pub(crate) async fn get_zone(
                     &devices,
                     &registered_output_ids,
                 );
-                let signal_path = build_signal_path(
+                let signal_path = avec_le_droit(premium_du_compte, || build_signal_path(
                     &ps,
                     &zone,
                     &state.backend,
                     renderer_label,
                     audio_backend_de_la_zone,
                     wire.as_ref(),
-                );
+                ));
                 super::composant_airplay2_7084::injecter_composant_airplay2_manquant(obj, &zone);
                 let signal_path = signal_path_sous_licence(
                     &state.license,
-                    build_signal_path(
+                    avec_le_droit(premium_du_compte, || build_signal_path(
                         &ps,
                         &zone,
                         &state.backend,
                         renderer_label,
                         audio_backend_de_la_zone,
                         wire.as_ref(),
-                    ),
+                    )),
                 )
                 .await;
                 // #8569 — voir la note au site jumeau (`list_zones`).

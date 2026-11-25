@@ -54,6 +54,8 @@ fn sortie_du_membre(
 
 /// Les sorties du groupe de `zone_id`, `None` si elle joue seule.
 pub(crate) async fn sorties_du_groupe(state: &AppState, zone_id: i64) -> Option<Value> {
+    // Revue #9520 — le droit Premium du compte, pour le panneau du signal.
+    let premium_du_compte = state.license.is_premium().await;
     let groupes = tune_core::zones::groupes_enregistres::lire(&SettingsRepo::with_backend(
         state.backend.clone(),
     ));
@@ -109,14 +111,14 @@ pub(crate) async fn sorties_du_groupe(state: &AppState, zone_id: i64) -> Option<
             super::backend_de_la_sortie_de_la_zone(state, zone.output_device_id.as_deref()).await;
         let audio_backend_de_la_zone =
             super::backend_affiche_pour_la_sortie(audio_backend, backend_sortie.as_deref());
-        let chemin = super::signal_path::build_signal_path(
+        let chemin = super::signal_path::avec_le_droit(premium_du_compte, || super::signal_path::build_signal_path(
             &ps,
             &zone,
             &state.backend,
             renderer_label,
             audio_backend_de_la_zone,
             wire.as_ref(),
-        );
+        ));
         sorties.push(sortie_du_membre(
             id,
             &zone.name,

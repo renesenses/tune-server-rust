@@ -443,21 +443,6 @@ pub fn profil_du_moteur(settings: &SettingsRepo, zone_id: i64, premium: bool) ->
     profil.enabled.then_some(profil)
 }
 
-/// Revue #9520 v2 — le droit Premium que le moteur a lu la dernière fois
-/// qu'il a chargé un égaliseur (`PlaybackOrchestrator::eq_profile_configure`,
-/// instantané de la licence). Le panneau historique, qui n'a pas la licence,
-/// lit ce même droit : il décrit ce que le moteur applique. Faux tant que le
-/// moteur n'a rien chargé (le panneau ne décrit qu'une zone qui joue).
-static DROIT_DU_MOTEUR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn retenir_le_droit_du_moteur(premium: bool) {
-    DROIT_DU_MOTEUR.store(premium, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn droit_du_moteur() -> bool {
-    DROIT_DU_MOTEUR.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Ce qui, dans une chaîne, change l'égaliseur du moteur : les façades
 /// cochées (ordre et réglages) et le headroom.
 pub fn signature(chaine: &ChaineTess) -> (Vec<(String, Value)>, Option<f64>) {
