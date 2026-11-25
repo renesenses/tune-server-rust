@@ -562,10 +562,9 @@ pub(super) async fn set_zone_dsp(
     if let Some(eq_val) = body.get("eq_profile")
         && let Ok(profile) =
             serde_json::from_value::<tune_core::audio::eq::EqProfile>(eq_val.clone())
-        && let Err(resp) = crate::routes::eq_parametrique_premium::exiger_le_droit(
-            &state, id, &profile, &headers,
-        )
-        .await
+        && let Err(resp) =
+            crate::routes::eq_parametrique_premium::exiger_le_droit(&state, id, &profile, &headers)
+                .await
     {
         return resp;
     }

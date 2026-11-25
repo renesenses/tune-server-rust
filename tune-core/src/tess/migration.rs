@@ -521,9 +521,9 @@ pub fn facade_d_un_profil_ecrit(
     zone_id: i64,
     profil: &EqProfile,
 ) -> &'static str {
-    let precedente = lire_zone(settings, zone_id, true).ok().and_then(|l| {
-        egaliseur_principal(&l.chaine).map(|i| l.chaine.plugins[i].id.clone())
-    });
+    let precedente = lire_zone(settings, zone_id, true)
+        .ok()
+        .and_then(|l| egaliseur_principal(&l.chaine).map(|i| l.chaine.plugins[i].id.clone()));
     let piece = profil_de_piece(settings, zone_id);
     classer_egaliseur(
         profil,

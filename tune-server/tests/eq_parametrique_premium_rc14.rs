@@ -142,10 +142,7 @@ fn refus_parametrique(s: StatusCode, v: &Value) {
     assert_eq!(v["code"], json!("parametric_eq"), "{v}");
     assert_eq!(v["feature"], json!("Parametric EQ"), "{v}");
     assert!(v["upgrade_url"].is_string(), "{v}");
-    assert!(
-        !v["message"].as_str().unwrap_or_default().is_empty(),
-        "{v}"
-    );
+    assert!(!v["message"].as_str().unwrap_or_default().is_empty(), "{v}");
 }
 
 #[tokio::test]
@@ -264,11 +261,7 @@ async fn une_zone_qui_a_deja_un_parametrique_n_est_pas_bloquee() {
     b.premium(false).await;
 
     let (s, v) = b
-        .appel(
-            Method::GET,
-            &format!("/api/v1/zones/{}/tess", b.zone),
-            None,
-        )
+        .appel(Method::GET, &format!("/api/v1/zones/{}/tess", b.zone), None)
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let (s, v) = b
