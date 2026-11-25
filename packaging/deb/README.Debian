@@ -41,6 +41,22 @@ Conséquence à connaître : après une mise à jour intégrée, les fichiers de
 (`debsums` le signalera), et réinstaller le .deb ramène la version du paquet.
 Les deux canaux fonctionnent, ils ne se synchronisent simplement pas.
 
+Conteneurs LXC sous Proxmox
+---------------------------
+
+Si Tune échoue au démarrage avec 226/NAMESPACE, le conteneur peut
+interdire la création d'un espace de noms de montage. Au démarrage et
+lors de systemctl daemon-reload, le paquet détecte LXC et teste cette
+opération. Si elle est refusée, Tune désactive ProtectSystem et PrivateTmp
+pour son seul service. NoNewPrivileges et les limites de capacités restent
+actifs. La surcharge est temporaire et consultable avec
+systemctl cat tune-server.service.
+
+L'option Proxmox nesting=1 autorise l'imbrication dans le conteneur.
+Si l'administrateur la choisit, redémarrer le conteneur puis vérifier
+systemctl cat tune-server.service. Lorsque le montage est permis, Tune
+conserve ProtectSystem=full et PrivateTmp=yes.
+
 Compatibilité glibc
 -------------------
 

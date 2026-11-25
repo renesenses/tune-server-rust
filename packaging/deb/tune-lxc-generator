@@ -1,0 +1,19 @@
+#!/bin/sh
+# Exécuté par systemd au démarrage et lors du daemon-reload du postinst.
+# Une image Debian déplacée hors de LXC retrouve ainsi l'unité d'origine.
+set -eu
+type=$(systemd-detect-virt --container 2>/dev/null) || exit 0
+case "$type" in lxc|lxc-libvirt) ;; *) exit 0 ;; esac
+command -v unshare >/dev/null 2>&1 || exit 0
+if unshare --mount --propagation slave /bin/true 2>/dev/null; then
+    exit 0
+fi
+
+# Sortie normale du générateur. /etc/systemd/system garde la priorité.
+dossier=$1/tune-server.service.d
+mkdir -p "$dossier"
+cat > "$dossier/20-tune-lxc.conf" <<'UNIT'
+[Service]
+ProtectSystem=no
+PrivateTmp=no
+UNIT
