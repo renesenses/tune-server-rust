@@ -514,6 +514,15 @@ async fn remplacer_le_chemin_refuse_le_reseau_sans_authentification() {
     let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
     let b = banc();
+    // rc14 : sans authentification, le réseau local administre par défaut
+    // (tests/administration_reseau_local_rc14.rs). Le réglage « Administration
+    // depuis cette machine seulement » rétablit le refus tenu ici.
+    tune_core::db::settings_repo::SettingsRepo::with_backend(b.state.backend.clone())
+        .set(
+            crate::auth::CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT,
+            "true",
+        )
+        .unwrap();
     let piste = piste_du_banc(&b);
     // Hors de `/var/folders` (macOS) : sous le répertoire courant.
     let scratch = tune_core::test_scratch::scratch_dir_in(

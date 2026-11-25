@@ -313,7 +313,7 @@ enum Liaison {
 /// (`AdminOuReseauLocalPourLeCompte`) relie le serveur ; depuis le réseau
 /// local, seulement s'il n'a pas de compte ou pour reconnecter le même
 /// ([`autre_compte_refuse`]). La déliaison reste à cette machine
-/// (`AdminOuCetteMachine`).
+/// (`AdminOuCetteMachineStricte`).
 /// Authentification active : l'administrateur relie le serveur, un compte
 /// standard ne relie que son propre profil.
 fn liaison_autorisee<G>(
@@ -1154,10 +1154,10 @@ async fn sso_status(
 /// untouched (a keyed premium survives).
 ///
 /// Décision du 23/11 : la déliaison reste réservée à cette machine ou à
-/// l'administrateur (`AdminOuCetteMachine`), jamais au réseau local : délier
+/// l'administrateur (`AdminOuCetteMachineStricte`), jamais au réseau local : délier
 /// puis relier un autre compte depuis un appareil du réseau n'est pas permis.
 async fn sso_disconnect(
-    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    garde: Result<crate::auth::AdminOuCetteMachineStricte, RefusDeGarde>,
     appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
 ) -> axum::response::Response {
@@ -1258,7 +1258,7 @@ async fn telemetry_status(State(state): State<AppState>) -> Json<Value> {
 /// pas pris — au lieu de basculer une case que le rafraichissement suivant
 /// remettra en place toute seule.
 async fn telemetry_enable(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1284,7 +1284,7 @@ async fn telemetry_enable(
 /// des droits premium SSO. Un opt-out ne doit jamais se payer en
 /// fonctionnalites perdues — voir `background::heartbeat_plan` (LIC-1).
 async fn telemetry_disable(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1403,7 +1403,7 @@ struct VoteRequest {
 }
 
 async fn marketplace_vote(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     Path(name): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1432,7 +1432,7 @@ struct ArtistImageReport {
 }
 
 async fn report_artist_image(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<ArtistImageReport>,
@@ -1467,7 +1467,7 @@ struct CoverSubmitRequest {
 }
 
 async fn submit_community_cover(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CoverSubmitRequest>,
@@ -1520,7 +1520,7 @@ struct CoverSyncRequest {
 }
 
 async fn sync_community_covers(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CoverSyncRequest>,
@@ -1943,7 +1943,9 @@ async fn bridge_disable(
 // ---------------------------------------------------------------------------
 
 async fn license_status(
-    garde: Result<crate::auth::AdminOuCetteMachine, (StatusCode, Json<Value>)>,
+    // La clé en clair reste à cette machine ou à l'administrateur (garde
+    // stricte), même quand les actions de licence s'ouvrent au réseau local.
+    garde: Result<crate::auth::AdminOuCetteMachineStricte, (StatusCode, Json<Value>)>,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let ls = state.license.license_state().await;
@@ -2044,7 +2046,7 @@ async fn license_status(
 /// et Free, exactement comme avant. Aucune clé ne débloque quoi que ce soit
 /// sans confirmation en ligne.
 async fn license_activate(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
@@ -2081,7 +2083,7 @@ async fn license_activate(
 }
 
 async fn license_deactivate(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let remote_released = retirer_la_licence(&state).await;
@@ -2397,7 +2399,7 @@ fn message_statut_distant(status: StatusCode) -> String {
 /// (#3906). La vérité vit dans le corps, et le champ qui la porte est
 /// `reason` — voir [`MotifValidation`].
 async fn license_validate(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let ls = state.license.license_state().await;
@@ -2999,7 +3001,7 @@ fn mode_demande(body: &ReconcileBody) -> tune_core::cloud::library_reconcile::Mo
 /// Manuelle et non automatique, deliberement : declencher une suppression de
 /// masse au demarrage sans l'avoir vue tourner une fois serait imprudent.
 async fn library_sync_reconcile(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     body: Option<Json<ReconcileBody>>,
 ) -> impl IntoResponse {
@@ -3062,7 +3064,7 @@ async fn library_sync_reconcile(
 
 /// POST /cloud/library-sync/trigger — triggers immediate sync (premium only).
 async fn library_sync_trigger(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     if let Err(resp) = crate::premium_guard::require_premium(
@@ -3147,7 +3149,7 @@ async fn library_sync_trigger(
 
 /// POST /cloud/library-sync/full-sync — queues a full library resync (premium only).
 async fn library_sync_full(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     if let Err(resp) = crate::premium_guard::require_premium(

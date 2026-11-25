@@ -786,13 +786,126 @@ impl FromRequestParts<AppState> for RequireAdmin {
 
 /// Garde des actions qui engagent la machine (effacer un disque, éteindre,
 /// installer un greffon) : l'administrateur quand l'authentification est
-/// active ; sinon, SEULEMENT un appel émis depuis cette machine (adresse de
-/// bouclage réelle de la connexion, jamais une requête relayée). Même doctrine
-/// que la garde de la base pour la migration : « cette machine », pas « le réseau local ».
+/// active ; sinon, un appel émis depuis cette machine (adresse de bouclage
+/// réelle de la connexion, jamais une requête relayée), ou — rc14 — depuis le
+/// RÉSEAU LOCAL ([`administration_depuis_le_reseau_local`]), sauf si le
+/// réglage « Administration depuis cette machine seulement »
+/// ([`CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT`]) est allumé.
+///
+/// Jamais : le relais distant ou l'écoute directe, un mandataire inverse, une
+/// adresse hors réseau local, le relais du port 80 de Tune OS, la passerelle
+/// d'un conteneur (réseau en pont).
 ///
 /// `RequireAdmin` laisse tout passer quand l'authentification est coupée ;
 /// cette garde ne le fait pas.
 pub struct AdminOuCetteMachine;
+
+/// La garde STRICTE de la rc13 : l'administrateur, ou cette machine
+/// seulement, jamais le réseau local. Pour le compte et la licence : délier
+/// le compte mozaiklabs.fr (décision du 23/11), poser, activer, désactiver ou
+/// retirer la licence, et lire la clé de licence en clair.
+pub struct AdminOuCetteMachineStricte;
+
+/// Réglage « Administration depuis cette machine seulement » : allumé
+/// (`true`), l'authentification coupée, les actions d'administration ne sont
+/// acceptées que depuis la machine de Tune (comportement de la rc13). Éteint
+/// par défaut. Préfixe protégé `auth_` : l'écriture générique des réglages et
+/// les imports ne le touchent pas ; il s'écrit par `POST /auth/admin-scope`,
+/// sous [`AdminOuCetteMachine`] — une fois allumé, seule cette machine (ou
+/// l'administrateur) peut l'éteindre.
+pub const CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT: &str = "auth_admin_this_machine_only";
+
+/// Variable par laquelle l'exploitant d'un CONTENEUR déclare qu'il voit
+/// l'adresse réelle des appareils (`network_mode: host`, aucun mandataire
+/// devant Tune) : l'administration depuis le réseau local y est alors
+/// permise, jamais depuis la passerelle du conteneur. Sans elle, un conteneur
+/// garde la règle stricte : en réseau en pont, toute connexion publiée arrive
+/// de la passerelle (172.17.0.1…), adresse privée, Internet compris.
+pub const VARIABLE_ADMINISTRATION_RESEAU_LOCAL_EN_CONTENEUR: &str = "TUNE_ADMIN_LAN_IN_CONTAINER";
+
+/// Le réglage « Administration depuis cette machine seulement » est-il
+/// allumé ? Une erreur de lecture répond OUI (dans le doute, strict).
+pub fn administration_cette_machine_seulement(state: &AppState) -> bool {
+    match SettingsRepo::with_backend(state.backend.clone())
+        .get(CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT)
+    {
+        Ok(v) => v.is_some_and(|v| v.trim() == "true"),
+        Err(_) => true,
+    }
+}
+
+/// Sans authentification, l'appel d'administration vient-il du réseau
+/// local, adresse fiable ? Voir [`juger_l_adresse_du_reseau_local`].
+/// `None` : réglage strict allumé.
+async fn administration_depuis_le_reseau_local(
+    parts: &mut Parts,
+    state: &AppState,
+) -> Option<AdresseDuReseauLocal> {
+    if administration_cette_machine_seulement(state) {
+        return None;
+    }
+    Some(
+        juger_l_adresse_du_reseau_local(
+            parts,
+            state,
+            variable_vraie(VARIABLE_ADMINISTRATION_RESEAU_LOCAL_EN_CONTENEUR),
+        )
+        .await,
+    )
+}
+
+/// La règle de [`AdminOuCetteMachine`] (ou de la garde stricte,
+/// `reseau_local` faux), authentification coupée. `Ok` : accepté.
+async fn action_de_machine_sans_authentification(
+    parts: &mut Parts,
+    state: &AppState,
+    reseau_local: bool,
+) -> Result<(), Refus> {
+    if appel_depuis_cette_machine(parts, state).await {
+        return Ok(());
+    }
+    if !reseau_local {
+        return Err(Refus::HorsDeCetteMachine);
+    }
+    let adresse = administration_depuis_le_reseau_local(parts, state).await;
+    if adresse == Some(AdresseDuReseauLocal::Fiable) {
+        tracing::info!(
+            chemin = %parts.uri.path(),
+            "action_machine_acceptee_depuis_le_reseau_local_sans_authentification"
+        );
+    }
+    refus_selon_l_adresse(adresse)
+}
+
+/// Le verdict de [`administration_depuis_le_reseau_local`] en refus.
+fn refus_selon_l_adresse(adresse: Option<AdresseDuReseauLocal>) -> Result<(), Refus> {
+    match adresse {
+        Some(AdresseDuReseauLocal::Fiable) => Ok(()),
+        // Réglage strict, ou Tune OS (relais du port 80) : la règle de la
+        // rc13, et son refus.
+        None | Some(AdresseDuReseauLocal::RelaisDuPort80) => Err(Refus::HorsDeCetteMachine),
+        Some(AdresseDuReseauLocal::Conteneur) => Err(Refus::ConteneurSansAdresseFiable),
+        Some(AdresseDuReseauLocal::HorsDuReseauLocal) => {
+            Err(Refus::AdministrationHorsDuReseauLocal)
+        }
+    }
+}
+
+/// Sans authentification, les actions d'administration sont-elles permises à
+/// CET appelant ? Même règle que [`AdminOuCetteMachine`], sans refus rendu :
+/// pour que l'interface grise ou non ses boutons. `None` : permises ; sinon le
+/// motif (`reason`) que la garde rendrait.
+pub async fn refus_des_actions_de_machine_sans_authentification(
+    parts: &mut Parts,
+    state: &AppState,
+) -> Option<&'static str> {
+    if appel_depuis_cette_machine(parts, state).await {
+        return None;
+    }
+    let refus =
+        refus_selon_l_adresse(administration_depuis_le_reseau_local(parts, state).await).err()?;
+    Some(motif_et_phrase_du_refus(refus, !crate::routes::appliance::bouclage_fiable()).0)
+}
 
 /// L'appel vient-il de cette machine ? Lu dans `ConnectInfo` (posé par
 /// `into_make_service_with_connect_info`, ou `MockConnectInfo` sous test).
@@ -971,10 +1084,29 @@ impl FromRequestParts<AppState> for AdminOuCetteMachine {
                 .await
                 .map(|_| AdminOuCetteMachine);
         }
-        if appel_depuis_cette_machine(parts, state).await {
-            return Ok(AdminOuCetteMachine);
+        match action_de_machine_sans_authentification(parts, state, true).await {
+            Ok(()) => Ok(AdminOuCetteMachine),
+            Err(refus) => Err(refus_action_reservee(parts, state, refus).await),
         }
-        Err(refus_action_reservee(parts, state, Refus::HorsDeCetteMachine).await)
+    }
+}
+
+impl FromRequestParts<AppState> for AdminOuCetteMachineStricte {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if authentification_active(state) {
+            return <RequireAdmin as FromRequestParts<AppState>>::from_request_parts(parts, state)
+                .await
+                .map(|_| AdminOuCetteMachineStricte);
+        }
+        match action_de_machine_sans_authentification(parts, state, false).await {
+            Ok(()) => Ok(AdminOuCetteMachineStricte),
+            Err(refus) => Err(refus_action_reservee(parts, state, refus).await),
+        }
     }
 }
 
@@ -989,6 +1121,12 @@ enum Refus {
     /// Liaison du compte mozaiklabs.fr sans authentification, appel venu
     /// d'ailleurs que du réseau local.
     CompteHorsDuReseauLocal,
+    /// Action d'administration sans authentification, appel venu d'ailleurs
+    /// que du réseau local (relais, mandataire, Internet, CGNAT/VPN).
+    AdministrationHorsDuReseauLocal,
+    /// Action d'administration sans authentification, dans un conteneur dont
+    /// l'adresse des appareils n'est pas fiable (réseau en pont, passerelle).
+    ConteneurSansAdresseFiable,
 }
 
 /// L'action que nomme le refus, d'après le chemin appelé : la clé de son
@@ -1015,6 +1153,26 @@ pub fn action_du_chemin(chemin: &str) -> &'static str {
         "extensions"
     } else {
         "other"
+    }
+}
+
+/// Le motif (`reason`) et la clé de la phrase d'un refus.
+fn motif_et_phrase_du_refus(refus: Refus, relais_port_80: bool) -> (&'static str, &'static str) {
+    match refus {
+        Refus::HorsDuReseauLocal => ("not_local_network", "api.machine.reservedOutsideLan"),
+        Refus::CompteHorsDuReseauLocal => {
+            ("not_local_network", "api.machine.reservedOutsideLanAccount")
+        }
+        Refus::AdministrationHorsDuReseauLocal => {
+            ("not_local_network", "api.machine.reservedOutsideLanAdmin")
+        }
+        Refus::ConteneurSansAdresseFiable => {
+            ("container_network", "api.machine.reservedContainerNetwork")
+        }
+        Refus::HorsDeCetteMachine if relais_port_80 => {
+            ("port80_relay", "api.machine.reservedPort80Relay")
+        }
+        Refus::HorsDeCetteMachine => ("not_local", "api.machine.reservedNotLocal"),
     }
 }
 
@@ -1049,16 +1207,7 @@ async fn refus_action_reservee(
     );
     // Le refus dit ce que le serveur a vu : l'exploitant comprend tout de
     // suite pourquoi « depuis cette machine » n'a pas été reconnu.
-    let (motif, cle) = match refus {
-        Refus::HorsDuReseauLocal => ("not_local_network", "api.machine.reservedOutsideLan"),
-        Refus::CompteHorsDuReseauLocal => {
-            ("not_local_network", "api.machine.reservedOutsideLanAccount")
-        }
-        Refus::HorsDeCetteMachine if relais_port_80 => {
-            ("port80_relay", "api.machine.reservedPort80Relay")
-        }
-        Refus::HorsDeCetteMachine => ("not_local", "api.machine.reservedNotLocal"),
-    };
+    let (motif, cle) = motif_et_phrase_du_refus(refus, relais_port_80);
     let lang = crate::i18n::lang_from_header(&parts.headers);
     let action_cle = action_du_chemin(&chemin);
     let action = crate::i18n::t(&lang, &format!("api.machine.action.{action_cle}"));
@@ -1149,8 +1298,8 @@ async fn appel_depuis_le_reseau_local(parts: &mut Parts, state: &AppState) -> bo
 ///   signature de `SHA256SUMS`.
 ///
 /// Les autres actions de machine (redémarrer, éteindre, extensions, accès à
-/// distance, sauvegardes, canal de mise à jour) restent sous
-/// [`AdminOuCetteMachine`].
+/// distance, sauvegardes, canal de mise à jour) sont sous
+/// [`AdminOuCetteMachine`] (rc14 : réseau local aussi, sauf réglage strict).
 pub struct AdminOuReseauLocalPourLaMiseAJour;
 
 impl FromRequestParts<AppState> for AdminOuReseauLocalPourLaMiseAJour {
@@ -1298,6 +1447,41 @@ pub fn router() -> Router<AppState> {
             get(etat_activation).post(activer_l_authentification),
         )
         .route("/activation/code", post(demander_un_code_d_activation))
+        .route("/admin-scope", post(regler_la_portee_de_l_administration))
+}
+
+#[derive(Deserialize)]
+struct PorteeDeLAdministration {
+    this_machine_only: bool,
+}
+
+/// `POST /auth/admin-scope` — allume ou éteint le réglage « Administration
+/// depuis cette machine seulement ». Garde [`AdminOuCetteMachine`] : une fois
+/// allumé, seule cette machine (ou l'administrateur, authentification active)
+/// peut l'éteindre.
+async fn regler_la_portee_de_l_administration(
+    _garde: AdminOuCetteMachine,
+    State(state): State<AppState>,
+    Json(body): Json<PorteeDeLAdministration>,
+) -> Response {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let ecrit = if body.this_machine_only {
+        settings.set(CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT, "true")
+    } else {
+        settings.delete(CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT)
+    };
+    if ecrit.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "setting_not_saved" })),
+        )
+            .into_response();
+    }
+    tracing::info!(
+        cette_machine_seulement = body.this_machine_only,
+        "portee_de_l_administration_reglee"
+    );
+    Json(json!({ "admin_this_machine_only": body.this_machine_only })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,6 +2007,7 @@ async fn auth_config(State(state): State<AppState>) -> Json<Value> {
         "auth_enabled": enabled,
         "has_jwt_secret": has_secret,
         "has_api_key": has_api_key,
+        "admin_this_machine_only": administration_cette_machine_seulement(&state),
     }))
 }
 
@@ -2446,8 +2631,12 @@ pub fn passerelles_par_defaut(route_v4: &str, route_v6: &str) -> Vec<std::net::I
 pub const VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR: &str = "TUNE_FIRST_SETUP_IN_CONTAINER";
 
 fn premiere_configuration_autorisee_en_conteneur() -> bool {
-    std::env::var(VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR)
-        .is_ok_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+    variable_vraie(VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR)
+}
+
+/// La variable d'environnement vaut-elle `1` ou `true` ?
+fn variable_vraie(nom: &str) -> bool {
+    std::env::var(nom).is_ok_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
 }
 
 /// Le conteneur et ses passerelles : `None` hors conteneur. En développement
@@ -2486,14 +2675,58 @@ fn source_passerelle(ip: std::net::IpAddr, passerelles: &[std::net::IpAddr]) -> 
     passerelles.contains(&ip)
 }
 
-/// L'appel vient-il du RÉSEAU LOCAL, au sens de la première configuration ?
-/// [`appel_depuis_le_reseau_local`], et en plus :
+/// Ce que vaut l'adresse d'un appel « du réseau local » quand on veut s'y fier
+/// (première configuration, administration sans authentification).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdresseDuReseauLocal {
+    /// Appel du réseau local, adresse réelle de l'appareil.
+    Fiable,
+    /// Appliance Tune OS dont le relais du port 80 masque l'adresse cliente.
+    RelaisDuPort80,
+    /// Conteneur sans autorisation de l'exploitant, ou appel venu de la
+    /// passerelle du conteneur : l'adresse vue n'est pas celle de l'appareil.
+    Conteneur,
+    /// Relais, mandataire, adresse hors réseau local, hôte ou origine refusés.
+    HorsDuReseauLocal,
+}
+
+/// Juge l'adresse d'un appel au sens du réseau local, avec les mêmes gardes
+/// partout : [`appel_depuis_le_reseau_local`], et en plus
 ///
-/// - jamais derrière le relais du port 80 d'une appliance ;
+/// - jamais derrière le relais du port 80 d'une appliance (le bouclage n'y
+///   dit rien de l'appareil d'origine) ;
 /// - jamais dans un conteneur, sauf si l'exploitant l'autorise
-///   ([`VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR`]), et alors jamais
-///   depuis la passerelle du conteneur ;
+///   (`conteneur_autorise`), et alors jamais depuis la passerelle du
+///   conteneur (réseau en pont : toutes les connexions publiées y arrivent) ;
 /// - jamais avec un `Host` à un seul label étranger à cette machine.
+pub(crate) async fn juger_l_adresse_du_reseau_local(
+    parts: &mut Parts,
+    state: &AppState,
+    conteneur_autorise: bool,
+) -> AdresseDuReseauLocal {
+    if !crate::routes::appliance::bouclage_fiable() {
+        return AdresseDuReseauLocal::RelaisDuPort80;
+    }
+    if !appel_depuis_le_reseau_local(parts, state).await
+        || crate::garde_origine::hote_de_la_requete_a_un_seul_label_etranger(&parts.headers)
+    {
+        return AdresseDuReseauLocal::HorsDuReseauLocal;
+    }
+    let Some(ip) = adresse_de_l_appelant(parts, state).await else {
+        return AdresseDuReseauLocal::HorsDuReseauLocal;
+    };
+    match passerelles_du_conteneur() {
+        None => AdresseDuReseauLocal::Fiable,
+        Some(passerelles) if conteneur_autorise && !source_passerelle(ip, &passerelles) => {
+            AdresseDuReseauLocal::Fiable
+        }
+        Some(_) => AdresseDuReseauLocal::Conteneur,
+    }
+}
+
+/// L'appel vient-il du RÉSEAU LOCAL, au sens de la première configuration ?
+/// [`juger_l_adresse_du_reseau_local`], le conteneur n'étant admis qu'avec
+/// [`VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR`].
 ///
 /// Extracteur infaillible, sans trace.
 pub struct DepuisLeReseauLocal(pub bool);
@@ -2505,25 +2738,15 @@ impl FromRequestParts<AppState> for DepuisLeReseauLocal {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if !crate::routes::appliance::bouclage_fiable() {
-            return Ok(Self(false));
-        }
-        if !appel_depuis_le_reseau_local(parts, state).await {
-            return Ok(Self(false));
-        }
-        if crate::garde_origine::hote_de_la_requete_a_un_seul_label_etranger(&parts.headers) {
-            return Ok(Self(false));
-        }
-        let Some(ip) = adresse_de_l_appelant(parts, state).await else {
-            return Ok(Self(false));
-        };
-        Ok(Self(match passerelles_du_conteneur() {
-            None => true,
-            Some(passerelles) => {
-                premiere_configuration_autorisee_en_conteneur()
-                    && !source_passerelle(ip, &passerelles)
-            }
-        }))
+        Ok(Self(
+            juger_l_adresse_du_reseau_local(
+                parts,
+                state,
+                premiere_configuration_autorisee_en_conteneur(),
+            )
+            .await
+                == AdresseDuReseauLocal::Fiable,
+        ))
     }
 }
 
@@ -2597,11 +2820,37 @@ fn comptes_existants(state: &AppState, admin: Option<i64>) -> Vec<Value> {
         .collect()
 }
 
+/// Sans authentification, le refus que la garde des actions
+/// d'administration opposerait à cet appelant
+/// ([`refus_des_actions_de_machine_sans_authentification`]), `None` s'il
+/// passe. Extracteur infaillible, sans trace.
+pub struct RefusDesActionsDeMachine(pub Option<&'static str>);
+
+impl FromRequestParts<AppState> for RefusDesActionsDeMachine {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            refus_des_actions_de_machine_sans_authentification(parts, state).await,
+        ))
+    }
+}
+
 /// `GET /auth/activation` — ce que l'écran d'activation doit afficher.
+///
+/// rc14 : `machine_actions_allowed` (authentification coupée seulement) dit
+/// si CET appelant peut lancer les actions d'administration — cette machine,
+/// ou le réseau local quand le réglage strict est éteint — et
+/// `machine_actions_refusal` le motif du refus sinon ; `admin_this_machine_only`
+/// l'état de ce réglage.
 async fn etat_activation(
     State(state): State<AppState>,
     DepuisCetteMachine(cette_machine): DepuisCetteMachine,
     DepuisLeReseauLocal(reseau_local): DepuisLeReseauLocal,
+    RefusDesActionsDeMachine(refus_actions): RefusDesActionsDeMachine,
 ) -> Json<Value> {
     let active = authentification_active(&state);
     // La fenêtre de première configuration, pour CET appelant : cette
@@ -2614,6 +2863,9 @@ async fn etat_activation(
     Json(json!({
         "auth_enabled": active,
         "from_this_machine": cette_machine,
+        "machine_actions_allowed": if active { None } else { Some(refus_actions.is_none()) },
+        "machine_actions_refusal": if active { None } else { refus_actions },
+        "admin_this_machine_only": administration_cette_machine_seulement(&state),
         "code_required": !active && !cette_machine && premiere_configuration.is_none(),
         "first_setup": premiere_configuration.is_some(),
         "first_setup_expires_in": premiere_configuration.map(|d| d.as_secs()),

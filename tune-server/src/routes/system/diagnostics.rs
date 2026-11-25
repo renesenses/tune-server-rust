@@ -4163,7 +4163,7 @@ pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Va
 /// `TUNE_TELEMETRY=false` reste souverain, et un appelant qui rallume alors
 /// que l'exploitant a coupe doit le voir.
 pub(super) async fn telemetry_toggle(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Json<Value> {

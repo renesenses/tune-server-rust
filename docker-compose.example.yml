@@ -57,6 +57,14 @@ services:
       # premier demarrage. A NE PAS poser en mode pont, sous Docker Desktop,
       # derriere un mandataire ou dans une VM en NAT.
       # - TUNE_FIRST_SETUP_IN_CONTAINER=1
+      # Administration sans authentification (redemarrer, mettre a jour,
+      # greffons...) : dans un conteneur, seulement avec l'authentification
+      # par defaut. Avec le reseau de l'hote (`network_mode: host`) ET sans
+      # mandataire inverse devant Tune, cette variable l'ouvre aux appareils
+      # du reseau local (jamais a la passerelle du conteneur). Memes reserves
+      # que ci-dessus : pas en mode pont, ni sous Docker Desktop, ni derriere
+      # un mandataire, ni dans une VM en NAT.
+      # - TUNE_ADMIN_LAN_IN_CONTAINER=1
       # Spotify Connect (librespot)
       # - LIBRESPOT_NAME=Tune
       # - LIBRESPOT_BITRATE=320
