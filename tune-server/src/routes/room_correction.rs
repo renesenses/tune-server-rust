@@ -251,22 +251,36 @@ async fn apply_profile_handler(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let eq_profile = profil_eq_de_correction(&profile.filters);
 
-    settings
-        .set(
-            &format!("zone_{zone_id}_eq_profile"),
-            &serde_json::to_string(&eq_profile).map_err(|e| AppError::internal(e.to_string()))?,
-        )
-        .map_err(AppError::internal)?;
-
-    // rc14 — la chaîne TESS de la zone est enregistrée tout de suite, avec la
-    // façade « Correction de pièce » que lui donne ce profil. Sans cela, la
-    // chaîne n'était relue qu'à la volée d'après `room_profile_{id}` : un
-    // nouveau profil enregistré ensuite (nouvelle mesure, pas encore
-    // appliquée) changeait la correction en « Égaliseur paramétrique ».
-    if let Ok(id) = zone_id.parse::<i64>()
-        && let Err(e) = tune_core::tess::migration::migrer_zone(&settings, id)
-    {
-        tracing::warn!(zone_id = id, erreur = %e, "correction_piece_chaine_tess_non_enregistree");
+    // rc14 (égaliseurs en série) — la correction passe par la chaîne TESS :
+    // son maillon `room-correction` reçoit les bandes du profil, les autres
+    // égaliseurs de la série restent tels quels, et la chaîne est enregistrée
+    // tout de suite (sa façade ne dépend plus d'une relecture d'après
+    // `room_profile_{id}`). Même verrou qu'un `PUT /zones/{id}/tess`. Une zone
+    // sans identifiant numérique, ou une chaîne d'une version plus récente,
+    // garde l'écriture directe d'avant.
+    let par_la_chaine = match zone_id.parse::<i64>() {
+        Ok(id) => {
+            let verrou = super::zones::tess::verrou_des_put(id);
+            let _garde = verrou.lock().await;
+            match tune_core::tess::migration::poser_la_correction_de_piece(&settings, id, &eq_profile)
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(zone_id = id, erreur = %e, "correction_piece_hors_chaine_tess");
+                    false
+                }
+            }
+        }
+        Err(_) => false,
+    };
+    if !par_la_chaine {
+        settings
+            .set(
+                &format!("zone_{zone_id}_eq_profile"),
+                &serde_json::to_string(&eq_profile)
+                    .map_err(|e| AppError::internal(e.to_string()))?,
+            )
+            .map_err(AppError::internal)?;
     }
 
     // Persister ne suffit pas : sans ceci la correction n'atteint le son qu'a

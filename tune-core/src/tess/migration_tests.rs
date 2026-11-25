@@ -2740,3 +2740,141 @@ fn une_correction_appliquee_reste_une_correction_apres_un_nouveau_profil_de_piec
         vec![(ID_CORRECTION_PIECE, false)]
     );
 }
+
+fn maillon_eq(id: &str, enabled: bool, bandes: Vec<EqBandSpec>) -> MaillonGreffon {
+    let mut v = serde_json::to_value(profil(enabled, bandes)).unwrap();
+    v.as_object_mut().unwrap().remove("enabled");
+    MaillonGreffon {
+        id: id.into(),
+        enabled,
+        settings: v,
+    }
+}
+
+fn ecrire_ancienne_cle(s: &SettingsRepo, z: i64, p: &EqProfile) {
+    s.set(
+        &format!("zone_{z}_eq_profile"),
+        &serde_json::to_string(p).unwrap(),
+    )
+    .unwrap();
+}
+
+/// rc14 (suite de #9532, m1) — `[pièce décochée, graphique coché]`, éteinte
+/// puis rallumée par un ancien client : la correction de pièce reste, le
+/// graphique se rallume. Le rallumage reclassait la correction de pièce
+/// (première façade) en graphique et supprimait le vrai graphique.
+#[test]
+fn eteindre_puis_rallumer_par_l_ancienne_cle_garde_la_correction_de_piece_decochee() {
+    let (_b, s) = base();
+    let z = 43;
+    let piece = crate::room_correction::profil_eq_de_correction(&filtres_de_piece()).bands;
+    let g = graphique(10, |i| if i == 2 { 3.0 } else { 0.0 }, &[None]);
+    let mut c = ChaineTess::default();
+    c.plugins.push(maillon_eq(ID_CORRECTION_PIECE, false, piece));
+    c.plugins.push(maillon_eq(ID_EQ_GRAPHIQUE, true, g.clone()));
+    ecrire_chaine(&s, z, &c).unwrap();
+
+    ecrire_ancienne_cle(&s, z, &profil(false, g.clone()));
+    // Enregistrée éteinte (redémarrage : migration T03).
+    assert_eq!(
+        ids(&migrer_zone(&s, z).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, false), (ID_EQ_GRAPHIQUE, false)]
+    );
+    ecrire_ancienne_cle(&s, z, &profil(true, g));
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, false), (ID_EQ_GRAPHIQUE, true)]
+    );
+}
+
+/// rc14 (suite de #9532, m3) — une correction de pièce devenue
+/// « paramétrique » en rc13.90 (mêmes bandes que le profil de pièce)
+/// redevient une correction de pièce. Contre-épreuve : un paramétrique d'une
+/// autre courbe reste paramétrique.
+#[test]
+fn un_parametrique_aux_bandes_du_profil_de_piece_redevient_une_correction_de_piece() {
+    let (_b, s) = base();
+    let z = 44;
+    poser_la_piece(&s, z, "Calibration abc", None);
+    let piece = crate::room_correction::profil_eq_de_correction(&filtres_de_piece()).bands;
+    let mut c = ChaineTess::default();
+    c.plugins.push(maillon_eq(ID_EQ_PARAMETRIQUE, true, piece));
+    ecrire_chaine(&s, z, &c).unwrap();
+    let l = lire_zone(&s, z, true).unwrap();
+    assert_eq!(ids(&l.chaine), vec![(ID_CORRECTION_PIECE, true)]);
+    assert_eq!(maillon(&l.chaine, ID_CORRECTION_PIECE).settings["origin"], json!("measured"));
+
+    let z = 45;
+    poser_la_piece(&s, z, "Calibration abc", None);
+    let mut c = ChaineTess::default();
+    c.plugins.push(maillon_eq(
+        ID_EQ_PARAMETRIQUE,
+        true,
+        vec![bande(1000.0, 2.0, 1.0, "peak", None)],
+    ));
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_EQ_PARAMETRIQUE, true)]
+    );
+}
+
+/// rc14 (suite de #9532, M1) — appliquer un profil de pièce sur une série
+/// `[graphique coché, correction de pièce cochée]` met à jour la correction
+/// et garde le graphique ; `eq_profile` reste le graphique (principal).
+#[test]
+fn appliquer_un_profil_de_piece_garde_les_autres_egaliseurs_de_la_serie() {
+    let (_b, s) = base();
+    let z = 46;
+    let g = graphique(10, |i| if i == 5 { -2.0 } else { 0.0 }, &[None]);
+    let mut c = ChaineTess::default();
+    c.plugins.push(maillon_eq(ID_EQ_GRAPHIQUE, true, g.clone()));
+    c.plugins.push(maillon_eq(
+        ID_CORRECTION_PIECE,
+        true,
+        vec![bande(80.0, -4.0, 3.0, "peak", None)],
+    ));
+    ecrire_chaine(&s, z, &c).unwrap();
+
+    poser_la_piece(&s, z, "Calibration abc", None);
+    // `poser_la_piece` écrit aussi `eq_profile` comme l'ancienne route :
+    // on remet la clé du graphique, seul le profil de pièce compte ici.
+    ecrire_ancienne_cle(&s, z, &profil(true, g.clone()));
+    let nouveau = crate::room_correction::profil_eq_de_correction(&filtres_de_piece());
+    poser_la_correction_de_piece(&s, z, &nouveau).unwrap();
+
+    let l = lire_zone(&s, z, true).unwrap();
+    assert_eq!(
+        ids(&l.chaine),
+        vec![(ID_EQ_GRAPHIQUE, true), (ID_CORRECTION_PIECE, true)]
+    );
+    let bandes: Vec<EqBandSpec> =
+        serde_json::from_value(maillon(&l.chaine, ID_CORRECTION_PIECE).settings["bands"].clone())
+            .unwrap();
+    assert!(memes_bandes(&bandes, &nouveau.bands));
+    let eq: EqProfile =
+        serde_json::from_str(&s.get(&format!("zone_{z}_eq_profile")).unwrap().unwrap()).unwrap();
+    assert!(memes_bandes(&eq.bands, &g));
+}
+
+/// rc14 (m4) — la règle commune que les gardes de droit des anciennes routes
+/// appliquent : éteindre ou rallumer une correction de pièce ajoutée à la
+/// main reste une correction de pièce ; une nouvelle courbe se reclasse.
+#[test]
+fn la_facade_d_une_ancienne_ecriture_suit_la_lecture_de_la_chaine() {
+    let (_b, s) = base();
+    let z = 47;
+    let mut c = ChaineTess::default();
+    c.plugins.push(MaillonGreffon {
+        id: ID_CORRECTION_PIECE.into(),
+        enabled: false,
+        settings: Value::Null,
+    });
+    ecrire_chaine(&s, z, &c).unwrap();
+    let mut p: EqProfile =
+        serde_json::from_str(&s.get(&format!("zone_{z}_eq_profile")).unwrap().unwrap()).unwrap();
+    p.enabled = true;
+    assert_eq!(facade_d_une_ancienne_ecriture(&s, z, &p), ID_CORRECTION_PIECE);
+    let autre = profil(true, vec![bande(1000.0, 2.0, 1.0, "peak", None)]);
+    assert_eq!(facade_d_une_ancienne_ecriture(&s, z, &autre), ID_EQ_PARAMETRIQUE);
+}
