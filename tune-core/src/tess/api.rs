@@ -112,9 +112,14 @@ pub struct EtatGreffonCatalogue {
     /// Installé, activé et branché dans l'hôte.
     pub available: bool,
     /// Pourquoi il ne traiterait pas s'il était coché, dans l'ordre de la
-    /// résolution : `plugin_unavailable` d'abord, puis `premium_required` ;
-    /// `None` : utilisable.
+    /// résolution : `plugin_not_installed` ou `plugin_unavailable` d'abord,
+    /// puis `premium_required` ; `None` : utilisable.
     pub reason: Option<MotifEtape>,
+    /// Avec `plugin_not_installed` seulement : le paquet à installer
+    /// (`POST /plugins/{install_package}/install`), qui rend le greffon
+    /// disponible sans redémarrage. Absent sinon ; un client ancien l'ignore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_package: Option<String>,
 }
 
 /// La réponse de `GET /tess/catalog` : le catalogue (schémas de réglages,
@@ -132,13 +137,29 @@ pub struct ReponseCatalogue {
 
 impl ReponseCatalogue {
     pub fn depuis(catalog: Catalogue, premium: bool, disponible: &dyn Fn(&str) -> bool) -> Self {
+        Self::depuis_avec_installation(catalog, premium, disponible, &|_| None)
+    }
+
+    /// Comme [`Self::depuis`] ; `a_installer(id)` rend le paquet facultatif
+    /// qui manque à un greffon indisponible (égaliseur, réaffectation des
+    /// canaux sur une base neuve) : le motif est alors `plugin_not_installed`
+    /// avec `install_package`, au lieu de `plugin_unavailable`.
+    pub fn depuis_avec_installation(
+        catalog: Catalogue,
+        premium: bool,
+        disponible: &dyn Fn(&str) -> bool,
+        a_installer: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
         let plugins = catalog
             .plugins
             .iter()
             .map(|d| {
                 let entitled = premium || !d.demande_le_premium();
                 let available = disponible(&d.id);
-                let reason = if !available {
+                let install_package = if available { None } else { a_installer(&d.id) };
+                let reason = if install_package.is_some() {
+                    Some(MotifEtape::PluginNotInstalled)
+                } else if !available {
                     Some(MotifEtape::PluginUnavailable)
                 } else if !entitled {
                     Some(MotifEtape::PremiumRequired)
@@ -150,6 +171,7 @@ impl ReponseCatalogue {
                     entitled,
                     available,
                     reason,
+                    install_package,
                 }
             })
             .collect();
@@ -219,7 +241,8 @@ pub fn schema_json() -> Value {
         "dsd_source_native", "chain_version_unsupported", "unknown_value", "unknown_plugin",
         "plugin_unavailable", "premium_required", "stereo_only", "replaced_in_group",
         "nothing_to_protect", "volume_not_software", "nothing_to_quantize", "not_in_service",
-        "renderer_without_lpcm", "not_applied_on_transport", null] });
+        "renderer_without_lpcm", "not_applied_on_transport", "plugin_not_installed",
+        "no_filter_selected", null] });
     let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://mozaiklabs.fr/schemas/tess/contract-1.json",
@@ -334,7 +357,9 @@ pub fn schema_json() -> Value {
                             "id": { "$ref": "#/$defs/id" },
                             "entitled": { "type": "boolean" },
                             "available": { "type": "boolean" },
-                            "reason": { "enum": ["plugin_unavailable", "premium_required", null] }
+                            "reason": { "enum": ["plugin_not_installed", "plugin_unavailable",
+                                                 "premium_required", null] },
+                            "install_package": { "$ref": "#/$defs/id" }
                         },
                         "additionalProperties": false
                     } }
@@ -882,6 +907,41 @@ mod tests {
                 (!premium).then_some(MotifEtape::PremiumRequired)
             );
         }
+        // rc14 — un paquet facultatif à installer : motif distinct et paquet
+        // nommé ; ce qui n'a rien à installer reste `plugin_unavailable`.
+        let a_installer = |id: &str| (id == "equalizer-graphic").then(|| "equalizer".to_owned());
+        let r = ReponseCatalogue::depuis_avec_installation(
+            catalogue_de_reference(),
+            true,
+            &|id: &str| id != "declick-live" && id != "equalizer-graphic",
+            &a_installer,
+        );
+        let v = serde_json::to_value(&r).unwrap();
+        strict("catalog_response", &v).unwrap();
+        lecture("catalog_response", &v).unwrap();
+        assert_eq!(serde_json::from_value::<ReponseCatalogue>(v).unwrap(), r);
+        let etat = |id: &str| r.plugins.iter().find(|p| p.id == id).unwrap().clone();
+        assert_eq!(
+            etat("equalizer-graphic").reason,
+            Some(MotifEtape::PluginNotInstalled)
+        );
+        assert_eq!(
+            etat("equalizer-graphic").install_package.as_deref(),
+            Some("equalizer")
+        );
+        assert_eq!(
+            etat("declick-live").reason,
+            Some(MotifEtape::PluginUnavailable)
+        );
+        assert_eq!(etat("declick-live").install_package, None);
+        // Un greffon disponible n'a jamais rien à installer.
+        let r = ReponseCatalogue::depuis_avec_installation(
+            catalogue_de_reference(),
+            true,
+            &tout,
+            &a_installer,
+        );
+        assert!(r.plugins.iter().all(|p| p.install_package.is_none()));
         // Contre-épreuve : un champ de plus n'est pas émis par ce serveur.
         let mut v = serde_json::to_value(ReponseCatalogue::depuis(
             catalogue_de_reference(),

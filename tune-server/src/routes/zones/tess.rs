@@ -45,7 +45,7 @@ use axum::response::Response;
 use tune_core::tess::TauxDsd;
 use tune_core::tess::api::{RefusTess, ReponseCatalogue, ReponseTessZone};
 use tune_core::tess::chaine::{
-    ChaineTess, ContexteValidation, ErreurChaine, MaillonGreffon, Upsampling,
+    ChaineTess, ContexteValidation, ErreurChaine, ID_UPSAMPLING, MaillonGreffon, Upsampling,
 };
 use tune_core::tess::greffon::{
     Canaux, Catalogue, Categorie, ContraintesPlace, DescripteurGreffon, Droit,
@@ -59,7 +59,7 @@ use tune_core::tess::migration::{
     origines_par_le_serveur,
 };
 use tune_core::tess::resolution::{
-    ContexteExecution, ControleVolume, LectureDsd, SourceFlux, VolumeZone,
+    CodeEtape, ContexteExecution, ControleVolume, LectureDsd, MotifEtape, SourceFlux, VolumeZone,
 };
 use tune_core::tess::zones::TransportZone;
 
@@ -179,10 +179,29 @@ pub fn greffon_disponible(settings: &SettingsRepo, id: &str) -> bool {
         ID_CROSSFEED => enabled(settings, "crossfeed"),
         ID_REAFFECTATION => enabled(settings, "channel-remap"),
         ID_CONVOLUTION | ID_MONO => true,
+        // rc14 — l'étage fixe de suréchantillonnage : le moteur `upsampler`.
+        ID_UPSAMPLING => enabled(settings, tune_core::audio::premium_plugins::UPSAMPLER),
         // Le moteur existe (T13) ; l'hôte ne le fait pas encore tourner.
         ID_DECLICK_LIVE => false,
         autre => tune_core::audio::natifs_tiers::actif(settings, autre),
     }
+}
+
+/// Le paquet facultatif qui manque à ce greffon et que l'utilisateur peut
+/// installer (`POST /plugins/{paquet}/install`), ou `None`. Depuis la
+/// v0.9.156, l'égaliseur et la réaffectation des canaux ne sont plus installés
+/// par la migration : sur une base neuve, ils sont « à installer », pas
+/// « indisponibles ». Un paquet installé mais désactivé, ou en échec de
+/// chargement, reste `plugin_unavailable`.
+pub fn paquet_a_installer(settings: &SettingsRepo, id: &str) -> Option<&'static str> {
+    use tune_core::audio::premium_plugins::installed;
+    let paquet = match id {
+        ID_EQ_GRAPHIQUE | ID_EQ_PARAMETRIQUE | ID_EQ_CASQUE | ID_CORRECTION_PIECE => "equalizer",
+        ID_REAFFECTATION => "channel-remap",
+        ID_UPSAMPLING => tune_core::audio::premium_plugins::UPSAMPLER,
+        _ => return None,
+    };
+    (!installed(settings, paquet)).then_some(paquet)
 }
 
 /// `GET /tess/catalog`
@@ -190,10 +209,12 @@ pub async fn catalogue_tess_route(State(state): State<AppState>) -> impl IntoRes
     let premium = state.license.is_premium().await;
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let disponible = |id: &str| greffon_disponible(&settings, id);
-    Json(ReponseCatalogue::depuis(
+    let a_installer = |id: &str| paquet_a_installer(&settings, id).map(str::to_owned);
+    Json(ReponseCatalogue::depuis_avec_installation(
         catalogue_du_serveur(),
         premium,
         &disponible,
+        &a_installer,
     ))
 }
 
@@ -396,14 +417,44 @@ pub(super) async fn reponse_de_zone(
                 .map(|l| l.get(p).is_some())
                 .unwrap_or(true)
         });
-    ReponseTessZone::depuis_avec_le_lecteur(
+    let mut reponse = ReponseTessZone::depuis_avec_le_lecteur(
         zone_id,
         lecture.chaine,
         actif,
         catalogue,
         &ctx,
         lecteur.as_ref(),
-    )
+    );
+    preciser_les_paquets_a_installer(&mut reponse, &settings);
+    reponse
+}
+
+/// rc14 — dans le chemin du signal, une étape éteinte `plugin_unavailable`
+/// dont le paquet facultatif n'est simplement pas installé (base neuve :
+/// égaliseur, réaffectation, suréchantillonneur) devient
+/// `plugin_not_installed`, avec `params.install_package`.
+fn preciser_les_paquets_a_installer(reponse: &mut ReponseTessZone, settings: &SettingsRepo) {
+    for e in &mut reponse.signal_path {
+        if e.reason != Some(MotifEtape::PluginUnavailable) {
+            continue;
+        }
+        let id = match e.code {
+            CodeEtape::Upsampling => ID_UPSAMPLING,
+            _ => match e.plugin_id.as_deref() {
+                Some(id) => id,
+                None => continue,
+            },
+        };
+        if let Some(paquet) = paquet_a_installer(settings, id) {
+            e.reason = Some(MotifEtape::PluginNotInstalled);
+            let mut p = match e.params.take() {
+                Some(Value::Object(m)) => m,
+                _ => serde_json::Map::new(),
+            };
+            p.insert("install_package".into(), Value::String(paquet.into()));
+            e.params = Some(Value::Object(p));
+        }
+    }
 }
 
 /// T12b — ce qui joue, pour les faits du lecteur ; rien quand la zone est
@@ -734,7 +785,13 @@ pub async fn put_zone_tess(
             .await;
     let (lecture, cles) = match resultat {
         Ok(Ok(x)) => x,
-        Ok(Err(r)) => return r,
+        Ok(Err(r)) => {
+            // rc14 (recette .18) : un refus laisse sa trace au journal ; sans
+            // elle, « rien ne se passe » ne se distinguait pas d'un PUT jamais
+            // parti.
+            info!(zone_id = id, status = %r.status(), "tess_put_refuse");
+            return r;
+        }
         Err(e) => return erreur_migration(&ErreurMigration::Stockage(e.to_string())),
     };
     // T17 : la chaîne a changé à la main ; le préréglage chargé n'est plus

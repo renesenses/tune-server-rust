@@ -1181,3 +1181,211 @@ async fn deux_egaliseurs_coches_409_et_un_seul_passe_rc14() {
     assert_eq!(s, StatusCode::CONFLICT, "{v}");
     refus_conforme(&v, 409, "mutually_exclusive");
 }
+
+/// rc14 — un paquet installé mais désactivé n'est pas « à installer » : il
+/// reste `plugin_unavailable`, sans `install_package`. Désinstallé, il
+/// redevient `plugin_not_installed` avec le paquet à installer.
+#[tokio::test]
+async fn catalogue_distingue_desactive_et_non_installe_rc14() {
+    let b = Banc::nouveau(true).await;
+    let etat = |rep: &Value, id: &str| {
+        rep["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == json!(id))
+            .unwrap()
+            .clone()
+    };
+    let catalogue = || async {
+        let (s, v) = b
+            .brut(Method::GET, "/api/v1/tess/catalog", None, None)
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        conforme_au_schema("catalog_response", &v).unwrap_or_else(|e| panic!("{e} : {v}"));
+        v
+    };
+    // Tout installé et actif : rien à installer.
+    let v = catalogue().await;
+    let eq = etat(&v, "equalizer-graphic");
+    assert_eq!(eq["available"], json!(true), "{eq}");
+    assert!(eq.get("install_package").is_none(), "{eq}");
+
+    b.settings()
+        .set("plugin_equalizer_enabled", "false")
+        .unwrap();
+    let v = catalogue().await;
+    let eq = etat(&v, "equalizer-graphic");
+    assert_eq!(eq["reason"], json!("plugin_unavailable"), "{eq}");
+    assert!(eq.get("install_package").is_none(), "{eq}");
+
+    b.settings()
+        .set("plugin_equalizer_installed", "false")
+        .unwrap();
+    b.settings()
+        .set("plugin_channel-remap_installed", "false")
+        .unwrap();
+    let v = catalogue().await;
+    for (id, paquet) in [
+        ("equalizer-graphic", "equalizer"),
+        ("equalizer-parametric", "equalizer"),
+        ("room-correction", "equalizer"),
+        ("channel-remap", "channel-remap"),
+    ] {
+        let e = etat(&v, id);
+        assert_eq!(e["available"], json!(false), "{e}");
+        assert_eq!(e["reason"], json!("plugin_not_installed"), "{e}");
+        assert_eq!(e["install_package"], json!(paquet), "{e}");
+    }
+    // Ni le crossfeed (installé), ni les greffons natifs tiers, ni le
+    // déclic en direct ne proposent d'installation.
+    for id in ["crossfeed", "crosstalk", "declick-live", "convolution"] {
+        let e = etat(&v, id);
+        assert!(e.get("install_package").is_none(), "{e}");
+        assert_ne!(e["reason"], json!("plugin_not_installed"), "{e}");
+    }
+}
+
+/// rc14 — le web ajoute la convolution cochée avant qu'un fichier soit
+/// choisi (`settings: null`). Ce n'est pas une chaîne invalide : 200, le
+/// maillon est inactif (`no_filter_selected`) et aucun `ir_path_{zone}`
+/// n'est posé. Contre-épreuve : avec un fichier, elle traite.
+#[tokio::test]
+async fn convolution_cochee_sans_fichier_acceptee_et_inactive_rc14() {
+    let b = Banc::nouveau(true).await;
+    let etape_conv = |v: &Value| {
+        v["signal_path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["plugin_id"] == json!("convolution"))
+            .unwrap_or_else(|| panic!("convolution absente du chemin : {v}"))
+            .clone()
+    };
+    let cle_ir = format!("ir_path_{}", b.zone);
+    for reglages in [Value::Null, json!({}), json!({"ir_path": "  "})] {
+        let (s, v) = b
+            .put(json!({"version": 1, "plugins": [
+                {"id": "convolution", "enabled": true, "settings": reglages}
+            ]}))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{reglages} → {v}");
+        conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{e} : {v}"));
+        let e = etape_conv(&v);
+        assert_eq!(e["requested"], json!(true), "{e}");
+        assert_eq!(e["effective"], json!(false), "{e}");
+        assert_eq!(e["reason"], json!("no_filter_selected"), "{e}");
+        assert!(b.settings().get(&cle_ir).unwrap().is_none());
+        // Relu par GET, même chose.
+        let (_, v) = b.get().await;
+        assert_eq!(etape_conv(&v)["reason"], json!("no_filter_selected"));
+    }
+    // Contre-épreuve : un fichier choisi, la convolution traite et le pose.
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "convolution", "enabled": true, "settings": {"ir_path": "/x.wav"}}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let e = etape_conv(&v);
+    assert_eq!(e["effective"], json!(true), "{e}");
+    assert!(e["reason"].is_null(), "{e}");
+    assert_eq!(
+        b.settings().get(&cle_ir).unwrap().as_deref(),
+        Some("/x.wav")
+    );
+}
+
+/// rc14 (relecture) — une zone a déjà `ir_path_{zone}` ; un client envoie la
+/// convolution cochée SANS fichier : la clé est effacée (comme décochée),
+/// sinon le DSP convoluerait encore `/a.wav` pendant que la réponse dit
+/// `no_filter_selected`.
+#[tokio::test]
+async fn convolution_cochee_sans_fichier_efface_l_ancien_ir_rc14() {
+    let cle_ir = |b: &Banc| format!("ir_path_{}", b.zone);
+    for reglages in [Value::Null, json!({}), json!({"ir_path": "  "})] {
+        let b = Banc::nouveau(true).await;
+        let (s, v) = b
+            .put(json!({"version": 1, "plugins": [
+                {"id": "convolution", "enabled": true, "settings": {"ir_path": "/a.wav"}}
+            ]}))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            b.settings().get(&cle_ir(&b)).unwrap().as_deref(),
+            Some("/a.wav")
+        );
+        let (s, v) = b
+            .put(json!({"version": 1, "plugins": [
+                {"id": "convolution", "enabled": true, "settings": reglages}
+            ]}))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{reglages} → {v}");
+        let e = v["signal_path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["plugin_id"] == json!("convolution"))
+            .unwrap()
+            .clone();
+        assert_eq!(e["effective"], json!(false), "{e}");
+        assert_eq!(e["reason"], json!("no_filter_selected"), "{e}");
+        assert!(
+            b.settings().get(&cle_ir(&b)).unwrap().is_none(),
+            "{reglages} : ir_path_{{zone}} encore posé"
+        );
+    }
+}
+
+/// rc14 (Rémi, base neuve) — le moteur `upsampler`, facultatif, n'est pas
+/// installé : l'étage fixe de suréchantillonnage demandé ne traite pas, et
+/// le chemin du signal le dit `plugin_not_installed` avec
+/// `params.install_package = "upsampler"` (avant : annoncé effectif alors
+/// que rien ne suréchantillonnait). Installé, il traite. Désactivé :
+/// `plugin_unavailable`, sans paquet.
+#[tokio::test]
+async fn surechantillonnage_non_installe_propose_l_installation_rc14() {
+    let b = Banc::nouveau(true).await;
+    b.settings()
+        .set("plugin_upsampler_installed", "false")
+        .unwrap();
+    let etape = |v: &Value| {
+        v["signal_path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["code"] == json!("upsampling"))
+            .unwrap()
+            .clone()
+    };
+    let corps =
+        json!({"version": 1, "fixed": {"upsampling": {"mode": "pcm", "filter": "polyvalent"}}});
+    let (s, v) = b.put(corps.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{e} : {v}"));
+    let e = etape(&v);
+    assert_eq!(e["requested"], json!(true), "{e}");
+    assert_eq!(e["effective"], json!(false), "{e}");
+    assert_eq!(e["reason"], json!("plugin_not_installed"), "{e}");
+    assert_eq!(e["params"]["install_package"], json!("upsampler"), "{e}");
+    let (_, v) = b.get().await;
+    assert_eq!(etape(&v)["reason"], json!("plugin_not_installed"));
+
+    // Installé (ce que fait `POST /plugins/upsampler/install`) : il traite.
+    b.settings()
+        .set("plugin_upsampler_installed", "true")
+        .unwrap();
+    let (_, v) = b.get().await;
+    let e = etape(&v);
+    assert_eq!(e["effective"], json!(true), "{e}");
+    assert!(e["reason"].is_null(), "{e}");
+
+    // Installé mais désactivé : indisponible, rien à installer.
+    b.settings()
+        .set("plugin_upsampler_enabled", "false")
+        .unwrap();
+    let (_, v) = b.get().await;
+    let e = etape(&v);
+    assert_eq!(e["reason"], json!("plugin_unavailable"), "{e}");
+    assert!(e["params"].get("install_package").is_none(), "{e}");
+}
