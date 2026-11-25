@@ -265,6 +265,23 @@ pub fn releve(tache: Tache) -> Option<Avancement> {
         .map(Etat::releve)
 }
 
+/// Épreuves seulement — le verrou des témoins qui OUVRENT une campagne de la
+/// cascade (ReplayGain, empreintes, plage dynamique, y compris le passage à
+/// la demande). L'état des campagnes (ici, et `replaygain::progression`) est
+/// global au PROCESSUS : un témoin qui constate « mon lot a ouvert la
+/// campagne, donc compté ses candidats » (`selections_hors_executeur_3013`)
+/// rougissait sous charge dès qu'un voisin rouvrait la même campagne entre sa
+/// remise au repos et son comptage (#9057). Chaque témoin qui appelle un lot
+/// de la cascade le prend.
+///
+/// Verrou de tokio : il est tenu à travers les `.await` du lot, sans bloquer
+/// le fil d'un exécuteur ni d'avertissement `await_holding_lock`.
+#[cfg(test)]
+static CAMPAGNES_DES_ESSAIS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(test)]
+pub(crate) async fn campagnes_des_essais() -> tokio::sync::MutexGuard<'static, ()> {
+    CAMPAGNES_DES_ESSAIS.lock().await
+}
 /// Remet l'état à neuf. **Réservé aux témoins.**
 #[doc(hidden)]
 pub fn reinitialiser_pour_les_essais() {

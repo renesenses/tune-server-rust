@@ -4109,6 +4109,7 @@ mod tests {
     /// la foulée du décodage.
     #[tokio::test]
     async fn la_passe_replaygain_pose_aussi_l_empreinte() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let fixture = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/ape/sine_16s_c3000.wav"
@@ -4187,6 +4188,7 @@ mod tests {
     /// ne jamais y revenir.
     #[tokio::test]
     async fn le_rattrapage_dr_reprend_les_pistes_que_la_passe_ecarte_a_jamais() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let f = tmp.path().join("plage.wav");
         wav_de_plage_connue(&f);
@@ -4228,6 +4230,7 @@ mod tests {
     /// remplacée par une estimation — mais un tag VIDE n'est pas une valeur.
     #[tokio::test]
     async fn le_rattrapage_dr_respecte_le_tag_du_fichier_mais_pas_un_tag_vide() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let f = tmp.path().join("plage.wav");
         wav_de_plage_connue(&f);
@@ -4265,6 +4268,7 @@ mod tests {
     /// que deux instances compareront.
     #[tokio::test]
     async fn la_mesure_ecrit_la_version_de_ses_algorithmes_5594() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let f = tmp.path().join("plage.wav");
         wav_de_plage_connue(&f);
@@ -4302,6 +4306,7 @@ mod tests {
     /// JAMAIS `rg_algo` : le gain en place vient des tags, pas de Tune.
     #[tokio::test]
     async fn le_rattrapage_dr_ecrit_dr_algo_sans_inventer_rg_algo_5594() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let f = tmp.path().join("plage.wav");
         wav_de_plage_connue(&f);
@@ -4325,6 +4330,7 @@ mod tests {
     /// reçoit jamais.
     #[tokio::test]
     async fn une_mesure_d_avant_la_version_reste_sans_version_5594() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let f = tmp.path().join("plage.wav");
         wav_de_plage_connue(&f);
@@ -4358,6 +4364,7 @@ mod tests {
     /// la marque, le rattrapage reprendrait éternellement les mêmes pistes.
     #[tokio::test]
     async fn le_rattrapage_dr_reporte_les_absents_et_marque_les_illisibles() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let absent = tmp.path().join("absente.flac");
         let (db, backend) = base_avec_piste(absent.to_string_lossy().as_ref());
@@ -4443,6 +4450,7 @@ mod tests {
     /// introuvables sans marque, et ne repasse pas sur ce qu'il a fait.
     #[tokio::test]
     async fn le_rattrapage_empreinte_les_pistes_analysees_et_reporte_les_absentes() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let fixture = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/ape/sine_16s_c3000.wav"
@@ -4502,6 +4510,7 @@ mod tests {
     /// zéro gain calculé.
     #[tokio::test]
     async fn un_fichier_introuvable_est_reporte_jamais_marque_analyse() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let absent = tmp
             .path()
@@ -4531,6 +4540,7 @@ mod tests {
     /// un état définitif — un disque rebranché est repris tout seul.
     #[tokio::test]
     async fn le_report_ecarte_puis_perime() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let absent = tmp
             .path()
@@ -4577,6 +4587,7 @@ mod tests {
     /// qui met ce test au rouge.
     #[tokio::test]
     async fn le_disque_en_nfd_est_retrouve_depuis_le_chemin_nfc_de_la_base() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         // Sur le disque : NFD (graphie d'un Mac ou d'un partage SMB).
         let nfd = tmp.path().join("Bjo\u{0308}rk - Jo\u{0301}ga.flac");
@@ -4612,6 +4623,7 @@ mod tests {
     /// être introuvable sur un montage sensible à la forme.
     #[tokio::test]
     async fn la_passe_ne_reecrit_jamais_le_chemin_stocke() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let nfd = tmp.path().join("E\u{0301}tienne.flac");
         std::fs::write(&nfd, b"x").unwrap();
@@ -4668,6 +4680,7 @@ mod tests {
     /// MESURÉE : gain, crête et plage dynamique.
     #[tokio::test]
     async fn la_piste_anciennement_ecartee_pour_sa_taille_est_maintenant_mesuree() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let f = tmp.path().join("longue.wav");
         wav_de_plage_connue(&f);
@@ -4691,6 +4704,7 @@ mod tests {
     /// plafond, et elles seules ; la passe reprend ensuite la piste.
     #[tokio::test]
     async fn le_rattrapage_rend_a_la_passe_les_pistes_ecartees_pour_leur_taille() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let f = tmp.path().join("longue.wav");
         wav_de_plage_connue(&f);
@@ -5814,6 +5828,7 @@ mod tests {
     /// l'application à la lecture relève d'un autre réglage.
     #[tokio::test]
     async fn disabling_stops_the_pass_without_losing_a_single_measured_gain() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let (_db, backend) = sweep_db(2);
         let settings = SettingsRepo::with_backend(backend.clone());
         let meta = TrackMetadataRepo::with_backend(backend.clone());
@@ -5869,6 +5884,7 @@ mod tests {
     /// décodage.
     #[tokio::test]
     async fn switching_off_mid_batch_interrupts_the_running_sweep() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let (_tmp, _db, interne) = sweep_db_fichiers_presents(4);
         SettingsRepo::with_backend(interne.clone())
             .set(MODE_KEY, "track")
@@ -5923,6 +5939,7 @@ mod tests {
     /// encore rendu : seuls les `largeur` déjà en vol peuvent finir.
     #[tokio::test]
     async fn switching_off_mid_batch_stops_launching_with_several_in_flight() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let (_tmp, _db, interne) = sweep_db_fichiers_presents(6);
         SettingsRepo::with_backend(interne.clone())
             .set(MODE_KEY, "track")
@@ -6159,6 +6176,7 @@ mod tests {
     /// derrière lui, et ne repart de 0 qu'une fois, quand plus rien ne suit.
     #[tokio::test]
     async fn le_tour_suivant_reprend_apres_le_curseur() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let (_tmp, _db, interne) = sweep_db_fichiers_presents(30);
         SettingsRepo::with_backend(interne.clone())
             .set(MODE_KEY, "track")
@@ -6182,6 +6200,7 @@ mod tests {
     /// est reprise au tour qui ne trouve plus rien devant lui.
     #[tokio::test]
     async fn une_piste_redevenue_candidate_derriere_le_curseur_est_reprise() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let (_tmp, _db, backend) = sweep_db_fichiers_presents(3);
         SettingsRepo::with_backend(backend.clone())
             .set(MODE_KEY, "track")
@@ -6209,6 +6228,7 @@ mod tests {
     /// reprend en premier, sans attendre la reprise depuis 0.
     #[tokio::test]
     async fn le_curseur_s_arrete_avant_la_premiere_piste_non_traitee() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let (_tmp, _db, interne) = sweep_db_fichiers_presents(4);
         SettingsRepo::with_backend(interne.clone())
             .set(MODE_KEY, "track")
@@ -6236,6 +6256,7 @@ mod tests {
     /// chacune avec son `COMMIT` et sa prise du verrou d'écriture.
     #[tokio::test]
     async fn un_tour_s_ecrit_en_une_seule_transaction() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let (_tmp, db, interne) = sweep_db_fichiers_presents(6);
         db.execute("ALTER TABLE tracks ADD COLUMN audio_fingerprint TEXT", &[])
             .unwrap();
@@ -6538,6 +6559,7 @@ mod tests {
     /// en bien moins d'une seconde, même un à la fois.
     #[tokio::test]
     async fn plus_de_pause_fixe_entre_deux_fichiers() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let (_tmp, _db, backend) = sweep_db_fichiers_presents(10);
         SettingsRepo::with_backend(backend.clone())
             .set(MODE_KEY, "track")
@@ -6796,6 +6818,7 @@ mod tests {
     /// autre raison.
     #[tokio::test]
     async fn une_piste_cedee_n_est_pas_estampillee_analysee() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let (_tmp, _db, interne) = sweep_db_fichiers_presents(1);
         SettingsRepo::with_backend(interne.clone())
             .set(MODE_KEY, "track")
@@ -6855,6 +6878,7 @@ mod tests {
     /// exactement la situation de #2495, en petit.
     #[tokio::test]
     async fn un_decodage_reel_deja_en_vol_est_abandonne_en_cours_de_route() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let (tmp, _db, interne) = sweep_db_fichiers_presents(1);
         SettingsRepo::with_backend(interne.clone())
             .set(MODE_KEY, "track")
@@ -6917,6 +6941,7 @@ mod tests {
     /// du signal afficherait « tags du fichier » sur une mesure Tune.
     #[tokio::test]
     async fn une_analyse_reelle_laisse_le_temoin_de_provenance() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let (tmp, _db, backend) = sweep_db_fichiers_presents(1);
         SettingsRepo::with_backend(backend.clone())
             .set(MODE_KEY, "track")
