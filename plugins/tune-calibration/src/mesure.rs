@@ -45,8 +45,9 @@ use crate::fournisseur::FournisseurBalayage;
 use crate::generateur::{Consigne, Deroule, Emission, Plan, Voies};
 use crate::hote::{ElementBalayage, HoteZone, TraitementsDeZone};
 
-/// Cadence imposée pendant la mesure (note §5 risque 2) : le balayage est
-/// servi à 48 kHz, la sortie suit ; la capture doit être à la même cadence.
+/// Cadence de la mesure (note §5 risque 2) : le balayage est servi à 48 kHz,
+/// la sortie suit ; l'analyse tourne à 48 kHz. rc14 : la capture se fait à
+/// la fréquence native du micro et y est ramenée (`cadence.rs`).
 pub const FREQUENCE_MESURE: u32 = 48_000;
 
 /// #8491 — en dessous, la réponse impulsionnelle est noyée dans le bruit :
@@ -534,12 +535,9 @@ impl Controleur {
             );
         }
         let (nom_entree, format) = self.peripheriques.format_natif(&demande.entree)?;
-        if format.frequence != FREQUENCE_MESURE {
-            return Err(format!(
-                "l'entrée « {nom_entree} » capte à {} Hz : la mesure exige {FREQUENCE_MESURE} Hz (régler le périphérique)",
-                format.frequence
-            ));
-        }
+        // rc14 — la capture se fait à la fréquence native du micro (44,1 à
+        // 192 kHz), ramenée à 48 kHz pour l'analyse (`cadence.rs`).
+        crate::cadence::verifier(&nom_entree, format.frequence)?;
         if demande.voie_micro >= format.canaux as usize {
             return Err(format!(
                 "voie {} demandée, l'entrée n'en a que {}",
@@ -704,8 +702,10 @@ impl Controleur {
         // tout le silence que le chemin de lecture aurait pu tirer d'avance.
         {
             let t = tampon.clone();
+            // rc14 — l'écoute est comptée en trames d'analyse (48 kHz), celles du générateur.
+            let cadence = crate::cadence::Cadence::de(tampon.format().frequence);
             deroule.cadencer_sur_l_ecoute(
-                Arc::new(move || t.trames()),
+                Arc::new(move || cadence.vers_analyse(t.trames())),
                 (AVANCE_SUR_L_ECOUTE_S * FREQUENCE_MESURE as f64) as u64,
             );
         }
@@ -929,7 +929,11 @@ impl Controleur {
     ) -> Result<Vec<f64>, Sortie> {
         let entree = mesure.demande.entree.as_str();
         let garde = (self.garde_trames() as f64).max(0.0) as u64;
-        let besoin = depart + em.trames + garde;
+        // rc14 — `em` et la garde sont en trames d'analyse (48 kHz) ; `depart`
+        // et le tampon, en trames du micro.
+        let cadence = crate::cadence::Cadence::de(tampon.format().frequence);
+        let a_capter = cadence.vers_capture(em.trames + garde);
+        let besoin = depart + a_capter;
         // Attente par tranches, pour voir passer une annulation.
         let echeance = Instant::now() + self.delai_capture;
         let mut vu = tampon.trames();
@@ -952,7 +956,8 @@ impl Controleur {
                 }
             }
         }
-        Ok(tampon.extraire(voie, depart, (em.trames + garde) as usize))
+        let capte = tampon.extraire(voie, depart, a_capter as usize);
+        Ok(cadence.a_l_analyse(capte, (em.trames + garde) as usize))
     }
 
     fn garde_trames(&self) -> u64 {

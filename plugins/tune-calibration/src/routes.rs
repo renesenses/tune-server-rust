@@ -220,7 +220,8 @@ async fn microphones(State(etat): State<EtatRoutes>) -> Response {
                     "frequences": e.frequences,
                     "bits_servis": e.bits_servis,
                     "virtuelle": e.virtuelle,
-                    "mesurable": e.frequence_courante == Some(crate::mesure::FREQUENCE_MESURE),
+                    // rc14 — toute fréquence de `cadence::FREQUENCES_ACCEPTEES`.
+                    "mesurable": e.frequence_courante.is_some_and(crate::cadence::acceptee),
                 })
             })
             .collect(),
@@ -230,7 +231,9 @@ async fn microphones(State(etat): State<EtatRoutes>) -> Response {
     };
     Json(json!({
         "pile": pile,
+        // Gardée pour les clients d'avant la rc14 ; la liste fait foi.
         "frequence_requise": crate::mesure::FREQUENCE_MESURE,
+        "frequences_acceptees": crate::cadence::FREQUENCES_ACCEPTEES,
         "entrees": entrees,
         "etalonnages": etat.controleur.etalonnages(),
     }))
