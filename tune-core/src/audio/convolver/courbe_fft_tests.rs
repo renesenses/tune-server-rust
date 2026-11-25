@@ -46,7 +46,10 @@ fn la_grille_a_512_points_logarithmiques_de_20_hz_a_20_khz() {
     assert!((c.freqs_hz[0] - 20.0).abs() < 1e-9);
     assert!((c.freqs_hz[511] - 20_000.0).abs() < 1e-6);
     let r = c.freqs_hz[1] / c.freqs_hz[0];
-    assert!((c.freqs_hz[300] / c.freqs_hz[299] - r).abs() < 1e-9, "pas constant en log");
+    assert!(
+        (c.freqs_hz[300] / c.freqs_hz[299] - r).abs() < 1e-9,
+        "pas constant en log"
+    );
     // 44,1 kHz : 0,45·fs borne le haut ; 16 kHz de cadence aussi.
     let c = courbe_du_canal(&dirac(16, 0), 16_000, 512).unwrap();
     assert!((c.freqs_hz[511] - 7_200.0).abs() < 1e-6);
@@ -60,7 +63,11 @@ fn une_impulsion_retardee_a_une_phase_lineaire_et_une_amplitude_plate() {
     let c = courbe_du_canal(&dirac(4096, d), FS, 512).unwrap();
     assert_eq!(c.retard_echantillons, d);
     for (i, f) in c.freqs_hz.iter().enumerate() {
-        assert!(c.magnitude_db[i].abs() < 1e-6, "{f} Hz : {}", c.magnitude_db[i]);
+        assert!(
+            c.magnitude_db[i].abs() < 1e-6,
+            "{f} Hz : {}",
+            c.magnitude_db[i]
+        );
         // Retard retiré : phase nulle partout.
         let ex = c.phase_deroulee_deg[i].expect("phase publiée");
         assert!(ex.abs() < 1e-6, "{f} Hz : {ex}°");
@@ -73,7 +80,10 @@ fn une_impulsion_retardee_a_une_phase_lineaire_et_une_amplitude_plate() {
         // La phase principale est la même, repliée.
         let p = c.phase_deg[i];
         let ecart = (p - attendu).rem_euclid(360.0);
-        assert!(ecart < 1e-6 || ecart > 360.0 - 1e-6, "{f} Hz : {p} vs {attendu}");
+        assert!(
+            ecart < 1e-6 || ecart > 360.0 - 1e-6,
+            "{f} Hz : {p} vs {attendu}"
+        );
     }
 }
 
@@ -116,7 +126,13 @@ fn la_fft_rend_la_meme_courbe_que_la_somme_directe() {
             p.magnitude_db
         );
         let ecart = (c.phase_deg[i] - p.phase_deg).rem_euclid(360.0);
-        assert!(ecart < 0.5 || ecart > 359.5, "{} Hz : phase {} vs {}", p.freq_hz, c.phase_deg[i], p.phase_deg);
+        assert!(
+            ecart < 0.5 || ecart > 359.5,
+            "{} Hz : phase {} vs {}",
+            p.freq_hz,
+            c.phase_deg[i],
+            p.phase_deg
+        );
     }
     // Retard 0 (pic au premier coefficient) : la phase déroulée est celle
     // du filtre analogique, −atan(a·sin ω / (1 − a·cos ω)), sans saut.

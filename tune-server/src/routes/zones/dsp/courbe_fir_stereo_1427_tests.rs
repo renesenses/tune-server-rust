@@ -63,7 +63,10 @@ fn la_courbe_fft_publie_la_phase_deroulee_hors_retard_par_canal_rc14() {
     for (canal, retard) in [(0usize, 10u64), (1, 480)] {
         let c = &canaux[canal];
         assert_eq!(c["phase_delay_samples"], retard);
-        assert_eq!(c["phase_delay_ms"], (retard as f64 / 48.0 * 100.0).round() / 100.0);
+        assert_eq!(
+            c["phase_delay_ms"],
+            (retard as f64 / 48.0 * 100.0).round() / 100.0
+        );
         let points = c["points"].as_array().unwrap();
         assert_eq!(points.len(), 512);
         for p in points {
