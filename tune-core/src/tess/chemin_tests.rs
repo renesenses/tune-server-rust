@@ -67,6 +67,7 @@ fn service(greffons: &[&str], headroom_db: Option<f64>, volume: bool) -> EnServi
         upsampling: false,
         volume_logiciel: volume,
         latences: vec![],
+        modulation_dsd: None,
     }
 }
 
@@ -266,6 +267,7 @@ fn sonde_globale_ordre_historique_hors_service_et_traitement_non_attribue() {
         upsampling: false,
         volume_logiciel: true,
         latences: vec![],
+        modulation_dsd: None,
     };
     let c = chemin(&chaine, &x, &s, None);
     assert_eq!(
@@ -593,6 +595,7 @@ fn sonde(actif: bool, volume: bool) -> EnService {
         upsampling: false,
         volume_logiciel: volume,
         latences: vec![],
+        modulation_dsd: None,
     }
 }
 
@@ -743,4 +746,86 @@ fn sortie_reseau_volume_de_l_appareil_ordre_reel_et_repli_mono_inerte() {
     assert_eq!(c.badge, Badge::AlteredOutsideTess);
     let c = chemin(&chaine, &x, &sonde(false, false), Some(true));
     assert_eq!(c.badge, Badge::BitPerfect);
+}
+
+/// rc14 — le modulateur DSD de la sortie locale : en service, il porte son
+/// ordre, sa cadence et son transport ; replié en PCM, l'upsampling et le
+/// modulateur sont publiés éteints avec le motif, et la quantification PCM
+/// reprend sa place.
+#[test]
+fn rc14_modulateur_en_service_ou_repli_dit() {
+    use crate::tess::modulation_dsd::{
+        EtatModulation, ModulationEnService, MotifDsdRefuse, TransportModulation,
+    };
+    let chaine = ChaineTess {
+        fixed: EtagesFixes {
+            upsampling: Upsampling::Dsd {
+                rate: TauxDsd::Dsd128,
+                filter: "polyvalent".into(),
+            },
+            ..EtagesFixes::default()
+        },
+        ..ChaineTess::default()
+    };
+    let mut s = service(&[], None, false);
+    s.modulation_dsd = Some(EtatModulation::EnService(ModulationEnService {
+        rate: TauxDsd::Dsd128,
+        rate_hz: 5_644_800,
+        transport: TransportModulation::Native,
+        order: 7,
+        carrier_rate_hz: 5_644_800,
+        source_rate_hz: 96_000,
+        source_channels: 2,
+        channels: 2,
+        plugins_in_stream: false,
+        headroom_db: 0.0,
+        continued: false,
+    }));
+    let c = chemin(&chaine, &ctx(TransportZone::Local, false, 0.0), &s, None);
+    let m = etape(&c, CodeEtape::DsdModulator);
+    assert!(m.etape.effective);
+    let p = m.etape.params.as_ref().unwrap();
+    assert_eq!(p["order"], 7);
+    assert_eq!(p["rate_hz"], 5_644_800);
+    assert_eq!(p["transport"], "native");
+    assert_eq!(p["rate"], "dsd128");
+    assert_eq!(p["zero_dbfs_modulation"], 0.5);
+    assert_eq!(p["reference_level"], "0 dB SACD");
+    assert!(etape(&c, CodeEtape::Upsampling).etape.effective);
+    assert!(
+        c.steps
+            .iter()
+            .all(|e| e.etape.code != CodeEtape::Quantization)
+    );
+    assert!(
+        c.discrepancies
+            .iter()
+            .all(|e| !matches!(e.code, CodeEtape::Upsampling | CodeEtape::DsdModulator)),
+        "{:?}",
+        c.discrepancies
+    );
+
+    s.modulation_dsd = Some(EtatModulation::Repli(
+        MotifDsdRefuse::SourceRateNotModulable,
+    ));
+    let c = chemin(&chaine, &ctx(TransportZone::Local, false, 0.0), &s, None);
+    let up = etape(&c, CodeEtape::Upsampling);
+    assert!(!up.etape.effective);
+    assert_eq!(up.etape.reason, Some(MotifEtape::DsdNotSupportedByOutput));
+    assert_eq!(
+        up.etape.detail.as_deref(),
+        Some("source_rate_not_modulable")
+    );
+    let m = etape(&c, CodeEtape::DsdModulator);
+    assert!(!m.etape.effective && m.etape.requested);
+    assert_eq!(m.etape.reason, Some(MotifEtape::DsdNotSupportedByOutput));
+    // Ordre : … Volume → modulateur (éteint) → Dither → Output.
+    let codes: Vec<_> = c.steps.iter().map(|e| e.etape.code).collect();
+    let i = codes
+        .iter()
+        .position(|c| *c == CodeEtape::DsdModulator)
+        .unwrap();
+    assert_eq!(codes[i - 1], CodeEtape::Volume);
+    assert_eq!(codes[i + 1], CodeEtape::Quantization);
+    assert_eq!(c.volume.placement, None);
 }

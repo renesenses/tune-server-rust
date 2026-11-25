@@ -603,8 +603,13 @@ pub async fn appliquer_prereglage(
     }
     let cat = catalogue.clone();
     let s = settings_de(&state);
-    let resultat =
-        tokio::task::spawn_blocking(move || appliquer_le_put(&s, id, &corps, premium, &cat)).await;
+    // rc14 — un préréglage vers le DSD obéit à la même règle qu'un PUT : une
+    // cible que la sortie locale ne prend pas est refusée, rien n'est éteint.
+    let capacites = state.orchestrator.capacites_dsd_de_zone(id).await;
+    let resultat = tokio::task::spawn_blocking(move || {
+        appliquer_le_put(&s, id, &corps, premium, &cat, Some(&capacites))
+    })
+    .await;
     let resultat = match resultat {
         Ok(r) => r,
         Err(e) => Err(erreur_migration(&ErreurMigration::Stockage(e.to_string()))),

@@ -54,6 +54,7 @@ use super::chaine::{ChaineTess, Dither, Upsampling};
 use super::etages_fixes::{BilanDeNiveau, GainDeRendu};
 use super::greffon::Catalogue;
 use super::migration::MARQUE_MONO_INERTE;
+use super::modulation_dsd::{EtatModulation, ModulationEnService};
 use super::resolution::{
     Badge, CodeEtape, EtapeResolue, EtatVolume, MotifEtape, PlacementVolume, Resolution,
 };
@@ -85,6 +86,10 @@ pub struct EnService {
     pub volume_logiciel: bool,
     /// Latence de chaque greffon préparé, en trames (id du greffon).
     pub latences: Vec<(String, u32)>,
+    /// rc14 — la modulation DSD de la piste (sortie locale) : en service, ou
+    /// repliée en PCM avec son motif. `None` : rien n'a été décidé pour la
+    /// piste (chaîne sans DSD, ou zone qui ne joue pas sur une sortie locale).
+    pub modulation_dsd: Option<super::modulation_dsd::EtatModulation>,
 }
 
 /// T07 — le bilan de niveau d'un étage en service, tel qu'il est publié.
@@ -249,6 +254,27 @@ pub fn params_du_greffon(id: &str, settings: &Value) -> Map<String, Value> {
         }
         _ => {}
     }
+    p
+}
+
+/// rc14 — les paramètres du modulateur en service (ordre, cadence, natif ou
+/// DoP, cadence du porteur), ajoutés à ceux de l'upsampling.
+pub fn params_du_modulateur(m: &ModulationEnService) -> Map<String, Value> {
+    let mut p = Map::new();
+    p.insert("order".into(), json!(m.order));
+    p.insert("rate_hz".into(), json!(m.rate_hz));
+    p.insert("transport".into(), json!(m.transport));
+    p.insert("carrier_rate_hz".into(), json!(m.carrier_rate_hz));
+    p.insert("source_rate_hz".into(), json!(m.source_rate_hz));
+    p.insert("source_channels".into(), json!(m.source_channels));
+    p.insert("channels".into(), json!(m.channels));
+    p.insert("continued".into(), json!(m.continued));
+    // Niveau de référence de T11b : 0 dBFS PCM = 50 % de modulation.
+    p.insert(
+        "zero_dbfs_modulation".into(),
+        json!(super::modulation_dsd::MODULATION_A_0_DBFS),
+    );
+    p.insert("reference_level".into(), json!("0 dB SACD"));
     p
 }
 
@@ -453,10 +479,32 @@ pub fn chemin_du_signal(
         .filter(|_| headroom.effective)
         .unwrap_or(0.0);
 
-    if upsampling.effective && !en_service.upsampling {
-        eteindre_pas_en_service(&mut upsampling, &mut ecarts);
-    } else if !upsampling.effective && en_service.upsampling {
-        allumer_hors_resolution(&mut upsampling, &mut ecarts);
+    // rc14 — vers le DSD, ce qui tourne est le modulateur de la piste
+    // (sortie locale) ; ailleurs, le suréchantillonneur PCM de la sortie.
+    let modulation = en_service.modulation_dsd.as_ref();
+    let upsampling_tourne = match modulation {
+        Some(EtatModulation::EnService(_)) => true,
+        Some(EtatModulation::Repli(_)) => false,
+        None => en_service.upsampling,
+    };
+    match modulation {
+        Some(EtatModulation::Repli(motif)) if upsampling.effective => {
+            upsampling.effective = false;
+            upsampling.reason = Some(MotifEtape::DsdNotSupportedByOutput);
+            upsampling.detail = Some(motif.as_str().to_owned());
+            ecarts.push(Ecart {
+                code: CodeEtape::Upsampling,
+                plugin_id: None,
+                kind: SensEcart::RequestedNotRunning,
+            });
+        }
+        _ if upsampling.effective && !upsampling_tourne => {
+            eteindre_pas_en_service(&mut upsampling, &mut ecarts);
+        }
+        _ if !upsampling.effective && upsampling_tourne => {
+            allumer_hors_resolution(&mut upsampling, &mut ecarts);
+        }
+        _ => {}
     }
 
     if volume.effective && !en_service.volume_logiciel {
@@ -482,6 +530,9 @@ pub fn chemin_du_signal(
         f.requested = true;
         f.effective = true;
         f.params = upsampling.params.clone();
+        if let Some(EtatModulation::EnService(m)) = modulation {
+            fusionner_params(&mut f, params_du_modulateur(m));
+        }
         f
     } else {
         let mut f = etape_vide(CodeEtape::Quantization);
@@ -538,8 +589,24 @@ pub fn chemin_du_signal(
     steps.push(nommer(headroom));
     steps.extend(actifs.into_iter().map(nommer));
     steps.extend(inactifs.into_iter().map(nommer));
+    // rc14 — le modulateur demandé (décision prise pour une sortie locale)
+    // qui ne tourne pas reste visible, éteint, avec le motif de l'upsampling.
+    let modulateur_eteint = (modulation.is_some()
+        && !vers_dsd
+        && matches!(chaine.fixed.upsampling, Upsampling::Dsd { .. }))
+    .then(|| {
+        let mut m = etape_vide(CodeEtape::DsdModulator);
+        m.requested = true;
+        m.params = upsampling.params.clone();
+        m.reason = upsampling.reason;
+        m.detail = upsampling.detail.clone();
+        m
+    });
     steps.push(nommer(upsampling));
     steps.push(nommer(volume));
+    if let Some(m) = modulateur_eteint {
+        steps.push(nommer(m));
+    }
     steps.push(nommer(finale));
     steps.push(nommer(sortie));
 

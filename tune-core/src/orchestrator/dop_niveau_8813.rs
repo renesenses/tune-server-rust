@@ -91,6 +91,12 @@ impl PlaybackOrchestrator {
         let Some(device_id) = zone.output_device_id else {
             return false;
         };
+        // rc14 — un flux modulé vers le DSD par TESS (DoP OU natif) porte
+        // le volume de la zone dans ses bits : il est appliqué juste avant le
+        // modulateur (Q9), rien à protéger ni à relancer.
+        if self.modulation_dsd_en_service(zone_id).await {
+            return false;
+        }
         let etat = self.playback.get_state(zone_id).await;
         let Some(np) = etat.now_playing else {
             return false;

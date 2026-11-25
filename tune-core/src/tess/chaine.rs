@@ -226,6 +226,11 @@ pub enum ErreurChaine {
     HeadroomHorsBornes(f64),
     #[error("réglage d'upsampling refusé : {0}")]
     UpsamplingInvalide(&'static str),
+    /// rc14 — la sortie de la zone ne prend pas la cible DSD demandée (motif
+    /// de `tess::modulation_dsd::MotifDsdRefuse`). La chaîne enregistrée ne
+    /// change pas : le suréchantillonnage en place n'est pas éteint.
+    #[error("la sortie de la zone ne prend pas {rate} : {motif}")]
+    DsdNonPrisParLaSortie { rate: String, motif: String },
 }
 
 impl ErreurChaine {
@@ -242,7 +247,8 @@ impl ErreurChaine {
             | Self::PasEnDernier(_)
             | Self::Exclusifs { .. }
             | Self::HeadroomHorsBornes(_)
-            | Self::UpsamplingInvalide(_) => 409,
+            | Self::UpsamplingInvalide(_)
+            | Self::DsdNonPrisParLaSortie { .. } => 409,
         }
     }
 
@@ -260,6 +266,7 @@ impl ErreurChaine {
             Self::PremiumRequis(_) => "premium_required",
             Self::HeadroomHorsBornes(_) => "headroom_out_of_range",
             Self::UpsamplingInvalide(_) => "invalid_upsampling",
+            Self::DsdNonPrisParLaSortie { .. } => "dsd_not_supported_by_output",
         }
     }
 
@@ -277,6 +284,7 @@ impl ErreurChaine {
             | Self::ValeurInconnue(_)
             | Self::HeadroomHorsBornes(_)
             | Self::UpsamplingInvalide(_) => None,
+            Self::DsdNonPrisParLaSortie { .. } => Some(ID_UPSAMPLING),
         }
     }
 
@@ -306,6 +314,10 @@ impl ErreurChaine {
             Self::PremiumRequis("x".into()),
             Self::HeadroomHorsBornes(3.0),
             Self::UpsamplingInvalide("filter"),
+            Self::DsdNonPrisParLaSortie {
+                rate: "dsd256".into(),
+                motif: "rate_above_zone_max".into(),
+            },
         ]
     }
 
@@ -323,10 +335,11 @@ impl ErreurChaine {
             Self::PremiumRequis(_) => 8,
             Self::HeadroomHorsBornes(_) => 9,
             Self::UpsamplingInvalide(_) => 10,
+            Self::DsdNonPrisParLaSortie { .. } => 11,
         }
     }
 
-    pub const NOMBRE_DE_VARIANTES: usize = 11;
+    pub const NOMBRE_DE_VARIANTES: usize = 12;
 }
 
 /// Le premier chemin présent dans `entree` et absent de `relu` : un champ que

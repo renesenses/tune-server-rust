@@ -57,6 +57,7 @@ use tune_core::tess::migration::{
     ID_EQ_GRAPHIQUE, ID_EQ_PARAMETRIQUE, ID_MONO, ID_REAFFECTATION, LectureZone, Partie,
     correction_estimee, ecrire_chaine, lecture_dsd, lire_zone, origines_par_le_serveur,
 };
+use tune_core::tess::modulation_dsd::CapacitesDsd;
 use tune_core::tess::resolution::{
     CodeEtape, ContexteExecution, ControleVolume, LectureDsd, MotifEtape, SourceFlux, VolumeZone,
 };
@@ -389,6 +390,8 @@ pub(super) async fn reponse_de_zone(
     // contexte : il emprunte une fermeture qui ne traverse pas un `await`.
     let piste = piste_en_cours(&etat);
     let lecteur = state.orchestrator.faits_upnp_de_zone(zone_id, &piste).await;
+    // Avant le contexte, pour la même raison.
+    let capacites_dsd = state.orchestrator.capacites_dsd_de_zone(zone_id).await;
     let disponible = |id: &str| greffon_disponible(&settings, id);
     let ctx = ContexteExecution {
         transport: TransportZone::depuis_type_de_sortie(zone.output_type.as_deref()),
@@ -425,7 +428,10 @@ pub(super) async fn reponse_de_zone(
         catalogue,
         &ctx,
         lecteur.as_ref(),
-    );
+    )
+    // rc14 — ce que la sortie fait de chaque cible DSD (sans sonder le
+    // pilote), reporté sur le chemin résolu.
+    .avec_capacites_dsd(capacites_dsd);
     preciser_les_paquets_a_installer(&mut reponse, &settings);
     reponse
 }
@@ -676,6 +682,7 @@ pub(super) fn appliquer_le_put(
     corps: &[u8],
     premium: bool,
     catalogue: &Catalogue,
+    capacites: Option<&CapacitesDsd>,
 ) -> Result<(LectureZone, Vec<String>), Response> {
     let texte = std::str::from_utf8(corps).map_err(|e| {
         refus(&ErreurChaine::CorpsIllisible(format!(
@@ -725,11 +732,56 @@ pub(super) fn appliquer_le_put(
         .map_err(|e| refus(&e))?;
     let chaine = origines_par_le_serveur(settings, zone_id, &chaine);
     valider_le_put(&chaine, &enregistree, catalogue, premium).map_err(|e| refus(&e))?;
+    refuser_un_dsd_impossible(&chaine, &enregistree, capacites)?;
     let chaine = chaine.mettre_a_niveau();
 
     let bilan = ecrire_chaine(settings, zone_id, &chaine).map_err(|e| erreur_migration(&e))?;
     let lecture = lire_zone(settings, zone_id, premium).map_err(|e| erreur_migration(&e))?;
     Ok((lecture, bilan.cles_modifiees))
+}
+
+/// rc14 — une cible DSD que la sortie LOCALE de la zone ne prend pas est
+/// refusée (409 `dsd_not_supported_by_output`, `reason` = motif précis, et
+/// les capacités) AVANT toute écriture : la chaîne enregistrée ne bouge pas,
+/// le suréchantillonnage PCM en place n'est donc jamais éteint par un choix
+/// DSD impossible. Après le contrôle du droit : un compte Free reçoit
+/// d'abord le 402. Une cible inchangée n'est pas revérifiée (capacité perdue
+/// depuis : la lecture repart en PCM et le dit) ; les sorties réseau ne sont
+/// pas concernées (`not_applied_on_transport`).
+pub fn refuser_un_dsd_impossible(
+    chaine: &ChaineTess,
+    enregistree: &ChaineTess,
+    capacites: Option<&CapacitesDsd>,
+) -> Result<(), Response> {
+    let Upsampling::Dsd { rate, .. } = &chaine.fixed.upsampling else {
+        return Ok(());
+    };
+    if chaine.fixed.upsampling == enregistree.fixed.upsampling {
+        return Ok(());
+    }
+    let Some(caps) = capacites.filter(|c| c.output_local) else {
+        return Ok(());
+    };
+    let Some(cible) = caps.cible(*rate).filter(|c| !c.famille_44k1.accepted) else {
+        return Ok(());
+    };
+    let motif = cible.famille_44k1.reason.map_or("unknown", |m| m.as_str());
+    let e = ErreurChaine::DsdNonPrisParLaSortie {
+        rate: serde_json::to_value(rate)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default(),
+        motif: motif.to_owned(),
+    };
+    let mut corps = corps_du_refus(&RefusTess::from(&e));
+    if let Some(o) = corps.as_object_mut() {
+        o.insert("reason".into(), json!(motif));
+        o.insert(
+            "dsd_capabilities".into(),
+            serde_json::to_value(caps).unwrap_or(Value::Null),
+        );
+    }
+    Err((StatusCode::CONFLICT, Json(corps)).into_response())
 }
 
 /// rc14 — la clé du mode PURE de la zone (hors chaîne), que le chargement
@@ -781,6 +833,13 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     // réaffectation.
     if bypass && !est(Partie::Surechantillonnage) {
         let _ = state.orchestrator.apply_bypass_all_portee(id).await;
+    }
+    // rc14 — piste modulée vers le DSD : les greffons et l'étage fixe vivent
+    // dans le flux du producteur, pas dans la sortie. Tout changement de la
+    // chaîne relance la piste à sa position (anti-rebond partagé avec
+    // l'égaliseur).
+    if !cles.is_empty() {
+        state.orchestrator.relancer_si_flux_dsd_module(id).await;
     }
 }
 
@@ -839,9 +898,11 @@ pub async fn put_zone_tess(
     let _garde = verrou.lock().await;
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let cat = catalogue.clone();
-    let resultat =
-        tokio::task::spawn_blocking(move || appliquer_le_put(&settings, id, &corps, premium, &cat))
-            .await;
+    let capacites = state.orchestrator.capacites_dsd_de_zone(id).await;
+    let resultat = tokio::task::spawn_blocking(move || {
+        appliquer_le_put(&settings, id, &corps, premium, &cat, Some(&capacites))
+    })
+    .await;
     let (lecture, cles) = match resultat {
         Ok(Ok(x)) => x,
         Ok(Err(r)) => {

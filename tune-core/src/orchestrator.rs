@@ -2598,7 +2598,9 @@ mod service_wav_progressif_5080;
 mod service_wav_progressif_openhome_6718;
 
 mod dop_niveau_8813;
+// rc14 — TESS vers le DSD sur la sortie locale (modulateur T11b).
 mod dsp;
+mod modulation_dsd_locale;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
 /// #8968 (PR 0) — banc de mesure de la jointure entre deux pistes.
 #[cfg(test)]

@@ -117,6 +117,10 @@ pub enum MotifEtape {
     /// Convolution cochée sans fichier de réponse impulsionnelle choisi :
     /// acceptée, mais elle ne traite rien tant qu'aucun filtre n'est choisi.
     NoFilterSelected,
+    /// rc14 — vers le DSD : la sortie locale ne prend pas la cible, ou la
+    /// piste est repartie en PCM ; `detail` porte le motif précis
+    /// (`tess::modulation_dsd::MotifDsdRefuse`, ex. `dsd_mode_not_enabled`).
+    DsdNotSupportedByOutput,
     #[serde(other)]
     Unknown,
 }

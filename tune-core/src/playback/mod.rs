@@ -2047,6 +2047,19 @@ impl PlaybackManager {
         });
     }
 
+    /// rc14 — publie le volume et la sourdine de la zone pour la
+    /// modulation DSD de TESS, SOUS le verrou des zones : une sourdine posée
+    /// en même temps ne peut pas être écrasée par une valeur lue avant elle.
+    pub async fn publier_le_volume_dsd(&self, zone_id: i64) {
+        let zones = self.zones.lock().await;
+        let (volume, muet) = zones
+            .get(&zone_id)
+            .map_or((ZoneState::default().volume, false), |s| {
+                (s.volume, s.muted)
+            });
+        crate::tess::modulation_dsd::publier_volume(zone_id, volume, muet);
+    }
+
     pub async fn set_volume(&self, zone_id: i64, volume: f64) {
         let mut zones = self.zones.lock().await;
         let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
@@ -2054,6 +2067,8 @@ impl PlaybackManager {
             ..Default::default()
         });
         state.volume = volume.clamp(0.0, 1.0);
+        // rc14 — publié pour la modulation DSD de TESS (lu sans verrou).
+        crate::tess::modulation_dsd::publier_volume(zone_id, state.volume, state.muted);
         self.emit(PlaybackEvent {
             event: "volume".into(),
             zone_id,
@@ -2126,6 +2141,7 @@ impl PlaybackManager {
         let mute_change = state.muted != muted;
         state.volume = volume;
         state.muted = muted;
+        crate::tess::modulation_dsd::publier_volume(zone_id, volume, muted);
         if volume_change {
             self.emit(PlaybackEvent {
                 event: "volume".into(),
@@ -2177,6 +2193,7 @@ impl PlaybackManager {
             zones.get_mut(&zone_id).map(|state| {
                 state.muted = muted;
                 state.last_mute_set_at = Some(Instant::now());
+                crate::tess::modulation_dsd::publier_volume(zone_id, state.volume, muted);
                 state.volume
             })
         };

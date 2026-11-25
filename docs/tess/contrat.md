@@ -251,6 +251,7 @@ Enregistrée sous `zone_{id}_tess_chain` (T02), échangée par
 | `must_be_last_plugin` | 409 | greffon `last_plugin` suivi d'un autre (même décoché) |
 | `mutually_exclusive` | 409 | deux membres cochés d'un groupe en politique `refuse` (le défaut) |
 | `premium_required` | **402** | greffon Premium **coché**, ou upsampling demandé, sans Premium, **`bypass_all` compris** (la chaîne garde ses maillons et les anciennes clés les reçoivent) |
+| `dsd_not_supported_by_output` | 409 | rc14 — upsampling vers une cible DSD **modifiée** que la sortie **locale** de la zone ne prend pas (après le contrôle du droit : un compte Free reçoit le 402). Corps : `reason` (motif précis, voir § 7) et `dsd_capabilities`. Rien n'est écrit : le suréchantillonnage en place n'est pas éteint. Les sorties réseau ne sont pas concernées. |
 
 Ce qui dépend du flux ou de l'installation n'est **pas** refusé au `PUT`
 (canaux, paquet désinstallé, droit perdu ensuite). La résolution l'éteint
@@ -332,6 +333,7 @@ chaîne. C'est le comportement de #7632.
 | `volume_not_software` | volume réglé par l'appareil, ou volume fixe |
 | `nothing_to_quantize` | rien ne modifie les échantillons ; le détail dit « Bit-perfect » |
 | `not_in_service` | T16 : résolu effectif, mais l'étage ne tourne pas (exécuteur ou sonde de la sortie) |
+| `dsd_not_supported_by_output` | rc14 : vers le DSD, la sortie locale ne prend pas la cible, ou la piste est repartie en PCM ; `detail` = motif précis (`dsd_mode_not_enabled`, `carrier_rate_not_supported`…). Sur `upsampling` et sur l'étape `dsd_modulator`, publiée éteinte. |
 
 ### Badge (A4)
 
@@ -532,6 +534,98 @@ Hors TESS, avec un motif affiché :
 Le serveur y ajoute (T08, champs facultatifs) la forme des autres refus de
 l'API : `error` (= `code`), `message` (= `detail`) et, sur un 402,
 `upgrade_url`.
+
+### `dsd_capabilities` (rc14, `tess::modulation_dsd`)
+
+Facultatif dans `zone_response` (absent d'un serveur antérieur : « inconnu »).
+Ce que la sortie de la zone fait de chaque cible DSD, **sans sonder le
+pilote, sans attendre une sortie occupée, sans mesurer la machine** (mesure
+en tâche de fond, en cache) :
+
+```json
+{
+  "dsd_mode": "dop", "output_local": true, "modulator_order": 7,
+  "reference_level": "0 dBFS = 50 % modulation (0 dB SACD)",
+  "volume_placement": "before_dsd_modulator", "machine_measured": true,
+  "status": "known",
+  "targets": [
+    { "rate": "dsd64", "rate_hz": 2822400, "accepted": true, "transport": "dop",
+      "dop_rate_hz": 176400, "reason": null, "native_reason": null,
+      "family_48k": { "rate_hz": 3072000, "accepted": true, "transport": "dop",
+                      "dop_rate_hz": 192000, "reason": null, "native_reason": null } },
+    …
+  ]
+}
+```
+
+- `accepted`/`transport`/`reason` à plat : famille 44,1 kHz (celle que
+  l'écran grise) ; `family_48k` : une piste 48/96/192 kHz y est modulée.
+- `transport` : `native` (ASIO `DsdU8`, ALSA `DSD_U32`, zone « natif » dont le
+  pilote déclare la cadence) ou `dop` ; `native_reason` dit pourquoi une zone
+  « natif » part en DoP. Le porteur est **toujours stéréo** : une source mono
+  est dupliquée, une source de plus de deux voies part en PCM.
+- `reason` : `output_not_local`, `dsd_mode_not_enabled` (zone `auto`/`pcm` :
+  jamais de DoP vers un DAC non déclaré), `rate_above_zone_max` (plafond de
+  zone, catalogue compris), `dop_refused_by_output` (sonde exclusive),
+  `carrier_rate_not_supported` (le périphérique a déjà rééchantillonné ce
+  porteur : constat retenu), `machine_too_slow` (marge ×2 de temps réel,
+  meilleure de trois passes, refaite après 10 min si elle refuse). À la
+  lecture seulement : `source_rate_not_modulable`, `channels_not_supported`,
+  `modulator_failed`.
+- **Niveau** : 0 dBFS PCM = 50 % de modulation = 0 dB SACD (T11b), limiteur
+  de sécurité à 60 %. L'étage de modulation a SA marge, −3 dB
+  (`MARGE_DU_MODULATEUR_DB`), indépendante du headroom automatique de la
+  chaîne PCM : appliquée en automatique, et plancher d'un headroom manuel
+  (un manuel plus fort, −6 dB, est gardé ; un plus faible, 0 dB, ne descend
+  pas sous −3 dB). Une crête intersample à +3 dB n'atteint jamais le
+  limiteur.
+- **`status`** : `unknown` tant que la sortie de la zone n'a jamais pu être
+  lue (sortie occupée, nom du périphérique jamais vu) : `targets` est alors
+  vide et le `PUT` ne refuse rien (la lecture décide et le dit).
+- **Volume (Q9)** : appliqué juste avant le modulateur. Un modulateur neuf
+  (piste, saut, relance) pose le niveau AVANT son premier échantillon :
+  jamais une milliseconde à 0 dB, même en sourdine. En cours de lecture, le
+  volume publié au changement (valeur atomique) est relu à chaque bloc et
+  suit une rampe de 10 ms. Le trim et le verrou PURE sont publiés de même
+  à chaque écriture de leurs réglages : quitter PURE en cours de piste rend
+  la main au volume. Il répond avec le retard de ce qui est déjà
+  modulé en aval : la session (≈ 0,4 s) plus l'anneau de la sortie locale
+  (≈ 2 s), soit **2 à 2,5 s**. Une baisse de volume ou la sourdine ne
+  relancent rien. La protection `dsd_volume_protection` (#8813) reste celle
+  des fichiers DSD. Proposé, non appliqué : un anneau réduit en mode modulé
+  (≈ 0,5 s) ramènerait la réponse vers 1 s, à mesurer sur Pi (famine).
+- **Repli en PCM** (file mixte, refus) : la piste joue au niveau PCM, soit
+  environ +6 dB au-dessus du même passage modulé (+9 dB avec la marge du
+  modulateur). Compensation simple possible, non appliquée : atténuer de 6
+  (ou 9) dB au rendu une piste repliée d'une zone vers le DSD.
+- **Rupture à l'ouverture** : si la sortie ouvre le périphérique à une autre
+  cadence que le porteur DoP (les marqueurs seraient détruits), la piste est
+  relancée à sa position et repart en PCM (`carrier_rate_not_supported`),
+  jamais en silence ; la cadence est ensuite refusée au `PUT`.
+- **Réglage à chaud** : un changement de la chaîne (égaliseur, convolution,
+  crossfeed…) pendant une piste modulée la relance à la même position. Le
+  préampli que garde la sortie est reporté dans le flux (lu en attendant la
+  sortie : jamais un 0 dB faute de verrou).
+- **Enchaînement** : la suivante de la file, annoncée par son pré-armement
+  gapless (lien explicite avec la session qui joue), de même famille et de
+  même cadence, reprend l'état du modulateur AU MOMENT où elle module son
+  premier bloc (elle attend que la piste en cours le dépose) : ni silence ni
+  clôture. L'attente dure tant que la piste en cours avance ; une fois la
+  suivante réellement lue par la sortie, elle ne dépasse pas 1,5 s sans
+  avance (producteur bloqué), puis la suivante part d'un modulateur neuf.
+  Aucune autre piste ne reprend jamais un état. Chaque piste émet un nombre
+  pair de trames DoP. **Sans clic en DoP seulement** : en DSD natif, la
+  sortie rouvre son bras à chaque piste, l'état du modulateur passe mais la
+  jonction n'est pas garantie sans clic.
+- **Longueur annoncée** : le producteur ne dépasse jamais la longueur de
+  données que son en-tête WAV annonce (la sortie ne lirait plus) ; il
+  s'arrête et abandonne son relais plutôt que de rester bloqué.
+
+Sur le chemin résolu, une cible acceptée ajoute à l'étape `dsd_modulator`
+`order`, `rate_hz`, `transport`, `dop_rate_hz` et `zero_dbfs_modulation`
+(0,5) ; le chemin du signal (T16) de la piste qui joue y ajoute
+`carrier_rate_hz`, `source_rate_hz`, `source_channels`, `channels`,
+`continued` et `reference_level` (« 0 dB SACD »).
 
 ### Routes (T08, `tune-server/src/routes/zones/tess.rs`)
 
