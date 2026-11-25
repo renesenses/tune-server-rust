@@ -31,6 +31,7 @@ const ZONE: i64 = 7;
 /// et les autres essais tiennent la zone 7 en même temps.
 const ZONE_BON: i64 = 701;
 const ZONE_PANIQUE: i64 = 702;
+const ZONE_RENDU: i64 = 703;
 
 /// La zone simulée du test de niveau : elle ouvre le signal par le
 /// fournisseur, comme l'orchestrateur, et le dépose dans la boucle que le
@@ -105,6 +106,9 @@ impl ZoneDeTest for ZoneSimulee {
 struct HoteOrphelin {
     simule: Arc<HoteSimule>,
     inactive: Option<SortieInactive>,
+    /// Relecture m1 — la garde de contournement tenait-elle la zone à chaque
+    /// réglage du volume ?
+    contournee_au_volume: Mutex<Vec<bool>>,
 }
 
 impl HoteZone for HoteOrphelin {
@@ -112,6 +116,10 @@ impl HoteZone for HoteOrphelin {
         self.simule.volume(zone_id)
     }
     fn regler_volume(&self, zone_id: i64, volume_pct: f64) -> Result<(), String> {
+        self.contournee_au_volume
+            .lock()
+            .unwrap()
+            .push(tune_core::audio::mesure_nue::active(zone_id));
         self.simule.regler_volume(zone_id, volume_pct)
     }
     fn jouer(&self, zone_id: i64, element: ElementBalayage) -> Result<(), String> {
@@ -137,6 +145,7 @@ impl HoteZone for HoteOrphelin {
 struct Banc {
     controleur: Arc<Controleur>,
     hote: Arc<HoteSimule>,
+    orphelin: Arc<HoteOrphelin>,
     zone: Arc<ZoneSimulee>,
     micro: Arc<MicroSimule>,
     boucle: Arc<Boucle>,
@@ -158,13 +167,15 @@ fn banc_asio(
     let fournisseur = FournisseurBalayage::new();
     let hote = HoteSimule::new(fournisseur.clone(), boucle.clone(), Some(50.0));
     // Fil 3094 (#9528) — la zone orpheline vient de l'hôte de la mesure.
-    let hote_zone: Arc<dyn HoteZone> = Arc::new(HoteOrphelin {
+    let orphelin = Arc::new(HoteOrphelin {
         simule: hote.clone(),
         inactive: inactive.map(|d| SortieInactive {
             device_id: d.to_string(),
             porteuse: Some((3, "Salon (DAC)".into())),
         }),
+        contournee_au_volume: Mutex::default(),
     });
+    let hote_zone: Arc<dyn HoteZone> = orphelin.clone();
     let micro = Arc::new(MicroSimule {
         nom: MICRO.into(),
         frequence: FREQUENCE_MESURE,
@@ -193,6 +204,7 @@ fn banc_asio(
     Banc {
         controleur,
         hote,
+        orphelin,
         zone,
         micro,
         boucle,
@@ -379,6 +391,27 @@ fn une_zone_en_lecture_est_refusee() {
         .expect("l'écoute seule reste possible");
     attendre_fin(&b.controleur, &id, Duration::from_secs(30));
     assert!(b.zone.journal.lock().unwrap().is_empty());
+}
+
+/// Relecture m1 (#9529 avec #9537) — le volume de mesure est posé SOUS la
+/// garde de contournement (verrou PURE levé), le volume d'avant est rendu
+/// APRÈS elle : en PURE « Forcer à 100 % », le verrou le tient de nouveau.
+#[test]
+fn le_volume_d_avant_est_rendu_apres_la_garde_de_contournement() {
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let b = banc(&sim, 1.0, None, "rendu");
+    let id = b
+        .controleur
+        .tester_niveau(DemandeNiveau::signal(ZONE_RENDU, MICRO))
+        .expect("lancé");
+    attendre_fin(&b.controleur, &id, Duration::from_secs(30));
+    assert_eq!(b.hote.journal().volumes, vec![40.0, 50.0]);
+    assert_eq!(
+        *b.orphelin.contournee_au_volume.lock().unwrap(),
+        vec![true, false],
+        "mesure sous la garde, volume d'avant rendu après elle"
+    );
+    assert!(!tune_core::audio::mesure_nue::active(ZONE_RENDU));
 }
 
 /// Relecture m5 — le fil du test panique : l'état devient « erreur »,

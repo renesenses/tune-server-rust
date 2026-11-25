@@ -1272,7 +1272,10 @@ struct ZoneTenuePourLeTest<'a> {
     zone_id: i64,
     volume_initial: f64,
     signal: Option<String>,
-    _contournement: tune_core::audio::mesure_nue::Contournement,
+    /// Rendue dans `drop` AVANT le volume, comme `ZoneTenue::rendre` : tant
+    /// qu'elle vit, le verrou de volume PURE est levé (#9537), et le volume
+    /// d'avant serait rendu sans lui.
+    contournement: Option<tune_core::audio::mesure_nue::Contournement>,
 }
 
 impl Drop for ZoneTenuePourLeTest<'_> {
@@ -1281,6 +1284,10 @@ impl Drop for ZoneTenuePourLeTest<'_> {
             self.zone.arreter_signal(self.zone_id, &id);
             self.controleur.niveaux.fournisseur.desarmer(&id);
         }
+        // Relecture m1 (#9529 avec #9537) — signal arrêté : la garde tombe
+        // d'abord, le verrou PURE revient, PUIS le volume d'avant est rendu
+        // (sous le verrou, « Forcer à 100 % » le tient de nouveau).
+        drop(self.contournement.take());
         if let Err(e) = self
             .controleur
             .hote
@@ -1594,7 +1601,7 @@ impl Controleur {
             zone_id,
             volume_initial,
             signal: None,
-            _contournement: contournement,
+            contournement: Some(contournement),
         };
         let horloge: HorlogeDEcoute = {
             let t = tampon.clone();
