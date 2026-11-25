@@ -14,8 +14,13 @@ pub mod autoeq_base;
 pub mod bornes_cue;
 pub mod canaux_declares;
 pub mod canaux_reseau_4573;
+/// rc14 — les réglages du greffon « Casque » tirés d'une correction OPRA.
+pub mod casque_opra;
 /// #6385 — les profils d'égaliseur OPRA (JSON), lus vers le même modèle.
 pub mod opra;
+/// rc14 — la base OPRA en ligne (greffon TESS « Casque ») : recherche,
+/// corrections, copie locale.
+pub mod opra_base;
 
 pub mod bitperfect_strict;
 /// #4969 — la carte des canaux de SORTIE (réaffectation, disposition,

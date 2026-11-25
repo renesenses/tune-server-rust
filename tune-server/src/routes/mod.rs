@@ -531,6 +531,15 @@ pub fn router_with_plugins(
         .nest("/zones", zones_and_playback)
         // TESS T08 — le catalogue ; 404 = serveur sans TESS (écran caché).
         .route("/tess/catalog", get(zones::tess::catalogue_tess_route))
+        // rc14 — le greffon « Casque » : chercher un casque dans OPRA.
+        .route(
+            "/tess/headphone/search",
+            get(zones::tess_casque::chercher_un_casque),
+        )
+        .route(
+            "/tess/headphone/profile",
+            get(zones::tess_casque::apercu_d_un_casque),
+        )
         // TESS T17 — préréglages de chaîne (globaux) et mode d'application.
         .route(
             "/tess/presets",
