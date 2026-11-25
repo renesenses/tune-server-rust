@@ -254,7 +254,11 @@ async fn la_correction_appliquee_reste_dans_la_chaine_tess_apres_un_nouveau_prof
     let tess = format!("/api/v1/zones/{zone}/tess");
     let (status, v) = appel(&app, "GET", &tess, None).await;
     assert_eq!(status, StatusCode::OK, "{v}");
-    assert_eq!(facades(&v), vec![("room-correction".to_owned(), true)], "{v}");
+    assert_eq!(
+        facades(&v),
+        vec![("room-correction".to_owned(), true)],
+        "{v}"
+    );
 
     // Nouvelle mesure enregistrée, pas encore appliquée.
     let (status, corps) = appel(&app, "POST", &chemin, Some(profil(-3.0))).await;

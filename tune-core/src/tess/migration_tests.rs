@@ -2701,7 +2701,10 @@ fn une_correction_de_piece_eteinte_par_une_ancienne_route_reste_une_correction_d
 
     // Contre-épreuve : une NOUVELLE courbe graphique écrite par l'écran de
     // l'égaliseur prend bien la façade graphique (un seul moteur).
-    let g = profil(true, graphique(10, |i| if i == 3 { 2.0 } else { 0.0 }, &[None]));
+    let g = profil(
+        true,
+        graphique(10, |i| if i == 3 { 2.0 } else { 0.0 }, &[None]),
+    );
     s.set(&cle, &serde_json::to_string(&g).unwrap()).unwrap();
     assert_eq!(
         ids(&lire_zone(&s, z, true).unwrap().chaine),
@@ -2722,12 +2725,11 @@ fn une_correction_appliquee_reste_une_correction_apres_un_nouveau_profil_de_piec
     assert_eq!(ids(&b.chaine), vec![(ID_CORRECTION_PIECE, true)]);
 
     // Nouveau profil de pièce, pas appliqué.
-    let mut autre = serde_json::from_str::<Value>(
-        &s.get(&format!("room_profile_{z}")).unwrap().unwrap(),
-    )
-    .unwrap();
+    let brut = s.get(&format!("room_profile_{z}")).unwrap().unwrap();
+    let mut autre: Value = serde_json::from_str(&brut).unwrap();
     autre["filters"][0]["gain_db"] = json!(-2.0);
-    s.set(&format!("room_profile_{z}"), &autre.to_string()).unwrap();
+    s.set(&format!("room_profile_{z}"), &autre.to_string())
+        .unwrap();
 
     let cle = format!("zone_{z}_eq_profile");
     let mut p: EqProfile = serde_json::from_str(&s.get(&cle).unwrap().unwrap()).unwrap();
