@@ -132,6 +132,7 @@ pub mod system;
 pub mod tagger;
 pub mod tags;
 pub mod upnp;
+pub mod upnp_icones;
 pub mod upnp_media_renderer;
 pub mod upnp_media_server;
 pub mod versions;
@@ -812,6 +813,10 @@ pub fn router_with_plugins(
     if let Some(upnp) = upnp_routes {
         app = app.nest("/upnp", upnp);
     }
+
+    // #9483 — le logo de Tune annoncé par le MediaServer et par chaque
+    // MediaRenderer. À la racine, hors authentification, toujours monté.
+    app = app.merge(upnp_icones::router());
 
     // MediaRenderer:1 par zone (#1750) — routes toujours montées, mais
     // chaque handler vérifie l'opt-in `zone_{id}_upnp_renderer` (404 sinon)
