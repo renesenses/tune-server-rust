@@ -556,18 +556,6 @@ pub(super) async fn set_zone_dsp(
             return response;
         }
     }
-    // rc14 — l'égaliseur paramétrique est Premium, ici comme par
-    // `PUT /zones/{id}/tess` ; le graphique et le casque restent libres.
-    // Vérifié avant toute écriture, comme le crossfeed.
-    if let Some(eq_val) = body.get("eq_profile")
-        && let Ok(profile) =
-            serde_json::from_value::<tune_core::audio::eq::EqProfile>(eq_val.clone())
-        && let Err(resp) =
-            crate::routes::eq_parametrique_premium::exiger_le_droit(&state, id, &profile, &headers)
-                .await
-    {
-        return resp;
-    }
     // Handle eq_profile if present
     let mut eq_applique_a_chaud = false;
     let mut eq_portee: Option<tune_core::orchestrator::PorteeDuReglage> = None;

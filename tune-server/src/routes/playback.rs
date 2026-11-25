@@ -7422,14 +7422,6 @@ async fn set_eq(
             }
         }
     }
-    // rc14 — l'égaliseur paramétrique est Premium, ici comme par
-    // `PUT /zones/{id}/tess` ; le graphique et le casque restent libres.
-    if let Err(resp) =
-        crate::routes::eq_parametrique_premium::exiger_le_droit(&state, zone_id, &profile, &headers)
-            .await
-    {
-        return resp;
-    }
     let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
 
     // Persister ne suffit pas : sans ceci, le reglage n'atteignait le son qu'a
