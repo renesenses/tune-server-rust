@@ -410,7 +410,11 @@ pub fn lundeby(e: &[f64], sample_rate: u32) -> Option<NoiseCrossing> {
         env.iter()
             .enumerate()
             .fold((0usize, f64::NEG_INFINITY), |m, (i, &(_, l))| {
-                if l > m.1 { (i, l) } else { m }
+                if l > m.1 {
+                    (i, l)
+                } else {
+                    m
+                }
             })
     };
     let (mut imax, mut lmax) = crete(&env);
