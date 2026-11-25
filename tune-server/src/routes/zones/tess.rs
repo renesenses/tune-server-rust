@@ -626,6 +626,32 @@ pub fn valider_le_put(
     if premium {
         return Ok(());
     }
+    // rc14 — un greffon Premium DÉCOCHÉ ne demande aucun droit, mais ses
+    // réglages non plus ne changent pas sans le droit : comme le cocher, les
+    // modifier est refusé (402). Ses réglages enregistrés, renvoyés tels
+    // quels, et un ajout sans réglages (`settings: null`) restent libres.
+    for m in chaine.plugins.iter().filter(|m| !m.enabled) {
+        let premium_requis = catalogue.get(&m.id).is_some_and(|d| d.demande_le_premium());
+        if !premium_requis || correction_estimee(m) {
+            continue;
+        }
+        // La marque `replaced_in_group`, posée par le serveur
+        // (`normaliser_les_egaliseurs`), n'est pas un réglage.
+        let sans_marque = |v: &Value| {
+            let mut v = v.clone();
+            if let Value::Object(o) = &mut v {
+                o.remove(tune_core::tess::migration::MARQUE_REMPLACE);
+            }
+            v
+        };
+        let reglages_changes = match enregistree.plugins.iter().find(|e| e.id == m.id) {
+            Some(e) => sans_marque(&e.settings) != sans_marque(&m.settings),
+            None => !m.settings.is_null(),
+        };
+        if reglages_changes {
+            return Err(ErreurChaine::PremiumRequis(m.id.clone()));
+        }
+    }
     // Un maillon (ou l'upsampling) inchangé est exempté, `bypass_all` ou
     // non : `ChaineTess::valider` contrôlant le droit sous `bypass_all`, la
     // chaîne enregistrée l'a passé (ou vient des anciennes routes, qui ont le
