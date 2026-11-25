@@ -83,7 +83,10 @@ pub fn borner_le_schema(id: &str, schema: &mut Value) {
     *items = resolu;
     if let Some(props) = items
         .as_object_mut()
-        .map(|o| o.entry("properties").or_insert_with(|| serde_json::json!({})))
+        .map(|o| {
+            o.entry("properties")
+                .or_insert_with(|| serde_json::json!({}))
+        })
         .and_then(Value::as_object_mut)
     {
         let gain = props
@@ -108,7 +111,10 @@ fn bande_a_gain(b: &Value) -> bool {
 /// reste dans [`bornes_de_gain`] (409 `invalid_settings` sinon). Un maillon
 /// inchangé n'est pas revérifié : un profil enregistré par une ancienne route
 /// (jusqu'à ±24 dB) se garde tel quel.
-pub fn verifier_les_gains(chaine: &ChaineTess, enregistree: &ChaineTess) -> Result<(), ErreurChaine> {
+pub fn verifier_les_gains(
+    chaine: &ChaineTess,
+    enregistree: &ChaineTess,
+) -> Result<(), ErreurChaine> {
     for m in &chaine.plugins {
         let Some((min, max)) = bornes_de_gain(&m.id) else {
             continue;
@@ -205,7 +211,10 @@ pub fn combiner_en_serie(profils: &[EqProfile]) -> Option<EqProfile> {
 
 /// La chaîne ENREGISTRÉE de la zone, sans la relire (rapide).
 fn chaine_brute(settings: &SettingsRepo, zone_id: i64) -> Option<ChaineTess> {
-    let brut = settings.get(&super::cle_chaine_zone(zone_id)).ok().flatten()?;
+    let brut = settings
+        .get(&super::cle_chaine_zone(zone_id))
+        .ok()
+        .flatten()?;
     serde_json::from_str(&brut).ok()
 }
 
@@ -223,7 +232,10 @@ pub fn bypass_all_de_zone(settings: &SettingsRepo, zone_id: i64) -> bool {
 /// Les égaliseurs cochés d'une chaîne, dans l'ordre, et la marge manuelle.
 /// `principal` sert à une façade sans réglages (`null`) : c'est
 /// `zone_{id}_eq_profile`.
-pub fn profil_de_la_chaine(chaine: &ChaineTess, principal: Option<&EqProfile>) -> Option<EqProfile> {
+pub fn profil_de_la_chaine(
+    chaine: &ChaineTess,
+    principal: Option<&EqProfile>,
+) -> Option<EqProfile> {
     let mut profils = Vec::new();
     for m in chaine
         .plugins

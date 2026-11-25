@@ -128,7 +128,11 @@ fn les_curseurs_jouent_aussi_en_serie() {
     let p = parametrique();
     let c = combiner_en_serie(&[curseurs.clone(), p.clone()]).unwrap();
     let f = frequences();
-    let (ra, rp, rc) = (courbe_db(&curseurs, &f), courbe_db(&p, &f), courbe_db(&c, &f));
+    let (ra, rp, rc) = (
+        courbe_db(&curseurs, &f),
+        courbe_db(&p, &f),
+        courbe_db(&c, &f),
+    );
     for i in 0..f.len() {
         assert!((rc[0][i] - ra[0][i] - rp[0][i]).abs() < 1e-6, "{} Hz", f[i]);
     }
@@ -238,7 +242,10 @@ fn le_schema_publie_les_bornes_rc14() {
     let mut s2 = s.clone();
     borner_le_schema("equalizer-graphic", &mut s2);
     let g = &s2["properties"]["bands"]["items"]["properties"]["gain"];
-    assert_eq!((g["minimum"].clone(), g["maximum"].clone()), (json!(-12.0), json!(12.0)));
+    assert_eq!(
+        (g["minimum"].clone(), g["maximum"].clone()),
+        (json!(-12.0), json!(12.0))
+    );
     let mut cf = json!({"type": "object"});
     borner_le_schema("crossfeed", &mut cf);
     assert_eq!(cf, json!({"type": "object"}));

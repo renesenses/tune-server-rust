@@ -1237,13 +1237,18 @@ async fn prereglage_a_deux_egaliseurs_charge_les_deux_rc14() {
         }
     }
     let mut liste = tune_core::tess::prereglages::lire(&b.settings()).unwrap();
-    for (id, chain) in [("ancien", chaine_a_deux_egaliseurs()), ("normalise", normalise)] {
-        liste.presets.push(tune_core::tess::prereglages::PreReglage {
-            id: id.into(),
-            name: id.into(),
-            builtin: false,
-            chain,
-        });
+    for (id, chain) in [
+        ("ancien", chaine_a_deux_egaliseurs()),
+        ("normalise", normalise),
+    ] {
+        liste
+            .presets
+            .push(tune_core::tess::prereglages::PreReglage {
+                id: id.into(),
+                name: id.into(),
+                builtin: false,
+                chain,
+            });
     }
     b.settings()
         .set(

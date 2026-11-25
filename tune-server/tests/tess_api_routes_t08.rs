@@ -1191,7 +1191,10 @@ async fn deux_egaliseurs_coches_passent_et_s_enchainent_rc14() {
         .brut(Method::GET, "/api/v1/tess/catalog", None, None)
         .await;
     let groupes = cat["catalog"]["groups"].as_array().unwrap();
-    assert!(!groupes.iter().any(|x| x["id"] == json!("equalizer")), "{cat}");
+    assert!(
+        !groupes.iter().any(|x| x["id"] == json!("equalizer")),
+        "{cat}"
+    );
     // Groupe crossfeed inchangé : toujours 409.
     let (s, v) = b
         .put(json!({"version": 1, "plugins": [{"id": "crossfeed", "enabled": true}, {"id": "crosstalk", "enabled": true}]}))
@@ -1262,7 +1265,11 @@ async fn les_bornes_de_gain_sont_publiees_et_tenues_rc14() {
         ("equalizer-graphic", -12.0, 12.0),
     ] {
         let g = gain(id);
-        assert_eq!((g["minimum"].as_f64(), g["maximum"].as_f64()), (Some(min), Some(max)), "{id} : {g}");
+        assert_eq!(
+            (g["minimum"].as_f64(), g["maximum"].as_f64()),
+            (Some(min), Some(max)),
+            "{id} : {g}"
+        );
     }
     let parametrique = |g: f64| {
         json!({"version": 1, "plugins": [

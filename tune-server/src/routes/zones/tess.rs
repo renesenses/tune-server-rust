@@ -150,10 +150,7 @@ pub fn catalogue_tess(paquets_charges: &[String]) -> Catalogue {
         if let Some(brut) = schema_de_reference(&d.id) {
             d.settings_schema = schema_de_maillon(brut);
             // rc14 — les bornes de gain d'une bande, que l'interface suit.
-            tune_core::tess::egaliseurs_en_serie::borner_le_schema(
-                &d.id,
-                &mut d.settings_schema,
-            );
+            tune_core::tess::egaliseurs_en_serie::borner_le_schema(&d.id, &mut d.settings_schema);
         }
     }
     for id in paquets_charges {
@@ -726,8 +723,7 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     // rc14 — le mode PURE basculé par un préréglage (« Pure » l'allume), ou
     // « Bypass all » basculé (`ecrire_chaine` rend alors la clé de la chaîne) :
     // même garde dans le moteur (`traitements_contournes`), même bascule.
-    if cles.contains(&cle_mode_pure(id)) || cles.contains(&tune_core::tess::cle_chaine_zone(id))
-    {
+    if cles.contains(&cle_mode_pure(id)) || cles.contains(&tune_core::tess::cle_chaine_zone(id)) {
         let _ = state.orchestrator.apply_audiophile_change_portee(id).await;
     }
 }

@@ -78,7 +78,7 @@ fn parametrique() -> EqProfile {
     EqProfile {
         enabled: true,
         bands: vec![
-            bande(3150.0, -28.0, 6.0, "peak"),
+            bande(3150.0, -28.0, 2.0, "peak"),
             bande(120.0, -4.0, 0.7, "low_shelf"),
         ],
         ..Default::default()
@@ -120,7 +120,8 @@ fn pcm() -> Vec<u8> {
 /// Le flux que la zone sert (relais réseau : égaliseur, convolution,
 /// crossfeed, compensation, ReplayGain).
 fn servi(o: &PlaybackOrchestrator, zone_id: i64) -> Vec<u8> {
-    let mut chaine = o.load_streaming_dsp(zone_id, crate::audio::replaygain::PisteRg::AUCUNE, SR, 2);
+    let mut chaine =
+        o.load_streaming_dsp(zone_id, crate::audio::replaygain::PisteRg::AUCUNE, SR, 2);
     let mut x = pcm();
     for bloc in x.chunks_mut(6 * 4096) {
         chaine.process(bloc, 24);
@@ -173,7 +174,7 @@ async fn graphique_et_parametrique_sonnent_ensemble_en_serie_rc14() {
         );
     }
     // Le creux à −28 dB du paramétrique est entendu (le moteur bornait à −24).
-    assert!(rp[0][5] < -27.0, "{}", rp[0][5]);
+    assert!(rp[0][5] < -27.5, "{}", rp[0][5]);
 
     // Ordre inversé dans la chaîne : bandes inversées.
     let inverse = ChaineTess {
@@ -187,7 +188,10 @@ async fn graphique_et_parametrique_sonnent_ensemble_en_serie_rc14() {
     ecrire_chaine(&settings(&o), z, &inverse).unwrap();
     let moteur = o.load_eq_profile(z).unwrap();
     let freqs: Vec<f64> = p.bands.iter().chain(&g.bands).map(|b| b.freq).collect();
-    assert_eq!(moteur.bands.iter().map(|b| b.freq).collect::<Vec<_>>(), freqs);
+    assert_eq!(
+        moteur.bands.iter().map(|b| b.freq).collect::<Vec<_>>(),
+        freqs
+    );
 
     // Un seul coché : lui seul.
     let mut un = inverse.clone();
@@ -245,10 +249,7 @@ async fn bypass_all_rend_le_flux_sans_traitement_a_l_echantillon_pres_rc14() {
         .set(&format!("zone_{z}_mono_downmix"), "true")
         .unwrap();
     settings(&o)
-        .set(
-            &crate::audio::frequence_fixe::cle_de_zone(z),
-            "96000",
-        )
+        .set(&crate::audio::frequence_fixe::cle_de_zone(z), "96000")
         .unwrap();
     let source = pcm();
     let traite = servi(&o, z);
@@ -265,7 +266,10 @@ async fn bypass_all_rend_le_flux_sans_traitement_a_l_echantillon_pres_rc14() {
     assert!(o.load_eq_profile(z).is_none());
     assert!(o.load_crossfeed_processor(z, SR).is_none());
     assert!(!PlaybackOrchestrator::zone_mono_downmix_with(&o.db, z));
-    assert_eq!(crate::audio::frequence_fixe::demandee_active(&o.db, z), None);
+    assert_eq!(
+        crate::audio::frequence_fixe::demandee_active(&o.db, z),
+        None
+    );
     let contourne = servi(&o, z);
     assert_eq!(contourne, source, "Bypass all a laissé un traitement");
     assert_eq!(contourne, servi(&o, nue));
@@ -290,7 +294,10 @@ async fn une_zone_d_avant_joue_comme_avant_rc14() {
     assert_eq!(avant, serde_json::from_str::<Value>(&brut).unwrap());
     migrer_zone(&settings(&o), z).unwrap();
     assert!(crate::tess::egaliseurs_en_serie::egaliseurs_de_zone(&settings(&o), z).is_none());
-    assert_eq!(serde_json::to_value(o.load_eq_profile(z).unwrap()).unwrap(), avant);
+    assert_eq!(
+        serde_json::to_value(o.load_eq_profile(z).unwrap()).unwrap(),
+        avant
+    );
     assert_eq!(
         settings(&o).get(&format!("zone_{z}_eq_profile")).unwrap(),
         Some(brut)
