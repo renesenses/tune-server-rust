@@ -215,8 +215,90 @@ pub struct EqProcessor {
     /// jusqu'au signal sec, sans la borne de volume de #6741. Suit le neutre
     /// d'une piste à l'autre ; un égaliseur réactivé repart sans.
     libere: bool,
+    /// rc14 (sécurité auditive, PURE et « Bypass all ») — les étages que
+    /// l'entrée en PURE retire (convolution, crossfeed, repli mono), joués
+    /// encore le temps d'un fondu vers le signal sec (voir [`ChaineSortante`]).
+    /// Porté par l'égaliseur COUPÉ de la transition : tant qu'il est là, le
+    /// neutre n'est pas au repos.
+    chaine_sortante: Option<ChaineSortante>,
     clipping: CompteurDEcretage,
     closed: AtomicBool,
+}
+
+/// rc14 (sécurité auditive, décision de Bertrand du 25/11) — ce que l'entrée
+/// en PURE ou en « Bypass all » retire en plus de l'égaliseur : la
+/// convolution (souvent −6 à −12 dB de réserve), le crossfeed, le repli
+/// mono. Les couper d'un bloc à l'autre faisait sauter le niveau (et le
+/// signal : un clic). L'exécuteur de la sortie locale les joue encore le
+/// temps de [`RAMPE_DE_BASCULE_MS`], sur une copie, et passe en fondu du
+/// signal traité au signal sec ; le sec est multiplié par `gain`, le niveau
+/// de cette chaîne MESURÉ sur la musique (rapport des énergies, jamais
+/// au-dessus de 1). Le fondu fini, ce gain rejoint le gain gardé de
+/// l'égaliseur coupé, qui remonte vers le niveau d'avant le traitement en
+/// [`TRANSITION_PURE_MS`], jamais au-delà ([`EqProcessor::terminer_la_chaine_sortante`]).
+pub struct ChaineSortante {
+    /// Le crossfeed retiré de la sortie (stéréo seulement).
+    pub crossfeed: Option<super::crossfeed::CrossfeedProcessor>,
+    /// Le repli mono était armé.
+    pub mono: bool,
+    /// Le convolveur de la sortie est à jouer (il y reste installé sous PURE).
+    pub convolution: bool,
+    /// Trames déjà fondues, sur `total`.
+    pub fait: usize,
+    pub total: usize,
+    /// Le gain appliqué au signal sec (niveau de la chaîne), entre 0 et 1.
+    pub gain: f64,
+    /// Énergies cumulées du traité et du sec, pour la mesure de `gain`.
+    pub energie_traitee: f64,
+    pub energie_seche: f64,
+}
+
+impl ChaineSortante {
+    /// Le plus bas gain retenu pour la chaîne : −30 dB.
+    pub const GAIN_MIN: f64 = 0.031_622_776_601_683_79;
+
+    /// Une chaîne à fondre en [`RAMPE_DE_BASCULE_MS`] à `sample_rate`, au
+    /// gain de départ `estime` (avant toute mesure). `None` sans rien à fondre.
+    pub fn nouvelle(
+        crossfeed: Option<super::crossfeed::CrossfeedProcessor>,
+        mono: bool,
+        convolution: bool,
+        sample_rate: u32,
+        estime: f64,
+    ) -> Option<Self> {
+        if crossfeed.is_none() && !mono && !convolution {
+            return None;
+        }
+        let total =
+            (u64::from(sample_rate) * u64::from(RAMPE_DE_BASCULE_MS) / 1000).max(1) as usize;
+        let gain = if estime.is_finite() {
+            estime.clamp(Self::GAIN_MIN, 1.0)
+        } else {
+            1.0
+        };
+        Some(Self {
+            crossfeed,
+            mono,
+            convolution,
+            fait: 0,
+            total,
+            gain,
+            energie_traitee: 0.0,
+            energie_seche: 0.0,
+        })
+    }
+
+    /// Le gain mesuré jusqu'ici : `√(énergie traitée / énergie sèche)`,
+    /// borné à `[GAIN_MIN, 1]` ; l'estimation tant que le sec est muet.
+    pub fn gain_mesure(&self) -> f64 {
+        if self.energie_seche > 1e-9 {
+            (self.energie_traitee / self.energie_seche)
+                .sqrt()
+                .clamp(Self::GAIN_MIN, 1.0)
+        } else {
+            self.gain
+        }
+    }
 }
 enum Engine {
     Bundled(tune_plugin_equalizer::EqProcessor),
@@ -272,6 +354,7 @@ impl EqProcessor {
             // #6741 — 0 : sans borne posée par la sortie, rien ne remonte.
             borne_de_remontee: 0.0,
             libere: false,
+            chaine_sortante: None,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
@@ -315,6 +398,7 @@ impl EqProcessor {
             extinction: None,
             borne_de_remontee: precedent.borne_de_remontee,
             libere: false,
+            chaine_sortante: None,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
@@ -469,6 +553,7 @@ impl EqProcessor {
             extinction: None,
             borne_de_remontee: self.borne_de_remontee,
             libere: self.libere,
+            chaine_sortante: None,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         };
@@ -673,6 +758,132 @@ impl EqProcessor {
         }
     }
 
+    /// rc14 (sécurité auditive) — un égaliseur COUPÉ qui ne garde rien
+    /// encore : le porteur d'une [`ChaineSortante`] quand l'entrée en PURE
+    /// trouve une chaîne sans égaliseur. Au repos dès que la chaîne est
+    /// fondue et qu'aucun gain n'est gardé.
+    pub fn neutre_de_transition(sample_rate: u32, channels: u16) -> Self {
+        Self {
+            engine: Engine::Neutre,
+            sample_rate,
+            channels,
+            fondu: None,
+            compensation: 1.0,
+            gain_moyen_db: 0.0,
+            gain_garde: None,
+            extinction: None,
+            borne_de_remontee: 0.0,
+            libere: false,
+            chaine_sortante: None,
+            clipping: Default::default(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// rc14 (sécurité auditive, flux réseau REFAIT) — un égaliseur coupé qui
+    /// garde `gain` (le niveau hors courbe du flux qu'on quitte) et le rend
+    /// jusqu'à `borne` (#6741), jamais au-delà. `None` pour un gain illisible
+    /// ou à l'unité : rien à garder.
+    pub fn neutre_qui_garde(
+        sample_rate: u32,
+        channels: u16,
+        gain: f64,
+        borne: f64,
+    ) -> Option<Self> {
+        if !(gain.is_finite() && gain > 0.0) || gain >= 1.0 - 1e-6 {
+            return None;
+        }
+        let mut neutre = Self::neutre_de_transition(sample_rate, channels);
+        neutre.borne_de_remontee = if borne.is_finite() && borne > 0.0 {
+            borne.min(1.0) as f32
+        } else {
+            0.0
+        };
+        neutre.gain_garde = Some(vec![gain as f32]);
+        neutre.eteindre_sans_hausse();
+        Some(neutre)
+    }
+
+    /// rc14 (sécurité auditive) — le niveau hors courbe que cet étage rend
+    /// en ce moment (le plus bas des canaux) : préampli × compensation ×
+    /// retenue d'un égaliseur actif, gain gardé d'un égaliseur coupé, niveau
+    /// de la chaîne sortante qu'il fond. 1,0 pour un neutre au repos.
+    pub fn niveau_hors_courbe(&self) -> f64 {
+        let chaine = self
+            .chaine_sortante
+            .as_ref()
+            .map_or(1.0, |c| c.gain.clamp(0.0, 1.0));
+        (0..self.channels.max(1))
+            .map(|c| self.niveau_atteint(c))
+            .filter(|n| n.is_finite())
+            .fold(1.0_f64, f64::min)
+            .max(0.0)
+            * chaine
+    }
+
+    /// rc14 (PURE) — confie à cet égaliseur COUPÉ la chaîne que l'entrée en
+    /// PURE retire, à fondre vers le signal sec. Sans effet hors d'un neutre.
+    pub fn poser_la_chaine_sortante(&mut self, chaine: ChaineSortante) {
+        if self.est_neutre() {
+            self.chaine_sortante = Some(chaine);
+        }
+    }
+
+    /// rc14 (PURE) — la chaîne sortante, retirée le temps d'un bloc :
+    /// l'exécuteur la joue hors du verrou de l'égaliseur, puis la rend
+    /// ([`Self::rendre_la_chaine_sortante`]) ou la termine.
+    pub fn prendre_la_chaine_sortante(&mut self) -> Option<ChaineSortante> {
+        self.chaine_sortante.take()
+    }
+
+    /// rc14 (PURE) — remettre la chaîne sortante après un bloc.
+    pub fn rendre_la_chaine_sortante(&mut self, chaine: ChaineSortante) {
+        self.poser_la_chaine_sortante(chaine);
+    }
+
+    /// rc14 (PURE) — une chaîne sortante est-elle en train de fondre ?
+    pub fn fond_une_chaine(&self) -> bool {
+        self.chaine_sortante.is_some()
+    }
+
+    /// rc14 (PURE) — le fondu de la chaîne sortante est fini : son niveau
+    /// `gain` (mesuré) rejoint le gain gardé, sans saut (le sec en portait
+    /// déjà la valeur), puis tout remonte vers `min(1, borne)` en `ms`,
+    /// jamais au-delà (#6741). Volume inchangé : identité exacte au bout,
+    /// le neutre se retire. Volume monté : le surplus reste gardé, voyant
+    /// et « Rendre le niveau » (#6524).
+    pub fn terminer_la_chaine_sortante(&mut self, gain: f64, ms: u32) {
+        self.chaine_sortante = None;
+        if !self.est_neutre() {
+            return;
+        }
+        let g = if gain.is_finite() && gain > 0.0 {
+            gain.min(1.0) as f32
+        } else {
+            1.0
+        };
+        let atteint: Vec<f32> = match self.extinction.take() {
+            Some(ext) => {
+                let coefs = ext.depart.len().max(1);
+                (0..coefs)
+                    .map(|c| Self::gain_de_la_rampe(&ext, 0, c))
+                    .collect()
+            }
+            None => self.gain_garde.clone().unwrap_or_else(|| vec![1.0]),
+        };
+        let depart: Vec<f32> = atteint.iter().map(|a| a * g).collect();
+        if depart.iter().all(|d| (d - 1.0).abs() < 1e-6) {
+            self.gain_garde = None;
+            return;
+        }
+        self.gain_garde = Some(depart.clone());
+        self.lancer_la_rampe(depart);
+        let total = (u64::from(self.sample_rate) * u64::from(ms) / 1000).max(1) as usize;
+        if let Some(ext) = self.extinction.as_mut() {
+            ext.total = total;
+        }
+    }
+
     /// rc14 (série TESS) — « Rendre le niveau » sur un égaliseur ACTIF qui
     /// retient une hausse : elle remonte jusqu'au niveau de la chaîne, sans
     /// la borne de volume. Rend `true` quand le geste le concernait.
@@ -846,7 +1057,10 @@ impl EqProcessor {
     /// préampli : identité exacte, à retirer de la chaîne. Un neutre qui
     /// garde un préampli reste monté : il porte le niveau (décision du 10/10).
     pub fn est_neutre_au_repos(&self) -> bool {
-        self.est_neutre() && self.fondu.is_none() && self.gain_garde.is_none()
+        self.est_neutre()
+            && self.fondu.is_none()
+            && self.gain_garde.is_none()
+            && self.chaine_sortante.is_none()
     }
 
     /// #4685 — ce que cet égaliseur, réserve automatique comprise, fait

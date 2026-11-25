@@ -223,6 +223,8 @@ pub(super) const TRANCHE: usize = 1 << 16;
 thread_local! {
     /// Tampon `f64` du décodage et de l'entrée `f32` : même règle.
     static TAMPON_F64: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    /// rc14 — la copie traitée du fondu de sortie de chaîne (PURE).
+    static TAMPON_TRAITE: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Nombre d'échantillons d'une tranche : au plus [`TRANCHE`], en trames
@@ -472,6 +474,103 @@ impl MoteursLocaux<'_> {
         })
     }
 
+    /// rc14 (sécurité auditive, décision du 25/11) — l'entrée en PURE ou en
+    /// « Bypass all » retire aussi la convolution, le crossfeed et le repli
+    /// mono : d'un bloc à l'autre, un saut de niveau (la réserve d'une
+    /// convolution, −6 à −12 dB) et une discontinuité du signal (un clic).
+    /// Le temps de [`crate::audio::eq::ChaineSortante`], ces étages jouent
+    /// encore sur une COPIE du bloc (après l'égaliseur de la transition), et
+    /// la sortie passe en fondu linéaire du traité au sec. Le sec est
+    /// multiplié par le niveau de la chaîne, MESURÉ sur la musique (rapport
+    /// des énergies, interpolé dans le bloc : aucune marche), jamais au-dessus
+    /// de 1. Fondu fini, ce niveau rejoint le gain gardé de l'égaliseur coupé
+    /// (`EqProcessor::terminer_la_chaine_sortante`), qui remonte vers le
+    /// niveau d'avant le traitement, jamais au-delà.
+    fn fondre_la_chaine_sortante(
+        &self,
+        ordre: OrdreLocal,
+        samples: &mut [f64],
+        canaux: usize,
+        trames: usize,
+    ) {
+        let Some(moteur) = self.eq else {
+            return;
+        };
+        // La chaîne sort du verrou le temps du bloc : la convolution prend
+        // le sien, jamais les deux à la fois.
+        let Some(mut chaine) = moteur
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(EqProcessor::prendre_la_chaine_sortante))
+        else {
+            return;
+        };
+        let n = trames * canaux;
+        avec_tampon(&TAMPON_TRAITE, n, |traite| {
+            traite.copy_from_slice(&samples[..n]);
+            for etage in ordre.etages {
+                match etage {
+                    EtageLocal::Egaliseur => {}
+                    EtageLocal::Convolution if chaine.convolution => {
+                        let mut conv = AdaptateurConvolution {
+                            moteur: self.convolver,
+                            canaux,
+                        };
+                        let _ = conv.traiter_sur_place(traite, trames);
+                    }
+                    EtageLocal::Convolution => {}
+                    EtageLocal::Crossfeed => {
+                        if canaux == 2
+                            && let Some(cf) = chaine.crossfeed.as_mut()
+                        {
+                            cf.process_interleaved_f64(traite);
+                        }
+                    }
+                    EtageLocal::RepliMono => {
+                        if canaux == 2 && chaine.mono {
+                            for trame in traite.as_chunks_mut::<2>().0 {
+                                let m = (trame[0] + trame[1]) * 0.5;
+                                trame[0] = m;
+                                trame[1] = m;
+                            }
+                        }
+                    }
+                }
+            }
+            chaine.energie_traitee += traite.iter().map(|x| x * x).sum::<f64>();
+            chaine.energie_seche += samples[..n].iter().map(|x| x * x).sum::<f64>();
+            let depart = chaine.gain;
+            let arrivee = chaine.gain_mesure();
+            for f in 0..trames {
+                let t = ((chaine.fait + f + 1) as f64 / chaine.total as f64).min(1.0);
+                let g = depart + (arrivee - depart) * ((f + 1) as f64 / trames as f64);
+                for c in 0..canaux {
+                    let i = f * canaux + c;
+                    samples[i] = traite[i] + (samples[i] * g - traite[i]) * t;
+                }
+            }
+            chaine.gain = arrivee;
+            chaine.fait += trames;
+        });
+        if let Ok(mut g) = moteur.lock() {
+            match g.as_mut() {
+                Some(p) if chaine.fait >= chaine.total => {
+                    p.terminer_la_chaine_sortante(
+                        chaine.gain,
+                        crate::audio::eq::TRANSITION_PURE_MS,
+                    );
+                    // Rien à garder (niveau mesuré à l'unité) : identité
+                    // exacte, l'étage se retire tout de suite.
+                    if p.est_neutre_au_repos() {
+                        *g = None;
+                    }
+                }
+                Some(p) => p.rendre_la_chaine_sortante(chaine),
+                None => {}
+            }
+        }
+    }
+
     /// Fait passer `samples` par les étages `ordre.etages()[debut..]`.
     fn executer(&self, ordre: OrdreLocal, debut: usize, samples: &mut [f64], channels: u16) {
         let canaux = usize::from(channels.max(1));
@@ -489,6 +588,7 @@ impl MoteursLocaux<'_> {
         if self.pure_bypass.load(Ordering::Relaxed) || ordre.bypass_all {
             if debut == 0 {
                 let _ = eq.traiter_sur_place(samples, trames);
+                self.fondre_la_chaine_sortante(ordre, samples, canaux, trames);
             }
             return;
         }

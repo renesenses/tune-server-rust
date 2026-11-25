@@ -55,9 +55,9 @@ pub(crate) struct EqEnVol {
     /// lecture fraîche passerait la station telle quelle, autre format.
     pub(crate) format_independant_du_traitement: bool,
     /// #8422 — le dernier dépôt vient d'une entrée en PURE : le préampli que
-    /// garde l'égaliseur coupé remonte jusqu'au signal SEC, sans la borne de
-    /// volume de #6741, pour que la chaîne se vide et rende les octets
-    /// décodés tels quels.
+    /// garde l'égaliseur coupé remonte vers le signal SEC en
+    /// `TRANSITION_PURE_MS`, borné par le volume (rc14, #6741), pour que la
+    /// chaîne se vide et rende les octets décodés tels quels.
     vers_le_sec: std::sync::atomic::AtomicBool,
     /// #6741 — volume de la zone (millièmes, sans trim), tenu à jour par
     /// l'orchestrateur à chaque consigne ; `u32::MAX` : inconnu.
@@ -65,10 +65,57 @@ pub(crate) struct EqEnVol {
     /// #6741 — volume de la zone quand l'égaliseur du flux est devenu actif :
     /// le « niveau d'avant l'égaliseur ». `u32::MAX` : aucun égaliseur actif.
     volume_avant: AtomicU32,
+    /// rc14 (sécurité auditive) — ce que le porteur applique hors courbe au
+    /// dernier bloc (`EqProcessor::niveau_hors_courbe`, bits d'un `f32`) :
+    /// de quoi faire démarrer un flux REFAIT au même niveau borné.
+    niveau_publie: AtomicU32,
+    /// rc14 — le voyant « niveau réduit » du porteur (bits d'un `f32`, en
+    /// dB ; `NaN` : rien de gardé) et sa rampe en cours.
+    garde_publiee_db: AtomicU32,
+    garde_en_retour: std::sync::atomic::AtomicBool,
+    /// rc14 — « Rendre le niveau » (#6524) demandé, servi au bloc suivant.
+    rendre_demande: std::sync::atomic::AtomicBool,
 }
 
 /// `u32::MAX` : volume inconnu (voir [`EqEnVol::noter_le_volume`]).
 const VOLUME_INCONNU: u32 = u32::MAX;
+
+/// rc14 (sécurité auditive, décision de Bertrand du 25/11) — le niveau
+/// qu'un flux réseau REFAIT (relance après un réglage : égaliseur coupé,
+/// PURE) doit reprendre. Sans lui, le nouveau flux repartait au signal sec
+/// après le blanc de la relance : avec un volume monté pour compenser la
+/// marge de l'égaliseur (jusqu'à −24 dB), un saut de toute cette marge.
+///
+/// Retenu seulement quand le sec dépasserait le niveau d'avant : volume
+/// monté depuis l'égaliseur, ou référence inconnue (#6708). Le flux refait
+/// démarre alors au niveau `niveau` (préampli gardé), borné comme une
+/// coupure en vol (#6741) : il ne remonte que quand le volume redescend à
+/// `volume_avant`, ou par « Rendre le niveau » (#6524).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NiveauAReporter {
+    /// Gain hors courbe du flux quitté, linéaire, < 1.
+    pub(crate) niveau: f64,
+    /// Volume de la zone (millièmes) d'avant l'égaliseur ; `None` : inconnu.
+    pub(crate) volume_avant: Option<u32>,
+    /// Quand il a été retenu : un report trop vieux ne sert plus.
+    pub(crate) depuis: std::time::Instant,
+}
+
+impl NiveauAReporter {
+    /// Durée de vie d'un report : une relance qui pré-transcode un fichier
+    /// entier peut prendre une minute avant le premier octet.
+    pub(crate) const VALIDITE: std::time::Duration = std::time::Duration::from_secs(180);
+
+    /// La borne de remontée au volume `courant` (millièmes) : 1 si le
+    /// volume n'est pas au-dessus de celui d'avant, 0 sinon (la courbe de
+    /// volume d'un appareil réseau est la sienne, #6741).
+    pub(crate) fn borne(&self, courant: Option<u32>) -> f64 {
+        match (self.volume_avant, courant) {
+            (Some(avant), Some(c)) if c <= avant => 1.0,
+            _ => 0.0,
+        }
+    }
+}
 
 impl Default for EqEnVol {
     fn default() -> Self {
@@ -83,6 +130,10 @@ impl Default for EqEnVol {
             vers_le_sec: std::sync::atomic::AtomicBool::new(false),
             volume_zone: AtomicU32::new(VOLUME_INCONNU),
             volume_avant: AtomicU32::new(VOLUME_INCONNU),
+            niveau_publie: AtomicU32::new(1.0_f32.to_bits()),
+            garde_publiee_db: AtomicU32::new(f32::NAN.to_bits()),
+            garde_en_retour: std::sync::atomic::AtomicBool::new(false),
+            rendre_demande: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -95,6 +146,54 @@ impl EqEnVol {
             let v = (volume.clamp(0.0, 1.0) * 1000.0).round() as u32;
             self.volume_zone.store(v, Ordering::SeqCst);
         }
+    }
+
+    /// rc14 (sécurité auditive, flux refait) — le volume d'avant l'égaliseur
+    /// retenu par ce poste (millièmes), `None` s'il n'en a pas.
+    pub(crate) fn volume_d_avant(&self) -> Option<u32> {
+        Some(self.volume_avant.load(Ordering::SeqCst)).filter(|v| *v != VOLUME_INCONNU)
+    }
+
+    /// rc14 (flux refait) — le poste d'un flux qui reprend le niveau gardé
+    /// d'un autre reprend aussi sa référence : la borne reste celle d'avant.
+    pub(crate) fn reprendre_le_volume_d_avant(&self, volume: u32) {
+        self.volume_avant.store(volume, Ordering::SeqCst);
+    }
+
+    /// rc14 — le niveau hors courbe appliqué au dernier bloc (1,0 : rien).
+    pub(crate) fn niveau_publie(&self) -> f64 {
+        f64::from(f32::from_bits(self.niveau_publie.load(Ordering::SeqCst)))
+    }
+
+    /// rc14 — le voyant « niveau réduit » de ce flux, tel que le porteur l'a
+    /// publié au dernier bloc.
+    pub(crate) fn preampli_garde(&self) -> Option<crate::audio::eq::PreampliGarde> {
+        let db = f32::from_bits(self.garde_publiee_db.load(Ordering::SeqCst));
+        db.is_finite().then(|| crate::audio::eq::PreampliGarde {
+            db: f64::from(db),
+            en_retour: self.garde_en_retour.load(Ordering::SeqCst),
+        })
+    }
+
+    /// rc14 — « Rendre le niveau » (#6524) sur ce flux : le gain gardé
+    /// remonte jusqu'au signal sec, par sa rampe, au prochain bloc.
+    pub(crate) fn rendre_le_niveau(&self) {
+        self.rendre_demande.store(true, Ordering::SeqCst);
+    }
+
+    fn publier(&self, courant: &Option<EqProcessor>) {
+        let niveau = courant
+            .as_ref()
+            .map_or(1.0, EqProcessor::niveau_hors_courbe);
+        self.niveau_publie
+            .store((niveau as f32).to_bits(), Ordering::SeqCst);
+        let garde = courant.as_ref().and_then(EqProcessor::preampli_garde);
+        self.garde_publiee_db.store(
+            garde.map_or(f32::NAN, |g| g.db as f32).to_bits(),
+            Ordering::SeqCst,
+        );
+        self.garde_en_retour
+            .store(garde.is_some_and(|g| g.en_retour), Ordering::SeqCst);
     }
 
     /// #6741 — la borne de remontée d'un flux servi à un APPAREIL : 1 (retour
@@ -110,7 +209,7 @@ impl EqEnVol {
     /// consigne inférieure ou égale à celle d'avant, le signal sec ne dépasse
     /// pas le niveau d'avant. Au-dessus, le préampli reste gardé jusqu'à un
     /// réglage qui redescend à ce niveau.
-    fn borne_de_remontee(&self) -> f64 {
+    pub(crate) fn borne_de_remontee(&self) -> f64 {
         let avant = self.volume_avant.load(Ordering::SeqCst);
         let courant = self.volume_zone.load(Ordering::SeqCst);
         if avant == VOLUME_INCONNU || courant == VOLUME_INCONNU || courant > avant {
@@ -197,10 +296,12 @@ impl EqEnVol {
     }
 
     /// #8422 — l'entrée en PURE, déposée en vol : couper l'égaliseur ET
-    /// rendre le signal sec. Le fondu de #5215 efface la courbe, puis le
-    /// préampli gardé remonte jusqu'à 0 dB à la vitesse de #6741 (aucune
-    /// marche), sans la borne de volume ; revenu à 0 dB, le neutre quitte la
+    /// rendre le signal sec. Le fondu de #5215 efface la courbe, et le
+    /// préampli gardé rejoint le niveau d'avant l'égaliseur en
+    /// `TRANSITION_PURE_MS` (rc14, décision du 25/11), BORNÉ par le volume
+    /// comme toute remontée (#6741) ; revenu à 0 dB, le neutre quitte la
     /// chaîne et le flux redevient les octets décodés, à l'échantillon près.
+    /// Volume monté pendant l'égaliseur : le préampli reste gardé.
     pub(crate) fn poser_vers_le_sec(&self) {
         let mut attente = self.attente.lock().unwrap_or_else(|e| e.into_inner());
         self.vers_le_sec.store(true, Ordering::SeqCst);
@@ -233,8 +334,14 @@ impl EqEnVol {
             }
             Err(_) => (None, false),
         };
+        if self.rendre_demande.swap(false, Ordering::SeqCst)
+            && let Some(eq) = courant.as_mut()
+        {
+            eq.liberer_le_gain_garde();
+        }
         let Some(profil) = depose else {
             self.suivre_le_niveau_d_avant(courant);
+            self.publier(courant);
             return;
         };
         let neuf = profil
@@ -242,16 +349,23 @@ impl EqEnVol {
             .filter(EqProcessor::is_enabled);
         let actif = neuf.is_some();
         *courant = EqProcessor::prendre_la_releve(neuf, courant.take());
-        if vers_le_sec && let Some(eq) = courant.as_mut() {
-            // Avant l'extinction ci-dessous : sa cible est alors le sec.
-            eq.liberer_le_gain_garde();
-        }
         self.suivre_le_niveau_d_avant(courant);
         if self.flux_sans_fin
             && let Some(eq) = courant.as_mut()
         {
             eq.eteindre_le_preampli_garde();
         }
+        // rc14 (sécurité auditive, décision du 25/11) — l'entrée en PURE ne
+        // remonte plus vers le sec SANS borne : le préampli gardé rejoint le
+        // niveau d'avant l'égaliseur en `TRANSITION_PURE_MS`, vers
+        // `min(1, borne de volume)` (#6741), jamais au-delà. Volume inchangé :
+        // le sec à l'échantillon près, le neutre se retire. Volume monté (ou
+        // inconnu) : le préampli reste gardé, voyant et « Rendre le niveau ».
+        // Posé APRÈS la borne et l'extinction, qui relancent la rampe.
+        if vers_le_sec && let Some(eq) = courant.as_mut() {
+            eq.rendre_le_niveau_d_avant_en(crate::audio::eq::TRANSITION_PURE_MS);
+        }
+        self.publier(courant);
         self.releves.fetch_add(1, Ordering::Relaxed);
         tracing::info!(sample_rate, channels, actif, "eq_en_vol_releve");
     }
@@ -611,12 +725,14 @@ mod tests {
     }
 
     /// #8422 — l'entrée en PURE déposée en vol rend le signal SEC, à
-    /// l'échantillon près, même quand la consigne de volume est inconnue (là
-    /// où une simple coupure garde le préampli, #6708) : la chaîne se vide,
-    /// sans marche, et rien ne dépasse le niveau d'avant l'égaliseur.
+    /// l'échantillon près, à volume inchangé : la chaîne se vide, sans
+    /// marche, et rien ne dépasse le niveau d'avant l'égaliseur. (rc14 : la
+    /// remontée est désormais bornée par le volume, voir
+    /// `entree_en_pure_en_vol_volume_monte_jamais_au_dessus_rc14`.)
     #[test]
     fn entree_en_pure_en_vol_rend_le_signal_sec_a_l_echantillon_pres_8422() {
         let mut radio = RadioFactice::new();
+        radio.poste.noter_le_volume(0.5);
         let avant = rms_f32(&radio.passer(8));
         radio.poste.poser(Some(profil()));
         radio.passer(20);
@@ -664,6 +780,116 @@ mod tests {
             radio.eq.as_ref().and_then(|e| e.preampli_garde()).is_some(),
             "coupure ordinaire : le préampli reste gardé, la demande de sec est oubliée"
         );
+    }
+
+    /// rc14 (sécurité auditive, décision du 25/11) — entrée en PURE en vol,
+    /// volume inchangé : le préampli gardé rejoint le signal sec en moins
+    /// d'une seconde (fondu de 300 ms et remontée de 450 ms qui se
+    /// recouvrent), à l'échantillon près ensuite, sans marche ni dépassement.
+    /// Avant : remontée à 2 dB/s, au moins 3 s.
+    #[test]
+    fn entree_en_pure_en_vol_volume_inchange_le_sec_en_moins_d_une_seconde_rc14() {
+        let mut radio = RadioFactice::new();
+        radio.poste.noter_le_volume(0.5);
+        let avant = rms_f32(&radio.passer(8));
+        radio.poste.poser(Some(profil()));
+        radio.passer(40);
+        radio.poste.poser_vers_le_sec();
+        // 1 024 trames à 44,1 kHz : 23,2 ms par bloc ; 35 blocs = 0,81 s.
+        let mut precedent = f64::MIN;
+        for n in 0..35 {
+            let bloc_db = 20.0 * (rms_f32(&radio.passer(1)) / avant).log10();
+            assert!(bloc_db < 0.1, "{bloc_db:+.2} dB au bloc {n} : dépassement");
+            if n > 0 {
+                assert!(
+                    bloc_db - precedent < 1.5,
+                    "marche de {:.2} dB au bloc {n}",
+                    bloc_db - precedent
+                );
+            }
+            precedent = bloc_db;
+        }
+        assert!(
+            radio.eq.is_none(),
+            "à 0,8 s, plus aucun étage dans la chaîne"
+        );
+        let debut = radio.position;
+        let servi = radio.passer(2);
+        let sec: Vec<f32> = (debut..debut + 2 * RadioFactice::BLOC)
+            .map(|i| {
+                (0.25 * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / f64::from(SR)).sin())
+                    as f32
+            })
+            .collect();
+        assert_eq!(servi, sec, "le sec, à l'échantillon près");
+        assert!(radio.poste.preampli_garde().is_none());
+        assert!((radio.poste.niveau_publie() - 1.0).abs() < 1e-9);
+    }
+
+    /// rc14 (sécurité auditive) — entrée en PURE en vol, volume MONTÉ pendant
+    /// l'égaliseur (25 % → 50 %, appareil à courbe en dB) : rien ne dépasse le
+    /// niveau d'avant la bascule, le préampli reste gardé et se voit ; « Rendre
+    /// le niveau » le rend ensuite. Avant : le sec revenait sans borne.
+    #[test]
+    fn entree_en_pure_en_vol_volume_monte_jamais_au_dessus_rc14() {
+        let mut radio = RadioFactice::new();
+        let mut consigne = 0.25;
+        radio.poste.noter_le_volume(consigne);
+        radio.passer(8);
+        radio.poste.poser(Some(profil()));
+        radio.passer(20);
+        let preampli = radio
+            .eq
+            .as_ref()
+            .and_then(|e| e.preamp_db(0))
+            .expect("égaliseur monté");
+        consigne = 0.5;
+        radio.poste.noter_le_volume(consigne);
+        radio.passer(20);
+        let avant_la_bascule = rms_f32(&radio.passer(4)) * appareil_en_db(consigne);
+        radio.poste.poser_vers_le_sec();
+        for n in 0..400 {
+            let rendu = rms_f32(&radio.passer(1)) * appareil_en_db(consigne);
+            assert!(
+                rendu <= avant_la_bascule * 1.012,
+                "PURE en vol, consigne montée : {rendu:.6} au bloc {n}, au-dessus de \
+                 {avant_la_bascule:.6} — jamais de dépassement (#6741)"
+            );
+        }
+        let garde = radio
+            .poste
+            .preampli_garde()
+            .expect("le préampli gardé se voit (voyant « niveau réduit »)");
+        assert!(
+            (garde.db - preampli).abs() < 0.3,
+            "gardé {garde:?}, attendu {preampli:.2} dB"
+        );
+        assert!(radio.poste.niveau_publie() < 0.9);
+        // « Rendre le niveau » (#6524) : retour au sec par la rampe.
+        radio.poste.rendre_le_niveau();
+        radio.passer(400);
+        assert!(radio.eq.is_none(), "rendu : plus aucun étage");
+        assert!(radio.poste.preampli_garde().is_none());
+    }
+
+    /// rc14 — le report d'un flux refait : borne à 1 seulement quand le
+    /// volume n'est pas au-dessus de celui d'avant l'égaliseur.
+    #[test]
+    fn la_borne_d_un_report_est_tout_ou_rien_rc14() {
+        let r = super::NiveauAReporter {
+            niveau: 0.25,
+            volume_avant: Some(250),
+            depuis: std::time::Instant::now(),
+        };
+        assert_eq!(r.borne(Some(250)), 1.0);
+        assert_eq!(r.borne(Some(200)), 1.0);
+        assert_eq!(r.borne(Some(500)), 0.0);
+        assert_eq!(r.borne(None), 0.0);
+        let inconnu = super::NiveauAReporter {
+            volume_avant: None,
+            ..r
+        };
+        assert_eq!(inconnu.borne(Some(100)), 0.0);
     }
 
     /// Un poste dont personne n'a rien déposé ne touche à rien.

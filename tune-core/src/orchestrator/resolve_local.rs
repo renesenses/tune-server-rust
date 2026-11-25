@@ -2199,7 +2199,11 @@ impl PlaybackOrchestrator {
             });
             let canaux_du_flux = transcodage.canaux_reduits.unwrap_or(source.channels);
             TraitementsDeZone {
-                egaliseur: self.zone_has_active_eq(req.zone_id),
+                // rc14 (sécurité auditive) — un niveau gardé à reporter dans
+                // le flux refait se porte comme un égaliseur : sans flux
+                // traité, le fichier partirait brut, au signal sec.
+                egaliseur: self.zone_has_active_eq(req.zone_id)
+                    || self.niveau_reseau_a_reporter(req.zone_id).is_some(),
                 correction_de_piece: self.zone_ir_s_appliquerait(
                     req.zone_id,
                     cadence_du_flux,
