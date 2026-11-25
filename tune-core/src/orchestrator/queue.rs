@@ -907,6 +907,14 @@ impl PlaybackOrchestrator {
     ) -> Result<PlayResult, String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
+        // Fil 3094 — un balayage de calibration périmé resté dans la file est
+        // écarté AVANT de lire la ligne : la position demandée désigne alors
+        // la ligne qui a pris sa place (la suivante).
+        let position = self
+            .ecarter_les_balayages_perimes(zone_id)
+            .await
+            .position_apres(position);
+
         let output_device_id = ZoneRepo::with_backend(self.db.clone())
             .get(zone_id)
             .ok()

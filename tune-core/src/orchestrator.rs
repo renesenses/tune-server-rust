@@ -2478,6 +2478,8 @@ mod contenu_explicite_8088_tests;
 pub mod ecoute_validee_7852;
 #[cfg(test)]
 mod ecoute_validee_7852_tests;
+// Fil 3094 — un balayage de calibration périmé est écarté, pas rejoué.
+pub mod file_technique_3094;
 // #8076 — FLAC local vers DLNA en PURE : voie servie et échantillons exacts.
 #[cfg(test)]
 mod gapless_dlna_pure_8076_tests;

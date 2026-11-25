@@ -389,6 +389,11 @@ impl PlaybackOrchestrator {
         // #8611 — une piste d'un artiste bloqué par la politique parentale
         // du profil : rien ne part.
         self.verifier_l_artiste_bloque(&req).await?;
+        // Fil 3094 — le balayage d'une mesure de calibration finie ne se
+        // rejoue pas : il quitte la file, et le refus le dit une fois.
+        if let Some(refus) = self.refuser_un_balayage_perime(&req).await {
+            return Err(refus);
+        }
 
         // Re-tap dedup (#1271): a controller (Flutter/web) can emit `play` TWICE
         // for the SAME track a few seconds apart. The first play already sent

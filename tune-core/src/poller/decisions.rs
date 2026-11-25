@@ -1682,7 +1682,8 @@ pub fn autoplay_prefers_streaming(source: Option<&str>) -> bool {
 
 /// True when the playing track differs from the one already latched
 /// (`latched_key`) AND it has genuinely been listened past the Last.fm
-/// threshold (50% / 4 min, `should_scrobble`). Radio never scrobbles.
+/// threshold (50% / 4 min, `should_scrobble`). Radio and technical sources
+/// (calibration sweep, fil 3094) never scrobble.
 pub fn should_dispatch_scrobble(
     latched_key: Option<&str>,
     current_key: &str,
@@ -1691,6 +1692,8 @@ pub fn should_dispatch_scrobble(
     position_ms: i64,
 ) -> bool {
     source != "radio"
+        // Fil 3094 — un balayage de calibration n'est jamais annoncé.
+        && !crate::source_pcm::source_technique(source)
         && latched_key != Some(current_key)
         && crate::scrobble::should_scrobble((duration_ms > 0).then_some(duration_ms), position_ms)
 }
