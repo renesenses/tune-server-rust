@@ -83,21 +83,41 @@ use super::chaine::TauxDsd;
 /// Ordre de la boucle sigma-delta publiée au chemin du signal.
 pub const ORDRE_DU_MODULATEUR: usize = tune_plugin_audio_support::modulateur_dsd::ORDRE;
 
-/// La marge PROPRE de l'étage de modulation, en dB : appliquée en headroom
-/// automatique, et plancher d'un headroom manuel (jamais moins de 3 dB de
-/// marge avant le modulateur). Indépendante de `HEADROOM_AUTO_DB` de la
-/// chaîne PCM : une crête intersample à +3 dB d'un master chaud ne doit
-/// jamais atteindre le limiteur de sécurité à ±60 % (+1,6 dB au-dessus du
-/// 0 dB SACD).
+/// La marge PROPRE de l'étage de modulation, en dB, toujours appliquée UNE
+/// fois par le modulateur, en plus du headroom de la chaîne (automatique ou
+/// manuel) : jamais moins de 3 dB de marge entre ce que les greffons rendent
+/// et le modulateur. Indépendante de `HEADROOM_AUTO_DB` de la chaîne PCM :
+/// une crête intersample à +3 dB d'un master chaud ne doit jamais atteindre
+/// le limiteur de sécurité à ±60 % (+1,6 dB au-dessus du 0 dB SACD).
 pub const MARGE_DU_MODULATEUR_DB: f64 = -3.0;
 
-/// Le headroom appliqué avant le modulateur : celui de la chaîne (auto ou
-/// manuel), jamais au-dessus de [`MARGE_DU_MODULATEUR_DB`].
+/// Le headroom de la chaîne (dB ≤ 0 ; 0 en automatique ou non effectif) :
+/// une valeur absurde ne compte pour rien.
+fn headroom_de_la_chaine(db: f64) -> f64 {
+    if db.is_finite() { db.min(0.0) } else { 0.0 }
+}
+
+/// Le headroom TOTAL appliqué avant le modulateur, celui que publie le chemin
+/// du signal : le headroom de la chaîne, appliqué une fois, plus la marge
+/// propre du modulateur ([`MARGE_DU_MODULATEUR_DB`]), ajoutée une fois.
 pub fn headroom_avant_le_modulateur(headroom_de_la_chaine_db: f64) -> f64 {
-    if headroom_de_la_chaine_db.is_finite() {
-        headroom_de_la_chaine_db.min(MARGE_DU_MODULATEUR_DB)
-    } else {
+    headroom_de_la_chaine(headroom_de_la_chaine_db) + MARGE_DU_MODULATEUR_DB
+}
+
+/// Revue rc14 (#9518 × #9520) — la part que le MODULATEUR applique lui-même
+/// (gain fixe, dB) : sa marge, plus le headroom de la chaîne seulement si
+/// aucun étage du flux ne l'a déjà appliqué. Un headroom manuel est porté par
+/// l'égaliseur du flux (`reserve_imposee_db`, ou le gain fixe d'une sortie
+/// locale sans égaliseur coché) : l'appliquer encore ici le doublerait
+/// (−12 dB demandés, −24 dB servis).
+pub fn gain_fixe_du_modulateur_db(
+    headroom_de_la_chaine_db: f64,
+    applique_par_le_flux: bool,
+) -> f64 {
+    if applique_par_le_flux {
         MARGE_DU_MODULATEUR_DB
+    } else {
+        headroom_avant_le_modulateur(headroom_de_la_chaine_db)
     }
 }
 
@@ -1221,8 +1241,9 @@ pub struct ModulationEnService {
     /// Les greffons de la zone sont-ils appliqués dans le flux (égaliseur,
     /// convolution, crossfeed, repli mono) ?
     pub plugins_in_stream: bool,
-    /// Headroom appliqué avant le modulateur (dB ≤ −3 : la marge propre du
-    /// modulateur, ou un headroom manuel plus fort).
+    /// Headroom total appliqué avant le modulateur (dB ≤ −3) : celui de la
+    /// chaîne, une fois, plus la marge propre du modulateur, une fois
+    /// ([`headroom_avant_le_modulateur`]).
     pub headroom_db: f64,
     /// Le flux continue l'état de la piste précédente (enchaînement).
     pub continued: bool,

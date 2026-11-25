@@ -431,9 +431,9 @@ async fn le_volume_s_applique_avant_le_modulateur() {
 
 /// Point 10 de la relecture : un master chaud (crête intersample à +3 dB)
 /// par la CHAÎNE COMPLÈTE (décodage, greffons, headroom, volume,
-/// modulateur). La marge propre du modulateur (−3 dB) s'applique quel que
-/// soit le headroom de la chaîne : automatique, ou manuel à 0 dB, le
-/// limiteur n'est jamais atteint ; manuel à −6 dB, la marge est de 6 dB.
+/// modulateur). La marge propre du modulateur (−3 dB) s'ajoute, une fois,
+/// au headroom de la chaîne : automatique, ou manuel à 0 dB, le limiteur
+/// n'est jamais atteint ; manuel à −6 dB, la marge est de 9 dB.
 /// (La contre-épreuve, sans marge, est celle du producteur :
 /// `le_headroom_garde_les_cretes_intersample_sous_le_limiteur`.)
 #[tokio::test]
@@ -455,7 +455,7 @@ async fn crete_intersample_par_la_chaine_complete() {
     for (headroom, marge) in [
         (Headroom::Auto {}, -3.0),
         (Headroom::Manual { db: 0.0 }, -3.0),
-        (Headroom::Manual { db: -6.0 }, -6.0),
+        (Headroom::Manual { db: -6.0 }, -9.0),
     ] {
         chaine(&b, Some(dsd(TauxDsd::Dsd64)), headroom);
         let j = jouer(&b, id).await;
@@ -525,4 +525,148 @@ fn les_sentinelles_de_longueur_ne_bornent_rien() {
     let e = crate::audio::wav::build_wav_header_with_data_size(2, 176_400, 24, 1_200);
     assert_eq!(super::longueur_annoncee(&e), Some(1_200));
     assert_eq!(super::longueur_annoncee(b"TUNEDSD1________"), None);
+}
+
+/// Niveau (dBFS PCM) porté par une voie d'un flux DoP : RMS de la densité
+/// DSD par fenêtres de 256 octets (≈ 0,7 ms à DSD64), le premier et le
+/// dernier dixième écartés, rapporté au RMS d'un sinus à 0 dBFS (modulation
+/// de 50 %, le « 0 dB SACD »).
+fn niveau_porte_dbfs(charge: &[u8], voie: usize) -> f64 {
+    let dsd: Vec<u8> = charge
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .flat_map(|t| [t[3 * voie + 1], t[3 * voie]])
+        .collect();
+    let moyennes: Vec<f64> = dsd
+        .chunks_exact(256)
+        .map(|f| {
+            let uns: u32 = f.iter().map(|o| o.count_ones()).sum();
+            (2.0 * f64::from(uns) - 8.0 * f.len() as f64) / (8.0 * f.len() as f64)
+        })
+        .collect();
+    let n = moyennes.len();
+    let utiles = &moyennes[n / 10..n - n / 10];
+    let rms = (utiles.iter().map(|m| m * m).sum::<f64>() / utiles.len() as f64).sqrt();
+    let reference = crate::tess::modulation_dsd::MODULATION_A_0_DBFS / std::f64::consts::SQRT_2;
+    20.0 * (rms / reference).log10()
+}
+
+/// Revue rc14 (#9518 × #9520) : la marge manuelle de TESS ne s'applique
+/// qu'UNE fois sous modulation DSD, et la marge propre du modulateur
+/// (−3 dB) s'y ajoute une seule fois. Mesuré sur les octets servis (sinus
+/// de 44,1 Hz à 0 dBFS), sans puis avec un égaliseur coché : le niveau
+/// porté est celui que publie le chemin du signal, et le modulateur ne
+/// ramène jamais rien au limiteur.
+#[tokio::test]
+async fn la_marge_manuelle_ne_s_applique_qu_une_fois_sous_modulation() {
+    use crate::tess::chaine::MaillonGreffon;
+    use crate::tess::modulation_dsd::MARGE_DU_MODULATEUR_DB;
+    let b = banc(true, "dop").await;
+    let s = SettingsRepo::with_backend(b.orch.db.clone());
+    s.set("plugin_equalizer_installed", "true").unwrap();
+    s.set("plugin_equalizer_enabled", "true").unwrap();
+    let wav = crate::test_scratch::scratch_file("marge-une-fois-rc14", ".wav");
+    let trames = 44_100usize;
+    let mut w =
+        crate::audio::wav::build_wav_header_with_data_size(2, 44_100, 16, (trames * 4) as u32)
+            .to_vec();
+    for i in 0..trames {
+        let x = (2.0 * std::f64::consts::PI * i as f64 / 1_000.0).sin();
+        let v = (x * 32_767.0).round() as i16;
+        w.extend_from_slice(&v.to_le_bytes());
+        w.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(wav.path(), &w).unwrap();
+    let chemin = wav.path().to_string_lossy().to_string();
+    let id = piste(&b, &chemin, "wav", 2);
+    // Un paramétrique qui ne touche pas 44,1 Hz : une coupe à 12 kHz.
+    let egaliseur = MaillonGreffon {
+        id: crate::tess::migration::ID_EQ_PARAMETRIQUE.into(),
+        enabled: true,
+        settings: {
+            let p = crate::audio::eq::EqProfile {
+                enabled: true,
+                bands: vec![crate::audio::eq::EqBandSpec {
+                    freq: 12_000.0,
+                    gain: -3.0,
+                    q: 1.0,
+                    band_type: "peak".into(),
+                    channel: None,
+                }],
+                ..Default::default()
+            };
+            let mut v = serde_json::to_value(p).unwrap();
+            v.as_object_mut().unwrap().remove("enabled");
+            v
+        },
+    };
+    let mut mesures = Vec::new();
+    for (headroom, avec_eq, attendu) in [
+        (Headroom::Auto {}, false, MARGE_DU_MODULATEUR_DB),
+        (Headroom::Manual { db: 0.0 }, false, MARGE_DU_MODULATEUR_DB),
+        (
+            Headroom::Manual { db: -12.0 },
+            false,
+            -12.0 + MARGE_DU_MODULATEUR_DB,
+        ),
+        (
+            Headroom::Manual { db: -12.0 },
+            true,
+            -12.0 + MARGE_DU_MODULATEUR_DB,
+        ),
+        (
+            Headroom::Manual { db: -2.0 },
+            true,
+            -2.0 + MARGE_DU_MODULATEUR_DB,
+        ),
+    ] {
+        let c = ChaineTess {
+            plugins: if avec_eq {
+                vec![egaliseur.clone()]
+            } else {
+                Vec::new()
+            },
+            fixed: EtagesFixes {
+                upsampling: dsd(TauxDsd::Dsd64),
+                headroom,
+                ..EtagesFixes::default()
+            },
+            ..ChaineTess::default()
+        };
+        crate::tess::migration::ecrire_chaine(&s, b.zone_id, &c).unwrap();
+        let j = jouer(&b, id).await;
+        let mesure = niveau_porte_dbfs(verifier_dop_stereo(&j, 176_400), 0);
+        let mut bilan = None;
+        for _ in 0..100 {
+            bilan = crate::tess::modulation_dsd::bilan(&j.stream_id);
+            if bilan.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let bilan = bilan.expect("bilan du flux");
+        let publie = match j.etat(&b) {
+            Some(EtatModulation::EnService(m)) => m.headroom_db,
+            autre => panic!("état {autre:?}"),
+        };
+        mesures.push((headroom, avec_eq, attendu, mesure, publie, bilan));
+    }
+    for (headroom, avec_eq, attendu, mesure, publie, bilan) in &mesures {
+        eprintln!(
+            "marge {headroom:?} égaliseur={avec_eq} : mesuré {mesure:.2} dBFS, publié {publie} dB, \
+             attendu {attendu} dB, entrée max {:.3}, écrêtages {}",
+            bilan.entree_max, bilan.ecretages
+        );
+    }
+    for (headroom, avec_eq, attendu, mesure, publie, bilan) in &mesures {
+        let quoi = format!("{headroom:?} égaliseur={avec_eq}");
+        assert!(
+            (mesure - attendu).abs() < 0.5,
+            "{quoi} : mesuré {mesure:.2} dBFS"
+        );
+        assert_eq!(publie, attendu, "{quoi} : chemin du signal");
+        assert_eq!(bilan.reinitialisations, 0, "{quoi}");
+        assert_eq!(bilan.ecretages, 0, "{quoi} : {bilan:?}");
+    }
 }
