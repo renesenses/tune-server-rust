@@ -215,7 +215,10 @@ Enregistrée sous `zone_{id}_tess_chain` (T02), échangée par
   par défaut : chaîne vide, headroom auto, upsampling éteint, TPDF.
 - **`headroom`** : `{"mode":"auto"}` ou `{"mode":"manual","db":x}`, x dans
   [−24 ; 0].
-  - Auto = −3 dB dès qu'un greffon ou l'upsampler est **effectif**, 0 dB sinon.
+  - Auto = 0 dB (rc14) : la marge est celle que les égaliseurs réservent sur
+    leur cascade entière. Le « −3 dB » d'origine n'était appliqué par aucun
+    moteur ; il n'est plus annoncé. Manuel = cette valeur remplace la réserve
+    des égaliseurs (une seule marge, limiteur doux armé).
   - L'étage porte aussi le ReplayGain et le gain de zone, réglés comme
     aujourd'hui.
 - **`upsampling`** (Premium) reprend **tous** les réglages d'`UpsamplerSettings`

@@ -1136,50 +1136,194 @@ async fn le_get_d_etat_n_attend_pas_la_sonde_d_une_lecture_t12b() {
     sonde.abort();
 }
 
-/// rc14 (GO du 24/11) — les quatre façades de l'égaliseur partagent une clé
-/// et un moteur : deux cochées = 409 `mutually_exclusive` (`plugin_id` =
-/// la seconde), sans rien écrire. Contre-épreuve : une seule passe. Le
-/// groupe crossfeed reste ce qu'il était.
+/// rc14 (GO du 25/11) — les égaliseurs sont COMBINABLES : graphique et
+/// paramétrique cochés ensemble passent (200), restent cochés, et sont tous
+/// deux effectifs. `zone_{id}_eq_profile` (anciennes routes) porte le
+/// premier ; un ancien client qui le lit ou l'écrit ne casse rien. Le groupe
+/// crossfeed, lui, reste exclusif.
 #[tokio::test]
-async fn deux_egaliseurs_coches_409_et_un_seul_passe_rc14() {
+async fn deux_egaliseurs_coches_passent_et_s_enchainent_rc14() {
     let b = Banc::nouveau(true).await;
-    let avant = b.enregistree();
     let (s, v) = b
         .put(json!({"version": 1, "plugins": [
             {"id": "equalizer-graphic", "enabled": true, "settings": profil(json!([]))},
             {"id": "equalizer-parametric", "enabled": true, "settings": profil(bandes_parametriques())}
         ]}))
         .await;
-    assert_eq!(s, StatusCode::CONFLICT, "{v}");
-    refus_conforme(&v, 409, "mutually_exclusive");
-    assert_eq!(v["plugin_id"], json!("equalizer-parametric"));
-    assert_eq!(b.enregistree(), avant);
-    let (s, v) = b
-        .put(json!({"version": 1, "plugins": [
-            {"id": "equalizer-graphic", "enabled": true, "settings": profil(json!([]))},
-            {"id": "equalizer-parametric", "enabled": false, "settings": profil(bandes_parametriques())}
-        ]}))
-        .await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    // Le catalogue publie le groupe et sa politique.
+    let c = b.chaine();
+    let coches: Vec<&str> = c
+        .plugins
+        .iter()
+        .filter(|m| m.enabled)
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(coches, ["equalizer-graphic", "equalizer-parametric"]);
+    for id in ["equalizer-graphic", "equalizer-parametric"] {
+        let e = etape(&v, id);
+        assert_eq!(e["effective"], json!(true), "{id} : {e}");
+        assert_eq!(e["reason"], Value::Null, "{id} : {e}");
+    }
+    // Ancien client : `GET /zones/{id}/eq` lit le principal (le graphique,
+    // à plat), et son `POST` le règle sans décocher le paramétrique.
+    let uri = format!("/api/v1/zones/{}/eq", b.zone);
+    let (s, eq) = b.brut(Method::GET, &uri, None, None).await;
+    assert_eq!(s, StatusCode::OK, "{eq}");
+    assert_eq!(eq["bands"], json!([]), "{eq}");
+    let (s, eq) = b
+        .brut(
+            Method::POST,
+            &uri,
+            Some(json!({"enabled": true, "bands": [{"freq": 1000.0, "gain": 2.0, "q": 1.0, "type": "peak"}]}).to_string()),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{eq}");
+    let c = b.chaine();
+    assert!(
+        c.plugins
+            .iter()
+            .any(|m| m.id == "equalizer-parametric" && m.enabled),
+        "{c:?}"
+    );
+    // Le catalogue ne publie plus de groupe « equalizer ».
     let (_, cat) = b
         .brut(Method::GET, "/api/v1/tess/catalog", None, None)
         .await;
     let groupes = cat["catalog"]["groups"].as_array().unwrap();
-    for g in ["equalizer", "crossfeed_crosstalk"] {
-        assert!(
-            groupes
-                .iter()
-                .any(|x| x["id"] == json!(g) && x["policy"] == json!("refuse")),
-            "{g} : {cat}"
-        );
-    }
+    assert!(
+        !groupes.iter().any(|x| x["id"] == json!("equalizer")),
+        "{cat}"
+    );
     // Groupe crossfeed inchangé : toujours 409.
     let (s, v) = b
         .put(json!({"version": 1, "plugins": [{"id": "crossfeed", "enabled": true}, {"id": "crosstalk", "enabled": true}]}))
         .await;
     assert_eq!(s, StatusCode::CONFLICT, "{v}");
     refus_conforme(&v, 409, "mutually_exclusive");
+}
+
+/// rc14 — une zone enregistrée sous l'exclusivité du 24/11 (paramétrique
+/// décoché avec `replaced_in_group` vers le graphique) : un compte Premium le
+/// retrouve coché (vue, moteur, puis enregistré au `PUT` suivant) ; un compte
+/// gratuit ne l'entendait pas et ne l'entend toujours pas (revue #9520).
+#[tokio::test]
+async fn une_zone_normalisee_par_l_exclusivite_retrouve_ses_egaliseurs_rc14() {
+    for premium in [true, false] {
+        let b = Banc::nouveau(true).await;
+        let (s, v) = b
+            .put(json!({"version": 1, "plugins": [
+                {"id": "equalizer-graphic", "enabled": true, "settings": profil(json!([]))},
+                {"id": "equalizer-parametric", "enabled": true, "settings": profil(bandes_parametriques())}
+            ]}))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        // La chaîne telle que #9512 l'aurait enregistrée.
+        let mut brute: Value = serde_json::from_str(&b.enregistree().unwrap()).unwrap();
+        for m in brute["plugins"].as_array_mut().unwrap() {
+            if m["id"] == json!("equalizer-parametric") {
+                m["enabled"] = json!(false);
+                m["settings"]["replaced_in_group"] = json!("equalizer-graphic");
+            }
+        }
+        b.settings()
+            .set(&cle_chaine_zone(b.zone), &brute.to_string())
+            .unwrap();
+        b.premium(premium).await;
+        let (_, v) = b.get().await;
+        let p = v["chain"]["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == json!("equalizer-parametric"))
+            .unwrap()
+            .clone();
+        assert_eq!(p["enabled"], json!(premium), "premium={premium} : {p}");
+        let moteur =
+            tune_core::tess::egaliseurs_en_serie::profil_du_moteur(&b.settings(), b.zone, premium);
+        let bandes = moteur.map_or(0, |p| p.bands.len());
+        assert_eq!(bandes, if premium { 2 } else { 0 }, "premium={premium}");
+        if premium {
+            // Renvoyée telle quelle, la vue s'enregistre recochée.
+            let (s, v) = b.put(v["chain"].clone()).await;
+            assert_eq!(s, StatusCode::OK, "{v}");
+            let c = b.chaine();
+            let m = c
+                .plugins
+                .iter()
+                .find(|m| m.id == "equalizer-parametric")
+                .unwrap();
+            assert!(
+                m.enabled && m.settings.get("replaced_in_group").is_none(),
+                "{m:?}"
+            );
+        }
+    }
+}
+
+/// rc14 — bornes de gain publiées au chemin que lit le web, et tenues au
+/// `PUT` : −30 / +15 dB pour le paramétrique et la pièce, −30 / +20 dB pour
+/// le casque (OPRA, #9519), ±12 dB pour le graphique.
+#[tokio::test]
+async fn les_bornes_de_gain_sont_publiees_et_tenues_rc14() {
+    let b = Banc::nouveau(true).await;
+    let (_, cat) = b
+        .brut(Method::GET, "/api/v1/tess/catalog", None, None)
+        .await;
+    let gain = |id: &str| {
+        cat["catalog"]["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == json!(id))
+            .unwrap()["settings_schema"]["properties"]["bands"]["items"]["properties"]["gain"]
+            .clone()
+    };
+    for (id, min, max) in [
+        ("equalizer-parametric", -30.0, 15.0),
+        ("equalizer-headphone", -30.0, 20.0),
+        ("room-correction", -30.0, 15.0),
+        ("equalizer-graphic", -12.0, 12.0),
+    ] {
+        let g = gain(id);
+        assert_eq!(
+            (g["minimum"].as_f64(), g["maximum"].as_f64()),
+            (Some(min), Some(max)),
+            "{id} : {g}"
+        );
+    }
+    let parametrique = |g: f64| {
+        json!({"version": 1, "plugins": [
+            {"id": "equalizer-parametric", "enabled": true,
+             "settings": profil(json!([{"freq": 3000.0, "gain": g, "q": 4.0, "type": "peak"}]))}
+        ]})
+    };
+    let (s, v) = b.put(parametrique(-30.0)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = b.put(parametrique(15.0)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    for g in [-30.5, 15.5] {
+        let avant = b.enregistree();
+        let (s, v) = b.put(parametrique(g)).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{g} : {v}");
+        refus_conforme(&v, 409, "invalid_settings");
+        assert_eq!(b.enregistree(), avant);
+    }
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "equalizer-graphic", "enabled": true,
+             "settings": profil(json!([{"freq": 1000.0, "gain": -13.0, "q": 1.0, "type": "peak"}]))}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    refus_conforme(&v, 409, "invalid_settings"); // #9519 — une correction casque OPRA à +20 dB passe.
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "equalizer-headphone", "enabled": true,
+             "settings": profil(json!([{"freq": 9000.0, "gain": 20.0, "q": 2.0, "type": "peak"}]))}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
 }
 
 /// rc14 — un paquet installé mais désactivé n'est pas « à installer » : il
@@ -1388,4 +1532,79 @@ async fn surechantillonnage_non_installe_propose_l_installation_rc14() {
     let e = etape(&v);
     assert_eq!(e["reason"], json!("plugin_unavailable"), "{e}");
     assert!(e["params"].get("install_package").is_none(), "{e}");
+}
+
+/// Revue #9520 (2) — un ancien client ne connaît qu'un égaliseur :
+/// `POST /zones/{id}/eq` `enabled: false` éteint TOUTE la série (le moteur
+/// n'applique plus rien, le `GET` le dit), et `enabled: true` les rallume
+/// toutes ensemble, réglages gardés.
+#[tokio::test]
+async fn revue_9520_ancien_client_eteint_l_egaliseur() {
+    let b = Banc::nouveau(true).await;
+    // Le graphique à plat (curseurs) : la façade qu'une ancienne route relit
+    // comme graphique.
+    let mut graphique = profil(json!([]));
+    graphique["bass_gain_db"] = json!(3.0);
+    let parametrique = profil(bandes_parametriques());
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "equalizer-graphic", "enabled": true, "settings": graphique},
+            {"id": "equalizer-parametric", "enabled": true, "settings": parametrique}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let reglages = |c: &ChaineTess, id: &str| {
+        let m = c.plugins.iter().find(|m| m.id == id).unwrap();
+        let mut r = m.settings.clone();
+        if let Some(o) = r.as_object_mut() {
+            o.remove("off_by_legacy_eq");
+        }
+        (m.enabled, r)
+    };
+    let avant = b.chaine();
+    let uri = format!("/api/v1/zones/{}/eq", b.zone);
+    let (s, eq) = b
+        .brut(
+            Method::POST,
+            &uri,
+            Some(json!({"enabled": false}).to_string()),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{eq}");
+    let c = b.chaine();
+    for id in ["equalizer-graphic", "equalizer-parametric"] {
+        assert!(!reglages(&c, id).0, "{id} doit être éteint : {c:?}");
+    }
+    assert!(
+        tune_core::tess::egaliseurs_en_serie::profil_du_moteur(&b.settings(), b.zone, true)
+            .is_none(),
+        "le moteur ne doit plus rien appliquer"
+    );
+    let (_, eq) = b.brut(Method::GET, &uri, None, None).await;
+    assert_eq!(eq["enabled"], json!(false), "{eq}");
+    let (_, v) = b.get().await;
+    for id in ["equalizer-graphic", "equalizer-parametric"] {
+        assert_eq!(etape(&v, id)["effective"], json!(false), "{id}");
+    }
+
+    let (s, eq) = b
+        .brut(
+            Method::POST,
+            &uri,
+            Some(json!({"enabled": true}).to_string()),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{eq}");
+    let apres = b.chaine();
+    for id in ["equalizer-graphic", "equalizer-parametric"] {
+        assert_eq!(reglages(&apres, id), reglages(&avant, id), "{id}");
+    }
+    let p = tune_core::tess::egaliseurs_en_serie::profil_du_moteur(&b.settings(), b.zone, true)
+        .expect("série rallumée");
+    // Les trois curseurs du graphique puis les deux bandes du paramétrique.
+    assert_eq!(p.bands.len(), 5, "{p:?}");
+    let (_, eq) = b.brut(Method::GET, &uri, None, None).await;
+    assert_eq!(eq["enabled"], json!(true), "{eq}");
 }

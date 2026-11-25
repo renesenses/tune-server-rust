@@ -43,6 +43,24 @@ pub fn local_backend_status_value(_output_type: Option<&str>, _requested: &str) 
     None
 }
 
+thread_local! {
+    /// Revue #9520 — le droit Premium du compte pendant la construction du
+    /// chemin du signal (synchrone), posé par [`avec_le_droit`] depuis
+    /// `state.license`. Faux hors de lui (témoins).
+    static DROIT_PREMIUM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Construit le chemin du signal avec le droit Premium du compte, que
+/// l'appelant lit sur `state.license` à chaque requête : le panneau décrit la
+/// série d'égaliseurs que le moteur applique pour ce droit (une façade Premium
+/// écartée par l'exclusivité du 24/11 n'est recochée qu'en Premium).
+pub fn avec_le_droit<T>(premium: bool, construire: impl FnOnce() -> T) -> T {
+    let avant = DROIT_PREMIUM.replace(premium);
+    let r = construire();
+    DROIT_PREMIUM.set(avant);
+    r
+}
+
 /// Build the `signal_path` object for a zone's current playback.
 /// Returns `None` when the zone is not playing.
 ///
@@ -79,21 +97,19 @@ pub(super) fn active_zone_eq_profile(
     zone_id: i64,
 ) -> Option<tune_core::audio::eq::EqProfile> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
-    if !tune_core::audio::premium_plugins::enabled(&settings, "equalizer") {
+    // PURE, mesure de pièce et (rc14) « Bypass all » : le PCM atteint la
+    // sortie intact, l'égaliseur n'est jamais construit.
+    if tune_core::audio::audiophile::traitements_contournes(backend, zone_id) {
         return None;
     }
-    // PURE : le PCM atteint la sortie intact, l'égaliseur n'est jamais construit.
-    if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
-        return None;
-    }
-    let profile = settings
-        .get(&format!("zone_{zone_id}_eq_profile"))
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str::<tune_core::audio::eq::EqProfile>(&s).ok())?;
-    if !profile.enabled {
-        return None;
-    }
+    // rc14 (revue #9520, règle #1548) — la même lecture que le moteur : tous
+    // les égaliseurs cochés de la série, ou le headroom manuel, avec le droit
+    // Premium du compte ([`avec_le_droit`]).
+    let profile = tune_core::tess::egaliseurs_en_serie::profil_du_moteur(
+        &settings,
+        zone_id,
+        DROIT_PREMIUM.get(),
+    )?;
     // 44100/2 n'est qu'une sonde : is_enabled() dépend des gains, pas du débit.
     tune_core::audio::eq::EqProcessor::new(&profile, 44100, 2)
         .is_enabled()

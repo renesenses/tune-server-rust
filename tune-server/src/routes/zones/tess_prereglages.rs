@@ -193,6 +193,13 @@ pub async fn enregistrer_prereglage(State(state): State<AppState>, corps: Bytes)
             ) {
                 return refus(&e);
             }
+            // Revue #9520 v2 — un préréglage posé par son corps est une
+            // NOUVELLE édition : les bornes de gain publiées valent pour lui
+            // (sinon il les contournerait au chargement, où ses façades sont
+            // « connues »).
+            if let Err(e) = tune_core::tess::egaliseurs_en_serie::verifier_les_gains(&c, &[]) {
+                return refus(&e);
+            }
             c
         }
         _ => {
@@ -210,10 +217,11 @@ pub async fn enregistrer_prereglage(State(state): State<AppState>, corps: Bytes)
             attendue: tune_core::tess::VERSION_CHAINE,
         });
     }
-    // rc14 — jamais un préréglage qu'on ne pourrait pas charger : une zone
-    // enregistrée avec deux égaliseurs cochés est normalisée.
+    // rc14 — égaliseurs combinables : une façade écartée par l'exclusivité
+    // du 24/11 (marque `replaced_in_group`) est recochée.
     let mut chaine = chaine;
-    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine);
+    let premium = state.license.is_premium().await;
+    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine, premium);
     let mut liste = match prereglages::lire(&settings) {
         Ok(l) => l,
         Err(e) => return stockage(e),
@@ -558,16 +566,15 @@ pub async fn appliquer_prereglage(
     let Some(p) = liste.get(&preset_id).cloned() else {
         return introuvable(&preset_id);
     };
-    // rc14 — un préréglage enregistré avant l'exclusivité des égaliseurs
-    // peut en cocher plusieurs : chargé normalisé (la première façade
-    // cochée), jamais refusé.
+    // rc14 — égaliseurs combinables : un préréglage enregistré sous
+    // l'exclusivité du 24/11 retrouve les façades qu'elle avait décochées.
+    let premium = state.license.is_premium().await;
     let mut chaine_du_prereglage = p.chain.clone();
-    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine_du_prereglage);
+    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine_du_prereglage, premium);
     let corps = match serde_json::to_vec(&chaine_du_prereglage) {
         Ok(c) => c,
         Err(e) => return refus(&ErreurChaine::CorpsIllisible(e.to_string())),
     };
-    let premium = state.license.is_premium().await;
     let catalogue = catalogue_du_serveur();
     let verrou = verrou_des_put(id);
     let _garde = verrou.lock().await;
@@ -676,9 +683,11 @@ pub(super) fn oublier_le_prereglage_s_il_differe(
         .and_then(|l| l.get(&actif).cloned())
         .is_some_and(|p| {
             // rc14 — comparé tel qu'il a été chargé (égaliseurs normalisés).
-            let mut c = p.chain.clone();
-            tune_core::tess::migration::normaliser_les_egaliseurs(&mut c);
-            sans_champs_du_serveur(&c) == sans_champs_du_serveur(&enregistree)
+            [false, true].into_iter().any(|premium| {
+                let mut c = p.chain.clone();
+                tune_core::tess::migration::normaliser_les_egaliseurs(&mut c, premium);
+                sans_champs_du_serveur(&c) == sans_champs_du_serveur(&enregistree)
+            })
         });
     if !decrit && !effacer_le_marqueur(&settings, zone_id) {
         return Some(AVERTISSEMENT_MARQUEUR.to_owned());

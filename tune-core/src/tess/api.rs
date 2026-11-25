@@ -813,7 +813,7 @@ mod tests {
         assert_eq!(r.badge, Badge::OutsideTess);
         // Contre-épreuve sur OAAT.
         let r = reponse(TransportZone::Oaat, chaine_complete());
-        assert_eq!(r.headroom_db, -3.0);
+        assert_eq!(r.headroom_db, crate::tess::chaine::HEADROOM_AUTO_DB);
         assert!(r.volume.placement.is_some());
     }
 

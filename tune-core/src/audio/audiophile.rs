@@ -42,7 +42,26 @@ pub fn zone_enabled(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
 /// #8513 — les traitements de la zone sont-ils contournés ? En PURE, ou
 /// pendant le balayage d'une mesure de pièce ([`super::mesure_nue`]). Ne
 /// touche ni au réglage PURE ni au verrou de volume : seul le chemin DSP le lit.
+///
+/// rc14 — et sous « Bypass all » de la chaîne TESS : même garde, donc les
+/// mêmes étages contournés (égaliseurs, convolution, crossfeed, natifs,
+/// repli mono, réaffectation, suréchantillonnage, ReplayGain). Le volume de
+/// la zone reste, comme sous PURE. Les protections (DoP #8813) et les rampes
+/// anti-clic ne lisent PAS cette garde : voir [`pure_ou_mesure`].
 pub fn traitements_contournes(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
+    zone_enabled(db, zone_id)
+        || super::mesure_nue::active(zone_id)
+        || crate::tess::egaliseurs_en_serie::bypass_all_de_zone(
+            &SettingsRepo::with_backend(db.clone()),
+            zone_id,
+        )
+}
+
+/// rc14 — PURE ou une mesure de pièce, SANS « Bypass all ». « Bypass all »
+/// est un outil de comparaison, pas du bit-perfect : la protection du niveau
+/// DoP (#8813) et les rampes anti-clic (soft mute, fondus de pause, seek,
+/// stop) restent en service sous lui ; elles lisent cette garde-ci.
+pub fn pure_ou_mesure(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
     zone_enabled(db, zone_id) || super::mesure_nue::active(zone_id)
 }
 

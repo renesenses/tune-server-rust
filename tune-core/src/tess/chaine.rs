@@ -25,7 +25,13 @@ use crate::audio::surechantillonnage::greffon::{DEFAULT_FILTER, OFFERED_FILTERS,
 pub const VERSION_CHAINE: u32 = 1;
 
 /// Headroom automatique dès qu'un greffon ou l'upsampler est actif (T07).
-pub const HEADROOM_AUTO_DB: f64 = -3.0;
+///
+/// rc14 — 0 dB : en Auto, la seule marge est celle que les égaliseurs
+/// réservent sur leur cascade entière (`EqProfile::reserve_db_at`). Le
+/// moteur n'a pas d'étage Headroom séparé ; annoncer −3 dB décrivait une
+/// baisse que rien n'appliquait. Un headroom MANUEL, lui, devient la marge
+/// des égaliseurs (`tess::egaliseurs_en_serie`).
+pub const HEADROOM_AUTO_DB: f64 = 0.0;
 /// Bornes d'un headroom manuel, en dB.
 pub const HEADROOM_MANUEL_MIN_DB: f64 = -24.0;
 pub const HEADROOM_MANUEL_MAX_DB: f64 = 0.0;
@@ -754,38 +760,17 @@ mod tests {
     }
 
     #[test]
-    fn les_facades_de_l_egaliseur_sont_exclusives_rc14() {
-        // GO du 24/11 : deux façades cochées = 409 `mutually_exclusive`.
-        for (a, b) in [
-            ("equalizer-graphic", "equalizer-parametric"),
-            ("equalizer-headphone", "room-correction"),
-            ("room-correction", "equalizer-graphic"),
-        ] {
-            let c = chaine(vec![
-                maillon(a, true),
-                maillon("crossfeed", true),
-                maillon(b, true),
-            ]);
-            let e = valider(&c, PREMIUM).unwrap_err();
-            assert_eq!(
-                e,
-                ErreurChaine::Exclusifs {
-                    premier: a.into(),
-                    second: b.into(),
-                    groupe: "equalizer".into()
-                }
-            );
-            assert_eq!(e.statut_http(), 409);
-            assert_eq!(e.code(), "mutually_exclusive");
-            assert_eq!(e.greffon(), Some(b));
-            // Contre-épreuve : une seule cochée, l'autre décochée, passe.
-            let un_seul = chaine(vec![
-                maillon(a, true),
-                maillon("crossfeed", true),
-                maillon(b, false),
-            ]);
-            valider(&un_seul, PREMIUM).unwrap();
-        }
+    fn les_facades_de_l_egaliseur_sont_combinables_rc14() {
+        // GO du 25/11 : graphique, paramétrique, casque et correction de pièce
+        // cochés ensemble passent (ils s'appliquent en série).
+        let c = chaine(vec![
+            maillon("equalizer-graphic", true),
+            maillon("crossfeed", true),
+            maillon("equalizer-parametric", true),
+            maillon("equalizer-headphone", true),
+            maillon("room-correction", true),
+        ]);
+        valider(&c, PREMIUM).unwrap();
     }
 
     #[test]

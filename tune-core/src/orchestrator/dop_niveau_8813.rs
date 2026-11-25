@@ -13,7 +13,9 @@ impl PlaybackOrchestrator {
         if !matches!(transport, TransportDsd::Dop | TransportDsd::NatifServiEnDop) {
             return false;
         }
-        if self.zone_audiophile(zone_id)
+        // rc14 (revue #9520) — PURE ou mesure seulement : « Bypass all » ne
+        // lève JAMAIS cette protection (un DSD à pleine échelle, volume à 6 %).
+        if crate::audio::audiophile::pure_ou_mesure(&self.db, zone_id)
             || crate::audio::bitperfect_strict::zone_enabled(&self.db, zone_id)
             || !crate::audio::dop_ecarte_7265::protection_du_niveau_active(&self.db, zone_id)
         {

@@ -811,7 +811,12 @@ mod tests {
         for id in ["crossfeed", "crosstalk"] {
             let mut r = resoudre(&[id], false, PCM24);
             assert_eq!(r.badge, Badge::ProcessedByTess, "{id}");
-            assert!(r.headroom_db < 0.0, "{id} : headroom automatique armé");
+            assert!(
+                r.etapes
+                    .iter()
+                    .any(|e| e.code == CodeEtape::Headroom && e.effective),
+                "{id} : headroom automatique armé"
+            );
             let a = acheminer(&r, &faits(Refused, false, Library));
             assert_eq!(a.route, VoieUpnp::Untouched);
             assert_eq!(a.reason, Some(MotifDeVoie::RendererWithoutLpcm));

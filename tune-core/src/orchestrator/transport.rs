@@ -2611,6 +2611,16 @@ impl PlaybackOrchestrator {
                     // lecture comme le strict : `play_url` la lit une fois.
                     local_output.set_secondes_sorties(secondes_sorties);
                     local_output.set_retard_de_depart_ms(retard_de_depart_ms);
+                    // Revue #9520 v2 — PURE ou mesure, sans « Bypass all » :
+                    // ce que lit la garde de départ bas (#8074).
+                    local_output.set_pure_ou_mesure(crate::audio::audiophile::pure_ou_mesure(
+                        &self.db, zone_id,
+                    ));
+                    // rc14 — l'ordre des étages suit la chaîne TESS de la zone.
+                    local_output.set_ordre_tess(&crate::tess::egaliseurs_en_serie::chaine_de_zone(
+                        &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+                        zone_id,
+                    ));
                     // #8869 — le silence de verrouillage de la zone, lu à
                     // chaque lecture : `play_url` le lit une fois.
                     local_output.set_silence_de_verrouillage_ms(
@@ -3453,8 +3463,9 @@ impl PlaybackOrchestrator {
     ) -> u32 {
         use crate::audio::soft_mute::{SOFT_MUTE_DEFAULT_MS, SOFT_MUTE_MAX_MS};
         // PURE : le PCM atteint la sortie intact, aucune rampe n'est appliquée.
-        // #8513 — ni pendant une mesure de pièce.
-        if crate::audio::audiophile::traitements_contournes(db, zone_id) {
+        // #8513 — ni pendant une mesure de pièce. rc14 — mais sous « Bypass
+        // all » la rampe anti-clic reste (`pure_ou_mesure`).
+        if crate::audio::audiophile::pure_ou_mesure(db, zone_id) {
             return 0;
         }
         crate::db::settings_repo::SettingsRepo::with_backend(db.clone())

@@ -1206,3 +1206,111 @@ fn le_traitement_avec_convolution_n_alloue_pas_t09b() {
         executer_chaine_locale(&mut f, &chaine.moteurs(), OrdreLocal::HISTORIQUE, 2, false);
     });
 }
+
+// ── rc14 : l'ordre affiché de la chaîne TESS règle la sortie locale ──
+
+/// Un égaliseur à bande PAR CANAL (gauche seulement) : avant ou après le
+/// crossfeed, qui mélange les voies, le résultat diffère.
+fn egaliseur_gauche() -> EqProcessor {
+    let profile = EqProfile {
+        enabled: true,
+        bands: vec![EqBandSpec {
+            freq: 1000.0,
+            gain: -15.0,
+            q: 1.0,
+            band_type: "peak".into(),
+            channel: Some(0),
+        }],
+        ..Default::default()
+    };
+    EqProcessor::new(&profile, 44_100, 2)
+}
+
+fn chaine_tess(ids: &[&str]) -> ChaineTess {
+    serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "plugins": ids.iter().map(|id| serde_json::json!({"id": id, "enabled": true})).collect::<Vec<_>>()
+    }))
+    .unwrap()
+}
+
+/// Crossfeed puis égaliseur à bande par canal (ordre inversé par
+/// l'utilisateur) : la sortie diffère de l'ordre historique, et vaut
+/// exactement les moteurs appelés dans CET ordre.
+#[test]
+fn crossfeed_puis_egaliseur_par_canal_suit_l_ordre_affiche_rc14() {
+    use EtageLocal::*;
+    let inverse = OrdreLocal::depuis_chaine(&chaine_tess(&["crossfeed", "equalizer-parametric"]));
+    assert_eq!(
+        inverse.etages(),
+        [Crossfeed, Egaliseur, Convolution, RepliMono]
+    );
+    let source = octets(&mots(8_000, 24), 24);
+    let sortie = |ordre: OrdreLocal| {
+        let c = Chaine::avec(Some(egaliseur_gauche()), None, Some(crossfeed()), false);
+        let mut f = crate::outputs::local::pcm_bytes_to_f64(&source, 24);
+        executer_chaine_locale(&mut f, &c.moteurs(), ordre, 2, false);
+        f
+    };
+    let historique = sortie(OrdreLocal::HISTORIQUE);
+    let affiche = sortie(inverse);
+    assert_ne!(historique, affiche, "l'ordre doit changer la sortie");
+    // Oracle : crossfeed, puis égaliseur.
+    let (mut cf, mut eq) = (crossfeed(), egaliseur_gauche());
+    let mut attendu = crate::outputs::local::pcm_bytes_to_f64(&source, 24);
+    cf.process_interleaved_f64(&mut attendu);
+    let _ = eq.process_interleaved_f64(&mut attendu);
+    assert_eq!(affiche, attendu);
+    // Et l'ordre historique est bien égaliseur puis crossfeed.
+    let (mut cf, mut eq) = (crossfeed(), egaliseur_gauche());
+    let mut attendu = crate::outputs::local::pcm_bytes_to_f64(&source, 24);
+    let _ = eq.process_interleaved_f64(&mut attendu);
+    cf.process_interleaved_f64(&mut attendu);
+    assert_eq!(historique, attendu);
+}
+
+/// L'ordre par défaut d'une chaîne (celui de la migration, `rang`) EST
+/// l'ordre historique : même ordre, mêmes octets.
+#[test]
+fn l_ordre_par_defaut_est_l_historique_a_l_octet_pres_rc14() {
+    let defaut = chaine_tess(&[
+        "equalizer-graphic",
+        "equalizer-parametric",
+        "room-correction",
+        "convolution",
+        "crossfeed",
+        "crosstalk",
+        "mono-downmix",
+        "channel-remap",
+    ]);
+    assert_eq!(OrdreLocal::depuis_chaine(&defaut), OrdreLocal::HISTORIQUE);
+    assert_eq!(
+        OrdreLocal::depuis_chaine(&ChaineTess::default()),
+        OrdreLocal::HISTORIQUE
+    );
+    let source = octets(&mots(6_000, 24), 24);
+    let a = Chaine::new(true, true, true, true);
+    let b = Chaine::new(true, true, true, true);
+    let x = decoder_par_la_chaine_tess(
+        &source,
+        24,
+        &a.moteurs(),
+        OrdreLocal::depuis_chaine(&defaut),
+        2,
+        false,
+    );
+    let y = decoder_par_la_chaine_tess(&source, 24, &b.moteurs(), OrdreLocal::HISTORIQUE, 2, false);
+    assert_eq!(bits_f32(&x), bits_f32(&y));
+}
+
+/// L'ordre posé pour une sortie ne vaut que pour elle, et s'oublie.
+#[test]
+fn l_ordre_pose_ne_vaut_que_pour_sa_sortie_rc14() {
+    let (une, autre) = (AtomicBool::new(false), AtomicBool::new(false));
+    let inverse = OrdreLocal::depuis_chaine(&chaine_tess(&["crossfeed", "equalizer-graphic"]));
+    OrdreLocal::poser_pour_la_sortie(&une, inverse);
+    assert_eq!(OrdreLocal::de_la_sortie(&une), inverse);
+    assert_eq!(OrdreLocal::de_la_sortie(&autre), OrdreLocal::HISTORIQUE);
+    OrdreLocal::oublier_la_sortie(&une);
+    assert_eq!(OrdreLocal::de_la_sortie(&une), OrdreLocal::HISTORIQUE);
+}
