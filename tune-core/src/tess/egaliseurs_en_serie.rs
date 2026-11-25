@@ -114,22 +114,33 @@ fn bande_a_gain(b: &Value) -> bool {
     )
 }
 
+/// Les réglages sans les marques que pose le serveur.
+fn sans_marques(v: &Value) -> Value {
+    let mut v = v.clone();
+    if let Value::Object(o) = &mut v {
+        o.remove(MARQUE_REMPLACE);
+        o.remove(super::migration::MARQUE_ETEINT_PAR_L_ANCIENNE_CLE);
+    }
+    v
+}
+
 /// `PUT` : le gain de chaque bande d'une façade dont les réglages CHANGENT
-/// reste dans [`bornes_de_gain`] (409 `invalid_settings` sinon). Un maillon
-/// inchangé n'est pas revérifié : un profil enregistré par une ancienne route
-/// (jusqu'à ±24 dB) se garde tel quel.
-pub fn verifier_les_gains(
-    chaine: &ChaineTess,
-    enregistree: &ChaineTess,
-) -> Result<(), ErreurChaine> {
+/// reste dans [`bornes_de_gain`] (409 `invalid_settings` sinon). Une façade
+/// dont les réglages sont ceux d'une chaîne CONNUE (`connues` : la chaîne
+/// enregistrée de la zone, les préréglages enregistrés) n'est pas revérifiée :
+/// un profil posé par une ancienne route ou un préréglage d'avant ces bornes
+/// (jusqu'à ±24 dB, ce que le moteur prenait) se garde et se charge tel quel.
+/// Les bornes ne valent que pour une NOUVELLE édition.
+pub fn verifier_les_gains(chaine: &ChaineTess, connues: &[&ChaineTess]) -> Result<(), ErreurChaine> {
     for m in &chaine.plugins {
         let Some((min, max)) = bornes_de_gain(&m.id) else {
             continue;
         };
-        let inchange = enregistree
-            .plugins
+        let reglages = sans_marques(&m.settings);
+        let inchange = connues
             .iter()
-            .any(|e| e.id == m.id && e.settings == m.settings);
+            .flat_map(|c| c.plugins.iter())
+            .any(|e| e.id == m.id && sans_marques(&e.settings) == reglages);
         if inchange {
             continue;
         }
@@ -161,6 +172,7 @@ pub fn profil_du_maillon(m: &MaillonGreffon) -> Option<EqProfile> {
     let mut s = s.clone();
     s.remove(CHAMP_ORIGINE);
     s.remove(MARQUE_REMPLACE);
+    s.remove(super::migration::MARQUE_ETEINT_PAR_L_ANCIENNE_CLE);
     s.insert("enabled".into(), Value::Bool(true));
     serde_json::from_value(Value::Object(s)).ok()
 }
@@ -205,6 +217,9 @@ pub fn combiner_en_serie(profils: &[EqProfile]) -> Option<EqProfile> {
     if !bandes.is_empty() {
         p.bands = bandes;
     }
+    // Revue #9520 — une série a toujours sa réserve L1 (pas de falaise pour
+    // une série purement soustractive).
+    p.reserve_l1_toujours = true;
     p.headroom_mode = if profils
         .iter()
         .all(|x| x.headroom_mode == HeadroomMode::Realistic)
@@ -258,6 +273,16 @@ pub fn ordre_des_coches(chaine: &ChaineTess) -> Vec<u8> {
     ordre
 }
 
+/// Un « égaliseur » sans bande qui n'est qu'un gain fixe de `db` (≤ 0) : la
+/// marge manuelle de TESS quand aucun égaliseur n'est coché.
+pub fn gain_fixe(db: f64) -> EqProfile {
+    EqProfile {
+        enabled: true,
+        reserve_imposee_db: Some(db.min(0.0)),
+        ..EqProfile::default()
+    }
+}
+
 /// La chaîne ENREGISTRÉE de la zone, sans la relire (rapide) ; la chaîne par
 /// défaut (vide) si elle est absente ou illisible.
 pub fn chaine_de_zone(settings: &SettingsRepo, zone_id: i64) -> ChaineTess {
@@ -307,12 +332,17 @@ pub fn profil_de_la_chaine(
             None => {}
         }
     }
-    let mut p = combiner_en_serie(&profils)?;
-    if let Headroom::Manual { db } = chaine.fixed.headroom
-        && db.is_finite()
-    {
-        p.reserve_imposee_db = Some(db.min(0.0));
-    }
+    let manuel = match chaine.fixed.headroom {
+        Headroom::Manual { db } if db.is_finite() => Some(db.min(0.0)),
+        _ => None,
+    };
+    let Some(mut p) = combiner_en_serie(&profils) else {
+        // Revue #9520 — headroom manuel sans égaliseur coché : il s'applique
+        // quand même, en gain fixe à l'étage de l'égaliseur (avant la
+        // convolution et le suréchantillonneur dans l'ordre historique).
+        return manuel.filter(|d| *d < 0.0).map(gain_fixe);
+    };
+    p.reserve_imposee_db = manuel;
     Some(p)
 }
 
@@ -326,7 +356,15 @@ pub fn profil_de_la_chaine(
 /// La chaîne est relue par [`lire_zone`] : un réglage écrit depuis par une
 /// ancienne route y est déjà réappliqué. Le mode PURE et « Bypass all » ne
 /// sont pas regardés ici (`traitements_contournes`).
-pub fn egaliseurs_de_zone(settings: &SettingsRepo, zone_id: i64) -> Option<Option<EqProfile>> {
+///
+/// `premium` : le droit du compte. Une façade Premium écartée par
+/// l'exclusivité du 24/11 n'est recochée qu'avec lui
+/// ([`super::migration::normaliser_les_egaliseurs`]).
+pub fn egaliseurs_de_zone(
+    settings: &SettingsRepo,
+    zone_id: i64,
+    premium: bool,
+) -> Option<Option<EqProfile>> {
     let brute = chaine_brute(settings, zone_id)?;
     let facades = brute
         .plugins
@@ -337,13 +375,42 @@ pub fn egaliseurs_de_zone(settings: &SettingsRepo, zone_id: i64) -> Option<Optio
     if brute.version > VERSION_CHAINE || (facades < 2 && !manuel) {
         return None;
     }
-    let chaine = lire_zone(settings, zone_id, true).ok()?.chaine;
+    let mut chaine = lire_zone(settings, zone_id, true).ok()?.chaine;
+    super::migration::normaliser_les_egaliseurs(&mut chaine, premium);
     let principal: Option<EqProfile> = settings
         .get(&format!("zone_{zone_id}_eq_profile"))
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok());
     Some(profil_de_la_chaine(&chaine, principal.as_ref()))
+}
+
+/// L'égaliseur ACTIVÉ que le moteur applique à la zone, PURE et « Bypass
+/// all » mis à part (ils sont tranchés par `traitements_contournes`) : la
+/// série de la chaîne ([`egaliseurs_de_zone`]), sinon `zone_{id}_eq_profile`
+/// comme avant. Les égaliseurs demandent le greffon `equalizer` installé ; le
+/// headroom manuel seul (gain fixe) est un étage de TESS et ne le demande
+/// pas. Une seule fonction pour le moteur et le panneau historique (#1548).
+pub fn profil_du_moteur(settings: &SettingsRepo, zone_id: i64, premium: bool) -> Option<EqProfile> {
+    let installe = crate::audio::premium_plugins::enabled(settings, "equalizer");
+    if let Some(chaine) = egaliseurs_de_zone(settings, zone_id, premium) {
+        return chaine.and_then(|p| {
+            if installe {
+                Some(p)
+            } else {
+                p.reserve_imposee_db.filter(|d| *d < 0.0).map(gain_fixe)
+            }
+        });
+    }
+    if !installe {
+        return None;
+    }
+    let profil: EqProfile = settings
+        .get(&format!("zone_{zone_id}_eq_profile"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())?;
+    profil.enabled.then_some(profil)
 }
 
 /// Ce qui, dans une chaîne, change l'égaliseur du moteur : les façades

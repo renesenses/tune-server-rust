@@ -3458,8 +3458,9 @@ impl PlaybackOrchestrator {
     ) -> u32 {
         use crate::audio::soft_mute::{SOFT_MUTE_DEFAULT_MS, SOFT_MUTE_MAX_MS};
         // PURE : le PCM atteint la sortie intact, aucune rampe n'est appliquée.
-        // #8513 — ni pendant une mesure de pièce.
-        if crate::audio::audiophile::traitements_contournes(db, zone_id) {
+        // #8513 — ni pendant une mesure de pièce. rc14 — mais sous « Bypass
+        // all » la rampe anti-clic reste (`pure_ou_mesure`).
+        if crate::audio::audiophile::pure_ou_mesure(db, zone_id) {
             return 0;
         }
         crate::db::settings_repo::SettingsRepo::with_backend(db.clone())

@@ -2350,7 +2350,11 @@ impl PlaybackOrchestrator {
     /// réglage que PURE cache. `None` si la clé est absente, illisible ou si
     /// le profil est désactivé.
     pub(super) fn eq_profile_configure(&self, zone_id: i64) -> Option<crate::audio::eq::EqProfile> {
-        Self::eq_profile_configure_with(&self.db, zone_id)
+        let premium = self
+            .license
+            .as_ref()
+            .is_none_or(|license| license.premium_snapshot());
+        Self::eq_profile_configure_with(&self.db, zone_id, premium)
     }
 
     /// #4176 — le profil ENREGISTRÉ de la zone est-il à plat : aucune bande
@@ -2377,32 +2381,13 @@ impl PlaybackOrchestrator {
     fn eq_profile_configure_with(
         db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
         zone_id: i64,
+        premium: bool,
     ) -> Option<crate::audio::eq::EqProfile> {
-        if !crate::audio::premium_plugins::enabled(
+        crate::tess::egaliseurs_en_serie::profil_du_moteur(
             &crate::db::settings_repo::SettingsRepo::with_backend(db.clone()),
-            "equalizer",
-        ) {
-            return None;
-        }
-        let settings = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
-        // rc14 — plusieurs égaliseurs cochés dans la chaîne TESS (ou un
-        // headroom manuel) : tous, en série, dans l'ordre de la chaîne.
-        // Sinon, `zone_{id}_eq_profile` comme avant.
-        if let Some(chaine) =
-            crate::tess::egaliseurs_en_serie::egaliseurs_de_zone(&settings, zone_id)
-        {
-            return chaine;
-        }
-        let key = format!("zone_{zone_id}_eq_profile");
-        let profile: crate::audio::eq::EqProfile = settings
-            .get(&key)
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str(&s).ok())?;
-        if !profile.enabled {
-            return None;
-        }
-        Some(profile)
+            zone_id,
+            premium,
+        )
     }
 
     /// Quel traitement, parmi ceux que le mode PURE gouverne sur un flux

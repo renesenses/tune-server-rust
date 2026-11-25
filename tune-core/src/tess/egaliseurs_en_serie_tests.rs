@@ -162,7 +162,16 @@ fn une_seule_marge_rc14() {
     chaine.fixed.headroom = Headroom::Manual { db: -4.5 };
     let c = profil_de_la_chaine(&chaine, None).unwrap();
     assert_eq!(c.reserve_imposee_db, Some(-4.5));
-    assert!((pre(&c) + 4.5).abs() < 1e-12, "{}", pre(&c));
+    // La plus forte des deux atténuations (revue #9520) : la réserve « Sûre »
+    // de la série n'est jamais perdue.
+    let mut sans = c.clone();
+    sans.reserve_imposee_db = None;
+    let attendu = (-4.5f64).min(pre(&sans));
+    assert!((pre(&c) - attendu).abs() < 1e-12, "{} vs {attendu}", pre(&c));
+    // Un manuel plus fort que la réserve : c'est lui.
+    let mut fort = c.clone();
+    fort.reserve_imposee_db = Some(pre(&sans) - 3.0);
+    assert!((pre(&fort) - (pre(&sans) - 3.0)).abs() < 1e-12);
     // Jamais écrite : le profil se relit comme avant.
     let texte = serde_json::to_string(&c).unwrap();
     assert!(!texte.contains("reserve_imposee"), "{texte}");
@@ -205,13 +214,13 @@ fn les_gains_sont_bornes_au_put_rc14() {
         ("equalizer-graphic", [-12.0, 12.0], [-12.5, 12.5]),
     ] {
         for g in ok {
-            verifier_les_gains(&avec(id, g), &vide).unwrap();
+            verifier_les_gains(&avec(id, g), &[&vide]).unwrap();
         }
         for g in refuse {
-            let e = verifier_les_gains(&avec(id, g), &vide).unwrap_err();
+            let e = verifier_les_gains(&avec(id, g), &[&vide]).unwrap_err();
             assert_eq!(e.code(), "invalid_settings", "{id} {g}");
             // Inchangé depuis l'enregistrement (ancienne route) : gardé.
-            verifier_les_gains(&avec(id, g), &avec(id, g)).unwrap();
+            verifier_les_gains(&avec(id, g), &[&avec(id, g)]).unwrap();
         }
     }
     // Le gain d'un passe-haut n'est pas lu.
@@ -223,7 +232,7 @@ fn les_gains_sont_bornes_au_put_rc14() {
         }],
         ..ChaineTess::default()
     };
-    verifier_les_gains(&ph, &vide).unwrap();
+    verifier_les_gains(&ph, &[&vide]).unwrap();
 }
 
 #[test]
@@ -303,7 +312,7 @@ fn un_profil_casque_a_plus_20_db_est_accepte_rc14() {
         plugins: vec![maillon("equalizer-headphone", true, &opra)],
         ..ChaineTess::default()
     };
-    verifier_les_gains(&casque, &ChaineTess::default()).unwrap();
+    verifier_les_gains(&casque, &[&ChaineTess::default()]).unwrap();
     let mut s: Value = serde_json::from_str(include_str!(
         "../../../sdk/tune-plugin-equalizer/schemas/config.json"
     ))

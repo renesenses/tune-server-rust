@@ -126,6 +126,11 @@ pub const MARQUE_MONO_INERTE: &str = "inert_on_network";
 /// ; sa valeur est l'id du gagnant. L'ancienne clé, elle, reste cochée.
 pub const MARQUE_REMPLACE: &str = "replaced_in_group";
 
+/// rc14 (revue #9520) — réglage d'une façade de l'égaliseur DÉCOCHÉE parce
+/// qu'un ancien client a éteint l'égaliseur (`enabled: false` dans
+/// `zone_{id}_eq_profile`) ; l'ancien client qui le rallume la recoche.
+pub const MARQUE_ETEINT_PAR_L_ANCIENNE_CLE: &str = "off_by_legacy_eq";
+
 /// Les quatre façades portées par `zone_{id}_eq_profile`.
 pub const FACADES_EQ: [&str; 4] = [
     ID_EQ_GRAPHIQUE,
@@ -730,6 +735,35 @@ fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, ctx: &Co
                 enabled: profil.enabled,
                 settings,
             };
+            // rc14 (revue #9520) — un ancien client ne connaît qu'UN
+            // égaliseur : l'éteindre éteint toute la série (les autres façades
+            // cochées sont décochées avec [`MARQUE_ETEINT_PAR_L_ANCIENNE_CLE`],
+            // réglages gardés) ; le rallumer rallume ensemble celles qu'il
+            // avait éteintes.
+            for (j, m) in chaine.plugins.iter_mut().enumerate() {
+                if Some(j) == principal || !FACADES_EQ.contains(&m.id.as_str()) {
+                    continue;
+                }
+                let marque = m
+                    .settings
+                    .get(MARQUE_ETEINT_PAR_L_ANCIENNE_CLE)
+                    .and_then(Value::as_bool)
+                    == Some(true);
+                if !profil.enabled && m.enabled {
+                    if !m.settings.is_object() {
+                        m.settings = Value::Object(Map::new());
+                    }
+                    if let Value::Object(s) = &mut m.settings {
+                        s.insert(MARQUE_ETEINT_PAR_L_ANCIENNE_CLE.into(), Value::Bool(true));
+                    }
+                    m.enabled = false;
+                } else if profil.enabled && marque {
+                    if let Value::Object(s) = &mut m.settings {
+                        s.remove(MARQUE_ETEINT_PAR_L_ANCIENNE_CLE);
+                    }
+                    m.enabled = true;
+                }
+            }
             match principal {
                 Some(i) => {
                     // Un autre maillon portait déjà cet id : l'ancienne clé
@@ -1058,8 +1092,9 @@ pub fn lire_zone(
 
     exclusivite_du_groupe(&mut chaine, &|id| membre_en_service(settings, id));
     // rc14 — les égaliseurs écartés par l'exclusivité du 24/11 reprennent
-    // leur place : ils sont combinables.
-    normaliser_les_egaliseurs(&mut chaine);
+    // leur place : ils sont combinables. Les façades Premium, seulement là où
+    // le droit est connu (vue d'un compte Premium, moteur, `PUT`).
+    normaliser_les_egaliseurs(&mut chaine, false);
     // D2 (18/11 soir) : la zone est passée d'une sortie locale au réseau
     // depuis la dernière synchronisation, et l'interrupteur mono n'a pas
     // bougé : même règle qu'à la migration, le mono est décoché d'office
@@ -1149,9 +1184,14 @@ fn membre_en_service(settings: &SettingsRepo, id: &str) -> bool {
 /// L'exclusivité posée la veille (#9512) décochait, dans une chaîne ou un
 /// préréglage enregistrés, chaque façade cochée après la première, avec la
 /// marque [`MARQUE_REMPLACE`] vers elle. Ces façades sont RECOCHÉES (c'était
-/// le choix de l'auditeur) et la marque retirée. Une façade décochée sans
-/// cette marque ne bouge pas. Rend `true` si la chaîne a changé.
-pub fn normaliser_les_egaliseurs(chaine: &mut ChaineTess) -> bool {
+/// le choix de l'auditeur) et la marque retirée.
+///
+/// Revue #9520 — une façade Premium (paramétrique, correction de pièce
+/// mesurée) n'est recochée que si `premium` : sur un compte gratuit, elle
+/// n'était pas entendue avant et ne doit pas l'être maintenant. Une façade
+/// cochée perd aussi la marque [`MARQUE_ETEINT_PAR_L_ANCIENNE_CLE`]. Rend
+/// `true` si la chaîne a changé.
+pub fn normaliser_les_egaliseurs(chaine: &mut ChaineTess, premium: bool) -> bool {
     let mut change = false;
     for m in &mut chaine.plugins {
         if !FACADES_EQ.contains(&m.id.as_str()) {
@@ -1162,9 +1202,20 @@ pub fn normaliser_les_egaliseurs(chaine: &mut ChaineTess) -> bool {
             .get(MARQUE_REMPLACE)
             .and_then(Value::as_str)
             .is_some_and(|g| FACADES_EQ.contains(&g));
-        if ecartee && let Value::Object(s) = &mut m.settings {
+        let demande_le_premium = m.id == ID_EQ_PARAMETRIQUE
+            || (m.id == ID_CORRECTION_PIECE && !correction_estimee(m));
+        if ecartee
+            && (premium || !demande_le_premium)
+            && let Value::Object(s) = &mut m.settings
+        {
             s.remove(MARQUE_REMPLACE);
             m.enabled = true;
+            change = true;
+        }
+        if m.enabled
+            && let Value::Object(s) = &mut m.settings
+            && s.remove(MARQUE_ETEINT_PAR_L_ANCIENNE_CLE).is_some()
+        {
             change = true;
         }
     }
@@ -1527,6 +1578,7 @@ fn projeter_egaliseur(
             // L'origine d'une correction de pièce (D1) n'appartient qu'à la
             // chaîne.
             base.remove(CHAMP_ORIGINE);
+            base.remove(MARQUE_ETEINT_PAR_L_ANCIENNE_CLE);
             base.insert("enabled".into(), Value::Bool(m.enabled));
             serde_json::from_value::<EqProfile>(Value::Object(base.clone())).map_err(|e| {
                 ErreurMigration::ReglagesInvalides {

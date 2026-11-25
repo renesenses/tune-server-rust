@@ -494,7 +494,17 @@ pub async fn get_zone_tess(State(state): State<AppState>, Path(id): Path<i64>) -
     };
     let premium = state.license.is_premium().await;
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let lecture = match tokio::task::spawn_blocking(move || lire_zone(&settings, id, premium)).await
+    let lecture = match tokio::task::spawn_blocking(move || {
+        // rc14 (revue #9520) — un compte Premium voit ses égaliseurs Premium
+        // écartés par l'exclusivité du 24/11 recochés, comme le moteur.
+        lire_zone(&settings, id, premium).map(|mut l| {
+            if premium {
+                tune_core::tess::migration::normaliser_les_egaliseurs(&mut l.chaine, true);
+            }
+            l
+        })
+    })
+    .await
     {
         Ok(Ok(l)) => l,
         Ok(Err(e)) => return erreur_migration(&e),
@@ -676,8 +686,16 @@ pub(super) fn appliquer_le_put(
     // rc14 — égaliseurs combinables : une façade écartée par l'exclusivité du
     // 24/11 est recochée ; le gain d'une bande modifiée reste dans les bornes
     // publiées (−30 / +15 dB, ±12 dB au graphique).
-    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine);
-    tune_core::tess::egaliseurs_en_serie::verifier_les_gains(&chaine, &enregistree)
+    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine, premium);
+    // Revue #9520 — un préréglage enregistré (bornes d'avant : celles du
+    // moteur) se charge tel quel : ses façades sont « connues ».
+    let prereglages: Vec<ChaineTess> = tune_core::tess::prereglages::lire(settings)
+        .map(|l| l.presets.into_iter().map(|p| p.chain).collect())
+        .unwrap_or_default();
+    let connues: Vec<&ChaineTess> = std::iter::once(&enregistree)
+        .chain(prereglages.iter())
+        .collect();
+    tune_core::tess::egaliseurs_en_serie::verifier_les_gains(&chaine, &connues)
         .map_err(|e| refus(&e))?;
     let chaine = origines_par_le_serveur(settings, zone_id, &chaine);
     valider_le_put(&chaine, &enregistree, catalogue, premium).map_err(|e| refus(&e))?;
@@ -727,8 +745,15 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     // rc14 — le mode PURE basculé par un préréglage (« Pure » l'allume), ou
     // « Bypass all » basculé (`ecrire_chaine` rend alors la clé de la chaîne) :
     // même garde dans le moteur (`traitements_contournes`), même bascule.
-    if cles.contains(&cle_mode_pure(id)) || cles.contains(&tune_core::tess::cle_chaine_zone(id)) {
+    let bypass = cles.contains(&tune_core::tess::cle_chaine_zone(id));
+    if cles.contains(&cle_mode_pure(id)) || bypass {
         let _ = state.orchestrator.apply_audiophile_change_portee(id).await;
+    }
+    // Revue #9520 — « Bypass all » coupe aussi le suréchantillonneur et la
+    // cadence fixe (sortie locale ; aucune voie réseau ne les applique, ni le
+    // repli mono ni la réaffectation) : même rafraîchissement que leur route.
+    if bypass && !est(Partie::Surechantillonnage) {
+        let _ = state.orchestrator.apply_upsampler_change_portee(id).await;
     }
 }
 

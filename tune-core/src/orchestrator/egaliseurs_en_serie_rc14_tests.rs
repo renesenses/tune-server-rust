@@ -213,7 +213,10 @@ async fn le_headroom_manuel_est_la_seule_marge_rc14() {
     let p = o.load_eq_profile(z).unwrap();
     assert_eq!(p.reserve_imposee_db, Some(-6.0));
     let proc = crate::audio::eq::EqProcessor::new(&p, SR, 2);
-    assert_eq!(proc.preamp_db(0), Some(-6.0));
+    let sure = crate::audio::eq::EqProcessor::new(&graphique(), SR, 2)
+        .preamp_db(0)
+        .unwrap();
+    assert_eq!(proc.preamp_db(0), Some((-6.0f64).min(sure)));
     // Auto : la réserve calculée de l'égaliseur, comme avant.
     chaine.fixed.headroom = Headroom::Auto {};
     ecrire_chaine(&settings(&o), z, &chaine).unwrap();
@@ -302,4 +305,178 @@ async fn une_zone_d_avant_joue_comme_avant_rc14() {
         settings(&o).get(&format!("zone_{z}_eq_profile")).unwrap(),
         Some(brut)
     );
+}
+
+/// Revue #9520 (P1) — « Bypass all » ne lève JAMAIS la protection du niveau
+/// DoP (#8813) : volume à 6 %, la conversion logicielle reste demandée.
+#[tokio::test]
+async fn revue_9520_bypass_all_garde_la_protection_dop_8813() {
+    use crate::orchestrator::TransportDsd;
+    let o = orchestrateur();
+    let zones = ZoneRepo::with_backend(o.db.clone());
+    let z = zones
+        .create("DoP 6 %", Some("local"), Some("local:dop-9520"))
+        .unwrap();
+    zones.update_volume(z, 6.0).unwrap();
+    o.playback.set_volume(z, 0.06).await;
+    let mut chaine = ChaineTess {
+        plugins: vec![crossfeed()],
+        ..ChaineTess::default()
+    };
+    chaine.bypass_all = true;
+    ecrire_chaine(&settings(&o), z, &chaine).unwrap();
+    assert!(crate::audio::audiophile::traitements_contournes(&o.db, z));
+    for transport in [TransportDsd::Dop, TransportDsd::NatifServiEnDop] {
+        assert!(
+            o.attenuation_logicielle_demandee_pour_dop(
+                z,
+                transport,
+                crate::audio::replaygain::PisteRg::AUCUNE
+            )
+            .await,
+            "Bypass all a levé la protection DoP : {transport:?}"
+        );
+    }
+    // Les rampes anti-clic restent aussi sous Bypass all (outil de
+    // comparaison, pas du bit-perfect) ; PURE, lui, les retire.
+    settings(&o)
+        .set(&format!("zone_{z}_soft_mute_ms"), "40")
+        .unwrap();
+    assert!(PlaybackOrchestrator::zone_soft_mute_ms_with(&o.db, z) > 0);
+    settings(&o)
+        .set(&format!("zone_{z}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+    assert_eq!(PlaybackOrchestrator::zone_soft_mute_ms_with(&o.db, z), 0);
+}
+
+/// Revue #9520 (3) — headroom manuel plus FAIBLE que la réserve « Sûre » :
+/// la réserve calculée est gardée (la plus forte des deux).
+#[tokio::test]
+async fn le_headroom_manuel_ne_retire_jamais_la_reserve_sure_9520() {
+    let o = orchestrateur();
+    let z = zone(&o, "reserve-sure");
+    let mut chaine = ChaineTess {
+        plugins: vec![maillon("equalizer-graphic", &graphique())],
+        ..ChaineTess::default()
+    };
+    chaine.fixed.headroom = Headroom::Manual { db: -0.5 };
+    ecrire_chaine(&settings(&o), z, &chaine).unwrap();
+    let p = o.load_eq_profile(z).unwrap();
+    let sure = crate::audio::eq::EqProcessor::new(&graphique(), SR, 2)
+        .preamp_db(0)
+        .unwrap();
+    assert!(sure < -0.5, "{sure}");
+    assert_eq!(
+        crate::audio::eq::EqProcessor::new(&p, SR, 2).preamp_db(0),
+        Some(sure)
+    );
+}
+
+/// Revue #9520 (4) — headroom manuel sans égaliseur coché : un gain fixe,
+/// réellement appliqué (même sans le greffon égaliseur installé).
+#[tokio::test]
+async fn le_headroom_manuel_sans_egaliseur_est_un_gain_fixe_9520() {
+    let o = orchestrateur();
+    let z = zone(&o, "gain-fixe");
+    settings(&o)
+        .set("plugin_equalizer_installed", "false")
+        .unwrap();
+    let mut chaine = ChaineTess {
+        plugins: vec![crossfeed()],
+        ..ChaineTess::default()
+    };
+    chaine.fixed.headroom = Headroom::Manual { db: -6.0 };
+    ecrire_chaine(&settings(&o), z, &chaine).unwrap();
+    let p = o.load_eq_profile(z).expect("gain fixe du headroom manuel");
+    assert!(p.bands.is_empty());
+    let mut proc = crate::audio::eq::EqProcessor::new(&p, SR, 2);
+    assert!(proc.is_enabled());
+    let mut x = vec![0.5f64, -0.25, 0.125, 0.0];
+    proc.process_interleaved_f64(&mut x);
+    let g = 10f64.powf(-6.0 / 20.0);
+    for (a, b) in x.iter().zip([0.5, -0.25, 0.125, 0.0]) {
+        assert!((a - b * g).abs() < 1e-12, "{a} vs {}", b * g);
+    }
+}
+
+/// Revue #9520 (5) — une série purement soustractive a sa réserve L1 : pas
+/// de falaise quand une bande passe de −0,01 à +0,01 dB.
+#[test]
+fn une_serie_soustractive_n_a_pas_de_falaise_9520() {
+    let creux = |g: f64| EqProfile {
+        enabled: true,
+        bands: vec![bande(1000.0, -20.0, 8.0, "peak"), bande(4000.0, g, 1.0, "peak")],
+        ..Default::default()
+    };
+    let serie = |g: f64| {
+        crate::tess::egaliseurs_en_serie::combiner_en_serie(&[creux(g), parametrique()]).unwrap()
+    };
+    let pre = |p: &EqProfile| crate::audio::eq::EqProcessor::new(p, SR, 2).preamp_db(0).unwrap();
+    let (a, b) = (pre(&serie(-0.01)), pre(&serie(0.01)));
+    assert!((a - b).abs() < 0.05, "falaise : {a} → {b}");
+}
+
+/// Revue #9520 — la voie LOCALE réelle : `refresh_zone_pure_dsp` pose
+/// `pure_bypass` et vide l'égaliseur sous « Bypass all », et les remet en le
+/// décochant.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn bypass_all_sur_la_voie_locale_reelle_9520() {
+    let o = orchestrateur();
+    let s = settings(&o);
+    for id in ["equalizer", "crossfeed"] {
+        s.set(&format!("plugin_{id}_installed"), "true").unwrap();
+        s.set(&format!("plugin_{id}_enabled"), "true").unwrap();
+    }
+    let z = ZoneRepo::with_backend(o.db.clone())
+        .create("Local 9520", Some("local"), Some("local:Local 9520"))
+        .unwrap();
+    o.outputs
+        .lock()
+        .await
+        .register(Box::new(crate::outputs::local::LocalOutput::new(
+            "Local 9520".to_string(),
+        )));
+    {
+        let arc = o.outputs.lock().await.get("local:Local 9520").unwrap();
+        let sortie = arc.lock().await;
+        let local = sortie
+            .as_any()
+            .downcast_ref::<crate::outputs::local::LocalOutput>()
+            .unwrap();
+        local.declare_current_format_for_test(44_100, 2);
+        local.set_pure_bypass(false);
+    }
+    let mut chaine = ChaineTess {
+        plugins: vec![
+            maillon("equalizer-graphic", &graphique()),
+            maillon("equalizer-parametric", &parametrique()),
+            crossfeed(),
+        ],
+        ..ChaineTess::default()
+    };
+    let etat = |o: &PlaybackOrchestrator| {
+        let o = o.outputs.clone();
+        async move {
+            let arc = o.lock().await.get("local:Local 9520").unwrap();
+            let sortie = arc.lock().await;
+            let local = sortie
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+                .unwrap();
+            (local.pure_bypass_for_test(), local.has_eq())
+        }
+    };
+    ecrire_chaine(&s, z, &chaine).unwrap();
+    assert!(o.refresh_zone_pure_dsp(z).await);
+    assert_eq!(etat(&o).await, (false, true));
+    chaine.bypass_all = true;
+    ecrire_chaine(&s, z, &chaine).unwrap();
+    assert!(o.refresh_zone_pure_dsp(z).await);
+    let (contourne, _) = etat(&o).await;
+    assert!(contourne, "Bypass all doit poser pure_bypass sur la sortie");
+    chaine.bypass_all = false;
+    ecrire_chaine(&s, z, &chaine).unwrap();
+    assert!(o.refresh_zone_pure_dsp(z).await);
+    assert_eq!(etat(&o).await, (false, true));
 }

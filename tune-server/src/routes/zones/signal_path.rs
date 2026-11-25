@@ -79,21 +79,17 @@ pub(super) fn active_zone_eq_profile(
     zone_id: i64,
 ) -> Option<tune_core::audio::eq::EqProfile> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
-    if !tune_core::audio::premium_plugins::enabled(&settings, "equalizer") {
+    // PURE, mesure de pièce et (rc14) « Bypass all » : le PCM atteint la
+    // sortie intact, l'égaliseur n'est jamais construit.
+    if tune_core::audio::audiophile::traitements_contournes(backend, zone_id) {
         return None;
     }
-    // PURE : le PCM atteint la sortie intact, l'égaliseur n'est jamais construit.
-    if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
-        return None;
-    }
-    let profile = settings
-        .get(&format!("zone_{zone_id}_eq_profile"))
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str::<tune_core::audio::eq::EqProfile>(&s).ok())?;
-    if !profile.enabled {
-        return None;
-    }
+    // rc14 (revue #9520, règle #1548) — la même lecture que le moteur : tous
+    // les égaliseurs cochés de la série, ou le headroom manuel. Le droit n'est
+    // pas connu ici : vue d'un compte gratuit (une façade Premium écartée par
+    // l'exclusivité du 24/11 n'y est pas recochée).
+    let profile =
+        tune_core::tess::egaliseurs_en_serie::profil_du_moteur(&settings, zone_id, false)?;
     // 44100/2 n'est qu'une sonde : is_enabled() dépend des gains, pas du débit.
     tune_core::audio::eq::EqProcessor::new(&profile, 44100, 2)
         .is_enabled()

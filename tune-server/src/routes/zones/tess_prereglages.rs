@@ -213,7 +213,8 @@ pub async fn enregistrer_prereglage(State(state): State<AppState>, corps: Bytes)
     // rc14 — égaliseurs combinables : une façade écartée par l'exclusivité
     // du 24/11 (marque `replaced_in_group`) est recochée.
     let mut chaine = chaine;
-    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine);
+    let premium = state.license.is_premium().await;
+    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine, premium);
     let mut liste = match prereglages::lire(&settings) {
         Ok(l) => l,
         Err(e) => return stockage(e),
@@ -560,13 +561,13 @@ pub async fn appliquer_prereglage(
     };
     // rc14 — égaliseurs combinables : un préréglage enregistré sous
     // l'exclusivité du 24/11 retrouve les façades qu'elle avait décochées.
+    let premium = state.license.is_premium().await;
     let mut chaine_du_prereglage = p.chain.clone();
-    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine_du_prereglage);
+    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine_du_prereglage, premium);
     let corps = match serde_json::to_vec(&chaine_du_prereglage) {
         Ok(c) => c,
         Err(e) => return refus(&ErreurChaine::CorpsIllisible(e.to_string())),
     };
-    let premium = state.license.is_premium().await;
     let catalogue = catalogue_du_serveur();
     let verrou = verrou_des_put(id);
     let _garde = verrou.lock().await;
@@ -675,9 +676,11 @@ pub(super) fn oublier_le_prereglage_s_il_differe(
         .and_then(|l| l.get(&actif).cloned())
         .is_some_and(|p| {
             // rc14 — comparé tel qu'il a été chargé (égaliseurs normalisés).
-            let mut c = p.chain.clone();
-            tune_core::tess::migration::normaliser_les_egaliseurs(&mut c);
-            sans_champs_du_serveur(&c) == sans_champs_du_serveur(&enregistree)
+            [false, true].into_iter().any(|premium| {
+                let mut c = p.chain.clone();
+                tune_core::tess::migration::normaliser_les_egaliseurs(&mut c, premium);
+                sans_champs_du_serveur(&c) == sans_champs_du_serveur(&enregistree)
+            })
         });
     if !decrit && !effacer_le_marqueur(&settings, zone_id) {
         return Some(AVERTISSEMENT_MARQUEUR.to_owned());

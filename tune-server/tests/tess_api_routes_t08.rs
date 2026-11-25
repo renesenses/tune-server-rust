@@ -1512,3 +1512,68 @@ async fn surechantillonnage_non_installe_propose_l_installation_rc14() {
     assert_eq!(e["reason"], json!("plugin_unavailable"), "{e}");
     assert!(e["params"].get("install_package").is_none(), "{e}");
 }
+
+/// Revue #9520 (2) — un ancien client ne connaît qu'un égaliseur :
+/// `POST /zones/{id}/eq` `enabled: false` éteint TOUTE la série (le moteur
+/// n'applique plus rien, le `GET` le dit), et `enabled: true` les rallume
+/// toutes ensemble, réglages gardés.
+#[tokio::test]
+async fn revue_9520_ancien_client_eteint_l_egaliseur() {
+    let b = Banc::nouveau(true).await;
+    // Le graphique à plat (curseurs) : la façade qu'une ancienne route relit
+    // comme graphique.
+    let mut graphique = profil(json!([]));
+    graphique["bass_gain_db"] = json!(3.0);
+    let parametrique = profil(bandes_parametriques());
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "equalizer-graphic", "enabled": true, "settings": graphique},
+            {"id": "equalizer-parametric", "enabled": true, "settings": parametrique}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let reglages = |c: &ChaineTess, id: &str| {
+        let m = c.plugins.iter().find(|m| m.id == id).unwrap();
+        let mut r = m.settings.clone();
+        if let Some(o) = r.as_object_mut() {
+            o.remove("off_by_legacy_eq");
+        }
+        (m.enabled, r)
+    };
+    let avant = b.chaine();
+    let uri = format!("/api/v1/zones/{}/eq", b.zone);
+    let (s, eq) = b
+        .brut(Method::POST, &uri, Some(json!({"enabled": false}).to_string()), None)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{eq}");
+    let c = b.chaine();
+    for id in ["equalizer-graphic", "equalizer-parametric"] {
+        assert!(!reglages(&c, id).0, "{id} doit être éteint : {c:?}");
+    }
+    assert!(
+        tune_core::tess::egaliseurs_en_serie::profil_du_moteur(&b.settings(), b.zone, true)
+            .is_none(),
+        "le moteur ne doit plus rien appliquer"
+    );
+    let (_, eq) = b.brut(Method::GET, &uri, None, None).await;
+    assert_eq!(eq["enabled"], json!(false), "{eq}");
+    let (_, v) = b.get().await;
+    for id in ["equalizer-graphic", "equalizer-parametric"] {
+        assert_eq!(etape(&v, id)["effective"], json!(false), "{id}");
+    }
+
+    let (s, eq) = b
+        .brut(Method::POST, &uri, Some(json!({"enabled": true}).to_string()), None)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{eq}");
+    let apres = b.chaine();
+    for id in ["equalizer-graphic", "equalizer-parametric"] {
+        assert_eq!(reglages(&apres, id), reglages(&avant, id), "{id}");
+    }
+    let p = tune_core::tess::egaliseurs_en_serie::profil_du_moteur(&b.settings(), b.zone, true)
+        .expect("série rallumée");
+    // Les trois curseurs du graphique puis les deux bandes du paramétrique.
+    assert_eq!(p.bands.len(), 5, "{p:?}");
+    let (_, eq) = b.brut(Method::GET, &uri, None, None).await;
+    assert_eq!(eq["enabled"], json!(true), "{eq}");
+}
