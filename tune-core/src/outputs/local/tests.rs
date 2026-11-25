@@ -4548,9 +4548,12 @@ fn un_neutre_au_repos_n_est_pas_un_dsp_applique_6524() {
     );
 }
 
-/// Sous PURE, rien ne reste monté : le préampli gardé n'est pas reporté.
+/// rc14 (décision de Bertrand du 25/11, sécurité auditive) — remplace « sous
+/// PURE, le préampli gardé n'est pas reporté » : le reporter est ce qui
+/// empêche la piste suivante de sauter au signal sec. Il rejoint ensuite le
+/// niveau d'avant l'égaliseur par sa rampe, jamais au-delà (#6741).
 #[test]
-fn sous_pure_le_preampli_garde_n_est_pas_reporte_5215() {
+fn sous_pure_le_preampli_garde_est_reporte_rc14() {
     let sortie = LocalOutput::new("Casque".to_string());
     sortie.set_compensation_de_niveau(false);
     sortie.set_eq(Some(egaliseur_a_preampli_negatif_5215()));
@@ -4558,11 +4561,19 @@ fn sous_pure_le_preampli_garde_n_est_pas_reporte_5215() {
     jouer_5215(&sortie, &mut trame, 5);
     sortie.replace_eq_live(None);
     jouer_5215(&sortie, &mut trame, 60);
+    let garde = sortie
+        .preampli_garde()
+        .expect("prémisse : un préampli gardé");
     sortie.pure_bypass.store(true, Ordering::Relaxed);
     sortie.set_eq(None);
+    let reporte = sortie
+        .preampli_garde()
+        .expect("PURE : le préampli gardé passe à la piste suivante, sans saut");
     assert!(
-        sortie.eq.lock().unwrap().is_none(),
-        "PURE : le neutre qui garde le préampli a été reporté sur la piste suivante"
+        (reporte.db - garde.db).abs() < 0.01,
+        "reporté à {:.2} dB, gardé {:.2} dB",
+        reporte.db,
+        garde.db
     );
 }
 
@@ -4629,13 +4640,18 @@ fn reactiver_l_egaliseur_en_vol_descend_au_niveau_du_preampli_par_une_rampe_5215
 
 #[test]
 fn en_pure_la_coupure_ne_laisse_rien_de_monte_5215() {
+    // rc14 (décision du 25/11) — l'entrée en PURE passe par un fondu
+    // d'environ 0,5 s (plus de saut au signal sec) ; à volume inchangé, il
+    // ne laisse ensuite RIEN de monté.
     let sortie = LocalOutput::new("Casque".to_string());
     sortie.set_eq(Some(egaliseur_a_preampli_negatif_5215()));
     sortie.set_pure_bypass(true);
     sortie.replace_eq_live(None);
+    let mut trame = 0;
+    jouer_5215(&sortie, &mut trame, 60);
     assert!(
         sortie.eq.lock().unwrap().is_none(),
-        "PURE : aucune rampe, aucun égaliseur neutre resté monté"
+        "PURE : après le fondu d'entrée, aucun égaliseur neutre resté monté"
     );
 }
 

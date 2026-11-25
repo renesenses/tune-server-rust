@@ -453,7 +453,23 @@ impl MoteursLocaux<'_> {
 
     /// La chaîne laissera-t-elle ce bloc intact ?
     fn sans_effet(&self, ordre: OrdreLocal, channels: u16, dop: bool) -> bool {
-        self.exemptee(ordre, dop) || !self.un_etage_agit(channels)
+        (self.exemptee(ordre, dop) && !self.transition_d_entree(dop))
+            || !self.un_etage_agit(channels)
+    }
+
+    /// rc14 (sécurité auditive, décision du 25/11) — sous PURE ou « Bypass
+    /// all » (jamais en DoP), l'égaliseur COUPÉ de la transition joue encore
+    /// tant qu'il n'est pas au repos : la transition d'entrée (`LocalOutput::set_pure_bypass`)
+    /// le fait rejoindre le niveau d'avant l'égaliseur au lieu d'un saut au
+    /// signal sec, puis il se retire et la chaîne redevient bit-perfect.
+    /// Seul cet étage joue alors ([`Self::executer`]).
+    fn transition_d_entree(&self, dop: bool) -> bool {
+        !dop && self.eq.is_some_and(|m| {
+            m.lock().is_ok_and(|g| {
+                g.as_ref()
+                    .is_some_and(|p| p.est_neutre() && !p.est_neutre_au_repos())
+            })
+        })
     }
 
     /// Fait passer `samples` par les étages `ordre.etages()[debut..]`.
@@ -468,6 +484,14 @@ impl MoteursLocaux<'_> {
             canaux,
             contourne: false,
         };
+        // rc14 — transition d'entrée en PURE / « Bypass all » : l'égaliseur
+        // seul, les autres étages restent contournés.
+        if self.pure_bypass.load(Ordering::Relaxed) || ordre.bypass_all {
+            if debut == 0 {
+                let _ = eq.traiter_sur_place(samples, trames);
+            }
+            return;
+        }
         let mut conv = AdaptateurConvolution {
             moteur: self.convolver,
             canaux,

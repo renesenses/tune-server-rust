@@ -1600,7 +1600,9 @@ impl LocalOutput {
             // préampli gardé à la coupure passe sur cette piste sans saut, et sa
             // rampe s'y poursuit vers le niveau d'avant l'égaliseur (#6524 b,
             // #6741). Jamais sous PURE, qui ne doit rien laisser monté.
-            if eq.is_none() && !self.pure_bypass.load(Ordering::Relaxed) {
+            // rc14 — sous PURE aussi : un surplus gardé (volume monté) ne
+            // saute pas à la piste suivante ; seul « Rendre le niveau » le rend.
+            if eq.is_none() {
                 eq = emplacement
                     .as_ref()
                     .and_then(|p| p.reporter_le_preampli_garde());
@@ -1697,7 +1699,15 @@ impl LocalOutput {
 
     /// #6741 — ce qu'un égaliseur coupé applique encore (voyant de la sortie).
     pub fn preampli_garde(&self) -> Option<super::super::audio::eq::PreampliGarde> {
-        if self.pure_bypass.load(Ordering::Relaxed) {
+        // rc14 — sous PURE, seul l'égaliseur coupé de la transition d'entrée
+        // peut rester monté : son gain gardé se voit (« niveau réduit »).
+        if self.pure_bypass.load(Ordering::Relaxed)
+            && self
+                .eq
+                .lock()
+                .ok()
+                .is_none_or(|e| e.as_ref().is_none_or(|p| !p.est_neutre()))
+        {
             return None;
         }
         self.eq
@@ -1800,7 +1810,13 @@ impl LocalOutput {
             *emplacement = if self.pure_bypass.load(Ordering::Relaxed) {
                 // PURE : la chaîne est contournée, rien à fondre — et rien ne
                 // doit rester monté qui ferait croire à un DSP actif.
-                eq
+                // rc14 — sauf l'égaliseur coupé de la transition d'entrée
+                // (`set_pure_bypass`) : il finit de rejoindre le niveau d'avant
+                // l'égaliseur, ou garde le surplus d'un volume monté.
+                match eq {
+                    None => precedent.filter(|p| p.est_neutre() && !p.est_neutre_au_repos()),
+                    eq => eq,
+                }
             } else {
                 // #5215 — héritage des filtres ET, si le niveau bouge
                 // (coupure, activation, préampli déplacé), fondu enchaîné de
@@ -2202,11 +2218,44 @@ impl LocalOutput {
             self.pure_contourne_un_gain_garde
                 .store(false, Ordering::Relaxed);
         }
+        // rc14 (sécurité auditive, décision du 25/11) — ENTRER en PURE ou en
+        // « Bypass all » ne saute plus d'un bloc au signal sec (toute la
+        // marge d'une série, jusqu'à +24 dB) : l'égaliseur en place devient
+        // un égaliseur coupé qui efface sa courbe par le fondu de #5215 et
+        // rejoint le niveau d'avant l'égaliseur en `TRANSITION_PURE_MS`,
+        // jamais au-delà (#6741). Seul cet étage joue pendant la transition
+        // (`executeur_tess`) ; revenu à 0 dB il se retire et PURE redevient
+        // bit-perfect. Volume monté : le surplus reste gardé, avec le voyant
+        // et « Rendre le niveau » (#6524). Posé AVANT le drapeau, sous le
+        // verrou de l'égaliseur : aucun bloc ne passe sec entre les deux.
+        if bypass && !self.pure_bypass.load(Ordering::Relaxed) {
+            self.entrer_en_pure_par_un_fondu();
+        }
         self.pure_bypass.store(bypass, Ordering::Relaxed);
         self.pure_ou_mesure.store(bypass, Ordering::Relaxed);
         // #4685 — un DSP contourné ne change aucun niveau : sa compensation
         // doit tomber avec lui.
         self.recalculer_la_compensation();
+    }
+
+    /// rc14 — voir [`Self::set_pure_bypass`] : l'étage d'égaliseur passe en
+    /// transition vers le niveau d'avant l'égaliseur. Sans égaliseur monté,
+    /// rien à faire.
+    fn entrer_en_pure_par_un_fondu(&self) {
+        let Ok(mut emplacement) = self.eq.lock() else {
+            return;
+        };
+        if emplacement.is_none() {
+            return;
+        }
+        let precedent = emplacement.take();
+        let mut transition =
+            super::super::audio::eq::EqProcessor::prendre_la_releve(None, precedent);
+        self.borner_la_remontee(&mut transition);
+        if let Some(t) = transition.as_mut() {
+            t.rendre_le_niveau_d_avant_en(super::super::audio::eq::TRANSITION_PURE_MS);
+        }
+        *emplacement = transition;
     }
 
     /// #6522, #6524 — dire à la sortie si les réglages ENREGISTRÉS de la zone
@@ -5299,7 +5348,12 @@ fn local_dsp_is_identity(
     mono_downmix: &AtomicBool,
 ) -> bool {
     if pure_bypass.load(Ordering::Relaxed) {
-        return true;
+        // rc14 — sauf pendant la transition d'entrée en PURE (égaliseur coupé
+        // qui rejoint le niveau d'avant l'égaliseur, ou surplus gardé).
+        return eq.lock().is_ok_and(|g| {
+            g.as_ref()
+                .is_none_or(|p| !p.est_neutre() || p.est_neutre_au_repos())
+        });
     }
     // Le repli mono compte comme les autres (#2362) : il RÉÉCRIT chaque
     // échantillon. Sans lui ici, le producteur Windows prendrait la branche
@@ -5326,6 +5380,14 @@ fn local_dsp_runtime_state(
         return OutputDspState::BypassedDop;
     }
     if pure_bypass.load(Ordering::Relaxed) {
+        // rc14 — transition d'entrée en PURE ou surplus gardé : le signal est
+        // encore modifié, le chemin ne dit PAS « bit-perfect ».
+        if eq.lock().is_ok_and(|g| {
+            g.as_ref()
+                .is_some_and(|p| p.est_neutre() && !p.est_neutre_au_repos())
+        }) {
+            return OutputDspState::Applied;
+        }
         // #4176 — dire si PURE contourne quelque chose. Un verrou
         // empoisonné ne permet pas de l'affirmer : on garde alors le
         // « contourné » d'avant, qui reste vrai.
@@ -10405,6 +10467,10 @@ mod chemin_compresse_publie_ses_transformations_4347;
 /// un fil arrêté pendant sa première lecture n'ouvre plus le périphérique.
 #[cfg(test)]
 mod bascule_pure_flux_en_demarrage_4176;
+
+/// rc14 — entrer en PURE ou en « Bypass all » ne fait plus sauter le niveau.
+#[cfg(test)]
+mod pure_sans_remontee_brutale_rc14;
 
 /// #4177 — en exclusif Windows, la pause rend le périphérique au lieu de le
 /// garder en poussant du silence.

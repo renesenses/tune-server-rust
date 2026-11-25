@@ -39,6 +39,13 @@ pub const SEUIL_DE_RAMPE_DB: f64 = 1.0;
 /// le retour au sec de TESS), jamais au-delà du niveau d'avant l'égaliseur.
 pub const REMONTEE_SERIE_MS: u32 = 450;
 
+/// rc14 (sécurité auditive, décision de Bertrand du 25/11) — durée du fondu
+/// d'ENTRÉE en PURE ou en « Bypass all » : la chaîne n'est plus contournée
+/// d'un bloc à l'autre (jusqu'à +24 dB d'une série) ; l'égaliseur s'efface
+/// et le niveau rejoint celui d'avant l'égaliseur en ce temps, jamais
+/// au-delà (voir [`EqProcessor::rendre_le_niveau_d_avant_en`]).
+pub const TRANSITION_PURE_MS: u32 = 450;
+
 /// #6211 — durée du fondu qui éteint le préampli GARDÉ d'un égaliseur coupé
 /// sur un flux SANS FIN (radio).
 ///
@@ -646,6 +653,24 @@ impl EqProcessor {
             self.relancer_depuis_le_gain_atteint();
         }
         true
+    }
+
+    /// rc14 (PURE, « Bypass all ») — un égaliseur COUPÉ rejoint le niveau
+    /// d'avant l'égaliseur en `ms`, tout de suite, même pendant le fondu de
+    /// la courbe (les deux se recouvrent, sans marche), vers
+    /// `min(1, borne de volume)` (#6741) : à volume inchangé il se retire
+    /// (identité exacte) ; volume monté, le surplus reste gardé, avec le
+    /// voyant et « Rendre le niveau » (#6524). `libere` n'est pas posé. Sans
+    /// effet hors d'un égaliseur coupé.
+    pub fn rendre_le_niveau_d_avant_en(&mut self, ms: u32) {
+        if !self.est_neutre() {
+            return;
+        }
+        self.relancer_depuis_le_gain_atteint();
+        let total = (u64::from(self.sample_rate) * u64::from(ms) / 1000).max(1) as usize;
+        if let Some(ext) = self.extinction.as_mut() {
+            ext.total = total;
+        }
     }
 
     /// rc14 (série TESS) — « Rendre le niveau » sur un égaliseur ACTIF qui

@@ -1043,9 +1043,9 @@ impl PlaybackOrchestrator {
     /// #6524 — geste explicite : libère la borne, par la rampe existante.
     /// Aucun profil, volume ou état de transport n'est modifié ; PURE reste intact.
     pub async fn rendre_le_niveau_garde(&self, zone_id: i64) -> bool {
-        if self.zone_audiophile(zone_id) {
-            return false;
-        }
+        // rc14 — PURE et « Bypass all » ne sont plus refusés : leur entrée
+        // peut garder un surplus (volume monté), que ce geste seul rend ;
+        // la sortie locale ne répond que si elle garde un préampli.
         #[cfg(feature = "local-audio")]
         {
             let device = self.peripherique_de_la_zone(zone_id);
