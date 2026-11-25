@@ -284,8 +284,10 @@ impl OrigineDuCache {
 ///    données (le .deb : `WorkingDirectory=/var/lib/tune`, base relative) :
 ///    c'est le même dossier, rendu absolu ;
 /// 3. l'ancien emplacement a des images : il est gardé tel quel ;
-/// 4. le cache sous les données a déjà des images (installation neuve
-///    relancée depuis un autre dossier) : il est suivi ;
+/// 4. le cache sous les données EXISTE, même vide : le choix « neuf » a
+///    déjà été fait (il crée le dossier, voir [`preparer_le_cache_retenu`]).
+///    Installation neuve redémarrée avant sa première pochette, ou relancée
+///    depuis un autre dossier : il est suivi ;
 /// 5. l'installation existait (base présente, ou PostgreSQL) : l'ancien
 ///    emplacement est gardé, comme avant — ses pochettes sont peut-être dans
 ///    le dossier d'où elle se lance d'habitude, et y revenir doit les rendre ;
@@ -311,7 +313,7 @@ pub fn cache_de_pochettes_sans_variable(
     if etat(&ancien) == EtatDuDossier::Garni {
         return (ancien, OrigineDuCache::AncienRelatifAuDossierCourant);
     }
-    if etat(&neuf) == EtatDuDossier::Garni {
+    if etat(&neuf) != EtatDuDossier::Absent {
         return (neuf, OrigineDuCache::SousLesDonnees);
     }
     if installation_existante {
@@ -440,7 +442,7 @@ struct Retenus {
     /// Le cache retenu au démarrage, hors `TUNE_ARTWORK_DIR`.
     cache: PathBuf,
     origine: OrigineDuCache,
-    avertissement: Option<AvertissementDuCache>,
+    appareil: bool,
     base: String,
 }
 
@@ -516,36 +518,63 @@ pub fn retenir(config: &TuneConfig) {
             )
         }
     };
-    // `TUNE_ARTWORK_DIR` tranche (Docker) : c'est lui qu'on sonde alors.
-    let servi = std::env::var_os("TUNE_ARTWORK_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cache.clone());
-    let origine_servie = if std::env::var_os("TUNE_ARTWORK_DIR").is_some() {
-        // Posée par l'exploitant : jamais « relative au dossier courant »
-        // au sens de l'avertissement, même si elle l'est.
-        OrigineDuCache::DefautDeLaPlateforme
-    } else {
-        origine
-    };
-    let avertissement =
-        avertissement_du_cache(&servi, origine_servie, appareil, sonder_le_cache(&servi));
     tracing::info!(
-        dossier = %servi.display(),
+        dossier = %cache.display(),
         origine = origine.id(),
         variable = std::env::var_os("TUNE_ARTWORK_DIR").is_some(),
         "artwork_cache_retenu"
     );
-    if let Some(a) = &avertissement {
-        tracing::warn!(dossier = %servi.display(), code = a.code, "{}", a.message);
-    }
     let retenus = Retenus {
         cache,
         origine,
-        avertissement,
+        appareil,
         base: config.db_path.clone(),
     };
     let _ = RETENUS.set(retenus);
 }
+
+/// Après l'attente du disque de données (`wait_for_data_volume`) : crée le
+/// cache « sous les données » retenu (le choix est alors durable, même
+/// avant la première pochette), puis sonde l'écriture du cache servi et
+/// établit l'avertissement. Sonder plus tôt, sur un Tune OS dont le disque
+/// externe se monte en retard, testerait un point de montage vide.
+pub fn preparer_le_cache_retenu() {
+    let _ = AVERTISSEMENT.get_or_init(etablir_l_avertissement);
+}
+
+/// Crée `dossier` quand c'est un choix « sous les données » ; ne touche à
+/// rien d'autre.
+pub fn creer_le_cache_choisi(dossier: &Path, origine: OrigineDuCache) -> std::io::Result<()> {
+    if origine == OrigineDuCache::SousLesDonnees {
+        std::fs::create_dir_all(dossier)?;
+    }
+    Ok(())
+}
+
+fn etablir_l_avertissement() -> Option<AvertissementDuCache> {
+    let r = RETENUS.get()?;
+    let variable = std::env::var_os("TUNE_ARTWORK_DIR");
+    // `TUNE_ARTWORK_DIR` tranche (Docker) : c'est lui qu'on sonde alors,
+    // et posée par l'exploitant elle n'est jamais « relative au dossier
+    // courant » au sens de l'avertissement.
+    let (servi, origine) = match &variable {
+        Some(v) => (PathBuf::from(v), OrigineDuCache::DefautDeLaPlateforme),
+        None => {
+            if let Err(e) = creer_le_cache_choisi(&r.cache, r.origine) {
+                tracing::warn!(dossier = %r.cache.display(), error = %e, "artwork_cache_creation_echouee");
+            }
+            (r.cache.clone(), r.origine)
+        }
+    };
+    let avertissement =
+        avertissement_du_cache(&servi, origine, r.appareil, sonder_le_cache(&servi));
+    if let Some(a) = &avertissement {
+        tracing::warn!(dossier = %servi.display(), code = a.code, "{}", a.message);
+    }
+    avertissement
+}
+
+static AVERTISSEMENT: OnceLock<Option<AvertissementDuCache>> = OnceLock::new();
 
 /// Le cache retenu au démarrage, hors `TUNE_ARTWORK_DIR` (`None` avant
 /// `retenir`, et dans l'hôte mobile qui ne l'appelle pas).
@@ -558,9 +587,12 @@ pub fn origine_du_cache_retenu() -> Option<OrigineDuCache> {
     RETENUS.get().map(|r| r.origine)
 }
 
-/// L'avertissement du cache de pochettes, s'il y en a un.
+/// L'avertissement du cache de pochettes, s'il y en a un. Établi par
+/// [`preparer_le_cache_retenu`] ; à défaut (aucun démarrage), au premier
+/// appel.
 pub fn avertissement_du_cache_retenu() -> Option<&'static AvertissementDuCache> {
-    RETENUS.get().and_then(|r| r.avertissement.as_ref())
+    RETENUS.get()?;
+    AVERTISSEMENT.get_or_init(etablir_l_avertissement).as_ref()
 }
 
 /// La base retenue au démarrage (`None` avant `retenir`).
@@ -1164,6 +1196,62 @@ mod tests {
         // d'ailleurs part sous les données.
         std::fs::remove_file(base).unwrap();
         assert_eq!(retenu(&ailleurs).0, donnees.join("artwork_cache"));
+    }
+
+    /// M1 — installation NEUVE (base hors du dossier courant) arrêtée
+    /// avant sa première pochette : au redémarrage, la base existe et le
+    /// cache sous les données est encore vide. Il reste choisi, puisque le
+    /// premier démarrage l'a créé.
+    #[test]
+    fn installation_neuve_relancee_avant_sa_premiere_pochette_reste_sous_les_donnees() {
+        let racine = tempfile::tempdir().unwrap();
+        let (cwd, donnees) = (
+            racine.path().join("lance-ici"),
+            racine.path().join("donnees"),
+        );
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&donnees).unwrap();
+        let base = donnees.join("tune.db");
+        let base = base.to_str().unwrap();
+        let demarrer = || {
+            let donnees = crate::gel_executeur::dossier_de_donnees(None, base, &cwd);
+            let (dossier, origine) = cache_de_pochettes_sans_variable(
+                Path::new("artwork_cache"),
+                &cwd,
+                &donnees,
+                installation_existante(base, false, &cwd),
+                etat_du_dossier,
+            );
+            creer_le_cache_choisi(&dossier, origine).unwrap();
+            (dossier, origine)
+        };
+        let attendu = (
+            donnees.join("artwork_cache"),
+            OrigineDuCache::SousLesDonnees,
+        );
+        // 1er démarrage : installation neuve ; l'ouverture crée la base.
+        assert_eq!(demarrer(), attendu);
+        std::fs::write(base, b"SQLite format 3\0").unwrap();
+        assert_eq!(etat_du_dossier(&attendu.0), EtatDuDossier::Vide);
+        // Arrêt, puis 2e et 3e démarrages : toujours sous les données.
+        assert_eq!(demarrer(), attendu);
+        assert_eq!(demarrer(), attendu);
+        assert!(!cwd.join("artwork_cache").exists());
+    }
+
+    /// Seul le choix « sous les données » crée son dossier.
+    #[test]
+    fn seul_le_choix_sous_les_donnees_cree_son_dossier() {
+        let racine = tempfile::tempdir().unwrap();
+        for origine in [
+            OrigineDuCache::AncienRelatifAuDossierCourant,
+            OrigineDuCache::DefautDeLaPlateforme,
+            OrigineDuCache::ImposeParLaConfiguration,
+        ] {
+            let d = racine.path().join(origine.id());
+            creer_le_cache_choisi(&d, origine).unwrap();
+            assert!(!d.exists(), "{origine:?}");
+        }
     }
 
     /// L'installation existe si sa base est sur le disque ; PostgreSQL est
