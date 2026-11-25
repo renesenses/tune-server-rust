@@ -482,6 +482,9 @@ impl Controleur {
     pub fn lancer(self: &Arc<Self>, demande: Demande) -> Result<String, String> {
         let demande = demande.borner();
         // rc14 — un test de niveau tient le micro ou la zone : la mesure attend.
+        // Vérification et enregistrement sous le verrou d'admission, partagé
+        // avec le test de niveau (relecture m6) : tenu jusqu'à la fin.
+        let _admission = self.niveaux.admission();
         if let Some(t) = self
             .niveaux
             .occupant(&demande.entree, Some(demande.zone_id))

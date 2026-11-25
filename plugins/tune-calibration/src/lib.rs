@@ -140,6 +140,7 @@ impl TunePlugin for CalibrationPlugin {
         controleur
             .niveaux
             .brancher(Arc::new(niveau::ZoneOrchestrateur {
+                affichages_avant: Default::default(),
                 backend: self.services.backend.clone(),
                 orchestrator: self.services.orchestrator.clone(),
                 playback: self.services.playback.clone(),

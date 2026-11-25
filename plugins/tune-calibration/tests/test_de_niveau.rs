@@ -27,6 +27,7 @@ const ZONE: i64 = 7;
 /// Une zone à elle : le contournement des traitements est un état global,
 /// et les autres essais tiennent la zone 7 en même temps.
 const ZONE_BON: i64 = 701;
+const ZONE_PANIQUE: i64 = 702;
 
 /// La zone simulée du test de niveau : elle ouvre le signal par le
 /// fournisseur, comme l'orchestrateur, et le dépose dans la boucle que le
@@ -38,6 +39,10 @@ struct ZoneSimulee {
     /// La zone sort en ASIO et, comme on le soupçonne chez Didier, l'entrée
     /// Windows de la même interface cesse de capter dès que la zone joue.
     asio: bool,
+    /// Relecture m3 — la zone joue de la musique.
+    en_lecture: AtomicBool,
+    /// Relecture m5 — `jouer_signal` panique (le fil du test aussi).
+    panique: AtomicBool,
     vivant: Mutex<Option<Arc<AtomicBool>>>,
     journal: Mutex<Vec<String>>,
     contournee_au_jeu: Mutex<Vec<bool>>,
@@ -49,6 +54,9 @@ impl ZoneDeTest for ZoneSimulee {
     }
 
     fn jouer_signal(&self, zone_id: i64, e: &ElementDeTest) -> Result<(), String> {
+        if self.panique.load(Ordering::SeqCst) {
+            panic!("panique simulée du fil de test");
+        }
         self.contournee_au_jeu
             .lock()
             .unwrap()
@@ -81,6 +89,10 @@ impl ZoneDeTest for ZoneSimulee {
 
     fn sortie_asio(&self, _zone_id: i64) -> bool {
         self.asio
+    }
+
+    fn zone_en_lecture(&self, _zone_id: i64) -> bool {
+        self.en_lecture.load(Ordering::SeqCst)
     }
 
     fn arreter_signal(&self, _zone_id: i64, id: &str) {
@@ -133,6 +145,8 @@ fn banc_asio(
         boucle: boucle.clone(),
         inactive: inactive.map(str::to_string),
         asio,
+        en_lecture: AtomicBool::new(false),
+        panique: AtomicBool::new(false),
         vivant: Mutex::default(),
         journal: Mutex::default(),
         contournee_au_jeu: Mutex::default(),
@@ -244,7 +258,159 @@ fn un_micro_trop_chaud_est_juge_trop_fort() {
     let v = b.controleur.test_niveau(&id).unwrap().verdict().unwrap();
     assert_eq!(v.jugement, Jugement::TropFort, "{v:?}");
     assert!(v.signal.crete_dbfs >= -3.0);
+    // Relecture m1 — la saturation est vue pendant la montée : coupure en
+    // fondu, sans attendre la référence.
+    assert!(v.coupe, "{v:?}");
     assert_eq!(b.hote.journal().volumes.last(), Some(&50.0));
+}
+
+/// Relecture m1 — avec un étalonnage, la pression au micro est plafonnée
+/// à 90 dB SPL comme pour la mesure : passé le plafond pendant la montée,
+/// le signal est coupé et le verdict le dit. Un micro moins sensible (même
+/// pièce, pression plus basse) passe.
+#[test]
+fn le_plafond_spl_coupe_le_signal() {
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let b = banc(&sim, 1.0, None, "spl");
+    // SPL = dBFS + 112 − sens : le palier de référence (≈ −17,6 dBFS de
+    // crête) donne ≈ 94 dB SPL avec un facteur 0, ≈ 84 avec +10.
+    let fort = "\"Sens Factor =0.0dB, SERNO: 1\"\n10 0.0\n20000 0.0\n";
+    let doux = "\"Sens Factor =10.0dB, SERNO: 2\"\n10 0.0\n20000 0.0\n";
+    b.controleur.deposer_etalonnage("fort", fort).unwrap();
+    b.controleur.deposer_etalonnage("doux", doux).unwrap();
+    let mut d = DemandeNiveau::signal(ZONE, MICRO);
+    d.etalonnage = Some("fort".into());
+    let id = b.controleur.tester_niveau(d).unwrap();
+    assert_eq!(
+        attendre_fin(&b.controleur, &id, Duration::from_secs(30)),
+        EtatTest::Terminee
+    );
+    let v = b.controleur.test_niveau(&id).unwrap().verdict().unwrap();
+    assert_eq!(
+        (v.jugement, v.motif),
+        (Jugement::TropFort, "trop_fort_spl"),
+        "{v:?}"
+    );
+    assert!(v.coupe && v.spl_db.is_some_and(|s| s > 90.0), "{v:?}");
+    let mut d = DemandeNiveau::signal(ZONE, MICRO);
+    d.etalonnage = Some("doux".into());
+    let id = b.controleur.tester_niveau(d).unwrap();
+    assert_eq!(
+        attendre_fin(&b.controleur, &id, Duration::from_secs(30)),
+        EtatTest::Terminee
+    );
+    let v = b.controleur.test_niveau(&id).unwrap().verdict().unwrap();
+    assert_eq!(v.jugement, Jugement::Bon, "{v:?}");
+    assert!(!v.coupe && v.spl_db.is_some_and(|s| s < 90.0), "{v:?}");
+    // Un étalonnage inconnu est refusé avant tout.
+    let mut d = DemandeNiveau::signal(ZONE, MICRO);
+    d.etalonnage = Some("absent".into());
+    assert!(matches!(
+        b.controleur.tester_niveau(d),
+        Err(RefusNiveau::Refus(_))
+    ));
+}
+
+/// Relecture m3 — une zone qui joue n'est pas coupée par le test : refus
+/// clair, rien n'est ouvert ni touché. L'écoute seule, elle, ne touche pas
+/// la zone et reste possible.
+#[test]
+fn une_zone_en_lecture_est_refusee() {
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let b = banc(&sim, 1.0, None, "lecture");
+    b.zone.en_lecture.store(true, Ordering::SeqCst);
+    let r = b
+        .controleur
+        .tester_niveau(DemandeNiveau::signal(ZONE, MICRO));
+    let Err(e @ RefusNiveau::ZoneEnLecture) = r else {
+        panic!("{r:?}")
+    };
+    assert!(
+        e.message().contains("Arrêtez la lecture"),
+        "{}",
+        e.message()
+    );
+    assert_eq!(demarrages(&b), 0);
+    assert!(b.hote.journal().volumes.is_empty());
+    let mut d = DemandeNiveau::ecoute(MICRO);
+    d.zone_id = Some(ZONE);
+    d.duree_s = 1.0;
+    let id = b
+        .controleur
+        .tester_niveau(d)
+        .expect("l'écoute seule reste possible");
+    attendre_fin(&b.controleur, &id, Duration::from_secs(30));
+    assert!(b.zone.journal.lock().unwrap().is_empty());
+}
+
+/// Relecture m5 — le fil du test panique : l'état devient « erreur »,
+/// l'entrée et la zone sont rendues (volume, contournement), un nouveau test
+/// démarre aussitôt.
+#[test]
+fn une_panique_du_fil_libere_l_entree_et_la_zone() {
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let b = banc(&sim, 1.0, None, "panique");
+    b.zone.panique.store(true, Ordering::SeqCst);
+    let id = b
+        .controleur
+        .tester_niveau(DemandeNiveau::signal(ZONE_PANIQUE, MICRO))
+        .unwrap();
+    let fin = attendre_fin(&b.controleur, &id, Duration::from_secs(30));
+    assert!(matches!(fin, EtatTest::Erreur { .. }), "{fin:?}");
+    assert_eq!(b.hote.journal().volumes, vec![40.0, 50.0]);
+    assert!(!tune_core::audio::mesure_nue::active(ZONE_PANIQUE));
+    assert_eq!(b.controleur.niveaux.fournisseur.armes(), 0);
+    b.zone.panique.store(false, Ordering::SeqCst);
+    let mut d = DemandeNiveau::ecoute(MICRO);
+    d.duree_s = 1.0;
+    let id2 = b.controleur.tester_niveau(d).expect("entrée libérée");
+    attendre_fin(&b.controleur, &id2, Duration::from_secs(30));
+}
+
+/// Relecture m6 — deux demandes au même instant (double clic) : une seule
+/// passe ; un test et une mesure au même instant : un seul des deux.
+#[test]
+fn deux_demandes_simultanees_une_seule_passe() {
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let b = banc(&sim, 1.0, None, "admission");
+    for _ in 0..5 {
+        let depart = Arc::new(std::sync::Barrier::new(2));
+        let fils: Vec<_> = (0..2)
+            .map(|k| {
+                let (c, depart) = (b.controleur.clone(), depart.clone());
+                std::thread::spawn(move || {
+                    depart.wait();
+                    let mut d = DemandeNiveau::ecoute(MICRO);
+                    d.duree_s = 1.0 + k as f64;
+                    c.tester_niveau(d).ok()
+                })
+            })
+            .collect();
+        let passes: Vec<String> = fils.into_iter().filter_map(|f| f.join().unwrap()).collect();
+        assert_eq!(passes.len(), 1, "{passes:?}");
+        attendre_fin(&b.controleur, &passes[0], Duration::from_secs(30));
+    }
+    // Test et mesure au même instant.
+    let depart = Arc::new(std::sync::Barrier::new(2));
+    let (c1, d1) = (b.controleur.clone(), depart.clone());
+    let test = std::thread::spawn(move || {
+        d1.wait();
+        let mut d = DemandeNiveau::ecoute(MICRO);
+        d.duree_s = 1.0;
+        c1.tester_niveau(d).ok()
+    });
+    let (c2, d2) = (b.controleur.clone(), depart.clone());
+    let mesure = std::thread::spawn(move || {
+        d2.wait();
+        let mut d = Demande::defaut(ZONE, MICRO);
+        d.duree_s = 2.0;
+        c2.lancer(d).ok()
+    });
+    let (t, m) = (test.join().unwrap(), mesure.join().unwrap());
+    assert!(t.is_some() != m.is_some(), "test {t:?}, mesure {m:?}");
+    if let Some(m) = m {
+        b.controleur.annuler(&m);
+    }
 }
 
 /// Didier : la mauvaise voie. Le micro simulé ne capte que sur la voie 1 ;
@@ -275,11 +441,11 @@ fn la_mauvaise_voie_dit_signal_absent() {
     ));
 }
 
-/// Une pièce bruyante : le signal ne sort pas assez du bruit de fond,
-/// « trop faible », et la phrase le dit. La mesure le confirme : au niveau
+/// Relecture m7 — une pièce bruyante : le signal sort peu du bruit de
+/// fond, « faible mais mesurable », et la phrase le dit. La mesure le confirme : au niveau
 /// du test, sa salve n'atteint pas le RSB visé, elle doit jouer plus fort.
 #[test]
-fn une_piece_bruyante_est_jugee_trop_faible() {
+fn une_piece_bruyante_est_jugee_faible_mais_mesurable() {
     let mut sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
     sim.noise_floor_dbfs = -36.0;
     let b = banc(&sim, 1.0, None, "bruit");
@@ -295,7 +461,7 @@ fn une_piece_bruyante_est_jugee_trop_faible() {
     eprintln!("pièce bruyante : {v:?}");
     assert_eq!(
         (v.jugement, v.motif),
-        (Jugement::TropFaible, "rsb_insuffisant"),
+        (Jugement::Faible, "rsb_faible"),
         "{v:?}"
     );
     assert!(v.message.contains("bruit de fond"), "{}", v.message);
@@ -637,12 +803,22 @@ fn le_signal_de_test_ne_passe_ni_par_la_file_ni_par_l_historique() {
     orch.sources_pcm()
         .inscrire(SOURCE_NIVEAU, fournisseur.clone());
     let zone = ZoneOrchestrateur {
+        affichages_avant: Default::default(),
         backend: backend.clone(),
         orchestrator: orch.clone(),
         playback: playback.clone(),
         runtime: rt.handle().clone(),
     };
     assert_eq!(zone.sortie_inactive(zone_id), None);
+    // Relecture m3 — la zone, arrêtée, affiche le titre 1 à 42 s.
+    let titre_1 = tune_core::playback::NowPlaying {
+        title: "Titre 1".into(),
+        source: "qobuz".into(),
+        source_id: Some("q-1".into()),
+        ..Default::default()
+    };
+    rt.block_on(playback.restore_position(zone_id, 42_000, titre_1));
+    assert!(!zone.zone_en_lecture(zone_id));
     let arme = SignalArme::new(vec![0.1; 4_800], Voies::LesDeux, None);
     fournisseur.armer("n1-essai", arme.clone());
     zone.jouer_signal(
@@ -661,19 +837,50 @@ fn le_signal_de_test_ne_passe_ni_par_la_file_ni_par_l_historique() {
     let etat = rt.block_on(playback.get_state(zone_id));
     let np = etat.now_playing.clone().expect("la zone joue le signal");
     assert_eq!(np.source, SOURCE_NIVEAU);
+    assert!(
+        zone.zone_en_lecture(zone_id),
+        "la zone joue le signal : un second test serait refusé"
+    );
     assert_eq!(lire_file(), avant, "la file a changé pendant le test");
     // Bien au-delà du seuil d'une écoute : rien n'est armé pour l'historique.
     let mut tard = etat.clone();
     tard.position_ms = 15_000;
     assert!(!orch.valider_l_ecoute(&tard), "une écoute a été validée");
 
-    zone.arreter_signal(zone_id, "n1-essai");
-    fournisseur.desarmer("n1-essai");
-    assert!(
+    // Relecture m4 — la fin d'un autre test (autre id) ne coupe pas celui-ci.
+    zone.arreter_signal(zone_id, "n9-autre");
+    assert_eq!(
         rt.block_on(playback.get_state(zone_id))
             .now_playing
-            .is_none(),
-        "la zone affiche encore le signal de test"
+            .map(|np| np.source),
+        Some(SOURCE_NIVEAU.to_string())
+    );
+    zone.arreter_signal(zone_id, "n1-essai");
+    fournisseur.desarmer("n1-essai");
+    // La zone n'affiche plus le signal, mais le titre 1 à sa position.
+    let apres = rt.block_on(playback.get_state(zone_id));
+    let np = apres.now_playing.expect("le titre d'avant revient");
+    assert_eq!(
+        (np.source.as_str(), np.title.as_str()),
+        ("qobuz", "Titre 1")
+    );
+    assert_eq!(apres.position_ms, 42_000);
+    assert!(!zone.zone_en_lecture(zone_id));
+    // Relecture m4 — une musique lancée par un autre client pendant le test
+    // n'est pas coupée par la fin du test.
+    let autre = tune_core::playback::NowPlaying {
+        title: "Musique d'un autre client".into(),
+        source: "qobuz".into(),
+        source_id: Some("q-9".into()),
+        ..Default::default()
+    };
+    rt.block_on(playback.update_now_playing(zone_id, autre));
+    zone.arreter_signal(zone_id, "n1-essai");
+    assert_eq!(
+        rt.block_on(playback.get_state(zone_id))
+            .now_playing
+            .map(|np| np.title),
+        Some("Musique d'un autre client".to_string())
     );
     assert_eq!(lire_file(), avant, "la file a changé après le test");
     let lignes = backend

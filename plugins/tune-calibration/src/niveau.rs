@@ -71,8 +71,25 @@ pub const SOURCE_NIVEAU: &str = "calibration-niveau";
 pub const DUREE_BRUIT_DE_FOND_S: f64 = 1.0;
 /// Les premières trames captées sont écartées (mise en route du pilote).
 pub const MISE_EN_ROUTE_S: f64 = 0.1;
-/// Durée du bruit rose joué.
-pub const DUREE_SIGNAL_S: f64 = 4.0;
+/// Durée du bruit rose joué : la montée ([`PALIERS_DB`]) puis le palier de
+/// référence.
+pub const DUREE_SIGNAL_S: f64 = 4.5;
+/// Relecture m1 — le signal MONTE comme la mesure : départ 12 dB sous la
+/// référence (l'équivalent du premier palier de la mesure, −30 dBFS), puis
+/// +6 dB toutes les [`DUREE_PALIER_S`], jusqu'à la référence. Pendant toute
+/// la montée, la veille coupe le signal en fondu si le micro sature ou si
+/// la pression dépasse [`SPL_MAX_DB`] (étalonnage fourni).
+pub const PALIERS_DB: [f64; 3] = [-12.0, -6.0, 0.0];
+pub const DUREE_PALIER_S: f64 = 0.5;
+/// Plafond de pression acoustique, celui de la mesure
+/// (`LevelPolicy::default().max_spl_db`).
+pub const SPL_MAX_DB: f64 = 90.0;
+/// Fondu de sortie du signal, à l'annulation comme à la coupure de sécurité.
+pub const FONDU_S: f64 = 0.02;
+/// Après un fondu, le temps que le chemin de lecture se vide (avance du
+/// générateur et latence de sortie) avant d'arrêter la zone : l'arrêt ne
+/// tombe jamais en plein signal.
+pub const VIDAGE_APRES_FONDU: Duration = Duration::from_millis(600);
 /// Silence joué avant le signal : la zone démarre sans craquer.
 pub const AMORCE_S: f64 = 0.3;
 /// Fenêtre captée au-delà de la fin théorique du signal : la latence de la
@@ -117,16 +134,18 @@ pub const CRETE_SATURATION_DBFS: f64 = -1.0;
 pub const CRETE_MAX_DBFS: f64 = -3.0;
 /// Rapport signal/bruit (efficace du signal capté sur efficace du bruit de
 /// fond, en large bande) sous lequel le micro n'entend PAS la zone : mauvaise
-/// entrée, mauvaise voie, ou zone muette.
-pub const RSB_ABSENT_DB: f64 = 3.0;
+/// entrée, mauvaise voie, ou zone muette. Relecture m7 : 1 dB et non 3 —
+/// dans la pièce simulée, la mesure aboutit encore avec 3 à 6 dB ici.
+pub const RSB_ABSENT_DB: f64 = 1.0;
 /// Rapport signal/bruit minimal. La déconvolution d'une salve (1 s de
 /// balayage) ajoute un gain de traitement à ce rapport large bande : relevé
 /// sur la pièce simulée (bruit de fond de −80 à −30 dBFS,
 /// `tests/test_de_niveau.rs`, `exploration_seuil_rsb`), le RSB de la salve
 /// jouée au niveau de référence vaut le RSB du test plus 40 dB environ. À
-/// 10 dB, la salve atteint donc le RSB visé (50 dB) AU niveau de référence ;
-/// en dessous, la mesure doit jouer plus fort que le test (jusqu'à 12 dB de
-/// plus), puis refuse.
+/// 10 dB, la salve atteint donc le RSB visé (50 dB) AU niveau de référence :
+/// verdict « bon ». Entre [`RSB_ABSENT_DB`] et 10 dB : « faible mais
+/// mesurable », la mesure devra jouer plus fort que le test (jusqu'à 12 dB
+/// de plus ; elle aboutit encore vers 3 dB dans la pièce simulée).
 pub const RSB_MIN_DB: f64 = 10.0;
 /// Rapport signal/bruit conseillé : 10 dB de marge, la mesure se fait sous
 /// le niveau de référence.
@@ -231,6 +250,8 @@ pub fn niveaux_du_signal(x: &[f64], bloc: usize, retenus: usize) -> Niveaux {
 #[serde(rename_all = "snake_case")]
 pub enum Jugement {
     TropFaible,
+    /// Relecture m7 — faible mais mesurable.
+    Faible,
     Bon,
     TropFort,
 }
@@ -239,26 +260,34 @@ pub enum Jugement {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Plage {
     pub crete_max_dbfs: f64,
+    pub rsb_absent_db: f64,
     pub rsb_min_db: f64,
     pub rsb_conseille_db: f64,
+    pub spl_max_db: f64,
 }
 
 pub const PLAGE: Plage = Plage {
     crete_max_dbfs: CRETE_MAX_DBFS,
+    rsb_absent_db: RSB_ABSENT_DB,
     rsb_min_db: RSB_MIN_DB,
     rsb_conseille_db: RSB_CONSEILLE_DB,
+    spl_max_db: SPL_MAX_DB,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Verdict {
     pub jugement: Jugement,
-    /// Code stable que le web traduit : `saturation`, `trop_fort`,
-    /// `entree_muette`, `signal_absent`, `rsb_insuffisant`, `bon`.
+    /// Code stable que le web traduit : `saturation`, `trop_fort_spl`,
+    /// `trop_fort`, `entree_muette`, `signal_absent`, `rsb_faible`, `bon`.
     pub motif: &'static str,
     pub signal: Niveaux,
     pub bruit: Niveaux,
     /// Efficace du signal capté moins efficace du bruit de fond (dB).
     pub rsb_db: f64,
+    /// Pression de crête au micro (dB SPL), avec un étalonnage seulement.
+    pub spl_db: Option<f64>,
+    /// La veille a coupé le signal pendant la montée (saturation ou SPL).
+    pub coupe: bool,
     pub plage: Plage,
     /// La phrase, en français comme les autres refus du greffon.
     pub message: String,
@@ -266,7 +295,7 @@ pub struct Verdict {
 
 /// Le verdict d'un test de niveau, d'après le bruit de fond et le signal
 /// captés. Voir les seuils plus haut.
-pub fn juger(bruit: Niveaux, signal: Niveaux) -> Verdict {
+pub fn juger(bruit: Niveaux, signal: Niveaux, spl_db: Option<f64>, coupe: bool) -> Verdict {
     let rsb_db = signal.rms_dbfs - bruit.rms_dbfs;
     let (jugement, motif, message) = if signal.crete_dbfs >= CRETE_SATURATION_DBFS {
         (
@@ -276,6 +305,15 @@ pub fn juger(bruit: Niveaux, signal: Niveaux) -> Verdict {
                 "saturation : crête captée {:.1} dBFS. Baissez le gain du micro (ou de l'interface), \
                  ou le volume de mesure",
                 signal.crete_dbfs
+            ),
+        )
+    } else if let Some(spl) = spl_db.filter(|s| *s > SPL_MAX_DB) {
+        (
+            Jugement::TropFort,
+            "trop_fort_spl",
+            format!(
+                "trop fort : {spl:.0} dB SPL au micro, {SPL_MAX_DB:.0} dB SPL au plus. Le signal a été \
+                 coupé ; baissez le volume de mesure"
             ),
         )
     } else if signal.crete_dbfs >= CRETE_MAX_DBFS {
@@ -309,12 +347,12 @@ pub fn juger(bruit: Niveaux, signal: Niveaux) -> Verdict {
         )
     } else if rsb_db < RSB_MIN_DB {
         (
-            Jugement::TropFaible,
-            "rsb_insuffisant",
+            Jugement::Faible,
+            "rsb_faible",
             format!(
-                "trop faible : {rsb_db:.0} dB au-dessus du bruit de fond, {RSB_MIN_DB:.0} dB au moins \
-                 ({RSB_CONSEILLE_DB:.0} dB conseillés). Montez le volume de mesure, rapprochez le micro \
-                 ou réduisez le bruit ambiant"
+                "faible mais mesurable : {rsb_db:.0} dB au-dessus du bruit de fond ({RSB_MIN_DB:.0} dB \
+                 pour un bon niveau, {RSB_CONSEILLE_DB:.0} dB conseillés). La mesure devra jouer plus \
+                 fort que ce test ; pour plus de marge, montez le volume de mesure ou rapprochez le micro"
             ),
         )
     } else {
@@ -333,9 +371,31 @@ pub fn juger(bruit: Niveaux, signal: Niveaux) -> Verdict {
         signal,
         bruit,
         rsb_db,
+        spl_db,
+        coupe,
         plage: PLAGE,
         message,
     }
+}
+
+/// Le signal du test : le bruit rose ([`bruit_rose`]) sous l'enveloppe de
+/// la montée ([`PALIERS_DB`]), chaque marche lissée sur 10 ms.
+pub fn signal_de_test(fs: u32, plafond_dbfs: f64) -> Vec<f64> {
+    let mut x = bruit_rose(fs, DUREE_SIGNAL_S, EFFICACE_SIGNAL_DBFS, plafond_dbfs);
+    let palier = (DUREE_PALIER_S * fs as f64) as usize;
+    let lissage = (0.01 * fs as f64) as usize;
+    let gain_a = |i: usize| -> f64 {
+        let k = (i / palier.max(1)).min(PALIERS_DB.len() - 1);
+        fft::from_db(PALIERS_DB[k])
+    };
+    let mut g = gain_a(0);
+    for (i, v) in x.iter_mut().enumerate() {
+        let cible = gain_a(i);
+        // Glissement vers la marche suivante, sans clic.
+        g += (cible - g) / lissage.max(1) as f64;
+        *v *= g;
+    }
+    x
 }
 
 // ─── Le bruit rose ─────────────────────────────────────────────────────────
@@ -435,6 +495,8 @@ pub struct SignalArme {
     trames_annoncees: u64,
     cadence: Option<(HorlogeDEcoute, u64)>,
     annule: AtomicBool,
+    /// Relecture m1 — la veille de sécurité a coupé le signal.
+    coupe: AtomicBool,
     ouvert: Mutex<bool>,
     signal: Condvar,
     rendues: AtomicU64,
@@ -459,6 +521,7 @@ impl SignalArme {
             trames_annoncees: DUREE_ANNONCEE_MS * FREQUENCE_MESURE as u64 / 1000,
             cadence,
             annule: AtomicBool::new(false),
+            coupe: AtomicBool::new(false),
             ouvert: Mutex::new(false),
             signal: Condvar::new(),
             rendues: AtomicU64::new(0),
@@ -469,8 +532,19 @@ impl SignalArme {
         self.trames_annoncees * self.format.octets_par_trame()
     }
 
+    /// Annule : le signal s'éteint en fondu ([`FONDU_S`]), le flux continue
+    /// en silence jusqu'à l'arrêt de la zone.
     pub fn annuler(&self) {
         self.annule.store(true, Ordering::SeqCst);
+    }
+
+    /// Relecture m1 — coupe de sécurité : même fondu que l'annulation.
+    pub fn couper(&self) {
+        self.coupe.store(true, Ordering::SeqCst);
+    }
+
+    fn eteint(&self) -> bool {
+        self.annule.load(Ordering::SeqCst) || self.coupe.load(Ordering::SeqCst)
     }
 
     pub fn ouvert(&self) -> bool {
@@ -520,6 +594,8 @@ pub struct LecteurSignal {
     position: u64,
     origine_ecoute: Option<u64>,
     reste: Vec<u8>,
+    /// Gain de sortie : 1, puis vers 0 en [`FONDU_S`] une fois éteint.
+    gain: f64,
 }
 
 impl LecteurSignal {
@@ -531,7 +607,7 @@ impl LecteurSignal {
         let echeance = Instant::now() + Duration::from_millis(100);
         loop {
             let ecoute = horloge().saturating_sub(origine);
-            if self.position + bloc <= ecoute + avance || self.arme.annule.load(Ordering::SeqCst) {
+            if self.position + bloc <= ecoute + avance || self.arme.eteint() {
                 return true;
             }
             if Instant::now() >= echeance {
@@ -545,16 +621,22 @@ impl LecteurSignal {
         let a = &self.arme;
         let n = n.min(a.trames_annoncees.saturating_sub(self.rendues));
         let mut sortie = Vec::with_capacity((n * a.format.octets_par_trame()) as usize);
-        let muet = a.annule.load(Ordering::SeqCst) || !avancer;
+        let eteint = a.eteint();
+        let pas = 1.0 / (FONDU_S * a.format.frequence as f64).max(1.0);
         for _ in 0..n {
-            let v = if muet {
+            let v = if !avancer || self.gain <= 0.0 {
                 0.0
             } else {
+                // Relecture m2 — éteint : fondu, jamais d'arrêt net.
+                if eteint {
+                    self.gain = (self.gain - pas).max(0.0);
+                }
                 let i = self.position;
                 self.position += 1;
                 i.checked_sub(a.amorce)
                     .and_then(|j| a.echantillons.get(j as usize).copied())
                     .unwrap_or(0.0)
+                    * self.gain
             };
             let v = v.clamp(-1.0, 1.0);
             let (g, d) = match a.voies {
@@ -642,6 +724,7 @@ impl FournisseurPcm for FournisseurNiveau {
                 position: 0,
                 origine_ecoute: None,
                 reste: Vec::new(),
+                gain: 1.0,
             }),
         })
     }
@@ -681,6 +764,11 @@ pub trait ZoneDeTest: Send + Sync {
     fn sortie_asio(&self, _zone_id: i64) -> bool {
         false
     }
+    /// Relecture m3 — la zone joue (ou est en pause) : le test la couperait
+    /// et ferait perdre la piste et sa position. Le test est alors refusé.
+    fn zone_en_lecture(&self, _zone_id: i64) -> bool {
+        false
+    }
 }
 
 /// Une sortie ouverte en ASIO, d'après ce que la base en sait : son
@@ -708,6 +796,9 @@ pub struct ZoneOrchestrateur {
     pub orchestrator: Arc<tune_core::orchestrator::PlaybackOrchestrator>,
     pub playback: Arc<tune_core::playback::PlaybackManager>,
     pub runtime: tokio::runtime::Handle,
+    /// Relecture m3 — ce qu'une zone ARRÊTÉE affichait avant le test (piste,
+    /// position) : rendu après, au lieu d'un affichage vide.
+    pub affichages_avant: Mutex<HashMap<i64, (tune_core::playback::NowPlaying, i64)>>,
 }
 
 impl ZoneOrchestrateur {
@@ -737,8 +828,21 @@ impl ZoneDeTest for ZoneOrchestrateur {
         Some(device_id)
     }
 
+    fn zone_en_lecture(&self, zone_id: i64) -> bool {
+        use tune_core::playback::PlayState;
+        let etat = self.runtime.block_on(self.playback.get_state(zone_id));
+        matches!(etat.state, PlayState::Playing | PlayState::Paused)
+    }
+
     fn jouer_signal(&self, zone_id: i64, e: &ElementDeTest) -> Result<(), String> {
         let output_device_id = self.zone(zone_id).and_then(|z| z.output_device_id);
+        let avant = self.runtime.block_on(self.playback.get_state(zone_id));
+        if let Some(np) = avant.now_playing {
+            self.affichages_avant
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(zone_id, (np, avant.position_ms));
+        }
         let r = self
             .runtime
             .block_on(self.orchestrator.play_transfere_sans_historique(
@@ -787,13 +891,29 @@ impl ZoneDeTest for ZoneOrchestrateur {
 
     fn arreter_signal(&self, zone_id: i64, id: &str) {
         self.runtime.block_on(async {
-            self.orchestrator.stop(zone_id, None).await;
-            // La zone n'affiche plus le signal : Lecture ne le relancera pas.
+            // Relecture m4 — seulement si la zone joue ENCORE le signal de
+            // ce test : une musique lancée entre-temps par un autre client
+            // n'est pas coupée.
             let affiche = self.playback.get_state(zone_id).await.now_playing;
-            if affiche
+            if !affiche
                 .is_some_and(|np| np.source == SOURCE_NIVEAU && np.source_id.as_deref() == Some(id))
             {
-                self.playback.stop_and_clear(zone_id).await;
+                return;
+            }
+            let avant = self
+                .affichages_avant
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&zone_id);
+            self.orchestrator.stop(zone_id, None).await;
+            // La zone n'affiche plus le signal : Lecture ne le relancera pas.
+            self.playback.stop_and_clear(zone_id).await;
+            // Relecture m3 — la piste qu'affichait la zone arrêtée revient.
+            // `restore_position` remet aussi la reprise à cette position.
+            if let Some((np, position_ms)) = avant {
+                self.playback
+                    .restore_position(zone_id, position_ms, np)
+                    .await;
             }
         });
     }
@@ -851,6 +971,9 @@ pub struct DemandeNiveau {
     pub voies: Voies,
     /// Durée de l'écoute seule (s), bornée à [1, `ECOUTE_MAX_S`].
     pub duree_s: f64,
+    /// Relecture m1 — l'étalonnage du micro : avec lui, la pression au micro
+    /// est connue et plafonnée à [`SPL_MAX_DB`], comme pour la mesure.
+    pub etalonnage: Option<String>,
 }
 
 impl DemandeNiveau {
@@ -863,6 +986,7 @@ impl DemandeNiveau {
             volume_mesure_pct: crate::mesure::Demande::defaut(0, entree).volume_mesure_pct,
             voies: Voies::LesDeux,
             duree_s: ECOUTE_MAX_S,
+            etalonnage: None,
         }
     }
 
@@ -897,6 +1021,8 @@ pub enum RefusNiveau {
     /// Fil 3094 — la zone n'a pas de sortie active (409
     /// `zone_sans_sortie_active`) : l'identifiant de son appareil.
     SortieInactive(String),
+    /// Relecture m3 — la zone joue ou est en pause (409 `zone_en_lecture`).
+    ZoneEnLecture,
     /// Tout autre refus motivé (422).
     Refus(String),
 }
@@ -905,6 +1031,9 @@ impl RefusNiveau {
     pub fn message(&self) -> String {
         match self {
             Self::Occupe(m) | Self::Refus(m) => m.clone(),
+            Self::ZoneEnLecture => {
+                "Arrêtez la lecture sur cette zone avant le test : il la couperait.".to_string()
+            }
             Self::SortieInactive(d) => {
                 let nom = d.split_once(':').map_or(d.as_str(), |(_, n)| n);
                 format!(
@@ -1072,6 +1201,10 @@ pub struct Magasin {
     zone: Mutex<Option<Arc<dyn ZoneDeTest>>>,
     tests: Mutex<HashMap<String, Arc<TestDeNiveau>>>,
     compteur: AtomicU64,
+    /// Relecture m6 — vérification ET enregistrement d'un test ou d'une
+    /// mesure sous ce même verrou : deux demandes simultanées (double clic,
+    /// test et mesure) ne passent plus toutes les deux.
+    admission: Mutex<()>,
 }
 
 impl Magasin {
@@ -1082,6 +1215,12 @@ impl Magasin {
 
     fn zone(&self) -> Option<Arc<dyn ZoneDeTest>> {
         self.zone.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Le verrou d'admission (voir le champ), tenu par `tester_niveau` et par
+    /// `Controleur::lancer` jusqu'à l'enregistrement.
+    pub fn admission(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.admission.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn verrou(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<TestDeNiveau>>> {
@@ -1174,6 +1313,25 @@ enum Fin {
     Erreur(String),
 }
 
+/// Relecture m5 — si le fil du test panique, ses gardes (capture, zone
+/// tenue, contournement) se rendent au déroulement de la pile, et celle-ci,
+/// la dernière, pose l'état final : l'entrée et la zone ne restent pas
+/// occupées jusqu'au redémarrage.
+struct GardeDeFin(Arc<TestDeNiveau>);
+
+impl Drop for GardeDeFin {
+    fn drop(&mut self) {
+        if !self.0.etat().finale() {
+            tracing::error!(test = %self.0.id, "calibration_niveau_fil_interrompu");
+            self.0.poser(EtatTest::Erreur {
+                message:
+                    "le test s'est interrompu (erreur interne) ; l'entrée et la zone sont rendues"
+                        .into(),
+            });
+        }
+    }
+}
+
 impl Controleur {
     pub fn test_niveau(&self, id: &str) -> Option<Arc<TestDeNiveau>> {
         self.niveaux.test(id)
@@ -1187,6 +1345,9 @@ impl Controleur {
                 "préciser l'entrée audio du micro".into(),
             ));
         }
+        // Relecture m6 — de la vérification à l'enregistrement, sous un seul
+        // verrou, partagé avec `Controleur::lancer`.
+        let _admission = self.niveaux.admission();
         // Une seule session par entrée ; ni pendant une mesure sur l'entrée
         // ou la zone (elle tient le micro et la zone).
         // L'écoute seule ne tient pas la zone : elle peut écouter pendant
@@ -1217,6 +1378,10 @@ impl Controleur {
                 format.canaux
             )));
         }
+        let etalonnage = match &demande.etalonnage {
+            Some(n) => Some(self.etalonnage(n).map_err(RefusNiveau::Refus)?),
+            None => None,
+        };
         let mut avertissements = Vec::new();
         if format.frequence != FREQUENCE_MESURE {
             avertissements.push(format!(
@@ -1250,6 +1415,9 @@ impl Controleur {
             })?;
             if let Some(device) = zone.sortie_inactive(zone_id) {
                 return Err(RefusNiveau::SortieInactive(device));
+            }
+            if zone.zone_en_lecture(zone_id) {
+                return Err(RefusNiveau::ZoneEnLecture);
             }
             if self.hote.traitements(zone_id).volume_fixe {
                 return Err(RefusNiveau::Refus(
@@ -1295,7 +1463,8 @@ impl Controleur {
         std::thread::Builder::new()
             .name("calibration-niveau".into())
             .spawn(move || {
-                let fin = moi.derouler_test(&test, zone_de_test, volume_initial);
+                let _garde = GardeDeFin(test.clone());
+                let fin = moi.derouler_test(&test, zone_de_test, volume_initial, etalonnage);
                 match fin {
                     Ok(()) => test.poser(EtatTest::Terminee),
                     Err(Fin::Annulee) => test.poser(EtatTest::Annulee),
@@ -1311,6 +1480,7 @@ impl Controleur {
         test: &Arc<TestDeNiveau>,
         zone: Option<Arc<dyn ZoneDeTest>>,
         volume_initial: f64,
+        etalonnage: Option<tune_calibration::mic_cal::MicCalibration>,
     ) -> Result<(), Fin> {
         let d = &test.demande;
         let capacite_s = match d.mode {
@@ -1320,7 +1490,7 @@ impl Controleur {
         let capture = CaptureVersTampon::demarrer(&self.peripheriques, &d.entree, capacite_s)
             .map_err(Fin::Erreur)?;
         test.verrou().peripherique = Some(capture.peripherique().to_string());
-        let r = self.ecouter_et_juger(test, &capture, zone, volume_initial);
+        let r = self.ecouter_et_juger(test, &capture, zone, volume_initial, etalonnage.as_ref());
         // L'entrée est TOUJOURS libérée.
         capture.arreter();
         if capture.debordements() > 0 {
@@ -1333,13 +1503,16 @@ impl Controleur {
     }
 
     /// Attend que le tampon tienne `besoin` trames, en relevant le vumètre ;
-    /// s'arrête sur une annulation, un micro figé ou l'échéance murale.
+    /// s'arrête sur une annulation, un micro figé, l'échéance murale, ou
+    /// quand `veille` (consultée à chaque relevé, toutes les 50 ms) le
+    /// demande.
     fn capter_jusqu_a(
         &self,
         test: &TestDeNiveau,
         tampon: &Arc<Tampon>,
         besoin: u64,
         echeance: Instant,
+        veille: &dyn Fn() -> bool,
     ) -> Result<bool, Fin> {
         let mut vu = tampon.trames();
         let mut vu_a = Instant::now();
@@ -1349,6 +1522,9 @@ impl Controleur {
             }
             let attente = tampon.attendre_trames(besoin, PAS_DU_RELEVE);
             test.relever(tampon);
+            if veille() {
+                return Ok(true);
+            }
             match attente {
                 Ok(Some(_)) => return Ok(true),
                 Ok(None) => {}
@@ -1384,6 +1560,7 @@ impl Controleur {
         capture: &CaptureVersTampon,
         zone: Option<Arc<dyn ZoneDeTest>>,
         volume_initial: f64,
+        etalonnage: Option<&tune_calibration::mic_cal::MicCalibration>,
     ) -> Result<(), Fin> {
         // #9070 — un micro ouvert qui ne rend rien échoue ici, vite.
         if let Err(sans) = capture.attendre_la_premiere_trame(self.delai_premiere_trame) {
@@ -1399,7 +1576,7 @@ impl Controleur {
             test.poser(EtatTest::Ecoute);
             let echeance = test.debut + Duration::from_secs_f64(d.duree_s);
             let besoin = tampon.trames() + trames(d.duree_s);
-            self.capter_jusqu_a(test, &tampon, besoin, echeance)?;
+            self.capter_jusqu_a(test, &tampon, besoin, echeance, &|| false)?;
             return Ok(());
         }
 
@@ -1411,7 +1588,7 @@ impl Controleur {
         test.poser(EtatTest::BruitDeFond);
         let debut_bruit = tampon.trames() + trames(MISE_EN_ROUTE_S);
         let fin_bruit = debut_bruit + trames(DUREE_BRUIT_DE_FOND_S);
-        if !self.capter_jusqu_a(test, &tampon, fin_bruit, echeance)? {
+        if !self.capter_jusqu_a(test, &tampon, fin_bruit, echeance, &|| false)? {
             return Err(Fin::Erreur(
                 "capture trop lente : bruit de fond incomplet".into(),
             ));
@@ -1442,12 +1619,7 @@ impl Controleur {
             Arc::new(move || t.trames())
         };
         let arme = SignalArme::new(
-            bruit_rose(
-                FREQUENCE_MESURE,
-                DUREE_SIGNAL_S,
-                EFFICACE_SIGNAL_DBFS,
-                politique.max_play_dbfs,
-            ),
+            signal_de_test(FREQUENCE_MESURE, politique.max_play_dbfs),
             d.voies,
             Some((
                 horloge,
@@ -1473,18 +1645,51 @@ impl Controleur {
         }
         let debut_signal = tampon.trames();
         let fenetre = trames(AMORCE_S + DUREE_SIGNAL_S + MARGE_LATENCE_S);
-        let complet = self.capter_jusqu_a(test, &tampon, debut_signal + fenetre, echeance)?;
+        // Relecture m1 — la veille : saturation ou pression trop forte ⇒
+        // coupure en fondu, sans attendre la fin de la montée.
+        let veille = || {
+            let Some(m) = test.verrou().vumetre else {
+                return false;
+            };
+            let spl = etalonnage.and_then(|c| c.spl_from_dbfs(m.crete_max_dbfs));
+            let danger =
+                m.crete_max_dbfs >= CRETE_SATURATION_DBFS || spl.is_some_and(|s| s > SPL_MAX_DB);
+            if danger && !arme.coupe.load(Ordering::SeqCst) {
+                tracing::warn!(test = %test.id, crete = m.crete_max_dbfs, spl = ?spl, "calibration_niveau_coupure");
+                arme.couper();
+            }
+            danger
+        };
+        let complet =
+            match self.capter_jusqu_a(test, &tampon, debut_signal + fenetre, echeance, &veille) {
+                Ok(c) => c,
+                Err(fin) => {
+                    // Relecture m2 — annulation (ou micro perdu) : fondu, puis
+                    // le chemin de lecture se vide, puis seulement l'arrêt.
+                    arme.annuler();
+                    std::thread::sleep(VIDAGE_APRES_FONDU);
+                    return Err(fin);
+                }
+            };
+        let coupe = arme.coupe.load(Ordering::SeqCst);
+        if coupe {
+            std::thread::sleep(VIDAGE_APRES_FONDU);
+            test.verrou()
+                .avertissements
+                .push("signal coupé en fondu pendant la montée : niveau dangereux au micro".into());
+        }
         // La zone est rendue AVANT l'analyse : rien ne joue plus.
         drop(tenue);
         let capte = tampon.extraire(d.voie_micro, debut_signal, fenetre as usize);
-        if !complet {
+        if !complet && !coupe {
             test.verrou()
                 .avertissements
                 .push("fenêtre captée incomplète : verdict sur ce qui a été capté".into());
         }
         let bloc = trames(0.1) as usize;
         let signal = niveaux_du_signal(&capte, bloc, (DUREE_RETENUE_S / 0.1).round() as usize);
-        let verdict = juger(bruit, signal);
+        let spl = etalonnage.and_then(|c| c.spl_from_dbfs(signal.crete_dbfs));
+        let verdict = juger(bruit, signal, spl, coupe);
         tracing::info!(
             test = %test.id,
             jugement = ?verdict.jugement,
@@ -1529,6 +1734,7 @@ pub(crate) mod http {
         volume: Option<f64>,
         voies: Option<String>,
         duree_s: Option<f64>,
+        etalonnage: Option<String>,
     }
 
     /// `POST /niveaux` — `{ mode: "signal" | "ecoute", entree, voie_micro,
@@ -1564,6 +1770,7 @@ pub(crate) mod http {
             },
         };
         d.voie_micro = c.voie_micro;
+        d.etalonnage = c.etalonnage.filter(|s| !s.trim().is_empty());
         if let Some(v) = c.volume {
             d.volume_mesure_pct = v;
         }
@@ -1600,6 +1807,9 @@ pub(crate) mod http {
                     .into_response()
             }
             Err(RefusNiveau::Occupe(m)) => refus(StatusCode::CONFLICT, "test_niveau_en_cours", m),
+            Err(e @ RefusNiveau::ZoneEnLecture) => {
+                refus(StatusCode::CONFLICT, "zone_en_lecture", e.message())
+            }
             Err(RefusNiveau::SortieInactive(device)) => {
                 let appareil = device.split_once(':').map_or(device.as_str(), |(_, n)| n);
                 // Même forme que le refus de la mesure (fil 3094, #9528) :
@@ -1706,41 +1916,54 @@ mod tests {
     #[test]
     fn le_verdict_suit_les_seuils() {
         let bruit = n(-60.0, -70.0);
-        let v = juger(bruit, n(-0.2, -12.0));
+        let j = |b, s| juger(b, s, None, false);
+        let v = j(bruit, n(-0.2, -12.0));
         assert_eq!((v.jugement, v.motif), (Jugement::TropFort, "saturation"));
-        let v = juger(bruit, n(-2.0, -14.0));
+        let v = j(bruit, n(-2.0, -14.0));
         assert_eq!((v.jugement, v.motif), (Jugement::TropFort, "trop_fort"));
         assert!(v.message.contains("-2.0 dBFS"), "{}", v.message);
-        let v = juger(bruit, n(-55.0, -68.5));
+        let v = j(bruit, n(-55.0, -69.5));
         assert_eq!(
             (v.jugement, v.motif),
             (Jugement::TropFaible, "signal_absent")
         );
-        let v = juger(bruit, n(-45.0, -64.0));
+        // Relecture m7 — 3 à 6 dB : faible mais mesurable, plus « absent ».
+        for rsb in [1.5, 3.0, 6.0, 9.9] {
+            let v = j(bruit, n(-45.0, -70.0 + rsb));
+            assert_eq!(
+                (v.jugement, v.motif),
+                (Jugement::Faible, "rsb_faible"),
+                "{rsb}"
+            );
+            assert!(v.message.contains("mesurable"), "{}", v.message);
+        }
+        // Relecture m1 — étalonnage : la pression au micro passe le plafond.
+        let v = juger(bruit, n(-12.0, -24.0), Some(95.0), true);
+        assert_eq!((v.jugement, v.motif), (Jugement::TropFort, "trop_fort_spl"));
+        assert!(v.coupe && v.spl_db == Some(95.0));
         assert_eq!(
-            (v.jugement, v.motif),
-            (Jugement::TropFaible, "rsb_insuffisant")
+            juger(bruit, n(-12.0, -24.0), Some(80.0), false).motif,
+            "bon"
         );
-        assert!((v.rsb_db - 6.0).abs() < 1e-9);
-        let v = juger(bruit, n(-15.0, -27.0));
+        let v = j(bruit, n(-15.0, -27.0));
         assert_eq!((v.jugement, v.motif), (Jugement::Bon, "bon"));
         assert_eq!(v.plage, PLAGE);
         // Fil de Didier : l'entrée vivait avant le signal, zéros pendant.
-        let v = juger(n(-70.0, -80.0), Niveaux::SILENCE);
+        let v = j(n(-70.0, -80.0), Niveaux::SILENCE);
         assert_eq!(
             (v.jugement, v.motif),
             (Jugement::TropFaible, "entree_muette")
         );
         // Une voie muette d'un bout à l'autre n'est pas ce cas-là.
-        let v = juger(Niveaux::SILENCE, Niveaux::SILENCE);
+        let v = j(Niveaux::SILENCE, Niveaux::SILENCE);
         assert_eq!(v.motif, "signal_absent");
         // Juste aux bornes.
         assert_eq!(
-            juger(bruit, n(CRETE_MAX_DBFS, -20.0)).jugement,
+            j(bruit, n(CRETE_MAX_DBFS, -20.0)).jugement,
             Jugement::TropFort
         );
         assert_eq!(
-            juger(bruit, n(-10.0, -70.0 + RSB_MIN_DB)).jugement,
+            j(bruit, n(-10.0, -70.0 + RSB_MIN_DB)).jugement,
             Jugement::Bon
         );
     }
@@ -1769,7 +1992,7 @@ mod tests {
     #[test]
     fn le_bruit_rose_tient_son_efficace_et_son_plafond() {
         let x = bruit_rose(48_000, DUREE_SIGNAL_S, EFFICACE_SIGNAL_DBFS, -6.0);
-        assert_eq!(x.len(), 4 * 48_000);
+        assert_eq!(x.len(), (DUREE_SIGNAL_S * 48_000.0) as usize);
         let milieu = &x[4_800..x.len() - 4_800];
         let e = 10.0 * (milieu.iter().map(|v| v * v).sum::<f64>() / milieu.len() as f64).log10();
         assert!((e - EFFICACE_SIGNAL_DBFS).abs() < 0.5, "efficace {e:.2}");
@@ -1783,8 +2006,50 @@ mod tests {
         );
     }
 
+    /// Relecture m1 — le signal monte comme la mesure : 12 dB sous la
+    /// référence, puis 6 dB sous, puis la référence.
+    #[test]
+    fn la_montee_part_douze_db_sous_la_reference() {
+        let x = signal_de_test(48_000, -6.0);
+        let efficace = |a: usize, b: usize| {
+            let s = &x[a..b];
+            10.0 * (s.iter().map(|v| v * v).sum::<f64>() / s.len() as f64).log10()
+        };
+        // Premier palier (après le fondu d'entrée), deuxième, référence.
+        let p1 = efficace(4_800, 21_600);
+        let p2 = efficace(26_400, 45_600);
+        let p3 = efficace(60_000, 180_000);
+        assert!((p3 - EFFICACE_SIGNAL_DBFS).abs() < 0.7, "{p3:.1}");
+        assert!((p3 - p1 - 12.0).abs() < 1.5, "{p1:.1} → {p3:.1}");
+        assert!((p3 - p2 - 6.0).abs() < 1.5, "{p2:.1} → {p3:.1}");
+    }
+
+    /// Relecture m2 — l'annulation éteint le signal en fondu (20 ms), sans
+    /// saut : chaque échantillon ne descend que d'un pas.
+    #[test]
+    fn l_annulation_eteint_en_fondu() {
+        let f = FournisseurNiveau::default();
+        let s = SignalArme::new(vec![0.5; 96_000], Voies::Gauche, None);
+        f.armer("n-2", s.clone());
+        let mut flux = f.ouvrir("n-2", 0).unwrap();
+        let amorce = (AMORCE_S * 48_000.0) as usize;
+        let mut debut = vec![0u8; (amorce + 4_800) * 6];
+        flux.lecteur.read_exact(&mut debut).unwrap();
+        s.annuler();
+        let mut suite = vec![0u8; 4_800 * 6];
+        flux.lecteur.read_exact(&mut suite).unwrap();
+        let gauche: Vec<f64> = suite
+            .chunks_exact(6)
+            .map(|t| (i32::from_le_bytes([0, t[0], t[1], t[2]]) >> 8) as f64 / 8_388_608.0)
+            .collect();
+        assert!(gauche[0] > 0.45, "{}", gauche[0]);
+        assert!(gauche.windows(2).all(|w| w[0] - w[1] < 0.5 / 900.0 + 1e-6));
+        assert_eq!(gauche[1_000], 0.0, "le fondu dure 20 ms");
+        assert!(gauche[1_000..].iter().all(|v| *v == 0.0));
+    }
+
     /// Le lecteur : amorce de silence, signal, puis silence jusqu'à la
-    /// longueur annoncée ; muet après annulation ; une voie seule.
+    /// longueur annoncée ; une voie seule.
     #[test]
     fn le_lecteur_rend_la_longueur_annoncee() {
         let f = FournisseurNiveau::default();
