@@ -474,7 +474,8 @@ pub fn origine_de_la_piece(profil: &Value) -> &'static str {
     }
 }
 
-fn memes_bandes(a: &[EqBandSpec], b: &[EqBandSpec]) -> bool {
+/// Deux listes de bandes identiques (fréquence, gain et Q à 1e-6 près).
+pub fn memes_bandes(a: &[EqBandSpec], b: &[EqBandSpec]) -> bool {
     let proche = |x: f64, y: f64| (x - y).abs() < 1e-6;
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
@@ -507,6 +508,28 @@ pub fn classer_egaliseur(
     } else {
         ID_EQ_PARAMETRIQUE
     }
+}
+
+/// rc14 — la façade que prendrait `profil` s'il était écrit dans
+/// `zone_{id}_eq_profile` par une ancienne route (`PUT /zones/{id}/dsp`,
+/// `POST /zones/{id}/eq`, `POST /eq/presets/{id}/activate`) : la même
+/// [`classer_egaliseur`] que la lecture de la chaîne, avec le profil de pièce
+/// de la zone et la façade qu'elle porte aujourd'hui. Une chaîne illisible ne
+/// donne pas de façade précédente. Rien n'est écrit.
+pub fn facade_d_un_profil_ecrit(
+    settings: &SettingsRepo,
+    zone_id: i64,
+    profil: &EqProfile,
+) -> &'static str {
+    let precedente = lire_zone(settings, zone_id, true).ok().and_then(|l| {
+        egaliseur_principal(&l.chaine).map(|i| l.chaine.plugins[i].id.clone())
+    });
+    let piece = profil_de_piece(settings, zone_id);
+    classer_egaliseur(
+        profil,
+        piece.as_ref().map(|(p, _)| p),
+        precedente.as_deref(),
+    )
 }
 
 /// D1 : réécrit l'origine de chaque `room-correction` d'après

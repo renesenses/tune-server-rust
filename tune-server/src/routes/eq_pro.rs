@@ -452,6 +452,16 @@ async fn activate_preset(
                 })
                 .unwrap_or_default();
             profile.enabled = true;
+            // rc14 — l'égaliseur paramétrique est Premium, ici comme par
+            // `PUT /zones/{id}/tess` ; un préréglage graphique ou casque
+            // (AutoEQ, OPRA) reste libre.
+            if let Err(resp) = crate::routes::eq_parametrique_premium::exiger_le_droit(
+                &state, zone_id, &profile, &headers,
+            )
+            .await
+            {
+                return resp;
+            }
             let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
 
             settings.set("eq_active_preset", &id).ok();

@@ -41,6 +41,7 @@ pub mod digest;
 pub mod discogs;
 pub(crate) mod ecriture_fichiers;
 pub mod eq_pro;
+pub(crate) mod eq_parametrique_premium;
 pub mod export;
 pub(crate) mod filtre_sources;
 pub mod graphql;
