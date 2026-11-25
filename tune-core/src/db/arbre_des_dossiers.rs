@@ -201,13 +201,14 @@ impl ArbreDesDossiers {
         }
     }
 
-    /// Pistes sous `dossier` par `file_path` seul : le compte d'une racine
-    /// ([`super::track_repo::compter_pistes_sous_dossier`]).
+    /// Pistes sous `dossier` par `file_path` seul (tranches d'images exclues).
     pub fn fichiers_sous(&self, dossier: &str) -> i64 {
         self.noeud(dossier).map_or(0, |n| i64::from(n.fichiers))
     }
 
-    /// Pistes sous `dossier` par `COALESCE(file_path, cue_media_path)`.
+    /// Pistes sous `dossier` par `COALESCE(file_path, cue_media_path)` : le
+    /// compte d'une racine ([`super::track_repo::compter_pistes_sous_dossier`]),
+    /// tranches d'ISO SACD et de CUE comprises (#9480).
     pub fn pistes_sous(&self, dossier: &str) -> i64 {
         self.noeud(dossier).map_or(0, |n| i64::from(n.pistes))
     }

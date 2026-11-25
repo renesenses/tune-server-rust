@@ -160,7 +160,7 @@ fn banc_200k_descente_par_niveau_arbre_contre_sql() {
         directes.sort();
         assert_eq!(directes, directes_attendues, "pistes directes de {dossier}");
         assert_eq!(
-            arbre.fichiers_sous(dossier),
+            arbre.pistes_sous(dossier),
             tr::compter_pistes_sous_dossier(&db, dossier).unwrap(),
             "compte de racine {dossier}"
         );
@@ -279,8 +279,8 @@ fn la_casse_suit_le_moteur() {
 }
 
 /// Une tranche CUE (`file_path` NULL, chemin dans `cue_media_path`) compte
-/// dans un sous-dossier (#4625) mais pas dans le compte d'une racine (la
-/// requête d'avant ne voyait que `file_path`) — en base comme dans l'arbre.
+/// dans un sous-dossier (#4625) ET dans le compte d'une racine (#9480) — en
+/// base comme dans l'arbre.
 #[test]
 fn tranches_cue() {
     let db = base();
@@ -295,9 +295,10 @@ fn tranches_cue() {
     .unwrap();
     let a = construire(&db).unwrap();
     assert_eq!(
-        a.fichiers_sous("/m"),
+        a.pistes_sous("/m"),
         tr::compter_pistes_sous_dossier(&db, "/m").unwrap()
     );
+    assert_eq!(a.pistes_sous("/m"), 3);
     assert_eq!(a.fichiers_sous("/m"), 1);
     let sql = tr::compter_pistes_par_sous_dossier(&db, "/m").unwrap();
     assert_eq!(

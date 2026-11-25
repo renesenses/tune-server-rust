@@ -405,27 +405,36 @@ pub fn compter_pistes_par_sous_dossier(
 /// bornes de [`bornes_du_dossier`]. Public pour que les témoins lisent le plan
 /// de la requête même que la route exécute.
 ///
-/// Le résultat est celui de la route d'avant, à l'unité près, sur les deux
-/// moteurs (`file_path LIKE …` : une tranche CUE n'y est pas comptée) ; seul le
-/// chemin d'accès change, moteur par moteur, MESURÉ (banc
-/// `banc_repertoires_9116`, 544 147 pistes, une racine qui couvre toute la
-/// bibliothèque) :
+/// #9480 (fil 3047) — le compte porte sur [`CHEMIN_DE_LA_PISTE`] : une
+/// tranche d'image (ISO SACD lue nativement, feuille CUE ; `file_path` NULL,
+/// chemin dans `cue_media_path`) compte, comme dans les sous-dossiers
+/// (#4625). Une racine qui ne contient que des images affichait 0 piste.
 ///
-/// * **SQLite** : le `LIKE` seul se lit dans l'index de `file_path`, sans
-///   toucher la table (`SCAN tracks USING COVERING INDEX`) — 84 ms. La plage de
-///   [`plage_du_dossier`] y COÛTE plus (259 ms) : l'index du chemin n'est pas
-///   couvrant et chaque entrée relit sa ligne. La requête reste donc telle
-///   quelle ; c'est le cache par révision de la route qui supprime la relecture.
+/// Le chemin d'accès, moteur par moteur, MESURÉ (banc `banc_repertoires_9116`,
+/// 544 147 pistes, une racine qui couvre toute la bibliothèque) :
+///
+/// * **SQLite** : le `LIKE` sur `file_path` se lit dans l'index de
+///   `file_path`, sans toucher la table (`SCAN tracks USING COVERING INDEX`) —
+///   84 ms. La plage de [`plage_du_dossier`] y COÛTE plus (259 ms) : l'index du
+///   chemin n'est pas couvrant et chaque entrée relit sa ligne. Les tranches
+///   s'y ajoutent par une seconde sous-requête, lue dans l'index partiel
+///   `idx_tracks_cue_identity` (les seules lignes qui ont un `cue_media_path`).
 /// * **PostgreSQL** : un `LIKE $1` préparé ne peut partir d'aucun index (plan
 ///   générique) et parcourt la table ; la plage sur
 ///   [`INDEX_CHEMIN_DOSSIER_PG`] le borne, le `LIKE` reste la garde exacte.
 pub fn sql_compter_pistes_sous_dossier(engine: Engine) -> String {
     let esc = like_escape_clause();
     match engine {
-        Engine::Sqlite => format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE ?1{esc}"),
+        Engine::Sqlite => format!(
+            "SELECT (SELECT COUNT(*) FROM tracks WHERE file_path LIKE ?1{esc}) \
+             + (SELECT COUNT(*) FROM tracks WHERE cue_media_path IS NOT NULL \
+             AND file_path IS NULL AND cue_media_path LIKE ?1{esc})"
+        ),
         Engine::Postgres => {
             let plage = plage_du_dossier(engine, CHEMIN_DE_LA_PISTE, "$2", "$3");
-            format!("SELECT COUNT(*) FROM tracks WHERE {plage} AND file_path LIKE $1{esc}")
+            format!(
+                "SELECT COUNT(*) FROM tracks WHERE {plage} AND {CHEMIN_DE_LA_PISTE} LIKE $1{esc}"
+            )
         }
     }
 }

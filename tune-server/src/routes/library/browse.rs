@@ -218,7 +218,8 @@ impl ModeDesComptes {
     /// Le compte d'une racine (`file_path` seul), ou `None` en attente.
     fn racine(&self, state: &AppState, racine: &str) -> Option<i64> {
         match self {
-            Self::Arbre { arbre, .. } => Some(arbre.fichiers_sous(racine)),
+            // #9480 — tranches d'images (ISO SACD, CUE) comprises.
+            Self::Arbre { arbre, .. } => Some(arbre.pistes_sous(racine)),
             Self::EnAttente => None,
             Self::Sql => Some(
                 tune_core::db::track_repo::compter_pistes_sous_dossier(
@@ -1490,5 +1491,47 @@ mod comptes_9116_tests {
         assert_eq!(compte_de(&b.state, &b.racine, &nfd), 2);
         assert_eq!(compte_de(&b.state, &dossier, "CD1"), 1);
         assert_eq!(pistes_de(&b.state, &dossier), vec![direct]);
+    }
+
+    /// #9480 (fil 3047) — une racine qui ne contient que des images (ISO SACD
+    /// lue nativement, ou feuille CUE) : ses pistes sont des TRANCHES
+    /// (`file_path` NULL, chemin dans `cue_media_path`). Le compte de la
+    /// racine les inclut, par l'arbre comme par la requête SQL de repli, et
+    /// aucun faux `browse_root_zero_tracks` n'est donc journalisé.
+    #[test]
+    fn une_racine_d_images_iso_ou_cue_compte_ses_tranches_9480() {
+        let b = banc();
+        let (s, r) = (&b.state, &b.racine);
+        // Le dossier des images existe sur le disque, comme chez le testeur.
+        std::fs::create_dir_all(r.join("SACD")).unwrap();
+        let image =
+            |nom: &str| -> String { r.join("SACD").join(nom).to_str().unwrap().nfc().collect() };
+        for (debut, media) in [
+            (0, image("disque.iso")),
+            (300_000, image("disque.iso")),
+            (0, image("album.flac")),
+        ] {
+            s.backend
+                .execute(
+                    "INSERT INTO tracks (title, file_path, cue_media_path, cue_start_ms, format, source) \
+                     VALUES ('t', NULL, ?, ?, 'dsf', 'local')",
+                    &[
+                        &media as &dyn tune_core::db::backend::ToSqlValue,
+                        &(debut as i64),
+                    ],
+                )
+                .unwrap();
+        }
+        assert_eq!(compte_racine(s), 3, "compte lu dans l'arbre");
+        assert_eq!(
+            tune_core::db::track_repo::compter_pistes_sous_dossier(
+                s.backend.as_ref(),
+                r.to_str().unwrap()
+            )
+            .unwrap(),
+            3,
+            "compte lu en SQL (repli sans arbre)"
+        );
+        assert_eq!(compte_de(s, r, "SACD"), 3);
     }
 }

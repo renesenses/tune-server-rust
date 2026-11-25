@@ -6,8 +6,9 @@
 //! 1. le PLAN ne lit pas les lignes de `tracks` : index couvrant de
 //!    `file_path` sur SQLite, plage de `idx_tracks_chemin_dossier` sur
 //!    PostgreSQL (avec `TUNE_TEST_PG_URL`), y compris en plan générique ;
-//! 2. le RÉSULTAT est celui de l'ancienne requête de la route, à l'unité près,
-//!    sur des chemins piégés (voisins, casse, jokers, tranche CUE).
+//! 2. le RÉSULTAT est celui de la requête de référence (`COALESCE(file_path,
+//!    cue_media_path) LIKE …`, tranches d'images comprises depuis #9480), à
+//!    l'unité près, sur des chemins piégés (voisins, casse, jokers, tranche CUE).
 
 use super::*;
 
@@ -60,14 +61,15 @@ fn compter(db: &dyn DbBackend, sql: &str, params: &[&dyn ToSqlValue]) -> i64 {
         .unwrap()
 }
 
-/// L'ancienne requête de la route, et le même compte par la nouvelle.
+/// La requête de référence (le plus simple énoncé du compte voulu), et le même
+/// compte par celle de la route.
 fn comparer(db: &dyn DbBackend, engine: Engine) {
     let p1 = match engine {
         Engine::Postgres => "$1",
         Engine::Sqlite => "?1",
     };
     let ancienne = format!(
-        "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {p1}{}",
+        "SELECT COUNT(*) FROM tracks WHERE COALESCE(file_path, cue_media_path) LIKE {p1}{}",
         like_escape_clause()
     );
     for dossier in [
@@ -86,9 +88,9 @@ fn comparer(db: &dyn DbBackend, engine: Engine) {
             "{engine:?} : le compte de {dossier:?} a changé"
         );
     }
-    // Racine piégée : 2 fichiers, et sur SQLite (LIKE ignore la casse ASCII)
-    // « MUSIQUE/C » en plus ; la tranche CUE n'est pas comptée, comme avant.
-    let attendu = if engine == Engine::Sqlite { 3 } else { 2 };
+    // Racine piégée : 2 fichiers et la tranche CUE (#9480), et sur SQLite
+    // (LIKE ignore la casse ASCII) « MUSIQUE/C » en plus.
+    let attendu = if engine == Engine::Sqlite { 4 } else { 3 };
     assert_eq!(
         compter_pistes_sous_dossier(db, &chemin(&["musique"])).unwrap(),
         attendu
@@ -128,10 +130,20 @@ fn sqlite_le_compte_d_une_racine_ne_lit_que_l_index_9116() {
         .filter_map(|r| r.get(3).and_then(|v| v.as_string()))
         .collect();
     eprintln!("#9116 plan SQLite du compte de racine : {plan:?}");
+    // Deux lectures, chacune dans un index (#9480) : les fichiers dans
+    // l'index couvrant de `file_path`, les tranches d'images (`file_path`
+    // NULL) par un index — jamais la table entière.
+    let lectures: Vec<&String> = plan
+        .iter()
+        // `SCAN CONSTANT ROW` (la somme des deux sous-requêtes) ne lit rien.
+        .filter(|l| l.starts_with("SCAN tracks") || l.starts_with("SEARCH tracks"))
+        .collect();
     assert!(
-        !plan.is_empty() && plan.iter().all(|l| l.contains("COVERING INDEX")),
-        "#9116 : le compte d'une racine doit se lire dans un index couvrant, \
-         sans relire les lignes de `tracks` : {plan:?}"
+        lectures.len() == 2
+            && lectures.iter().any(|l| l.contains("COVERING INDEX"))
+            && lectures.iter().all(|l| l.contains("INDEX")),
+        "#9116 : le compte d'une racine doit se lire dans un index couvrant (fichiers) \
+         et dans un index pour les tranches, sans parcourir `tracks` : {plan:?}"
     );
     comparer(&db, Engine::Sqlite);
 }
