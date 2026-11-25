@@ -1911,12 +1911,15 @@ pub struct CodeActivation {
 }
 
 /// L'état du code d'activation : le code en cours, la dernière émission et les
-/// échecs comptés par adresse.
+/// échecs comptés par adresse. Aussi l'heure MONOTONE d'ouverture de la
+/// fenêtre de première configuration, quand c'est CE processus qui l'a
+/// ouverte (voir [`ouvrir_la_premiere_configuration`]).
 #[derive(Default)]
 pub struct EtatCodeActivation {
     en_cours: Option<CodeActivation>,
     derniere_emission: Option<std::time::Instant>,
     echecs_par_ip: std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>,
+    premiere_configuration: Option<std::time::Instant>,
 }
 
 /// Durée de vie d'un code d'activation.
@@ -2140,6 +2143,19 @@ fn refus_activation_hors_machine() -> Response {
         .into_response()
 }
 
+/// La fenêtre de première configuration s'est fermée entre la lecture de
+/// l'état et la création (autre navigateur, délai écoulé) : le code reste.
+fn refus_premiere_configuration_fermee() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "first_setup_closed",
+            "message": "The first-time setup window is closed; use the one-time activation code.",
+        })),
+    )
+        .into_response()
+}
+
 fn refus_deja_active() -> Response {
     (
         StatusCode::CONFLICT,
@@ -2149,6 +2165,215 @@ fn refus_deja_active() -> Response {
         })),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Première configuration : le mot de passe administrateur dans l'assistant
+// ---------------------------------------------------------------------------
+//
+// Sur une installation NEUVE, l'assistant de première configuration fait créer
+// le mot de passe administrateur sans le code du journal, si les quatre
+// conditions sont réunies :
+//
+// 1. aucun administrateur n'a encore de mot de passe, et l'authentification
+//    n'est pas active ;
+// 2. moins de [`DUREE_PREMIERE_CONFIGURATION`] depuis le premier démarrage de
+//    cette installation — fenêtre ouverte au démarrage seulement quand la base
+//    vient d'être créée ([`base_neuve_avant_ouverture`]) ;
+// 3. l'appel vient de cette machine ou du RÉSEAU LOCAL
+//    ([`appel_depuis_le_reseau_local`] : ni relais, ni écoute directe, ni
+//    mandataire inverse, ni CGNAT, ni requête inter-sites) ;
+// 4. une seule fois : la création se fait sous [`VERROU_ACTIVATION`], par une
+//    écriture conditionnelle, puis la fenêtre est fermée pour de bon.
+//
+// Hors de ces conditions, rien ne change : cette machine, ou le code à usage
+// unique du journal. Une installation EXISTANTE (base déjà présente au
+// démarrage) n'ouvre jamais la fenêtre.
+
+/// Durée de la fenêtre de première configuration. 45 minutes : le temps de
+/// démarrer la machine (premier démarrage de Tune OS compris), de trouver
+/// l'adresse de Tune et de parcourir l'assistant, sans laisser une
+/// installation oubliée réclamable pendant des heures.
+pub const DUREE_PREMIERE_CONFIGURATION: std::time::Duration =
+    std::time::Duration::from_secs(45 * 60);
+
+/// Heure (secondes Unix) du premier démarrage d'une installation neuve. Clé
+/// protégée (préfixe `auth_`) : l'écriture générique des réglages ne la pose
+/// pas sans session administrateur.
+pub const CLE_DEBUT_PREMIERE_CONFIGURATION: &str = "auth_premiere_configuration_debut";
+/// Posée quand la fenêtre a servi : elle ne se rouvre plus.
+pub const CLE_FIN_PREMIERE_CONFIGURATION: &str = "auth_premiere_configuration_close";
+
+/// Longueur maximale d'un mot de passe administrateur, en caractères.
+pub const LONGUEUR_MAX_MOT_DE_PASSE: usize = 256;
+/// Longueur minimale d'un mot de passe administrateur, en caractères.
+pub const LONGUEUR_MIN_MOT_DE_PASSE: usize = 8;
+
+/// La base est-elle NEUVE, juste avant que le serveur ne l'ouvre ? Seulement
+/// en SQLite, et seulement si le fichier n'existe pas encore. PostgreSQL :
+/// non (rien ne distingue sûrement une base vide d'une base déjà servie), la
+/// voie du code reste.
+pub fn base_neuve_avant_ouverture(db_path: &str, database_url: Option<&str>) -> bool {
+    let sqlite = database_url
+        .map(tune_core::db::engine::Engine::from_connection_string)
+        .is_none_or(|e| e == tune_core::db::engine::Engine::Sqlite);
+    sqlite && db_path != ":memory:" && !std::path::Path::new(db_path).exists()
+}
+
+/// Un administrateur a-t-il déjà un mot de passe ? Une erreur de lecture
+/// répond OUI : dans le doute, la fenêtre reste fermée.
+fn un_administrateur_a_un_mot_de_passe(state: &AppState) -> bool {
+    match state.backend.query_one(
+        "SELECT id FROM profiles WHERE is_admin = 1 \
+         AND ((password_hash IS NOT NULL AND password_hash <> '') \
+           OR (password_hash_v2 IS NOT NULL AND password_hash_v2 <> '')) LIMIT 1",
+        &[],
+    ) {
+        Ok(ligne) => ligne.is_some(),
+        Err(_) => true,
+    }
+}
+
+fn maintenant_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Ouvre la fenêtre de première configuration. Appelé au démarrage, et
+/// seulement quand [`base_neuve_avant_ouverture`] a répondu oui. Ne rouvre
+/// jamais une fenêtre déjà ouverte ou fermée. Rend vrai si elle s'ouvre.
+pub fn ouvrir_la_premiere_configuration(state: &AppState) -> bool {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let deja = |cle: &str| settings.get(cle).ok().flatten().is_some();
+    if authentification_active(state)
+        || un_administrateur_a_un_mot_de_passe(state)
+        || deja(CLE_DEBUT_PREMIERE_CONFIGURATION)
+        || deja(CLE_FIN_PREMIERE_CONFIGURATION)
+    {
+        return false;
+    }
+    if settings
+        .set(CLE_DEBUT_PREMIERE_CONFIGURATION, &maintenant_unix().to_string())
+        .is_err()
+    {
+        return false;
+    }
+    state
+        .code_activation_auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .premiere_configuration = Some(std::time::Instant::now());
+    let minutes = DUREE_PREMIERE_CONFIGURATION.as_secs() / 60;
+    eprintln!(
+        "Tune : première configuration — le mot de passe administrateur peut être créé \
+         dans l'assistant, depuis le réseau local, pendant {minutes} min. / First-time \
+         setup: the administrator password can be created in the setup assistant, from the \
+         local network, for {minutes} min."
+    );
+    tracing::info!(minutes, "premiere_configuration_ouverte");
+    true
+}
+
+/// Le temps qui reste à la fenêtre de première configuration, ou `None` si
+/// elle est fermée. Mesuré sur l'horloge MONOTONE quand ce processus l'a
+/// ouverte (un réglage de l'horloge au premier démarrage ne la prolonge
+/// pas) ; après un redémarrage, sur l'heure enregistrée — une heure dans le
+/// futur la ferme.
+pub fn premiere_configuration_restante(state: &AppState) -> Option<std::time::Duration> {
+    if authentification_active(state) {
+        return None;
+    }
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if settings
+        .get(CLE_FIN_PREMIERE_CONFIGURATION)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return None;
+    }
+    let debut: u64 = settings
+        .get(CLE_DEBUT_PREMIERE_CONFIGURATION)
+        .ok()
+        .flatten()?
+        .trim()
+        .parse()
+        .ok()?;
+    let ecoule = match state
+        .code_activation_auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .premiere_configuration
+    {
+        Some(ouverture) => ouverture.elapsed(),
+        None => {
+            let maintenant = maintenant_unix();
+            if maintenant < debut {
+                return None;
+            }
+            std::time::Duration::from_secs(maintenant - debut)
+        }
+    };
+    let reste = DUREE_PREMIERE_CONFIGURATION.checked_sub(ecoule)?;
+    if reste.is_zero() || un_administrateur_a_un_mot_de_passe(state) {
+        return None;
+    }
+    Some(reste)
+}
+
+/// Pour les épreuves : fait comme si la fenêtre avait été ouverte `il_y_a`
+/// plus tôt (horloge monotone et heure enregistrée).
+#[doc(hidden)]
+pub fn vieillir_la_premiere_configuration(state: &AppState, il_y_a: std::time::Duration) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Some(debut) = settings
+        .get(CLE_DEBUT_PREMIERE_CONFIGURATION)
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        settings
+            .set(
+                CLE_DEBUT_PREMIERE_CONFIGURATION,
+                &debut.saturating_sub(il_y_a.as_secs()).to_string(),
+            )
+            .ok();
+    }
+    let mut etat = state
+        .code_activation_auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(ouverture) = etat.premiere_configuration {
+        etat.premiere_configuration = ouverture.checked_sub(il_y_a);
+    }
+}
+
+/// Pour les épreuves : oublie l'horloge monotone, comme après un
+/// redémarrage du serveur.
+#[doc(hidden)]
+pub fn oublier_l_horloge_de_la_premiere_configuration(state: &AppState) {
+    state
+        .code_activation_auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .premiere_configuration = None;
+}
+
+/// L'appel vient-il du RÉSEAU LOCAL ([`appel_depuis_le_reseau_local`]) ?
+/// Extracteur infaillible, sans trace : le gestionnaire décide.
+pub struct DepuisLeReseauLocal(pub bool);
+
+impl FromRequestParts<AppState> for DepuisLeReseauLocal {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(appel_depuis_le_reseau_local(parts, state).await))
+    }
 }
 
 /// Le compte administrateur : le premier profil administrateur (le profil
@@ -2225,19 +2450,30 @@ fn comptes_existants(state: &AppState, admin: Option<i64>) -> Vec<Value> {
 async fn etat_activation(
     State(state): State<AppState>,
     DepuisCetteMachine(cette_machine): DepuisCetteMachine,
+    DepuisLeReseauLocal(reseau_local): DepuisLeReseauLocal,
 ) -> Json<Value> {
     let active = authentification_active(&state);
+    // La fenêtre de première configuration, pour CET appelant : cette
+    // machine ou le réseau local.
+    let premiere_configuration = if active || !(cette_machine || reseau_local) {
+        None
+    } else {
+        premiere_configuration_restante(&state)
+    };
     Json(json!({
         "auth_enabled": active,
         "from_this_machine": cette_machine,
-        "code_required": !active && !cette_machine,
+        "code_required": !active && !cette_machine && premiere_configuration.is_none(),
+        "first_setup": premiere_configuration.is_some(),
+        "first_setup_expires_in": premiere_configuration.map(|d| d.as_secs()),
+        "max_password_length": LONGUEUR_MAX_MOT_DE_PASSE,
         "admin_username": if active { None } else { compte_administrateur(&state).map(|(_, u)| u) },
         "accounts": if active {
             Vec::new()
         } else {
             comptes_existants(&state, compte_administrateur(&state).map(|(id, _)| id))
         },
-        "min_password_length": 8,
+        "min_password_length": LONGUEUR_MIN_MOT_DE_PASSE,
     }))
 }
 
@@ -2286,10 +2522,13 @@ static VERROU_ACTIVATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// `POST /auth/activation` — pose le mot de passe du compte administrateur
 /// et active l'authentification. Seulement tant qu'elle est coupée, et
-/// seulement depuis cette machine ou avec le code de la console.
+/// seulement depuis cette machine, avec le code de la console, ou — une seule
+/// fois, sur une installation neuve — depuis le réseau local pendant la
+/// fenêtre de première configuration.
 async fn activer_l_authentification(
     State(state): State<AppState>,
     DepuisCetteMachine(cette_machine): DepuisCetteMachine,
+    DepuisLeReseauLocal(reseau_local): DepuisLeReseauLocal,
     ConnectInfo(pair): ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
     Json(body): Json<ActivationRequest>,
@@ -2297,7 +2536,8 @@ async fn activer_l_authentification(
     if authentification_active(&state) {
         return refus_deja_active();
     }
-    if body.password.chars().count() < 8 {
+    let longueur = body.password.chars().count();
+    if longueur < LONGUEUR_MIN_MOT_DE_PASSE {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -2307,6 +2547,21 @@ async fn activer_l_authentification(
         )
             .into_response();
     }
+    if longueur > LONGUEUR_MAX_MOT_DE_PASSE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "password_too_long",
+                "message": "password must be at most 256 characters",
+            })),
+        )
+            .into_response();
+    }
+    // Première configuration : seulement quand ni cette machine ni le code
+    // n'est en jeu, depuis le réseau local, fenêtre ouverte. Revérifié sous
+    // le verrou plus bas.
+    let par_la_premiere_configuration =
+        !cette_machine && reseau_local && premiere_configuration_restante(&state).is_some();
     let Some((id, nom)) = compte_administrateur(&state) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2336,7 +2591,7 @@ async fn activer_l_authentification(
         )
             .into_response();
     }
-    if !cette_machine {
+    if !cette_machine && !par_la_premiere_configuration {
         let Some(code) = body.code.as_deref().filter(|c| !c.trim().is_empty()) else {
             return refus_activation_hors_machine();
         };
@@ -2387,7 +2642,37 @@ async fn activer_l_authentification(
             return refus_deja_active();
         }
         use tune_core::db::backend::ToSqlValue;
-        if let Err(e) = state.backend.execute(
+        if par_la_premiere_configuration {
+            // Une seule fois : fenêtre relue sous le verrou, et écriture
+            // CONDITIONNELLE — elle ne touche qu'un administrateur encore
+            // sans mot de passe.
+            if premiere_configuration_restante(&state).is_none() {
+                return refus_premiere_configuration_fermee();
+            }
+            match state.backend.execute(
+                "UPDATE profiles SET password_hash_v2 = ?, password_hash = NULL WHERE id = ? \
+                 AND (password_hash IS NULL OR password_hash = '') \
+                 AND (password_hash_v2 IS NULL OR password_hash_v2 = '')",
+                &[&hachage as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+            ) {
+                Ok(1) => {}
+                Ok(_) => return refus_premiere_configuration_fermee(),
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("failed to set password: {e}")})),
+                    )
+                        .into_response();
+                }
+            }
+            SettingsRepo::with_backend(state.backend.clone())
+                .set(CLE_FIN_PREMIERE_CONFIGURATION, &maintenant_unix().to_string())
+                .ok();
+            tracing::warn!(
+                appelant = %pair.ip(),
+                "administrateur_cree_par_la_premiere_configuration"
+            );
+        } else if let Err(e) = state.backend.execute(
             "UPDATE profiles SET password_hash_v2 = ?, password_hash = NULL WHERE id = ?",
             &[&hachage as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         ) {
@@ -2422,7 +2707,12 @@ async fn activer_l_authentification(
     // Les WebSocket ouvertes pendant que tout était ouvert se ferment : le
     // client se reconnecte avec une session.
     state.fermeture_websockets.send_modify(|n| *n += 1);
-    tracing::info!(cette_machine, admin = %nom, "authentification_activee");
+    tracing::info!(
+        cette_machine,
+        par_la_premiere_configuration,
+        admin = %nom,
+        "authentification_activee"
+    );
 
     let Some(token) = token else {
         return Json(json!({"auth_enabled": true, "username": nom, "deleted_accounts": supprimes}))

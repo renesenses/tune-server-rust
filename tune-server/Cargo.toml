@@ -2286,6 +2286,12 @@ path = "tests/durcissement_routes_admin.rs"
 name = "activation_authentification"
 path = "tests/activation_authentification.rs"
 
+# rc14 : mot de passe administrateur créé dans l'assistant de première
+# configuration (installation neuve, réseau local, fenêtre courte, une fois).
+[[test]]
+name = "premiere_configuration_admin"
+path = "tests/premiere_configuration_admin.rs"
+
 # rc13.2 : connexion de `default` sur cette machine et depuis le réseau local,
 # après l'activation et sur une base rc12 (ancien hachage). SQLite, et
 # PostgreSQL quand `TUNE_TEST_PG_URL` est posée (feature `postgres`).

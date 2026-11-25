@@ -430,8 +430,16 @@ pub async fn run_with(opts: RunOptions) {
     tune_core::coffre::installer_le_dossier_du_serveur(tune_core::coffre::dossier_de_la_base(
         &config.db_path,
     ));
+    // Installation neuve : la base n'existe pas encore. Lu AVANT de l'ouvrir
+    // (l'ouverture la crée). Seule une base neuve ouvre la fenêtre de
+    // première configuration (mot de passe administrateur dans l'assistant).
+    let base_neuve =
+        crate::auth::base_neuve_avant_ouverture(&config.db_path, config.database_url.as_deref());
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");
+    if base_neuve {
+        crate::auth::ouvrir_la_premiere_configuration(&state);
+    }
 
     // #5320 — la sonde du processeur est relevée en tâche de fond, une fois
     // par seconde : l'écran et la garde thermique lisent une médiane, pas la
