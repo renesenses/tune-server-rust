@@ -323,7 +323,18 @@ async fn attendre_pistes(state: &AppState, prefixe: &str, n: usize) -> Vec<(i64,
 /// la piste se lit par sa route de lecture, et une source coupée garde ses
 /// pistes (indisponibles, pas supprimées).
 #[tokio::test(flavor = "multi_thread")]
+// Le verrou commun des scans est tenu à travers les `.await` à dessein : c'est
+// lui qui tient les autres épreuves à l'écart du droit de scanner global.
+#[allow(clippy::await_holding_lock)]
 async fn une_source_distante_s_indexe_se_lit_et_survit_a_une_coupure() {
+    // #9057 — cette épreuve lance de VRAIS scans (`rescanner`, puis
+    // `lancer_un_scan`) : elle prend le verrou commun des scans de test, comme
+    // toutes les autres. Sans lui, son scan de la source coupée tenait le droit
+    // de scanner (global au processus) pendant que les épreuves de scan réel
+    // démarraient le leur : sous charge, six d'entre elles rougissaient
+    // ensemble (« spawn_library_scan_avec_lecteur(…) » refusé).
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
+    crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
     let (state, _d) = etat(false);
     let m = faux_nas("nas-scan");
     m.ajouter(
@@ -415,6 +426,9 @@ async fn une_source_distante_s_indexe_se_lit_et_survit_a_une_coupure() {
     let (_, o, _) = appel(&state, "GET", &format!("/api/v1/sources-reseau/{id}"), None).await;
     assert_eq!(json_de(&o)["etat"], "injoignable");
     m.couper(false);
+    // Le droit n'est rendu qu'à la terminaison réelle du scan : la suivante
+    // ne doit pas le trouver encore tenu.
+    crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
 }
 
 /// Créer, supprimer, tester, rescanner, parcourir et signer un lien sont des
