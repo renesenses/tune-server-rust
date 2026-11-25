@@ -19,6 +19,8 @@ async fn le_catalogue_donne_chaque_filtre_et_sa_reserve() {
     assert_eq!(v["default_filter"], "polyvalent");
     assert_eq!(v["premium"], false);
     assert_eq!(v["installed"], false);
+    assert_eq!(v["auto_available"], false);
+    assert!(v.get("auto_choices").is_none());
     assert!(v["machine_test"].is_null());
 }
 
@@ -203,4 +205,33 @@ async fn zone_reseau_le_reglage_n_agit_jamais() {
     assert_eq!(corps["applies_at"], "never", "{corps}");
     let Json(v) = lire_zone(State(state), Path(id)).await;
     assert_eq!(v["applies_at"], "never");
+}
+
+#[tokio::test]
+async fn la_route_auto_ne_publie_aucun_plan_pour_une_zone_arretee() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+    let reponse = router()
+        .with_state(etat())
+        .oneshot(
+            Request::builder()
+                .uri("/zones/42/auto")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reponse.status(), StatusCode::OK);
+    let corps = to_bytes(reponse.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&corps).unwrap(),
+        json!({"zone_id":42,"decision":null})
+    );
+    assert_eq!(
+        applies_at(tune_core::orchestrator::PorteeDuReglage::EnNegociation),
+        "pending"
+    );
 }

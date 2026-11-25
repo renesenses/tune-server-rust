@@ -796,7 +796,16 @@ fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, ctx: &Co
         }
         (Partie::Mono, _) => retirer(chaine, ID_MONO),
         (Partie::Surechantillonnage, Decodee::Surechantillonnage(s)) => {
-            chaine.fixed.upsampling = if s.enabled {
+            chaine.fixed.upsampling = if s.enabled
+                && s.mode == crate::audio::surechantillonnage::greffon::UpsamplerMode::Auto
+            {
+                Upsampling::Auto {
+                    profile: s.profile.clone(),
+                    declarations: s.declarations.clone(),
+                    max_ratio: s.max_ratio,
+                    max_rate_hz: s.max_rate_hz,
+                }
+            } else if s.enabled {
                 Upsampling::Pcm {
                     filter: s.filter,
                     max_ratio: s.max_ratio,
@@ -1638,6 +1647,24 @@ fn projeter_surechantillonnage(chaine: &ChaineTess, courant: Option<&str>) -> Ec
             filter: filter.clone(),
             max_rate_hz: *max_rate_hz,
             max_ratio: *max_ratio,
+            ..UpsamplerSettings::default()
+        },
+        Upsampling::Auto {
+            profile,
+            declarations,
+            max_ratio,
+            max_rate_hz,
+        } => UpsamplerSettings {
+            enabled: true,
+            mode: crate::audio::surechantillonnage::greffon::UpsamplerMode::Auto,
+            profile: profile.clone(),
+            declarations: declarations.clone(),
+            max_ratio: *max_ratio,
+            max_rate_hz: *max_rate_hz,
+            filter: actuel
+                .as_ref()
+                .map(|a| a.filter.clone())
+                .unwrap_or_else(|| UpsamplerSettings::default().filter),
         },
         // Le suréchantillonneur d'aujourd'hui ne fait pas de DSD : pour les
         // anciennes routes, il est éteint ; ses autres réglages restent.

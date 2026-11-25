@@ -455,3 +455,9 @@ changement de cadence dans le SDK (étape I2, engagée).
   (formule du seuil d'audition).
 - J. O. Smith, *Introduction to Digital Filters with Audio Applications*,
   W3K, 2007 (en ligne), « Creating Minimum Phase Filters ».
+
+### Transport flottant et retour à une version antérieure
+
+Pour une sortie CPAL en F32, la négociation Auto annonce 24 bits de précision significative, bit implicite compris. Cette valeur décrit le transport entre Tune et le pilote. La résolution physique du convertisseur dépend du matériel.
+
+Les réglages manuels qui utilisent uniquement les champs historiques restent lisibles par le binaire précédent. Dès qu’une zone enregistre des champs Auto, son ancien désérialiseur strict les refuse. Avant un retour à cette version, sauvegarder les réglages de zone et restaurer une sauvegarde antérieure à l’activation d’Auto.

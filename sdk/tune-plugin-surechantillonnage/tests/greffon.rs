@@ -437,3 +437,101 @@ fn machine_pairs_cover_every_family_rate() {
     assert_eq!(machine_reference_pair(768_000), Some((48_000, 768_000)));
     assert_eq!(machine_reference_pair(100_000), None);
 }
+
+#[test]
+fn les_reglages_historiques_restent_manuels_et_les_declarations_auto_survivent() {
+    use tune_plugin_surechantillonnage::sdk::UpsamplerMode;
+    let ancien =
+        parse_settings(&json!({"enabled":true,"filter":"precision","max_ratio":8})).unwrap();
+    assert_eq!(ancien.mode, UpsamplerMode::Manual);
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Legacy {
+        enabled: bool,
+        filter: String,
+        max_ratio: Option<u32>,
+        max_rate_hz: Option<u32>,
+    }
+    let mut manuel = serde_json::to_value(&ancien).unwrap();
+    for _ in 0..2 {
+        let normalized = parse_settings(&manuel).unwrap();
+        let old: Legacy =
+            serde_json::from_value(serde_json::to_value(normalized).unwrap()).unwrap();
+        assert!(old.enabled);
+        assert_eq!(old.filter, "precision");
+        assert_eq!(old.max_ratio, Some(8));
+        assert_eq!(old.max_rate_hz, None);
+        manuel["mode"] = json!("manual");
+        manuel["profile"] = json!("p-b");
+        manuel["declarations"] = json!({"b":2});
+    }
+    assert!(
+        parse_settings(&json!({"mode":"auto"}))
+            .unwrap()
+            .profile
+            .is_empty()
+    );
+    let auto = parse_settings(&json!({"enabled":true,"mode":"auto","profile":"p-a",
+        "declarations":{"a":["x",false,null]}}))
+    .unwrap();
+    assert_eq!(auto.mode, UpsamplerMode::Auto);
+    assert_eq!(auto.profile, "p-a");
+    assert_eq!(auto.declarations["a"], json!(["x", false, null]));
+    let relu = parse_settings(&serde_json::to_value(&auto).unwrap()).unwrap();
+    assert_eq!(auto, relu);
+    assert!(parse_settings(&json!({"mode":"inconnu"})).is_err());
+}
+
+#[test]
+fn une_conception_externe_garde_son_noyau_et_sa_latence() {
+    use tune_plugin_surechantillonnage::{Conception, Fenetre, Phase};
+    let request = RateRequest::new(stereo(48_000), 96_000, 256).unwrap();
+    let conception = Conception {
+        id: "banc_externe",
+        nom: "Banc externe",
+        portee: 64,
+        coupure: 0.45,
+        fenetre: Fenetre::Kaiser { beta: 8.0 },
+        phase: Phase::Lineaire,
+        resume: "Conception originale du test",
+    };
+    let instance = Instance::avec_conception(request, conception.clone()).unwrap();
+    assert_eq!(instance.filter_id(), "banc_externe");
+    assert!(
+        (63..=64).contains(&instance.latency_frames()),
+        "la latence doit venir des 128 coefficients externes"
+    );
+    assert!(instance.gain().is_finite() && instance.gain() <= 1.0);
+    for portee in [0, usize::MAX] {
+        let mut invalide = conception.clone();
+        invalide.portee = portee;
+        assert!(matches!(
+            Instance::avec_conception(request, invalide),
+            Err(Error::InvalidSettings)
+        ));
+    }
+    let mut invalide = conception;
+    invalide.coupure = f64::NAN;
+    assert!(matches!(
+        Instance::avec_conception(request, invalide),
+        Err(Error::InvalidSettings)
+    ));
+}
+
+#[test]
+fn auto_sans_plan_hote_ne_prepare_pas_un_filtre_manuel() {
+    let rendu = render_rate_f32(
+        &Upsampler,
+        context(false),
+        true,
+        &json!({"enabled":true,"mode":"auto"}),
+        stereo(44100),
+        &ACCEPTED,
+        &sines(44100, 1024),
+        256,
+    );
+    assert!(
+        matches!(rendu, Err(Error::InvalidSettings)),
+        "Auto exige la décision de l'hôte"
+    );
+}

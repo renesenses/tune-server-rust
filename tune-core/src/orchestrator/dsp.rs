@@ -24,6 +24,8 @@ pub enum PorteeDuReglage {
     Immediate,
     /// Zone réseau : le flux va être relancé à la position courante.
     Relance,
+    /// Le fil audio doit encore négocier le changement de profil entre les deux filtres.
+    EnNegociation,
     /// Rien ne peut agir avant la piste suivante (position inconnue, #2595).
     PisteSuivante,
     /// Rien ne joue : la prochaine lecture partira avec ce réglage.
@@ -120,6 +122,7 @@ impl PorteeDuReglage {
             Self::Immediate => "immediate",
             Self::Relance => "restart",
             Self::PisteSuivante => "next_track",
+            Self::EnNegociation => "pending",
             Self::RienNeJoue => "not_playing",
         }
     }
@@ -2750,12 +2753,21 @@ impl PlaybackOrchestrator {
         // Le nouveau choix se compare aux réglages lus à l'OUVERTURE du flux
         // qui joue, pas au choix posé avant ce PUT : un changement fait en
         // pause, puis un PUT identique après la reprise, doit encore relancer.
-        let change = match self.surechantillonneur_du_flux_et_choix(zone_id).await {
-            Some((du_flux, choix)) => du_flux != choix,
-            None => false,
-        };
+        let (change, concerne_auto, auto_vers_auto) = self
+            .surechantillonneur_du_flux_et_choix(zone_id)
+            .await
+            .map_or((false, false, false), |(du_flux, choix)| {
+                let auto = du_flux.iter().chain(choix.iter()).any(|r| {
+                    r.mode == crate::audio::surechantillonnage::greffon::UpsamplerMode::Auto
+                });
+                let deux_auto = du_flux
+                    .as_ref()
+                    .zip(choix.as_ref())
+                    .is_some_and(|(a, b)| a.mode == b.mode && auto);
+                (du_flux != choix, auto, deux_auto)
+            });
         let portee = self
-            .portee_du_reglage_du_surechantillonneur(zone_id, change)
+            .portee_du_reglage_du_surechantillonneur(zone_id, change, concerne_auto, auto_vers_auto)
             .await;
         info!(zone_id, portee = ?portee, "upsampler_change_portee");
         if let Some(ref bus) = self.event_bus {
@@ -2768,6 +2780,8 @@ impl PlaybackOrchestrator {
         self: &std::sync::Arc<Self>,
         zone_id: i64,
         choix_change: bool,
+        concerne_auto: bool,
+        auto_vers_auto: bool,
     ) -> PorteeDuReglage {
         let etat = self.playback.get_state(zone_id).await;
         if etat.now_playing.is_none() || etat.state == crate::playback::PlayState::Stopped {
@@ -2779,7 +2793,13 @@ impl PlaybackOrchestrator {
         // #7556 — en pause, la relance remettrait la zone en lecture : le
         // choix vaudra à la reprise d'un nouveau flux, au plus tard à la
         // piste suivante.
-        if etat.state != crate::playback::PlayState::Playing {
+        // Les paramètres Auto sont négociés pour chaque ouverture. Tant que
+        // le rendu n'a pas accepté un fondu à cadence et atténuation égales,
+        // le choix posé ne doit pas redémarrer la piste en cours.
+        if auto_vers_auto && etat.state == crate::playback::PlayState::Playing {
+            return PorteeDuReglage::EnNegociation;
+        }
+        if concerne_auto || etat.state != crate::playback::PlayState::Playing {
             return PorteeDuReglage::PisteSuivante;
         }
         if self.schedule_replay_pour(zone_id, RaisonDeRelance::Surechantillonnage) {
@@ -2789,6 +2809,28 @@ impl PlaybackOrchestrator {
         }
     }
 
+    pub async fn decision_auto_du_flux(&self, zone_id: i64) -> Option<serde_json::Value> {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            None
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let etat = self.playback.get_state(zone_id).await;
+            if etat.now_playing.is_none() || etat.state == crate::playback::PlayState::Stopped {
+                return None;
+            }
+            let device = self.peripherique_de_la_zone(zone_id);
+            let sortie = { self.outputs.lock().await.get(&device) }?;
+            sortie
+                .lock()
+                .await
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()?
+                .decision_auto_du_flux()
+        }
+    }
     /// Sur la sortie locale de la zone : les réglages lus à l'ouverture du
     /// flux qui joue, et le choix posé pour la suite. `None` sans sortie
     /// locale vivante (le réglage n'y agit pas).

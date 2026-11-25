@@ -94,9 +94,9 @@ tune_plugin_abi::export_dsp!(crate::Plugin, include_str!("../manifest.json"));
 
 /// Les capacités du manifeste de test : le traitement audio, et le F64
 /// (`audio-f64`, TESS T05) pour un identifiant qui finit par `-f64` (T14).
-fn capacites(id: &str) -> serde_json::Value {
+fn capacites(id: &str, capacite: &str) -> serde_json::Value {
     let mut c = vec![serde_json::json!(
-        {"id": "audio-process", "version": {"major": 0, "minor": 1}, "required": true}
+        {"id": capacite, "version": {"major": 0, "minor": 1}, "required": true}
     )];
     if id.ends_with("-f64") {
         c.push(serde_json::json!({
@@ -123,6 +123,15 @@ fn capacites(id: &str) -> serde_json::Value {
 pub fn construire_les_bibliotheques_de_test(
     dossier: &std::path::Path,
     ids: &[&str],
+) -> Vec<std::path::PathBuf> {
+    construire_cdylibs(dossier, ids, SOURCE_DU_GREFFON_DE_TEST, "audio-process")
+}
+
+pub(crate) fn construire_cdylibs(
+    dossier: &std::path::Path,
+    ids: &[&str],
+    source: &str,
+    capacite: &str,
 ) -> Vec<std::path::PathBuf> {
     let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -160,12 +169,12 @@ pub fn construire_les_bibliotheques_de_test(
                     "config_version": 1,
                     "entitlement": format!("plugin.{id}"),
                     "distribution": "source",
-                    "capabilities": capacites(id)
+                    "capabilities": capacites(id, capacite)
                 })
                 .to_string(),
             )
             .unwrap();
-            std::fs::write(caisse.join("src/lib.rs"), SOURCE_DU_GREFFON_DE_TEST).unwrap();
+            std::fs::write(caisse.join("src/lib.rs"), source).unwrap();
             std::fs::copy(racine.join("Cargo.lock"), caisse.join("Cargo.lock")).unwrap();
 
             let sortie = std::process::Command::new(env!("CARGO"))

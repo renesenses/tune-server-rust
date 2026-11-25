@@ -36,6 +36,11 @@ fn pic(eq: bool, crossfeed: bool) -> usize {
     let cf = Mutex::new(
         crossfeed.then(|| crate::audio::crossfeed::CrossfeedProcessor::new(48_000, 0.6, 0.3)),
     );
+    // Le banc mesure le traitement de la piste. Sur macOS, la première
+    // acquisition de chaque Mutex initialise aussi son verrou système.
+    drop(eq.lock().unwrap());
+    drop(convolver.lock().unwrap());
+    drop(cf.lock().unwrap());
     let (pure, mono) = (AtomicBool::new(false), AtomicBool::new(false));
     let ((), pic) = super::ringbuf_tests::pic_d_octets_alloues(|| {
         apply_local_dsp(&mut piste, &eq, &convolver, &cf, &pure, &mono, 2, false);

@@ -2621,6 +2621,13 @@ impl LocalOutput {
     /// 19/11/2026 — les réglages du suréchantillonneur lus à l'ouverture du
     /// flux qui JOUE (pas le choix posé pour le suivant) : c'est à eux qu'un
     /// changement de réglage se compare pour décider d'une relance.
+    pub fn decision_auto_du_flux(&self) -> Option<serde_json::Value> {
+        if self.current_format.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.reserve_du_surechantillonneur.decision_auto()
+    }
+
     pub fn reglages_du_flux_surechantillonne(
         &self,
     ) -> Option<crate::audio::surechantillonnage::UpsamplerSettings> {
@@ -4473,6 +4480,58 @@ where
     read
 }
 
+/// Quantification sur la grille du DAC après le volume logiciel. Le silence
+/// ajouté quand le tampon est vide ne reçoit jamais de bruit de quantification.
+#[allow(clippy::too_many_arguments)]
+fn rendre_pcm_entier_quantifie<T: Copy>(
+    ring: &RingBuf,
+    volume: &AtomicU32,
+    paused: &AtomicBool,
+    silent: &AtomicBool,
+    data_started: &AtomicBool,
+    ramp: &mut crate::audio::soft_mute::SoftMuteRamp,
+    armed_ms: u32,
+    min_buf: usize,
+    zero: T,
+    data: &mut [T],
+    quantification: &mut tune_plugin_native::rate::NativeFinalPcm,
+) where
+    f64: symphonia::core::audio::conv::IntoSample<T>,
+{
+    use symphonia::core::audio::conv::IntoSample;
+
+    let mut source = [0.0f32; 1024];
+    let mut mots = [0.0f64; 1024];
+    // Garder les frontières de trame quand la période dépasse le tampon.
+    let voies = usize::from(ramp.dop.canaux());
+    let taille = source.len() / voies * voies;
+    for chunk in data.chunks_mut(taille) {
+        let lus = render_local_shared_f32_callback(
+            ring,
+            volume,
+            paused,
+            silent,
+            data_started,
+            ramp,
+            armed_ms,
+            min_buf,
+            &mut source[..chunk.len()],
+        );
+        chunk.fill(zero);
+        if volume.load(Ordering::Relaxed) != 0 && lus > 0 {
+            let actifs = &mut mots[..lus];
+            for (dst, src) in actifs.iter_mut().zip(&source) {
+                *dst = f64::from(*src);
+            }
+            if quantification.process(actifs).is_ok() {
+                for (dst, src) in chunk.iter_mut().zip(actifs.iter()) {
+                    *dst = (*src).into_sample();
+                }
+            }
+        }
+    }
+}
+
 /// Repli entier, HORS de toute branche : les DEUX chemins de sortie locale
 /// s'en servent.
 ///
@@ -4506,9 +4565,11 @@ fn build_int_stream<T>(
     min_buf: usize,
     device_gone: Arc<AtomicBool>,
     soft_mute_cb: crate::audio::soft_mute::SoftMuteGate,
+    mut quantification: Option<(Arc<AtomicBool>, tune_plugin_native::rate::NativeFinalPcm)>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: cpal::SizedSample + Send + 'static,
+    f64: symphonia::core::audio::conv::IntoSample<T>,
     f32: symphonia::core::audio::conv::IntoSample<T>,
 {
     use symphonia::core::audio::conv::IntoSample;
@@ -4521,6 +4582,24 @@ where
         cfg,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             promotion.a_la_premiere_periode();
+            if let Some((active, q)) = quantification.as_mut()
+                && active.load(Ordering::Acquire)
+            {
+                rendre_pcm_entier_quantifie(
+                    &ring_cb,
+                    &vol_cb,
+                    &paused_cb,
+                    &silent_cb,
+                    &ds_cb,
+                    &mut ramp_cb,
+                    soft_mute_cb.armed_ms(),
+                    min_buf,
+                    zero,
+                    data,
+                    q,
+                );
+                return;
+            }
             render_local_shared_integer_callback(
                 &ring_cb,
                 &vol_cb,
@@ -5684,6 +5763,10 @@ struct EtageDeConversion<'a> {
 /// #7614 — l'étage du suréchantillonneur (quand il tourne) et le choix de la
 /// zone, relu à la frontière de piste seulement.
 pub(super) struct SurechDeLEtage<'a> {
+    publication: Option<(
+        &'a reserve_du_surechantillonneur::ReserveDuSurechantillonneur,
+        u64,
+    )>,
     pub(super) etage: Option<crate::audio::surechantillonnage::EtageSurechantillonneur>,
     pub(super) choix_de_la_zone:
         &'a std::sync::Mutex<Option<crate::audio::surechantillonnage::ChoixSurechantillonnage>>,
@@ -5971,13 +6054,35 @@ impl EtageDeConversion<'_> {
             // gardes #3233 et REF-7 lisent ici, même refus en silence.
             mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
         }
-        if let Some(etage) = self
-            .surechantillonneur
-            .as_mut()
-            .and_then(|s| s.etage.as_mut())
+        if let Some(surech) = self.surechantillonneur.as_mut()
+            && let Some(etage) = surech.etage.as_mut()
         {
+            if etage.reglages().mode
+                == crate::audio::surechantillonnage::greffon::UpsamplerMode::Auto
+            {
+                // Cloner le choix uniquement lorsqu’il change. La préparation
+                // du filtre s’effectue ensuite hors du verrou de la zone.
+                let choix = surech.choix_de_la_zone.try_lock().ok().and_then(|c| {
+                    c.as_ref()
+                        .filter(|c| etage.doit_proposer(&c.reglages))
+                        .cloned()
+                });
+                if let Some(choix) = choix
+                    && let Some(refus) = etage.proposer_transition(Some(&choix))
+                    && let Some((reserve, generation)) = surech.publication
+                {
+                    reserve.poser_decision_auto(generation, Some(refus));
+                }
+            }
             // #7614 — le greffon porte la cadence ; rubato ne tourne pas.
             mots = etage.traiter(&mots);
+            if let Some((reserve, generation)) = surech.publication
+                && let Some(decision) =
+                    etage.decision_apres_transition(mots.len() / etage.canaux() as usize)
+            {
+                reserve.terminer_transition(generation, etage.reglages(), decision);
+                surech.reglages_a_l_ouverture = Some(etage.reglages().clone());
+            }
         } else if self.needs_resample {
             let debut = std::time::Instant::now();
             mots = rubato_resample_chunk(
@@ -7696,6 +7801,7 @@ impl OutputTarget for LocalOutput {
                             min_buf,
                             device_gone.clone(),
                             soft_mute.clone(),
+                            None,
                         ),
                         FormatDeSortie::I16 => build_int_stream::<i16>(
                             &device,
@@ -7708,6 +7814,7 @@ impl OutputTarget for LocalOutput {
                             min_buf,
                             device_gone.clone(),
                             soft_mute.clone(),
+                            None,
                         ),
                     };
                     if bati.is_ok() {
@@ -8667,13 +8774,17 @@ impl OutputTarget for LocalOutput {
                 .cadence_du_surechantillonneur()
                 .zip(choix_du_surechantillonneur.as_ref())
                 .and_then(|(vers, choix)| {
-                    match crate::audio::surechantillonnage::EtageSurechantillonneur::nouveau(
+                    match crate::audio::surechantillonnage::EtageSurechantillonneur::preparer(
                         &choix.reglages,
                         sample_rate,
                         vers,
                         output_ch,
+                        backend.plan_natif.as_ref(),
                     ) {
                         Ok(etage) => {
+                            if backend.plan_natif.is_some() {
+                                backend.quantification_active.store(true, Ordering::Release);
+                            }
                             info!(
                                 from_sr = sample_rate,
                                 to_sr = vers,
@@ -8703,6 +8814,12 @@ impl OutputTarget for LocalOutput {
                     .as_ref()
                     .map(crate::audio::surechantillonnage::EtageSurechantillonneur::reserve_db),
             ) {
+                reserve_du_surechantillonneur.poser_decision_auto(
+                    my_generation,
+                    etage_du_surechantillonneur
+                        .as_ref()
+                        .and_then(|e| e.decision_auto()),
+                );
                 cretes_de_sortie.poser_le_gain_aval(reserve_du_surechantillonneur.gain());
             }
             if choix_du_surechantillonneur.is_some() && etage_du_surechantillonneur.is_none() {
@@ -8814,6 +8931,7 @@ impl OutputTarget for LocalOutput {
                 sortie: FormatOuvert::new(output_sr, output_ch),
                 needs_resample,
                 surechantillonneur: Some(SurechDeLEtage {
+                    publication: Some((&reserve_du_surechantillonneur, my_generation)),
                     etage: etage_du_surechantillonneur,
                     choix_de_la_zone: &surechantillonnage,
                     reglages_a_l_ouverture: choix_du_surechantillonneur
