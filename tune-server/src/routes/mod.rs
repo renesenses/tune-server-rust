@@ -1240,6 +1240,13 @@ mod eq_refresh_guard {
              le code de production la LIT via `audiophile::zone_enabled`",
         ),
         (
+            "_eq_profile",
+            "eq_parametrique_premium.rs",
+            "rc14 (#9517) : ne fait que LIRE `zone_*_eq_profile` pour décider du droit \
+             Premium d'une écriture ; l'écriture et son `apply_eq_change` restent dans \
+             les routes appelantes (`zones/dsp.rs`, `playback.rs`, `eq_pro.rs`)",
+        ),
+        (
             "_audiophile",
             "limites_de_volume_6541_tests.rs",
             "module de tests (`#[cfg(test)] #[path]` de `zones/limites_de_volume_6541.rs`) : \
@@ -1310,6 +1317,61 @@ mod eq_refresh_guard {
         })
     }
 
+    /// La seconde forme d'un module de test sorti : `#[cfg(test)]` et
+    /// `#[path = "…"]` devant `mod <nom>;`, déclarés dans un fichier frère
+    /// (`zones/tess_casque.rs` → `zones/tess_casque_tests.rs`) ou dans le
+    /// fichier parent `<dossier>.rs`. Le chemin de `#[path]` se résout depuis
+    /// le dossier du fichier qui le déclare ; seule une déclaration qui
+    /// désigne CE fichier, sous `#[cfg(test)]`, l'exclut.
+    fn est_module_de_test_par_path(chemin: &Path) -> bool {
+        let Some(dossier) = chemin.parent() else {
+            return false;
+        };
+        let Ok(cible) = fs::canonicalize(chemin) else {
+            return false;
+        };
+        let mut declarants = vec![dossier.with_extension("rs")];
+        if let Ok(entrees) = fs::read_dir(dossier) {
+            declarants.extend(
+                entrees
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| {
+                        p != chemin && p.extension().and_then(|e| e.to_str()) == Some("rs")
+                    }),
+            );
+        }
+        declarants.iter().any(|declarant| {
+            let (Some(base), Ok(texte)) = (declarant.parent(), fs::read_to_string(declarant))
+            else {
+                return false;
+            };
+            let lignes: Vec<&str> = texte.lines().map(str::trim).collect();
+            lignes.iter().enumerate().any(|(i, l)| {
+                let Some(valeur) = l
+                    .strip_prefix("#[path = \"")
+                    .and_then(|r| r.strip_suffix("\"]"))
+                else {
+                    return false;
+                };
+                if fs::canonicalize(base.join(valeur)).ok().as_ref() != Some(&cible) {
+                    return false;
+                }
+                let debut = (0..i)
+                    .rev()
+                    .take_while(|&k| lignes[k].starts_with("#["))
+                    .last()
+                    .unwrap_or(i);
+                let fin = (i + 1..lignes.len())
+                    .find(|&k| !lignes[k].starts_with("#["))
+                    .unwrap_or(lignes.len());
+                lignes
+                    .get(fin)
+                    .is_some_and(|m| m.starts_with("mod ") && m.ends_with(';'))
+                    && lignes[debut..fin].contains(&"#[cfg(test)]")
+            })
+        })
+    }
+
     /// REF-4 (#2219) : un module de PRODUCTION sorti d'un fichier de routes en
     /// module enfant (`mod <nom>;` sans `#[cfg(test)]` dans `<dossier>.rs`) est
     /// un morceau de ce fichier, pas une route à part. Il se lit AVEC son
@@ -1348,7 +1410,7 @@ mod eq_refresh_guard {
                 if chemin.extension().and_then(|e| e.to_str()) != Some("rs") {
                     continue;
                 }
-                if est_module_de_test_sorti(&chemin) {
+                if est_module_de_test_sorti(&chemin) || est_module_de_test_par_path(&chemin) {
                     continue;
                 }
                 let nom = chemin
