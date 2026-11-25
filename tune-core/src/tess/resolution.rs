@@ -1314,7 +1314,13 @@ mod tests {
             },
             ..ChaineTess::default()
         };
-        let marge = |r: &Resolution| r.etapes.iter().find(|e| e.code == HEADROOM).cloned().unwrap();
+        let marge = |r: &Resolution| {
+            r.etapes
+                .iter()
+                .find(|e| e.code == HEADROOM)
+                .cloned()
+                .unwrap()
+        };
         // Locale : −6,5 dB, avec ou sans greffon.
         for plugins in [vec![], vec![maillon("crossfeed", true)]] {
             let r = resoudre(&manuelle(-6.5, plugins), &ctx(TransportZone::Local));
@@ -1335,9 +1341,15 @@ mod tests {
         let mut c = manuelle(-6.5, vec![maillon("crossfeed", true)]);
         c.bypass_all = true;
         let r = resoudre(&c, &ctx(TransportZone::Local));
-        assert_eq!((r.headroom_db, marge(&r).reason), (0.0, Some(MotifEtape::BypassAll)));
+        assert_eq!(
+            (r.headroom_db, marge(&r).reason),
+            (0.0, Some(MotifEtape::BypassAll))
+        );
         // Réseau sans égaliseur : pas appliquée ; avec un égaliseur : appliquée.
-        let r = resoudre(&manuelle(-6.5, vec![maillon("crossfeed", true)]), &ctx(TransportZone::AirPlay));
+        let r = resoudre(
+            &manuelle(-6.5, vec![maillon("crossfeed", true)]),
+            &ctx(TransportZone::AirPlay),
+        );
         assert_eq!(r.headroom_db, 0.0);
         assert_eq!(marge(&r).reason, Some(MotifEtape::NotAppliedOnTransport));
         let r = resoudre(

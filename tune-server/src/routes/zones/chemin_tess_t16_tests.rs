@@ -568,7 +568,11 @@ fn la_marge_manuelle_est_en_service_quand_l_etage_dsp_tourne_rc14() {
     let applique = json!({"steps": [{"name": "DSP", "bit_perfect": false}]});
     let pure = json!({"steps": [{"name": "DSP", "bit_perfect": true}]});
     assert_eq!(marge_manuelle_en_service(&c, &applique), Some(-7.5));
-    assert_eq!(marge_manuelle_en_service(&c, &pure), None, "PURE la contourne");
+    assert_eq!(
+        marge_manuelle_en_service(&c, &pure),
+        None,
+        "PURE la contourne"
+    );
     assert_eq!(marge_manuelle_en_service(&c, &json!({"steps": []})), None);
     // Automatique, ou 0 dB : jamais un gain à part.
     c.fixed.headroom = Headroom::Manual { db: 0.0 };

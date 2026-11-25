@@ -605,7 +605,11 @@ mod tests {
         let mut hm = chaine(&[]);
         hm.fixed.headroom = Headroom::Manual { db: -3.0 };
         let mut r = hm.resoudre(&catalogue_de_reference(), &x);
-        assert_eq!(r.badge, Badge::BitPerfect, "headroom manuel : déjà non appliqué");
+        assert_eq!(
+            r.badge,
+            Badge::BitPerfect,
+            "headroom manuel : déjà non appliqué"
+        );
         assert_eq!(r.headroom_db, 0.0);
         let a = acheminer(&r, &faits(Refused, false, Library));
         assert_eq!(a.route, VoieUpnp::Untouched);
