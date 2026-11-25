@@ -84,7 +84,12 @@ fn un_passe_bas_a_phase_lineaire_coupe_au_bon_endroit_et_n_a_pas_de_phase_hors_r
     assert_eq!(c.retard_echantillons, 511, "le centre du FIR symétrique");
     let db = |f: f64| c.magnitude_db[au_plus_pres(&c, f)];
     assert!(db(100.0).abs() < 0.05, "bande passante : {}", db(100.0));
-    assert!((db(1_000.0) + 6.0).abs() < 0.6, "−6 dB à la coupure : {}", db(1_000.0));
+    // −6 dB à la coupure : la courbe passe −6 dB à 1 kHz (± 2 %).
+    let i = c.magnitude_db.iter().position(|d| *d < -6.0).unwrap();
+    let (f0, f1) = (c.freqs_hz[i - 1], c.freqs_hz[i]);
+    let (d0, d1) = (c.magnitude_db[i - 1], c.magnitude_db[i]);
+    let coupure = f0 + (f1 - f0) * (-6.0 - d0) / (d1 - d0);
+    assert!((coupure - 1_000.0).abs() < 20.0, "−6 dB à {coupure} Hz");
     assert!(db(5_000.0) < -70.0, "bande coupée : {}", db(5_000.0));
     // Bande passante : phase hors retard nulle (phase linéaire pure).
     for f in [50.0, 200.0, 500.0, 800.0] {
