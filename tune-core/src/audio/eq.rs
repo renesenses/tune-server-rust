@@ -537,15 +537,18 @@ impl EqProcessor {
     }
 
     /// rc14 (décision de Bertrand du 25/11) — égaliseur DÉCOCHÉ dans TESS :
-    /// le gain gardé remonte jusqu'au signal sec (sans la borne de volume de
-    /// #6741) en [`REMONTEE_RAPIDE_TESS_MS`], tout de suite, même pendant le
-    /// fondu de la courbe (les deux se recouvrent : signal sec en moins de
-    /// 0,5 s, sans marche). Sans effet hors d'un égaliseur coupé.
+    /// le gain gardé remonte en [`REMONTEE_RAPIDE_TESS_MS`], tout de suite,
+    /// même pendant le fondu de la courbe (les deux se recouvrent, sans
+    /// marche), vers `min(1, borne de volume)` comme toute remontée (#6741,
+    /// sécurité auditive, fil 1974) : à volume inchangé, le signal sec au bit
+    /// près en moins de 0,5 s ; si le volume a monté pendant que
+    /// l'égaliseur jouait, le niveau d'avant l'égaliseur, jamais au-dessus —
+    /// le reste demeure gardé, avec son voyant et « Rendre le niveau »
+    /// (#6524). `libere` n'est PAS posé. Sans effet hors d'un égaliseur coupé.
     pub fn rendre_le_sec_vite(&mut self) {
         if !self.est_neutre() {
             return;
         }
-        self.libere = true;
         self.rampe_rapide = true;
         self.relancer_depuis_le_gain_atteint();
     }
@@ -628,8 +631,11 @@ impl EqProcessor {
             return;
         }
         self.borne_de_remontee = borne;
-        if !self.est_neutre() || self.fondu.is_some() {
-            // Pendant le fondu de la courbe, la borne sert à la fin du fondu.
+        // Pendant le fondu de la courbe, la borne sert à la fin du fondu —
+        // sauf si une rampe est DÉJÀ en cours (flux sans fin, retour rapide
+        // de TESS) : elle est reciblée tout de suite, sinon elle finirait
+        // vers l'ancienne borne, au-dessus du niveau d'avant l'égaliseur.
+        if !self.est_neutre() || (self.fondu.is_some() && self.extinction.is_none()) {
             return;
         }
         self.relancer_depuis_le_gain_atteint();

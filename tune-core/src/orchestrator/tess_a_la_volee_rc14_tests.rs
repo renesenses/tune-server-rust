@@ -251,16 +251,18 @@ fn relances_programmees(orch: &PlaybackOrchestrator, zone_id: i64) -> u64 {
 
 // ── 1. Désactivation à la volée ────────────────────────────────────
 
-/// LE témoin du bogue 2 sur la sortie locale : égaliseur activé à volume
-/// bas, volume monté (pour compenser son préampli), puis égaliseur DÉCOCHÉ
-/// dans TESS. La sortie doit redevenir l'entrée au bit près. Avant : le
-/// préampli de −12 dB restait gardé indéfiniment (borne de volume de #6741),
-/// la désactivation « ne faisait rien » à l'oreille.
-#[tokio::test]
-async fn desactiver_l_egaliseur_dans_tess_rend_l_entree_au_bit_pres() {
+/// LE témoin du bogue 2 sur la sortie locale : égaliseur activé, puis
+/// DÉCOCHÉ dans TESS. Décision du 25/11 (A/B) : retour en 0,6 s au plus,
+/// sans marche (blocs de 10 ms ; un sinus de 40 Hz nu varie de ≈ 0,0026 entre
+/// deux échantillons). Sécurité auditive (#6741, fil 1974) : jamais
+/// au-dessus du niveau d'avant l'égaliseur.
+///
+/// Rend `(instant en ms où la sortie se stabilise, rapport sortie/entrée
+/// final)` ; échoue sur une marche.
+async fn decocher_l_egaliseur_dans_tess(volume_avant: f64, volume_apres: f64) -> (u32, f32, bool) {
     let orch = orchestrateur();
     let zone_id = zone_locale(&orch).await;
-    volume_local(&orch, 0.25).await;
+    volume_local(&orch, volume_avant).await;
     regler_l_egaliseur(&orch, zone_id, true);
     changement_d_egaliseur_tess(&orch, zone_id).await;
     let mut trame = 0;
@@ -269,46 +271,132 @@ async fn desactiver_l_egaliseur_dans_tess_rend_l_entree_au_bit_pres() {
         !identiques_au_bit_pres(&entree, &sortie),
         "contre-épreuve : l'égaliseur actif traite le signal"
     );
-    volume_local(&orch, 1.0).await;
+    volume_local(&orch, volume_apres).await;
 
     regler_l_egaliseur(&orch, zone_id, false);
     changement_d_egaliseur_tess(&orch, zone_id).await;
-    // Décision de Bertrand du 25/11 (A/B) : le signal sec revient en
-    // 0,6 s au plus, sans marche. Blocs de 10 ms : on relève l'instant où la
-    // sortie redevient l'entrée au bit près, et la plus grande variation
-    // entre deux échantillons (un sinus de 40 Hz nu en fait ≈ 0,0026).
     let mut tout = Vec::new();
-    let mut sec_a_ms: Option<u32> = None;
-    for bloc in 1..=100u32 {
+    let mut rapports = Vec::new();
+    for _ in 1..=100u32 {
         let entree = sinus(&mut trame, (TAUX / 100) as usize);
         let mut sortie = entree.clone();
         avec_la_sortie_locale(&orch, |l| l.traiter_un_bloc_pour_test(&mut sortie)).await;
         tout.extend(sortie.chunks(2).map(|t| t[0]));
-        if identiques_au_bit_pres(&entree, &sortie) {
-            sec_a_ms.get_or_insert(bloc * 10);
-        } else {
-            assert!(sec_a_ms.is_none(), "le sec ne doit pas repartir ({bloc})");
-        }
+        let crete = |v: &[f32]| v.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        rapports.push(crete(&sortie) / crete(&entree));
     }
     let marche = tout
         .windows(2)
         .map(|w| (w[1] - w[0]).abs())
         .fold(0.0_f32, f32::max);
     assert!(marche <= 0.01, "marche de {marche} à la désactivation");
-    let sec_a_ms = sec_a_ms.expect("la sortie doit redevenir l'entrée au bit près");
+    let final_ = *rapports.last().unwrap();
+    // Le premier bloc à partir duquel le niveau ne bouge plus.
+    let stable = rapports
+        .iter()
+        .rposition(|r| (r - final_).abs() > 1e-4)
+        .map_or(0, |i| i + 1);
+    let (entree, sortie) = jouer(&orch, &mut trame, 0.5).await;
+    let au_bit_pres = identiques_au_bit_pres(&entree, &sortie);
+    ((stable as u32 + 1) * 10, final_, au_bit_pres)
+}
+
+/// Volume inchangé (le cas d'un A/B) : le signal sec, au bit près, en
+/// 0,6 s au plus. Avant (rc13.90) : remontée à 2 dB/s, ≈ 6 s pour 12 dB.
+#[tokio::test]
+async fn decocher_a_volume_inchange_rend_l_entree_au_bit_pres_en_0_6_s() {
+    let (stable_ms, rapport, au_bit_pres) = decocher_l_egaliseur_dans_tess(0.5, 0.5).await;
     assert!(
-        sec_a_ms <= 600,
-        "le signal sec revient en {sec_a_ms} ms, attendu ≤ 600 ms"
+        stable_ms <= 600,
+        "stabilisé en {stable_ms} ms, attendu ≤ 600 ms"
     );
-    let (entree, sortie) = jouer(&orch, &mut trame, 1.0).await;
+    assert!((rapport - 1.0).abs() < 1e-6, "rapport final {rapport}");
+    assert!(au_bit_pres, "la sortie doit être l'entrée au bit près");
+}
+
+/// Volume monté pendant que l'égaliseur jouait (0,25 → 0,5) : le niveau
+/// revient à celui d'avant l'égaliseur (−6 dB ici), vite, JAMAIS au signal
+/// sec (+6 dB au-dessus) ; le reste demeure gardé (#6741, fil 1974).
+#[tokio::test]
+async fn decocher_apres_un_volume_monte_s_arrete_au_niveau_d_avant() {
+    let (stable_ms, rapport, au_bit_pres) = decocher_l_egaliseur_dans_tess(0.25, 0.5).await;
+    assert!(stable_ms <= 600, "stabilisé en {stable_ms} ms");
+    let db = 20.0 * f64::from(rapport).log10();
     assert!(
-        identiques_au_bit_pres(&entree, &sortie),
-        "désactivé dans TESS, la sortie doit être l'entrée au bit près"
+        (db + 6.02).abs() < 0.3,
+        "{db} dB, attendu ≈ −6 dB (niveau d'avant)"
     );
-    assert!(
-        !avec_la_sortie_locale(&orch, |l| l.has_eq()).await,
-        "plus aucun égaliseur monté"
-    );
+    assert!(!au_bit_pres, "le reste du préampli reste gardé");
+}
+
+/// Même règle sur la voie réseau relevée en vol (radio, renderer DLNA) :
+/// `poser_vers_le_sec_rapide` remonte vite, mais jamais au-dessus du niveau
+/// d'avant l'égaliseur. Volume inchangé : sec en 0,6 s. Volume monté : le
+/// volume d'un appareil réseau suit SA courbe (souvent en dB), la borne y est
+/// tout ou rien (#6741, `EqEnVol::borne_de_remontee`) : tout le préampli
+/// reste gardé, aucune remontée.
+#[test]
+fn en_vol_le_retour_rapide_suit_la_borne_de_volume() {
+    for apres in [0.25, 0.5] {
+        let poste = EqEnVol::pour_la_radio();
+        poste.noter_le_volume(0.25);
+        let profil: crate::audio::eq::EqProfile = serde_json::from_str(&profil(true)).unwrap();
+        let mut courant = None;
+        let mut trame = 0usize;
+        let mut bloc = |courant: &mut Option<crate::audio::eq::EqProcessor>| -> f64 {
+            poste.relever(courant, TAUX, 2);
+            let n = (TAUX / 100) as usize;
+            let mut pcm = Vec::with_capacity(n * 4);
+            let mut crete_in = 0i32;
+            for _ in 0..n {
+                let t = trame as f64 / f64::from(TAUX);
+                let v = (0.5 * (2.0 * std::f64::consts::PI * 40.0 * t).sin() * 32_767.0) as i16;
+                crete_in = crete_in.max(i32::from(v).abs());
+                pcm.extend_from_slice(&v.to_le_bytes());
+                pcm.extend_from_slice(&v.to_le_bytes());
+                trame += 1;
+            }
+            if let Some(eq) = courant.as_mut() {
+                eq.process_pcm(&mut pcm, 16);
+            }
+            let crete_out = pcm
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i32::from(i16::from_le_bytes(*b)).abs())
+                .max()
+                .unwrap_or(0);
+            f64::from(crete_out) / f64::from(crete_in.max(1))
+        };
+        poste.poser(Some(profil));
+        let mut avant = 0.0;
+        for _ in 0..100 {
+            avant = bloc(&mut courant);
+        }
+        poste.noter_le_volume(apres);
+        poste.poser(None);
+        poste.poser_vers_le_sec_rapide();
+        let mut rapports = Vec::new();
+        for _ in 0..100 {
+            rapports.push(bloc(&mut courant));
+        }
+        // 0,6 s après la coupure, le niveau est atteint et ne bouge plus.
+        let a_0_6 = rapports[60];
+        let fin = *rapports.last().unwrap();
+        let attendu = if apres <= 0.25 { 1.0 } else { avant };
+        assert!(
+            (fin - attendu).abs() < 0.01,
+            "{apres} : rapport final {fin}, attendu {attendu} (avant la coupure : {avant})"
+        );
+        assert!(
+            (a_0_6 - fin).abs() < 0.01,
+            "{apres} : pas stabilisé à 0,6 s ({a_0_6} / {fin})"
+        );
+        assert!(
+            rapports.iter().all(|r| *r <= 1.0 + 1e-3),
+            "{apres} : jamais au-dessus du signal d'entrée"
+        );
+    }
 }
 
 /// Contre-épreuve : le chemin des anciennes routes (`apply_eq_change_portee`)
@@ -395,6 +483,26 @@ async fn une_desactivation_sous_le_plancher_est_differee_pas_abandonnee() {
     );
     assert!(RaisonDeRelance::Reglage.differe_sous_le_plancher());
     assert!(!RaisonDeRelance::BasculePure.differe_sous_le_plancher());
+}
+
+/// Relecture de #9540 (m1) — l'ancien écran Égaliseur lit la portée : une
+/// relance demandée sous le plancher arrive au plus tard à sa fin (5 s), la
+/// réponse dit donc `restart` (« dans l'instant »), jamais `next_track`. Avant
+/// ce correctif elle disait déjà `restart`… et la relance était abandonnée.
+#[tokio::test]
+async fn sous_le_plancher_la_portee_dit_relance_pas_piste_suivante() {
+    let orch = orchestrateur();
+    let zone_id = zone_reseau(&orch).await;
+    regler_l_egaliseur(&orch, zone_id, true);
+    jouer_np(&orch, zone_id, "local", "sid-portee").await;
+    orch.eq_replay_last
+        .lock()
+        .unwrap()
+        .insert(zone_id, std::time::Instant::now());
+    regler_l_egaliseur(&orch, zone_id, false);
+    let portee = orch.apply_eq_change_portee(zone_id).await;
+    assert_eq!(portee, super::dsp::PorteeDuReglage::Relance);
+    assert_eq!(portee.code(), "restart");
 }
 
 // ── 2. Reprise = prochaine lecture ─────────────────────────────────
@@ -493,4 +601,32 @@ async fn en_mode_immediat_une_convolution_changee_relance_le_flux_reseau_qui_jou
     orch.playback.pause(zone_id).await;
     assert!(!orch.relancer_si_flux_reseau_perime(zone_id).await);
     assert_eq!(relances_programmees(&orch, zone_id), 1);
+}
+
+/// Relecture de #9540 (m2) — sur une station mono, un changement de
+/// crossfeed seul n'entre pas dans le flux : la relance est évitée (la
+/// session dit « mono ») ; un autre étage changé relance encore.
+#[tokio::test]
+async fn sur_une_radio_seul_le_crossfeed_change_est_reconnu() {
+    let orch = orchestrateur();
+    let zone_id = zone_reseau(&orch).await;
+    jouer_np(&orch, zone_id, "radio", "sid-mono").await;
+    flux_fabrique(&orch, zone_id, "sid-mono");
+    SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &format!("zone_{zone_id}_crossfeed"),
+            r#"{"enabled":true,"amount":0.4,"delay_ms":0.3}"#,
+        )
+        .unwrap();
+    let np = orch.playback.get_state(zone_id).await.now_playing.unwrap();
+    assert!(
+        orch.flux_reseau_perime(zone_id, &np),
+        "le crossfeed a changé"
+    );
+    assert!(orch.seuls_des_etages_stereo_ont_change(zone_id, &np));
+    let _ri = regler_la_convolution(&orch, zone_id, "ri-tv-mono", 0.5);
+    assert!(
+        !orch.seuls_des_etages_stereo_ont_change(zone_id, &np),
+        "la convolution agit aussi sur une station mono"
+    );
 }

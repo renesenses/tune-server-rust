@@ -205,8 +205,9 @@ impl EqEnVol {
         self.poser_vers_le_sec_avec(false);
     }
 
-    /// rc14 (TESS) — [`Self::poser_vers_le_sec`], retour au sec RAPIDE
-    /// (moins de 0,5 s, `EqProcessor::rendre_le_sec_vite`).
+    /// rc14 (TESS) — [`Self::poser_vers_le_sec`], retour RAPIDE (moins de
+    /// 0,5 s, `EqProcessor::rendre_le_sec_vite`) et BORNÉ : vers le niveau
+    /// d'avant l'égaliseur (#6741), pas au-delà, contrairement à PURE.
     pub(crate) fn poser_vers_le_sec_rapide(&self) {
         self.poser_vers_le_sec_avec(true);
     }

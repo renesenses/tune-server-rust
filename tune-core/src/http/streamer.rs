@@ -2060,6 +2060,16 @@ impl AudioStreamer {
         self.sessions.lock().await.contains_key(stream_id)
     }
 
+    /// rc14 (TESS) — le nombre de canaux que la session a publié pour son
+    /// PCM (radio décodée : après la sonde), `None` s'il n'est pas connu.
+    pub async fn canaux_detectes(&self, stream_id: &str) -> Option<u16> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .get(stream_id)?
+            .detected_output_format()
+            .map(|(_, canaux)| canaux)
+    }
+
     /// #6612 — depuis combien de temps cette session a reçu une plage hors
     /// fichier (voir [`StreamSession::age_plage_hors_fichier`]).
     pub async fn age_plage_hors_fichier(&self, stream_id: &str) -> Option<std::time::Duration> {

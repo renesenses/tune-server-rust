@@ -1544,25 +1544,72 @@ impl PlaybackOrchestrator {
         if !self.flux_reseau_perime(zone_id, np) {
             return false;
         }
+        // Relecture de #9540 (m2) — une station MONO ne porte ni crossfeed ni
+        // greffon natif (étages stéréo seulement, `chaine_radio_9346`) : si
+        // seuls ceux-là ont changé, relancer la radio couperait le son pour
+        // rien.
+        if np.source == "radio"
+            && let Some(sid) = np.stream_id.as_deref()
+            && self.streamer.canaux_detectes(sid).await == Some(1)
+            && self.seuls_des_etages_stereo_ont_change(zone_id, np)
+        {
+            info!(zone_id, "tess_radio_mono_crossfeed_inerte_pas_de_relance");
+            return false;
+        }
         let programmee = self.schedule_replay_pour(zone_id, RaisonDeRelance::Reglage);
         info!(zone_id, programmee, "tess_flux_reseau_perime_relance");
         programmee
     }
 
+    /// Relecture de #9540 (m2) — entre le traitement servi et celui demandé,
+    /// seuls le crossfeed (`cf=`), sa compensation (`lc=`) et les natifs
+    /// tiers (`tiers=`) diffèrent-ils ? Ces étages sont stéréo seulement.
+    pub(super) fn seuls_des_etages_stereo_ont_change(
+        &self,
+        zone_id: i64,
+        np: &crate::playback::NowPlaying,
+    ) -> bool {
+        let Some(sid) = np.stream_id.as_deref() else {
+            return false;
+        };
+        let servi = self
+            .traitement_des_flux
+            .lock()
+            .unwrap()
+            .get(&zone_id)
+            .and_then(|notes| notes.iter().find(|(s, _)| s == sid).map(|(_, e)| e.clone()));
+        let Some(servi) = servi else {
+            return false;
+        };
+        let sans = |e: &str| {
+            e.split('\u{1f}')
+                .filter(|c| {
+                    !(c.starts_with("cf=") || c.starts_with("lc=") || c.starts_with("tiers="))
+                })
+                .collect::<Vec<_>>()
+                .join("\u{1f}")
+        };
+        sans(&servi) == sans(&self.empreinte_du_traitement(zone_id, np.piste_rg()))
+    }
+
     /// rc14 (retour de Rémi sur la rc13.90) — l'égaliseur vient d'être
-    /// DÉCOCHÉ dans TESS : décocher est le geste explicite qui rend le niveau.
-    /// Le préampli que l'égaliseur coupé garde (décision du 10/10, #6741 :
-    /// pour toujours si le volume a monté pendant qu'il jouait) remonte
-    /// jusqu'au signal sec en moins de 0,5 s (décision du 25/11, A/B), par
-    /// rampe, sans marche ; la sortie redevient l'entrée au bit près.
+    /// DÉCOCHÉ dans TESS : le préampli que l'égaliseur coupé garde (décision
+    /// du 10/10) remonte en moins de 0,5 s (décision du 25/11, A/B), par
+    /// rampe, sans marche, vers le niveau d'avant l'égaliseur (#6741,
+    /// sécurité auditive) : à volume inchangé, la sortie redevient l'entrée au
+    /// bit près ; si le volume a monté entre-temps, le reste demeure gardé
+    /// (voyant, « Rendre le niveau » #6524).
     ///
-    /// - sortie locale : retour rapide au sec (`rendre_le_sec_vite`) ;
-    /// - flux réseau dont l'égaliseur vient d'être relevé en vol : la relève
-    ///   « vers le sec » de l'entrée en PURE (#8422) ;
-    /// - flux refabriqué (relance) : il repart sans égaliseur, donc sec.
+    /// - sortie locale : `LocalOutput::rendre_le_sec_vite` ;
+    /// - flux réseau dont l'égaliseur vient d'être relevé en vol :
+    ///   `EqEnVol::poser_vers_le_sec_rapide` (même borne) ;
+    /// - flux refabriqué (relance réseau) : il repart sans égaliseur ni gain
+    ///   gardé, au niveau sec, après la coupure de la relance — comme avant ce
+    ///   correctif ; le volume d'un appareil réseau est le sien (matériel), la
+    ///   borne n'y est pas transposable (documenté dans #9540).
     ///
     /// Sans effet si l'égaliseur est actif, ou en PURE. Rend `true` quand un
-    /// préampli gardé a été libéré.
+    /// retour a été demandé.
     pub async fn rendre_le_sec_si_egaliseur_coupe(&self, zone_id: i64) -> bool {
         if self.zone_audiophile(zone_id) || self.eq_profile_configure(zone_id).is_some() {
             return false;
