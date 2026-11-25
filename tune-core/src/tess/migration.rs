@@ -877,27 +877,20 @@ pub struct PoseDeLaCorrection {
     pub en_serie: Vec<String>,
 }
 
-/// Les bandes des anciennes corrections de pièce de la zone que l'on sait
-/// retrouver : la dernière appliquée ([`cle_correction_appliquee`]) et
-/// l'égaliseur d'avant TESS ([`cle_sauvegarde_eq`]), quand il ressemble à
-/// une correction (bandes sans canal, posées par une route `apply`).
+/// Les bandes de la dernière correction de pièce APPLIQUÉE à la zone
+/// ([`cle_correction_appliquee`]), si on les a. L'égaliseur d'avant TESS
+/// (`cle_sauvegarde_eq`) n'est PAS une preuve : il peut être un paramétrique
+/// de l'utilisateur (AutoEQ, réglage manuel).
 fn anciennes_corrections(settings: &SettingsRepo, zone_id: i64) -> Vec<Vec<EqBandSpec>> {
-    let lire = |cle: String| {
-        settings
-            .get(&cle)
-            .ok()
-            .flatten()
-            .and_then(|b| serde_json::from_str::<EqProfile>(&b).ok())
-            .map(|p| p.bands)
-            .filter(|b| !b.is_empty())
-    };
-    let mut v = Vec::new();
-    v.extend(lire(cle_correction_appliquee(zone_id)));
-    v.extend(
-        lire(cle_sauvegarde_eq(zone_id))
-            .filter(|b| b.iter().all(|x| x.channel.is_none()) && !est_courbe_graphique(b)),
-    );
-    v
+    settings
+        .get(&cle_correction_appliquee(zone_id))
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_str::<EqProfile>(&b).ok())
+        .map(|p| p.bands)
+        .filter(|b| !b.is_empty())
+        .into_iter()
+        .collect()
 }
 
 /// rc14 (égaliseurs en série) — `POST /room-correction/profiles/{zone}/apply`
@@ -906,10 +899,9 @@ fn anciennes_corrections(settings: &SettingsRepo, zone_id: i64) -> Vec<Vec<EqBan
 ///
 /// - un maillon `room-correction` déjà présent est mis à jour sur place ;
 /// - sinon, un « Égaliseur paramétrique » qui ÉTAIT une correction de pièce
-///   (ses bandes sont celles du profil actuel ou d'une ancienne correction
-///   de la zone, [`anciennes_corrections`] : reclassé en rc13.90 après le
-///   remplacement de son profil) est REMPLACÉ, pour qu'il ne reste qu'une
-///   correction ;
+///   (ses bandes sont celles du profil actuel ou de la dernière correction
+///   appliquée, [`anciennes_corrections`]) est REMPLACÉ, pour qu'il ne reste
+///   qu'une correction ;
 /// - sinon, la correction est ajoutée à la suite des égaliseurs.
 ///
 /// Les autres façades ne sont pas touchées ; [`PoseDeLaCorrection::en_serie`]
@@ -2117,6 +2109,16 @@ fn ecrire_chaine_avec(
                 .cles_modifiees
                 .push(super::egaliseurs_en_serie::cle_ordre_tess(zone_id));
         }
+    }
+
+    // La correction de pièce retirée de la chaîne : la trace de la dernière
+    // correction appliquée ne désigne plus rien.
+    if reference
+        .as_ref()
+        .is_some_and(|r| r.plugins.iter().any(|m| m.id == ID_CORRECTION_PIECE))
+        && !chaine.plugins.iter().any(|m| m.id == ID_CORRECTION_PIECE)
+    {
+        stockage(settings.delete(&cle_correction_appliquee(zone_id)))?;
     }
 
     entre();

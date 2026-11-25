@@ -2894,9 +2894,10 @@ fn la_facade_d_une_ancienne_ecriture_suit_la_lecture_de_la_chaine() {
 /// rc14 (revue de #9534, M1) — `[paramétrique R1 coché]`, où R1 est une
 /// ancienne correction de pièce reclassée en rc13.90 après le remplacement
 /// de son profil : appliquer R2 REMPLACE R1 (une seule correction joue). R1
-/// est reconnue par la dernière correction appliquée, ou par l'égaliseur
-/// d'avant TESS. Contre-épreuve : un paramétrique de l'utilisateur reste, et
-/// il est dit en série.
+/// est reconnue par la dernière correction appliquée. Contre-épreuves : un
+/// paramétrique de l'utilisateur reste et il est dit en série, y compris
+/// quand il était l'égaliseur d'avant TESS (`cle_sauvegarde_eq` n'est pas
+/// une preuve de correction de pièce).
 #[test]
 fn appliquer_un_profil_remplace_une_ancienne_correction_devenue_parametrique() {
     let (_b, s) = base();
@@ -2944,7 +2945,7 @@ fn appliquer_un_profil_remplace_une_ancienne_correction_devenue_parametrique() {
 
         let pose = poser_la_correction_de_piece(&s, z, &r2).unwrap();
         let l = lire_zone(&s, z, true).unwrap();
-        if source == "aucune" {
+        if source != "appliquee" {
             assert_eq!(
                 ids(&l.chaine),
                 vec![(ID_EQ_PARAMETRIQUE, true), (ID_CORRECTION_PIECE, true)],
@@ -2967,4 +2968,23 @@ fn appliquer_un_profil_remplace_une_ancienne_correction_devenue_parametrique() {
             assert!(memes_bandes(&b, &r2.bands), "{source}");
         }
     }
+}
+
+/// rc14 — la trace de la dernière correction appliquée disparaît quand la
+/// correction de pièce est retirée de la chaîne.
+#[test]
+fn retirer_la_correction_de_piece_efface_la_trace_de_la_correction_appliquee() {
+    let (_b, s) = base();
+    let z = 54;
+    let r2 = crate::room_correction::profil_eq_de_correction(&filtres_de_piece());
+    poser_la_correction_de_piece(&s, z, &r2).unwrap();
+    assert!(s.get(&cle_correction_appliquee(z)).unwrap().is_some());
+    // Une autre écriture qui la garde ne touche pas la trace.
+    let c = lire_zone(&s, z, true).unwrap().chaine;
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert!(s.get(&cle_correction_appliquee(z)).unwrap().is_some());
+    let mut sans = c.clone();
+    sans.plugins.retain(|m| m.id != ID_CORRECTION_PIECE);
+    ecrire_chaine(&s, z, &sans).unwrap();
+    assert_eq!(s.get(&cle_correction_appliquee(z)).unwrap(), None);
 }
