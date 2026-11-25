@@ -489,7 +489,10 @@ async fn tess_marque_replaced_in_group_n_est_pas_un_reglage() {
         .iter()
         .filter(|m| m["enabled"] == json!(true))
         .count();
-    assert_eq!(coches, 2, "l'ancienne chaîne coche deux égaliseurs : {chaine}");
+    assert_eq!(
+        coches, 2,
+        "l'ancienne chaîne coche deux égaliseurs : {chaine}"
+    );
     let (s, v) = b.appel(Method::PUT, &uri, Some(chaine)).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let p = v["chain"]["plugins"]
