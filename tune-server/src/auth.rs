@@ -2255,7 +2255,10 @@ pub fn ouvrir_la_premiere_configuration(state: &AppState) -> bool {
         return false;
     }
     if settings
-        .set(CLE_DEBUT_PREMIERE_CONFIGURATION, &maintenant_unix().to_string())
+        .set(
+            CLE_DEBUT_PREMIERE_CONFIGURATION,
+            &maintenant_unix().to_string(),
+        )
         .is_err()
     {
         return false;
@@ -2666,7 +2669,10 @@ async fn activer_l_authentification(
                 }
             }
             SettingsRepo::with_backend(state.backend.clone())
-                .set(CLE_FIN_PREMIERE_CONFIGURATION, &maintenant_unix().to_string())
+                .set(
+                    CLE_FIN_PREMIERE_CONFIGURATION,
+                    &maintenant_unix().to_string(),
+                )
                 .ok();
             tracing::warn!(
                 appelant = %pair.ip(),

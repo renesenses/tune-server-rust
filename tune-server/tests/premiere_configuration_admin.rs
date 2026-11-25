@@ -15,9 +15,9 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use tune_server::auth::{
-    DUREE_PREMIERE_CONFIGURATION, base_neuve_avant_ouverture, oublier_l_horloge_de_la_premiere_configuration,
-    ouvrir_la_premiere_configuration, premiere_configuration_restante,
-    vieillir_la_premiere_configuration,
+    DUREE_PREMIERE_CONFIGURATION, base_neuve_avant_ouverture,
+    oublier_l_horloge_de_la_premiere_configuration, ouvrir_la_premiere_configuration,
+    premiere_configuration_restante, vieillir_la_premiere_configuration,
 };
 use tune_server::state::AppState;
 
@@ -319,7 +319,10 @@ async fn refus_si_un_administrateur_existe_deja() {
     let (st, v) = creer(&state, HOTE_DU_LAN, &[], "intrus-1234").await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
     assert!(!active(&state));
-    assert_eq!(mot_de_passe_admin(&state).as_deref(), Some(hachage.as_str()));
+    assert_eq!(
+        mot_de_passe_admin(&state).as_deref(),
+        Some(hachage.as_str())
+    );
 }
 
 #[tokio::test]
@@ -374,9 +377,14 @@ async fn deux_navigateurs_en_meme_temps_un_seul_gagne() {
     for _ in 0..5 {
         let state = installation_neuve();
         let mut taches = Vec::new();
-        for (i, adresse) in [HOTE_DU_LAN, AUTRE_HOTE_DU_LAN, HOTE_DU_LAN, AUTRE_HOTE_DU_LAN]
-            .into_iter()
-            .enumerate()
+        for (i, adresse) in [
+            HOTE_DU_LAN,
+            AUTRE_HOTE_DU_LAN,
+            HOTE_DU_LAN,
+            AUTRE_HOTE_DU_LAN,
+        ]
+        .into_iter()
+        .enumerate()
         {
             let state = state.clone();
             taches.push(tokio::spawn(async move {
