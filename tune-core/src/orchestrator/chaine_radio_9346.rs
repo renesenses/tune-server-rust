@@ -54,6 +54,8 @@ pub(super) struct ChaineRadio {
     crossfeed: Option<CrossfeedPrepare>,
     /// Interrupteur de compensation de niveau (#5071), PURE exclu.
     compensation: bool,
+    /// rc14 — le réglage des enceintes de la zone (hors PURE, « Bypass all »).
+    enceintes: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
 }
 
 impl ChaineRadio {
@@ -105,10 +107,16 @@ impl ChaineRadio {
         } else {
             None
         };
+        let enceintes = self
+            .enceintes
+            .clone()
+            .filter(|r| !r.est_neutre(usize::from(channels)))
+            .map(crate::audio::reglage_enceintes::ProcesseurEnceintes::new);
         StreamingDsp {
             convolver,
             crossfeed,
             compensation,
+            enceintes,
             channels,
             sample_rate,
             ..Default::default()
@@ -142,7 +150,10 @@ impl PlaybackOrchestrator {
             ombre: self.crossfeed_ombre_configuree(zone_id),
             tiers,
         });
-        if convolution.is_none() && crossfeed.is_none() {
+        let enceintes = self
+            .zone_reglage_enceintes(zone_id)
+            .filter(|r| !r.est_neutre_partout());
+        if convolution.is_none() && crossfeed.is_none() && enceintes.is_none() {
             return None;
         }
         Some(ChaineRadio {
@@ -150,6 +161,7 @@ impl PlaybackOrchestrator {
             convolution,
             crossfeed,
             compensation: self.zone_compensation_de_niveau(zone_id),
+            enceintes,
         })
     }
 }

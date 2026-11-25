@@ -2067,6 +2067,11 @@ struct StreamingDsp {
     /// locale (qui compense par son volume), en PURE, interrupteur coupé, ou
     /// sans égaliseur ni crossfeed.
     compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
+    /// rc14 — le réglage des enceintes (greffon TESS `speaker-setup`) :
+    /// délai, gain et phase par voie, APRÈS tous les autres greffons (dernier
+    /// étage de l'exécuteur), avant la compensation. `None` : réglage absent,
+    /// neutre pour ce flux, PURE ou « Bypass all ».
+    enceintes: Option<crate::audio::reglage_enceintes::ProcesseurEnceintes>,
     /// #4407 — la cadence du PCM que ce porteur voit : de quoi rebâtir un
     /// égaliseur relevé en vol aux bons coefficients.
     sample_rate: u32,
@@ -2091,6 +2096,7 @@ impl StreamingDsp {
             || self.convolver.is_some()
             || self.crossfeed.is_some()
             || self.compensation.is_some()
+            || self.enceintes.is_some()
     }
 
     /// Le crossfeed de ce porteur sera-t-il réellement EXÉCUTÉ ?
@@ -2137,6 +2143,9 @@ impl StreamingDsp {
         if let Some(cf) = self.crossfeed.as_ref() {
             let inerte = if self.channels == 2 { "" } else { "(inerte)" };
             etages.extend(cf.decrire().into_iter().map(|e| format!("{e}{inerte}")));
+        }
+        if self.enceintes.is_some() {
+            etages.push(format!("enceintes@{flux}"));
         }
         if let Some(c) = self.compensation.as_ref() {
             etages.push(format!("compensation:{:+.2}dB@{flux}", c.cible_db()));

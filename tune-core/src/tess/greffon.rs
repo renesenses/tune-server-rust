@@ -80,6 +80,12 @@ pub enum Position {
     Free,
     /// Dernier des greffons, juste avant les étages fixes de sortie.
     LastPlugin,
+    /// rc14 — APRÈS tous les greffons (réaffectation comprise), juste avant
+    /// le suréchantillonneur, quelle que soit sa place dans la liste : le
+    /// réglage des enceintes (`speaker-setup`) voit les voies telles qu'elles
+    /// partent vers les enceintes. Un client qui ne connaît pas cette valeur
+    /// la lit `unknown`.
+    BeforeUpsampling,
     #[serde(other)]
     Unknown,
 }
@@ -368,7 +374,8 @@ impl Ligne {
     }
 }
 
-/// Les onze greffons TESS de la v1.0 et leurs droits (décisions Q2 révisée,
+/// Les douze greffons TESS de la v1.0 (rc14 : `speaker-setup`, réglage des
+/// enceintes, placé juste avant le suréchantillonneur) et leurs droits (décisions Q2 révisée,
 /// Q3, P1 ; `mono-downmix` ajouté par T02, décision D2 de Bertrand du 18/11).
 /// Room correction : Premium pour une correction mesurée ; une correction
 /// calculée sans micro (C5) est Free (D1, voir `migration::correction_estimee`).
@@ -513,6 +520,23 @@ pub fn catalogue_de_reference() -> Catalogue {
         },
     ];
     let mut plugins: Vec<DescripteurGreffon> = lignes.iter().map(Ligne::descripteur).collect();
+    // rc14 (GO du 25/11) — le réglage des enceintes : distance, gain et phase
+    // par voie. Gratuit par défaut (droit à trancher par Bertrand). Son schéma
+    // vit avec son moteur, bornes comprises.
+    plugins.push(DescripteurGreffon {
+        id: crate::audio::reglage_enceintes::ID_GREFFON.into(),
+        name: "Speaker setup".into(),
+        category: Categorie::RoomAndFilters,
+        entitlement: Droit::Free,
+        feature: None,
+        origin: Origine::Reference,
+        settings_schema: crate::audio::reglage_enceintes::schema_reglages(),
+        placement: ContraintesPlace {
+            channels: Canaux::Any,
+            position: Position::BeforeUpsampling,
+            exclusive_group: None,
+        },
+    });
     for d in &mut plugins {
         if FACADES_EGALISEUR.contains(&d.id.as_str()) {
             d.placement.exclusive_group = Some(GroupeExclusif {
@@ -577,7 +601,7 @@ mod tests {
     #[test]
     fn le_catalogue_de_reference_suit_les_decisions() {
         let c = catalogue_de_reference();
-        assert_eq!(c.plugins.len(), 11);
+        assert_eq!(c.plugins.len(), 12);
         c.verifier().unwrap();
         let droit = |id: &str| c.get(id).unwrap().entitlement;
         for id in [
@@ -586,6 +610,7 @@ mod tests {
             "crossfeed",
             "mono-downmix",
             "channel-remap",
+            "speaker-setup",
         ] {
             assert_eq!(droit(id), Droit::Free, "{id}");
         }
@@ -775,6 +800,32 @@ mod tests {
         assert!(
             d.verifier_reglages(&json!({ "filter_set": "a.wav", "gain": 3 }))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn le_reglage_des_enceintes_passe_avant_le_surechantillonneur_rc14() {
+        let c = catalogue_de_reference();
+        c.verifier().unwrap();
+        let d = c.get("speaker-setup").unwrap();
+        assert_eq!(d.entitlement, Droit::Free);
+        assert!(!d.demande_le_premium());
+        assert_eq!(d.origin, Origine::Reference);
+        assert_eq!(d.placement.channels, Canaux::Any);
+        assert_eq!(d.placement.position, Position::BeforeUpsampling);
+        assert!(d.groupe_effectif().is_none());
+        // Le schéma publié est celui du moteur, bornes comprises.
+        assert_eq!(
+            d.settings_schema,
+            crate::audio::reglage_enceintes::schema_reglages()
+        );
+        let v = serde_json::to_value(d).unwrap();
+        assert_eq!(v["placement"]["position"], json!("before_upsampling"));
+        // L'hôte vérifie la forme : clé inconnue refusée.
+        assert!(d.verifier_reglages(&json!({ "delay_ms": 3 })).is_err());
+        assert!(
+            d.verifier_reglages(&json!({ "channels": [], "invert_all": true }))
+                .is_ok()
         );
     }
 }

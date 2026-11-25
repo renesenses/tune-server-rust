@@ -951,6 +951,36 @@ pub(super) fn zone_mono_downmix_step_lang(
         .then(|| ts(lang, "mono").to_string())
 }
 
+/// rc14 — le réglage des enceintes (greffon TESS `speaker-setup`) touche-t-il
+/// la sortie LOCALE de la zone, et si oui, que dire ? Même règle que
+/// l'orchestrateur (`zone_reglage_enceintes` : armé, hors PURE et « Bypass
+/// all »), jugée sur les voies de la piste. Le texte donne le délai de chaque
+/// voie et la latence ajoutée (le plus grand délai).
+pub(super) fn zone_enceintes_step_lang(
+    lang: &str,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    output_type: &str,
+    canaux: Option<u16>,
+) -> Option<String> {
+    if output_type != "local" {
+        return None;
+    }
+    let r = tune_core::audio::reglage_enceintes::reglages_appliques(backend, zone_id)?;
+    let n = usize::from(canaux.unwrap_or(2).max(1));
+    if r.est_neutre(n) {
+        return None;
+    }
+    let retards = r.retards_ms(n);
+    let latence = retards.iter().copied().fold(0.0, f64::max);
+    let liste = retards
+        .iter()
+        .map(|d| format!("{d:.2}"))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    Some(fs(lang, "speaker_setup", &[&liste, &format!("{latence:.2}")]))
+}
+
 /// #6044 — la zone réaffecte-t-elle les canaux de la piste en cours, et si
 /// oui, que dire ?
 ///
@@ -2146,6 +2176,7 @@ fn assembler_les_etapes_lang(
         mono_downmix_step,
         reaffectation_step,
         reaffectation_ignoree,
+        enceintes_step,
         compensation_reseau_db,
         crossfeed_du_flux,
         ui_volume,
@@ -2909,6 +2940,18 @@ fn assembler_les_etapes_lang(
             "bit_perfect": false,
         }));
     }
+    // rc14 — « Réglage des enceintes » : après l'adaptation des voies, juste
+    // avant le suréchantillonneur, là où l'étage de conversion l'applique.
+    // `bit_perfect: false` : un délai seul garde chaque mot, mais décale les
+    // voies entre elles ; gain et phase réécrivent les échantillons.
+    if let Some(desc) = &enceintes_step {
+        steps.push(json!({
+            "name": "Speaker setup",
+            "code": "speaker_setup",
+            "description": desc,
+            "bit_perfect": false,
+        }));
+    }
     // #6230 — une règle armée que l'étage n'applique pas se DIT, avec la
     // raison : sans cette ligne, l'utilisateur voit tous ses canaux sortir
     // et ne sait pas pourquoi sa grille est restée sans effet. Rien n'est
@@ -3175,6 +3218,7 @@ fn rendre_les_verdicts(
         && !transformation_reelle_declaree
         && !replaygain_altere
         && mono_downmix_step.is_none()
+        && traitements.enceintes_step.is_none()
         && !reaffectation_active
         && !compensation_reseau
         && !crossfeed_du_flux;
@@ -3811,6 +3855,8 @@ struct Traitements {
     eq_step_description: Option<String>,
     replaygain_step: Option<ReplayGainStep>,
     mono_downmix_step: Option<String>,
+    /// rc14 — le réglage des enceintes de la sortie locale, décrit.
+    enceintes_step: Option<String>,
     /// #6044 — la réaffectation des canaux de la sortie locale, décrite.
     /// Posée après `relever_les_traitements`, qui ne voit pas les
     /// transformations déclarées par la sortie.
@@ -3879,6 +3925,8 @@ fn relever_les_traitements_lang(
     // vraie transformation — elle réécrit chaque échantillon — donc elle porte
     // une étape et fait tomber le verdict bit-perfect, comme le ReplayGain.
     let mono_downmix_step = zone_mono_downmix_step_lang(lang, &backend, zid, output_type);
+    let enceintes_step =
+        zone_enceintes_step_lang(lang, &backend, zid, output_type, np.channels);
 
     // #5071 — la compensation de niveau d'une zone RÉSEAU multiplie chaque
     // échantillon du flux : une étape, et le verdict en tient compte.
@@ -3932,6 +3980,7 @@ fn relever_les_traitements_lang(
         eq_step_description,
         replaygain_step,
         mono_downmix_step,
+        enceintes_step,
         reaffectation_step: None,
         reaffectation_ignoree: None,
         compensation_reseau_db,

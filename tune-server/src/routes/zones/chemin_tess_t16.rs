@@ -73,6 +73,7 @@ pub(crate) fn en_service_d_apres_le_chemin(sp: &Value, volume_logiciel: bool) ->
         || steps.iter().any(|e| {
             (a_le_nom(e, "DSP") || a_le_nom(e, "Mono") || a_le_code(e, "crossfeed")) && altere(e)
                 || a_le_code(e, "channel_remap")
+                || a_le_code(e, "speaker_setup")
         });
     let mut hors_service = Vec::new();
     if sp

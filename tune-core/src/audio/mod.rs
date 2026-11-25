@@ -157,6 +157,8 @@ pub mod pipeline;
 /// #6044 — le greffon « Réaffectation des canaux » : réglage par zone et par
 /// album, résolution de la règle qui s'applique à une piste.
 pub mod reaffectation_canaux;
+// rc14 — greffon TESS « Speaker Setup » (distance, gain, phase par voie).
+pub mod reglage_enceintes;
 pub mod reglages_de_volume;
 pub mod replaygain;
 pub mod repli_dsd_4354;

@@ -51,6 +51,7 @@
 //! | `zone_{id}_native_plugin_{p}` | greffon `{p}` (Crossfeed Pro, Crosstalk, paquets tiers), idem |
 //! | `zone_{id}_mono_downmix` | `mono-downmix` (greffon dédié, D2), coché si `"true"` sur une sortie locale |
 //! | `zone_{id}_channel_remap` | `channel-remap`, en dernier, idem |
+//! | `zone_{id}_speaker_setup` | `speaker-setup` (rc14, réglage des enceintes), idem ; s'exécute après la réaffectation |
 //! | `zone_{id}_upsampler` | `fixed.upsampling` : `pcm` avec `filter`, `max_ratio`, `max_rate_hz` si `enabled`, sinon `off` |
 //! | `zone_{id}_audiophile`, `zone_{id}_strict_bitperfect` | hors chaîne : [`LectureZone::pure`] (`ContexteExecution.pure`) |
 //! | `zone_{id}_level_compensation` | hors chaîne : [`LectureZone::compensation_de_niveau`] (T07) |
@@ -108,6 +109,8 @@ pub const ID_CONVOLUTION: &str = "convolution";
 pub const ID_CROSSFEED: &str = "crossfeed";
 pub const ID_MONO: &str = "mono-downmix";
 pub const ID_REAFFECTATION: &str = "channel-remap";
+/// rc14 — le réglage des enceintes (distance, gain, phase par voie).
+pub const ID_ENCEINTES: &str = crate::audio::reglage_enceintes::ID_GREFFON;
 
 /// D1 : réglage d'un `room-correction` qui dit d'où vient la correction :
 /// [`ORIGINE_MESURE`] (micro, Premium) ou [`ORIGINE_ESTIMATION`] (calculée
@@ -236,16 +239,19 @@ pub enum Partie {
     Natif(String),
     Mono,
     Reaffectation,
+    /// rc14 — `zone_{id}_speaker_setup`.
+    Enceintes,
     Surechantillonnage,
 }
 
 impl Partie {
-    const FIXES: [Partie; 6] = [
+    const FIXES: [Partie; 7] = [
         Partie::Egaliseur,
         Partie::Convolution,
         Partie::Crossfeed,
         Partie::Mono,
         Partie::Reaffectation,
+        Partie::Enceintes,
         Partie::Surechantillonnage,
     ];
 
@@ -258,6 +264,7 @@ impl Partie {
             Self::Natif(id) => format!("native_plugin_{id}"),
             Self::Mono => "mono_downmix".into(),
             Self::Reaffectation => "channel_remap".into(),
+            Self::Enceintes => "speaker_setup".into(),
             Self::Surechantillonnage => "upsampler".into(),
         }
     }
@@ -269,6 +276,7 @@ impl Partie {
             "crossfeed" => Self::Crossfeed,
             "mono_downmix" => Self::Mono,
             "channel_remap" => Self::Reaffectation,
+            "speaker_setup" => Self::Enceintes,
             "upsampler" => Self::Surechantillonnage,
             autre => Self::Natif(autre.strip_prefix("native_plugin_")?.to_owned()),
         })
@@ -283,6 +291,7 @@ impl Partie {
             Self::Natif(id) => crate::audio::natifs_tiers::cle_de_zone(zone_id, id),
             Self::Mono => format!("zone_{zone_id}_mono_downmix"),
             Self::Reaffectation => crate::audio::reaffectation_canaux::cle_de_zone(zone_id),
+            Self::Enceintes => crate::audio::reglage_enceintes::cle_de_zone(zone_id),
             Self::Surechantillonnage => crate::audio::surechantillonnage::cle_de_zone(zone_id),
         }
     }
@@ -382,6 +391,12 @@ fn decoder(partie: &Partie, cle: &str, brut: Option<&str>) -> Result<Decodee, Er
                 Value::Object(m.clone()),
             )
             .map_err(|e| corrompue(cle, format!("not channel remap settings: {e}")))?;
+            Decodee::Objet(m)
+        }
+        Partie::Enceintes => {
+            let m = objet(cle, brut)?;
+            crate::audio::reglage_enceintes::ReglagesEnceintes::lire(&Value::Object(m.clone()))
+                .map_err(|e| corrompue(cle, format!("not speaker setup settings: {e}")))?;
             Decodee::Objet(m)
         }
         // Un chemin vide ne désigne aucune réponse impulsionnelle.
@@ -639,6 +654,8 @@ fn rang(id: &str) -> u8 {
         6
     } else if id == ID_REAFFECTATION {
         7
+    } else if id == ID_ENCEINTES {
+        8
     } else {
         5
     }
@@ -783,6 +800,11 @@ fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, ctx: &Co
             poser(chaine, ID_REAFFECTATION, on, sans_enabled(m));
         }
         (Partie::Reaffectation, _) => retirer(chaine, ID_REAFFECTATION),
+        (Partie::Enceintes, Decodee::Objet(m)) => {
+            let on = coche(&m);
+            poser(chaine, ID_ENCEINTES, on, sans_enabled(m));
+        }
+        (Partie::Enceintes, _) => retirer(chaine, ID_ENCEINTES),
         (Partie::Mono, Decodee::Mono(true)) if ctx.sortie_locale || !ctx.premiere_lecture => {
             poser(chaine, ID_MONO, true, Value::Null)
         }
@@ -1691,6 +1713,10 @@ fn projeter(
             .map(|_| ())
             .map_err(|e| e.to_string())
         }),
+        Partie::Enceintes => projeter_objet(trouver(ID_ENCEINTES), courant, |m| {
+            crate::audio::reglage_enceintes::ReglagesEnceintes::lire(&Value::Object(m.clone()))
+                .map(|_| ())
+        }),
         Partie::Mono => Ok(projeter_mono(chaine, courant)),
         Partie::Surechantillonnage => Ok(projeter_surechantillonnage(chaine, courant)),
     }
@@ -1701,7 +1727,8 @@ fn projeter(
 pub struct BilanEcriture {
     /// Les anciennes clés réécrites ou effacées. La route qui écrit (T08)
     /// rafraîchit la sortie vivante pour chacune, comme les anciennes routes
-    /// (`REGLAGES_A_RAFRAICHIR`).
+    /// (`REGLAGES_A_RAFRAICHIR`). rc14 : la clé du réglage des enceintes y
+    /// figure aussi, sans être réécrite, quand « Bypass all » bascule.
     pub cles_modifiees: Vec<String>,
     /// La chaîne enregistrée a changé.
     pub chaine_ecrite: bool,
@@ -1754,6 +1781,12 @@ fn ecrire_chaine_avec(
         }
     };
     let chaine = &marques_par_le_serveur(reference.as_ref(), chaine);
+    // rc14 — « Bypass all » coupe le réglage des enceintes sans changer sa
+    // clé : la bascule doit tout de même atteindre la sortie vivante.
+    let bypass_bascule_les_enceintes = chaine.plugins.iter().any(|m| m.id == ID_ENCEINTES)
+        && reference
+            .as_ref()
+            .is_some_and(|r| r.bypass_all != chaine.bypass_all);
 
     let mut inst = lire_instantane(settings, zone_id)?;
     let mut parties: Vec<Partie> = inst.keys().cloned().collect();
@@ -1796,6 +1829,11 @@ fn ecrire_chaine_avec(
             Ecriture::Rien => continue,
         }
         bilan.cles_modifiees.push(cle);
+    }
+    let cle_enceintes = Partie::Enceintes.cle(zone_id);
+    if bypass_bascule_les_enceintes && !bilan.cles_modifiees.contains(&cle_enceintes) {
+        // Pas réécrite : seulement à rafraîchir (voir `BilanEcriture`).
+        bilan.cles_modifiees.push(cle_enceintes);
     }
 
     entre();

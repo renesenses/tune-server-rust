@@ -434,6 +434,9 @@ const ECHEANCE_FIL_A_LA_DESTRUCTION: std::time::Duration = std::time::Duration::
 /// `stop()`, il n'y a plus ni canal ni fil : rien à faire.
 impl Drop for LocalOutput {
     fn drop(&mut self) {
+        // rc14 — le réglage des enceintes est rangé par l'adresse du drapeau
+        // PURE de la sortie : il part avec elle.
+        enceintes_de_sortie::oublier(&self.pure_bypass);
         let fil = self
             .play_thread
             .get_mut()
@@ -608,6 +611,9 @@ mod sortie_double_locale;
 mod periode;
 /// #6044 — la réaffectation des canaux (greffon `channel-remap`).
 mod reaffectation;
+/// rc14 — le réglage des enceintes (greffon TESS `speaker-setup`) de chaque
+/// sortie : délai, gain et phase par voie, juste avant le suréchantillonneur.
+pub(crate) mod enceintes_de_sortie;
 
 /// #6057 — la disposition des canaux DÉCLARÉE par le fichier de la piste,
 /// posée par l'orchestrateur ; `None` quand le fichier ne dit rien ou dit
@@ -2401,6 +2407,23 @@ impl LocalOutput {
     /// ne peut pas claquer.
     pub fn set_mono_downmix(&self, mono: bool) {
         self.mono_downmix.store(mono, Ordering::Relaxed);
+    }
+
+    /// rc14 — poser (ou retirer, `None`) le réglage des enceintes de la zone
+    /// (greffon TESS `speaker-setup`). En pleine lecture, le passage se fait
+    /// par un fondu de `reglage_enceintes::RAMPE_MS` : ni saut de délai, ni
+    /// marche de gain. `None` sous PURE ou « Bypass all » (l'orchestrateur ne
+    /// le charge pas) ; le drapeau PURE le coupe de toute façon au bloc.
+    pub fn set_reglage_enceintes(
+        &self,
+        reglages: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
+    ) {
+        enceintes_de_sortie::poser(&self.pure_bypass, reglages);
+    }
+
+    /// rc14 — le réglage des enceintes touche-t-il le signal de cette sortie ?
+    pub fn reglage_enceintes_actif(&self) -> bool {
+        enceintes_de_sortie::agit(&self.pure_bypass, self.dop_active.load(Ordering::Relaxed))
     }
 
     /// #6044 — poser (ou retirer) la matrice de réaffectation des canaux de
@@ -5478,6 +5501,7 @@ fn prepare_windows_native_pcm_a_voies_egales(
         pure_bypass,
         mono_downmix,
         adaptation,
+        44_100,
     )
 }
 
@@ -5510,6 +5534,9 @@ fn prepare_windows_native_pcm(
     pure_bypass: &AtomicBool,
     mono_downmix: &AtomicBool,
     adaptation: Option<AdaptationNative<'_>>,
+    // rc14 — la cadence de la source : le réglage des enceintes y compte ses
+    // délais en échantillons.
+    cadence: u32,
 ) -> Option<PreparedNativePcm> {
     let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
     if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
@@ -5535,6 +5562,7 @@ fn prepare_windows_native_pcm(
     let bit_perfect = dop
         || (volume_units == UNITE_DU_GAIN_DE_RENDU
             && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass, mono_downmix)
+            && !enceintes_de_sortie::agit(pure_bypass, false)
             && !canaux_adaptes);
     if dop && sortie != channels {
         let trames = bytes.len() / (usize::from(channels.max(1)) * usize::from(bit_depth / 8));
@@ -5571,6 +5599,9 @@ fn prepare_windows_native_pcm(
                 declaree.as_deref(),
             );
         }
+        // rc14 — le réglage des enceintes, sur les voies ouvertes, avant le
+        // volume.
+        enceintes_de_sortie::traiter(pure_bypass, &mut float, sortie, cadence, false);
         let volume = volume_units as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
         if volume != 1.0 {
             for sample in &mut float {
@@ -5971,6 +6002,16 @@ impl EtageDeConversion<'_> {
             // gardes #3233 et REF-7 lisent ici, même refus en silence.
             mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
         }
+        // rc14 — le réglage des enceintes : sur les voies qui partent vers les
+        // enceintes (après l'adaptation), avant le suréchantillonneur et le
+        // rééchantillonnage, à la cadence de la source.
+        enceintes_de_sortie::traiter(
+            self.pcm.pure_bypass,
+            &mut mots,
+            self.sortie.canaux,
+            self.spec.cadence(),
+            self.pcm.dop_active.load(Ordering::Relaxed),
+        );
         if let Some(etage) = self
             .surechantillonneur
             .as_mut()
@@ -6012,6 +6053,9 @@ impl EtageDeConversion<'_> {
             self.pcm.convolver,
             self.pcm.crossfeed,
             self.pcm.mono_downmix,
+        ) || enceintes_de_sortie::agit(
+            self.pcm.pure_bypass,
+            self.pcm.dop_active.load(Ordering::Relaxed),
         ) || (!self.pcm.dop_active.load(Ordering::Relaxed)
             && !self.pcm.pure_bypass.load(Ordering::Relaxed)
             && self

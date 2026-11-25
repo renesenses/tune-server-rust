@@ -177,6 +177,8 @@ pub fn rang_historique(id: &str, settings: &Value) -> u8 {
         _ if id.starts_with("crossfeed-") => 2,
         "mono-downmix" => 4,
         "channel-remap" => 5,
+        // rc14 — après tout, juste avant l'upsampling.
+        "speaker-setup" => 6,
         _ => 3,
     }
 }

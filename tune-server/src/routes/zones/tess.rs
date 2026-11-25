@@ -179,6 +179,8 @@ pub fn greffon_disponible(settings: &SettingsRepo, id: &str) -> bool {
         ID_CROSSFEED => enabled(settings, "crossfeed"),
         ID_REAFFECTATION => enabled(settings, "channel-remap"),
         ID_CONVOLUTION | ID_MONO => true,
+        // rc14 — le réglage des enceintes est compilé dans le serveur.
+        tune_core::tess::migration::ID_ENCEINTES => true,
         // rc14 — l'étage fixe de suréchantillonnage : le moteur `upsampler`.
         ID_UPSAMPLING => enabled(settings, tune_core::audio::premium_plugins::UPSAMPLER),
         // Le moteur existe (T13) ; l'hôte ne le fait pas encore tourner.
@@ -712,6 +714,10 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     }
     if est(Partie::Reaffectation) {
         let _ = state.orchestrator.refresh_zone_reaffectation(id).await;
+    }
+    // rc14 — le réglage des enceintes (ou « Bypass all » qui le coupe).
+    if est(Partie::Enceintes) {
+        let _ = state.orchestrator.refresh_zone_enceintes(id).await;
     }
     if est(Partie::Surechantillonnage) {
         state.orchestrator.refresh_zone_upsampler(id).await;

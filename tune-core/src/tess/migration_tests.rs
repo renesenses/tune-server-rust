@@ -2654,3 +2654,87 @@ fn d1_une_chaine_de_version_future_est_relue_avec_l_origine_du_serveur() {
     assert!(!l.conversion_piece);
     assert!(correction_estimee(&l.chaine.plugins[0]));
 }
+
+/// rc14 — le réglage des enceintes : écriture croisée vers
+/// `zone_{id}_speaker_setup`, relecture, bornes refusées à l'écriture, et
+/// « Bypass all » qui demande le rafraîchissement sans réécrire la clé.
+#[test]
+fn le_reglage_des_enceintes_s_ecrit_et_se_relit_rc14() {
+    let (_db, s) = base();
+    let z = 41;
+    let cle = format!("zone_{z}_speaker_setup");
+    let reglages = json!({
+        "channels": [
+            { "distance_cm": 300, "gain_db": 0, "invert": false },
+            { "distance_cm": 250, "gain_db": -2.5, "invert": true }
+        ],
+        "invert_all": false
+    });
+    let mut c = ChaineTess::default();
+    c.plugins.push(MaillonGreffon {
+        id: ID_ENCEINTES.into(),
+        enabled: true,
+        settings: reglages.clone(),
+    });
+    let b = ecrire_chaine(&s, z, &c).unwrap();
+    assert!(b.cles_modifiees.contains(&cle), "{:?}", b.cles_modifiees);
+    let ecrit: Value = serde_json::from_str(&s.get(&cle).unwrap().unwrap()).unwrap();
+    assert_eq!(ecrit["enabled"], json!(true));
+    assert_eq!(ecrit["channels"], reglages["channels"]);
+    assert_eq!(
+        crate::audio::reglage_enceintes::reglages_configures(&s, z)
+            .unwrap()
+            .channels
+            .len(),
+        2
+    );
+    let lu = lire_zone(&s, z, true).unwrap();
+    assert_eq!(ids(&lu.chaine), vec![(ID_ENCEINTES, true)]);
+    assert_eq!(maillon(&lu.chaine, ID_ENCEINTES).settings, reglages);
+
+    // Réécrire la même chaîne ne touche rien.
+    assert!(ecrire_chaine(&s, z, &c).unwrap().cles_modifiees.is_empty());
+
+    // « Bypass all » : la clé ne change pas, mais elle est à rafraîchir (la
+    // sortie vivante coupe le greffon).
+    let mut contourne = c.clone();
+    contourne.bypass_all = true;
+    let b = ecrire_chaine(&s, z, &contourne).unwrap();
+    assert_eq!(b.cles_modifiees, vec![cle.clone()]);
+    let apres: Value = serde_json::from_str(&s.get(&cle).unwrap().unwrap()).unwrap();
+    assert_eq!(apres, ecrit, "la clé n'est pas réécrite");
+
+    // Hors bornes : refusé, rien n'est écrit.
+    let mut hors = c.clone();
+    hors.plugins[0].settings = json!({ "channels": [{ "gain_db": 12 }] });
+    assert!(matches!(
+        ecrire_chaine(&s, z, &hors),
+        Err(ErreurMigration::ReglagesInvalides { .. })
+    ));
+    assert_eq!(
+        serde_json::from_str::<Value>(&s.get(&cle).unwrap().unwrap()).unwrap(),
+        ecrit
+    );
+
+    // Décoché : la clé est décochée, ses réglages restent.
+    let mut decoche = c.clone();
+    decoche.plugins[0].enabled = false;
+    ecrire_chaine(&s, z, &decoche).unwrap();
+    assert!(crate::audio::reglage_enceintes::reglages_configures(&s, z).is_none());
+    let v: Value = serde_json::from_str(&s.get(&cle).unwrap().unwrap()).unwrap();
+    assert_eq!(v["enabled"], json!(false));
+    assert_eq!(v["channels"], reglages["channels"]);
+
+    // Placé après la réaffectation à la relecture des anciennes clés.
+    let (_db2, s2) = base();
+    s2.set(&cle.replace("41", "42"), &json!({"enabled": true}).to_string())
+        .unwrap();
+    s2.set(
+        "zone_42_channel_remap",
+        &json!({"enabled": true}).to_string(),
+    )
+    .unwrap();
+    let lu = lire_zone(&s2, 42, true).unwrap();
+    let ordre: Vec<&str> = lu.chaine.plugins.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ordre, vec![ID_REAFFECTATION, ID_ENCEINTES]);
+}

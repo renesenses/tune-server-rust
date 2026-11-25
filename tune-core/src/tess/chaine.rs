@@ -456,7 +456,18 @@ impl ChaineTess {
         self.verifier_upsampling()?;
 
         let mut actifs_par_groupe: Vec<(String, &str)> = Vec::new();
-        let dernier = self.plugins.len().saturating_sub(1);
+        // rc14 — un greffon placé avant le suréchantillonneur (`speaker-setup`)
+        // s'exécute après tous les autres, où qu'il soit dans la liste : il ne
+        // compte pas pour « dernier des greffons ».
+        let dernier = self
+            .plugins
+            .iter()
+            .rposition(|m| {
+                catalogue
+                    .get(&m.id)
+                    .is_none_or(|d| d.placement.position != Position::BeforeUpsampling)
+            })
+            .unwrap_or(0);
         for (i, m) in self.plugins.iter().enumerate() {
             let d = catalogue
                 .get(&m.id)
@@ -805,6 +816,35 @@ mod tests {
                 Err(ErreurChaine::PasEnDernier("channel-remap".into()))
             );
         }
+    }
+
+    #[test]
+    fn le_reglage_des_enceintes_peut_suivre_la_reaffectation_rc14() {
+        // `speaker-setup` passe après tous les greffons : le placer après la
+        // réaffectation (`last_plugin`) est accepté, sans Premium.
+        let ok = chaine(vec![
+            maillon("equalizer-graphic", true),
+            maillon("channel-remap", true),
+            maillon("speaker-setup", true),
+        ]);
+        valider(&ok, GRATUIT).unwrap();
+        // Ailleurs dans la liste aussi (il s'exécute de toute façon en fin).
+        let ok = chaine(vec![
+            maillon("speaker-setup", true),
+            maillon("channel-remap", true),
+        ]);
+        valider(&ok, GRATUIT).unwrap();
+        // Contre-épreuve : un greffon ordinaire après la réaffectation reste
+        // refusé, même suivi du réglage des enceintes.
+        let ko = chaine(vec![
+            maillon("channel-remap", true),
+            maillon("equalizer-graphic", true),
+            maillon("speaker-setup", true),
+        ]);
+        assert_eq!(
+            valider(&ko, PREMIUM),
+            Err(ErreurChaine::PasEnDernier("channel-remap".into()))
+        );
     }
 
     #[test]

@@ -603,3 +603,71 @@ fn t06_une_longue_piste_compensee_reste_en_f32_et_reserve_sa_place() {
     // Et le seuil de production borne une piste de 10 min en 192 kHz.
     assert!(192_000 * 2 * 600 > SEUIL_STOCKAGE_F64);
 }
+
+/// rc14 — le réglage des enceintes dans un flux que Tune fabrique (relais
+/// progressif, flux tiré) : dernier étage de l'exécuteur. Un délai seul rend
+/// chaque mot EXACT, décalé du nombre entier d'échantillons attendu, en 16 et
+/// 24 bits, au fil de tampons successifs ; la voie la plus lointaine garde ses
+/// octets. Le délai n'est pas retiré comme une amorce de latence : la
+/// longueur du flux est conservée.
+#[test]
+fn le_reglage_des_enceintes_decale_une_voie_au_mot_pres_rc14() {
+    use crate::audio::reglage_enceintes::{ProcesseurEnceintes, ReglagesEnceintes, VoieEnceinte};
+    let reglages = ReglagesEnceintes {
+        channels: vec![
+            VoieEnceinte {
+                distance_cm: 343.0 / 2.0, // 5 ms plus près : 240 trames à 48 kHz
+                ..VoieEnceinte::default()
+            },
+            VoieEnceinte {
+                distance_cm: 343.0,
+                ..VoieEnceinte::default()
+            },
+        ],
+        invert_all: false,
+    };
+    assert_eq!(reglages.retards_en_echantillons(2, 48_000), vec![240, 0]);
+    for bits in [16u16, 24] {
+        let w = usize::from(bits / 8);
+        let src = source(bits, 9_600 * 2, 0.9, 21);
+        let mut dsp = StreamingDsp {
+            enceintes: Some(ProcesseurEnceintes::new(reglages.clone())),
+            ..porteur(None)
+        };
+        assert!(dsp.is_active());
+        let mut servi = Vec::new();
+        for bloc in src.chunks(1_000 * 2 * w) {
+            let mut b = bloc.to_vec();
+            dsp.process_flux(&mut b, bits);
+            assert_eq!(b.len(), bloc.len(), "aucune amorce retirée");
+            servi.extend(b);
+        }
+        let trame = 2 * w;
+        for n in 0..9_600 {
+            // Voie droite (la plus lointaine) : ses octets, intacts.
+            assert_eq!(
+                servi[n * trame + w..(n + 1) * trame],
+                src[n * trame + w..(n + 1) * trame],
+                "{bits} bits, trame {n}, droite"
+            );
+            // Voie gauche : le mot de la trame n − 240, exact.
+            let attendu = if n < 240 {
+                vec![0u8; w]
+            } else {
+                src[(n - 240) * trame..(n - 240) * trame + w].to_vec()
+            };
+            assert_eq!(
+                servi[n * trame..n * trame + w],
+                attendu[..],
+                "{bits} bits, trame {n}, gauche"
+            );
+        }
+    }
+    // Contre-épreuve : sans réglage, le porteur est inactif (bit-perfect).
+    let mut vide = porteur(None);
+    assert!(!vide.is_active());
+    let src = source(16, 2_000, 0.9, 3);
+    let mut pcm = src.clone();
+    vide.process(&mut pcm, 16);
+    assert_eq!(pcm, src);
+}

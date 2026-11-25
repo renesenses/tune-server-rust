@@ -2085,6 +2085,8 @@ impl PlaybackOrchestrator {
             // quoi une zone qui sort de PURE resterait stéréo jusqu'à la piste
             // suivante alors que le panneau annonce déjà « Mono ».
             local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+            // rc14 — le réglage des enceintes aussi (coupé sous PURE).
+            local_output.set_reglage_enceintes(self.zone_reglage_enceintes(zone_id));
             // #6044 — la réaffectation est elle aussi gouvernée par PURE.
             local_output.set_reaffectation(self.reaffectation_de_la_piste(
                 zone_id,
@@ -2189,6 +2191,8 @@ impl PlaybackOrchestrator {
             crossfeed: self.load_crossfeed_processor(zone_id, sample_rate),
             channels,
             compensation: None,
+            // rc14 — le réglage des enceintes, s'il touche ce flux.
+            enceintes: self.load_reglage_enceintes(zone_id, channels),
             sample_rate,
             en_vol: None,
             convolveur_reste_a_jeter: None,
@@ -2442,6 +2446,7 @@ impl PlaybackOrchestrator {
         self.traitement_que_pure_gouverne(zone_id, crate::audio::replaygain::PisteRg::AUCUNE)
             .is_some()
             || Self::zone_mono_downmix_configure_with(&self.db, zone_id)
+            || Self::zone_enceintes_configure_with(&self.db, zone_id)
             || Self::reaffectation_de_zone_armee_with(&self.db, zone_id)
             || track_id.is_some_and(|tid| Self::reaffectation_d_album_armee_with(&self.db, tid))
     }
@@ -3258,6 +3263,98 @@ impl PlaybackOrchestrator {
             .flatten()
             .as_deref()
             == Some("true")
+    }
+
+    /// rc14 — le réglage des enceintes (greffon TESS `speaker-setup`) que la
+    /// lecture APPLIQUE : armé, hors PURE (et mesure de pièce), hors « Bypass
+    /// all ». `None` : le greffon ne tourne pas.
+    pub fn zone_reglage_enceintes(
+        &self,
+        zone_id: i64,
+    ) -> Option<crate::audio::reglage_enceintes::ReglagesEnceintes> {
+        crate::audio::reglage_enceintes::reglages_appliques(&self.db, zone_id)
+    }
+
+    /// rc14 — le réglage des enceintes CONFIGURÉ et non neutre, sans regarder
+    /// PURE (le bouclier PURE le compte parmi ce qu'il contourne).
+    pub(super) fn zone_enceintes_configure_with(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: i64,
+    ) -> bool {
+        crate::audio::reglage_enceintes::reglages_configures(
+            &crate::db::settings_repo::SettingsRepo::with_backend(db.clone()),
+            zone_id,
+        )
+        .is_some_and(|r| !r.est_neutre_partout())
+    }
+
+    /// rc14 — la zone a-t-elle un réglage des enceintes qui touche le signal
+    /// (hors PURE et « Bypass all ») ? Même usage que
+    /// [`Self::zone_has_active_crossfeed`] : décider du flux traité avant de
+    /// connaître le nombre de voies.
+    pub(super) fn zone_has_active_enceintes(&self, zone_id: i64) -> bool {
+        self.zone_reglage_enceintes(zone_id)
+            .is_some_and(|r| !r.est_neutre_partout())
+    }
+
+    /// rc14 — le processeur du réglage des enceintes d'un flux de `channels`
+    /// voies que Tune fabrique ; `None` s'il ne toucherait rien.
+    pub(super) fn load_reglage_enceintes(
+        &self,
+        zone_id: i64,
+        channels: u16,
+    ) -> Option<crate::audio::reglage_enceintes::ProcesseurEnceintes> {
+        self.zone_reglage_enceintes(zone_id)
+            .filter(|r| !r.est_neutre(usize::from(channels)))
+            .map(crate::audio::reglage_enceintes::ProcesseurEnceintes::new)
+    }
+
+    /// rc14 — reposer le réglage des enceintes sur la sortie locale qui joue,
+    /// sans attendre la piste suivante : le processeur passe au nouveau
+    /// réglage par un fondu (pas de clic). Rend `true` si une sortie locale
+    /// vivante l'a reçu.
+    pub async fn refresh_zone_enceintes(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let track_id = self.piste_en_cours(zone_id).await;
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            let reglages = self.zone_reglage_enceintes(zone_id);
+            let arme = reglages.is_some();
+            local_output.set_reglage_enceintes(reglages);
+            self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
+            info!(
+                zone_id,
+                device_id = %device_id,
+                arme,
+                "zone_speaker_setup_refreshed_live"
+            );
+            true
+        }
     }
 
     /// Réappliquer le repli mono d'une zone à la sortie locale qui joue, sans
