@@ -206,7 +206,7 @@ tune-aes67 = { path = "../plugins/tune-aes67", optional = true }
 
 [dev-dependencies]
 # Les épreuves d'intégration voient les fonctions de `test-utils`.
-tune-server = { path = ".", features = ["test-utils"] }
+tune-server = { path = ".", default-features = false, features = ["test-utils"] }
 tower = "0.5"
 # Test-only (#6286) : donner aux FLAC témoins de l'audit d'intégrité le MD5
 # STREAMINFO de leur PCM. Déjà dans Cargo.lock par tune-core.

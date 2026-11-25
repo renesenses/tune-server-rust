@@ -101,8 +101,10 @@ fn contournement_conteneur_cgroup_v2_non_detecte() {
         cgroup: "0::/\n",
         ..Default::default()
     };
+    // Le reste du serveur garde sa détection : pas de conteneur ici.
+    assert_eq!(tune_server::conteneur::moteur(&i), None);
     assert!(
-        tune_server::conteneur::moteur(&i).is_some(),
+        tune_server::conteneur::conteneur_probable(&i, false, false),
         "conteneur_cgroup_v2_sans_marqueur_non_detecte"
     );
 }
