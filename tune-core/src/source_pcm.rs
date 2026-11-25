@@ -168,8 +168,12 @@ pub const SOURCE_CALIBRATION: &str = "calibration";
 /// l'écoute », ni dans les statistiques, et n'est jamais annoncée (scrobble) ;
 /// périmée, elle est écartée de la file plutôt que jouée.
 pub fn source_technique(source: &str) -> bool {
-    source == SOURCE_CALIBRATION
+    source == SOURCE_CALIBRATION || source == SOURCE_CALIBRATION_NIVEAU
 }
+
+/// Le signal du test de niveau du micro (greffon « calibration », rc14) :
+/// une source technique lui aussi, jamais dans l'historique ni annoncée.
+pub const SOURCE_CALIBRATION_NIVEAU: &str = "calibration-niveau";
 
 /// Un flux en direct : pas de longueur, pas de durée, pas d'avance possible.
 pub struct FluxDirect {

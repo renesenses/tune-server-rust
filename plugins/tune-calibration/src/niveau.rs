@@ -63,7 +63,7 @@ use crate::mesure::{
 
 /// Le nom de la source du signal de test, dans `NowPlaying` le temps du
 /// test. Jamais dans la file.
-pub const SOURCE_NIVEAU: &str = "calibration-niveau";
+pub const SOURCE_NIVEAU: &str = tune_core::source_pcm::SOURCE_CALIBRATION_NIVEAU;
 
 // ─── Le signal de test ─────────────────────────────────────────────────────
 
@@ -732,6 +732,12 @@ impl FournisseurPcm for FournisseurNiveau {
     fn pre_armable(&self) -> bool {
         false
     }
+
+    /// Fil 3094 — `calibration-niveau` est une source technique : une ligne
+    /// d'un test fini est écartée au lieu d'être rejouée.
+    fn encore_jouable(&self, source_id: &str) -> bool {
+        self.verrou().contains_key(source_id)
+    }
 }
 
 // ─── Ce que le test demande à la zone ──────────────────────────────────────
@@ -752,10 +758,10 @@ impl ElementDeTest {
 
 /// Ce que le test de niveau demande à l'hôte, en plus de [`crate::hote::HoteZone`]
 /// (volume, traitements). Synchrone, comme `HoteZone`.
+///
+/// La zone orpheline (fil 3094) est celle de [`crate::hote::HoteZone::sortie_inactive`],
+/// qui nomme aussi la zone porteuse de l'appareil.
 pub trait ZoneDeTest: Send + Sync {
-    /// L'appareil de la zone n'est pas enregistré (zone orpheline, fil
-    /// 3094) : rend son identifiant. Le test est alors refusé avant tout.
-    fn sortie_inactive(&self, zone_id: i64) -> Option<String>;
     /// Lance le signal sur la zone : ni la file ni l'historique ne changent.
     fn jouer_signal(&self, zone_id: i64, element: &ElementDeTest) -> Result<(), String>;
     /// Arrête la zone et efface le signal de ce qu'elle affiche.
@@ -811,23 +817,6 @@ impl ZoneOrchestrateur {
 }
 
 impl ZoneDeTest for ZoneOrchestrateur {
-    fn sortie_inactive(&self, zone_id: i64) -> Option<String> {
-        let zone = self.zone(zone_id)?;
-        // Une zone navigateur n'a pas d'appareil enregistré.
-        if zone.output_type.as_deref() == Some("browser") {
-            return None;
-        }
-        let device_id = zone.output_device_id?;
-        let enregistrees = self
-            .runtime
-            .block_on(async { self.orchestrator.outputs.lock().await.list() });
-        if enregistrees.iter().any(|d| d == &device_id) {
-            return None;
-        }
-        tracing::warn!(zone_id, device_id = %device_id, "calibration_niveau_zone_sans_sortie_active");
-        Some(device_id)
-    }
-
     fn zone_en_lecture(&self, zone_id: i64) -> bool {
         use tune_core::playback::PlayState;
         let etat = self.runtime.block_on(self.playback.get_state(zone_id));
@@ -1019,8 +1008,8 @@ pub enum RefusNiveau {
     /// Un test ou une mesure tient déjà l'entrée ou la zone (409).
     Occupe(String),
     /// Fil 3094 — la zone n'a pas de sortie active (409
-    /// `zone_sans_sortie_active`) : l'identifiant de son appareil.
-    SortieInactive(String),
+    /// `zone_sans_sortie_active`), avec la zone qui porte l'appareil.
+    SortieInactive(crate::hote::SortieInactive),
     /// Relecture m3 — la zone joue ou est en pause (409 `zone_en_lecture`).
     ZoneEnLecture,
     /// Tout autre refus motivé (422).
@@ -1034,13 +1023,7 @@ impl RefusNiveau {
             Self::ZoneEnLecture => {
                 "Arrêtez la lecture sur cette zone avant le test : il la couperait.".to_string()
             }
-            Self::SortieInactive(d) => {
-                let nom = d.split_once(':').map_or(d.as_str(), |(_, n)| n);
-                format!(
-                    "Cette zone n'a pas de sortie active : l'appareil « {nom} » n'est pas détecté. \
-                     Vérifiez qu'il est branché et allumé, ou testez depuis la zone qui l'utilise."
-                )
-            }
+            Self::SortieInactive(inactive) => inactive.message(),
         }
     }
 }
@@ -1413,8 +1396,8 @@ impl Controleur {
                     "zone {zone_id} inconnue : volume non lisible, test refusé"
                 ))
             })?;
-            if let Some(device) = zone.sortie_inactive(zone_id) {
-                return Err(RefusNiveau::SortieInactive(device));
+            if let Some(inactive) = self.hote.sortie_inactive(zone_id) {
+                return Err(RefusNiveau::SortieInactive(inactive));
             }
             if zone.zone_en_lecture(zone_id) {
                 return Err(RefusNiveau::ZoneEnLecture);
@@ -1810,19 +1793,10 @@ pub(crate) mod http {
             Err(e @ RefusNiveau::ZoneEnLecture) => {
                 refus(StatusCode::CONFLICT, "zone_en_lecture", e.message())
             }
-            Err(RefusNiveau::SortieInactive(device)) => {
-                let appareil = device.split_once(':').map_or(device.as_str(), |(_, n)| n);
-                // Même forme que le refus de la mesure (fil 3094, #9528) :
-                // motif stable, l'appareil en paramètre.
-                (
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "error": "zone_sans_sortie_active",
-                        "message": RefusNiveau::SortieInactive(device.clone()).message(),
-                        "params": { "device": appareil, "holder_zone_id": null, "holder_zone_name": null },
-                    })),
-                )
-                    .into_response()
+            // Le refus de la mesure, tel quel (fil 3094) : la zone porteuse
+            // nommée en paramètres.
+            Err(RefusNiveau::SortieInactive(inactive)) => {
+                crate::routes::refus_sortie_inactive(&inactive)
             }
             Err(RefusNiveau::Refus(m)) => {
                 refus(StatusCode::UNPROCESSABLE_ENTITY, "test_niveau_refuse", m)
