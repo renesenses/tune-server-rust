@@ -28,10 +28,12 @@
 //! aujourd'hui avec un UMIK-1 séparé à 48 kHz : sur un balayage de 20 s,
 //! 40 ppm font 0,8 ms d'étirement, que la déconvolution d'un balayage
 //! exponentiel absorbe (léger étalement de la RI dans l'aigu, aucun effet sur
-//! la réponse dans la bande de correction). Les essais le vérifient
-//! (`tests/mesure_frequences.rs`).
+//! la réponse dans la bande de correction). Les essais le vérifient pour la
+//! réponse et la correction (`tests/mesure_frequences.rs`) ; le RT60 des
+//! bandes au-dessus de 4 kHz, lui, reste sensible à la dérive (la RI s'y
+//! étale), et n'est pas couvert par ces essais.
 
-use tune_core::audio::resample::rubato_resample_batch_exact;
+use tune_core::audio::resample::{new_streaming_resampler, rubato_resample_batch_exact};
 
 use crate::mesure::FREQUENCE_MESURE;
 
@@ -80,12 +82,35 @@ impl Cadence {
         (trames_analyse as u128 * self.captee as u128).div_ceil(FREQUENCE_MESURE as u128) as u64
     }
 
+    /// L'horloge d'écoute du générateur : les trames captées (`trames`,
+    /// celles du micro) comptées en trames d'analyse. Le balayage comme le
+    /// signal du test de niveau sont cadencés sur elle ; compter les trames
+    /// du micro insérait des blocs de silence à 44,1 kHz et laissait filer
+    /// l'avance à 96 kHz et au-delà.
+    pub fn horloge(
+        self,
+        trames: impl Fn() -> u64 + Send + Sync + 'static,
+    ) -> crate::generateur::HorlogeDEcoute {
+        std::sync::Arc::new(move || self.vers_analyse(trames()))
+    }
+
     /// Un segment capté (une voie), ramené à la cadence d'analyse et à
     /// exactement `trames_analyse` trames. Identité à 48 kHz.
     pub fn a_l_analyse(&self, capte: Vec<f64>, trames_analyse: usize) -> Vec<f64> {
         let mut x = if self.captee == FREQUENCE_MESURE {
             capte
         } else {
+            // `rubato_resample_batch_exact` se replie en silence sur une
+            // interpolation linéaire s'il ne peut pas construire le sinc :
+            // la mesure le dit dans le journal, en clair.
+            if let Err(e) = new_streaming_resampler(self.captee, FREQUENCE_MESURE, 1) {
+                tracing::warn!(
+                    captee = self.captee,
+                    erreur = %e,
+                    "calibration : rééchantillonneur sinc indisponible, repli linéaire — \
+                     la réponse mesurée est moins juste dans l'aigu"
+                );
+            }
             let f: Vec<f32> = capte.iter().map(|v| *v as f32).collect();
             rubato_resample_batch_exact(&f, self.captee, FREQUENCE_MESURE, 1)
                 .into_iter()
@@ -126,6 +151,19 @@ mod tests {
         let c = Cadence::de(192_000);
         assert_eq!(c.vers_capture(3 * 48_000), 3 * 192_000);
         assert_eq!(Cadence::de(48_000).vers_capture(12_345), 12_345);
+    }
+
+    #[test]
+    fn l_horloge_d_ecoute_compte_en_trames_du_generateur() {
+        for (fs, captees) in [
+            (44_100u32, 44_100u64),
+            (48_000, 48_000),
+            (96_000, 96_000),
+            (192_000, 192_000),
+        ] {
+            let h = Cadence::de(fs).horloge(move || captees);
+            assert_eq!(h(), 48_000, "{fs} Hz");
+        }
     }
 
     /// Un sinus de 1 kHz capté à 96 kHz ressort à 48 kHz, même amplitude,

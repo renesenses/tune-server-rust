@@ -1366,11 +1366,10 @@ impl Controleur {
             None => None,
         };
         let mut avertissements = Vec::new();
-        if format.frequence != FREQUENCE_MESURE {
-            avertissements.push(format!(
-                "l'entrée « {nom} » capte à {} Hz : la mesure exigera {FREQUENCE_MESURE} Hz",
-                format.frequence
-            ));
+        // rc14 (#9538) — la mesure capte à la fréquence native du micro :
+        // seule une fréquence hors de la liste est signalée.
+        if let Err(motif) = crate::cadence::verifier(&nom, format.frequence) {
+            avertissements.push(motif);
         }
         // Fil de Didier : une zone en ASIO peut couper l'entrée Windows de la
         // même interface. Dit dès le départ, en mode signal comme en écoute
@@ -1599,7 +1598,8 @@ impl Controleur {
         };
         let horloge: HorlogeDEcoute = {
             let t = tampon.clone();
-            Arc::new(move || t.trames())
+            // rc14 (#9538) — l'écoute comptée en trames du générateur (48 kHz).
+            crate::cadence::Cadence::de(tampon.format().frequence).horloge(move || t.trames())
         };
         let arme = SignalArme::new(
             signal_de_test(FREQUENCE_MESURE, politique.max_play_dbfs),

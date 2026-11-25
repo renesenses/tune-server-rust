@@ -973,3 +973,112 @@ fn exploration_seuil_rsb() {
         );
     }
 }
+
+/// rc14 (#9538) — le test de niveau d'un micro à 44,1 ou 96 kHz, face à une
+/// zone à 48 kHz : le verdict, le niveau capté et le RSB sont ceux du micro à
+/// 48 kHz, et aucun avertissement de fréquence ne sort. Le cadencement du
+/// signal sur l'écoute comptée en trames du générateur est vérifié à part
+/// (`cadence::tests::l_horloge_d_ecoute_compte_en_trames_du_generateur`) :
+/// ce banc, dont le micro attend la zone, ne le distingue pas.
+fn tester_a(
+    frequence: Option<u32>,
+    zone: i64,
+    nom: &str,
+) -> tune_calibration_greffon::niveau::AvancementNiveau {
+    use tune_calibration_greffon::simulation::micro_a_cadence::MicroACadence;
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    // L'anneau de 2 s d'une sortie locale (#9066) : seul le cadencement sur
+    // l'écoute empêche le signal d'y prendre de l'avance sur le micro.
+    let boucle = Boucle::avec_tampon(
+        PieceEnDirect::depuis(&sim, 1.0),
+        VITESSE,
+        2 * FREQUENCE_MESURE as usize,
+    );
+    let fournisseur = FournisseurBalayage::new();
+    let hote = HoteSimule::new(fournisseur.clone(), boucle.clone(), Some(50.0));
+    let peripheriques: Arc<dyn Peripheriques> = match frequence {
+        None => Arc::new(MicroSimule {
+            nom: MICRO.into(),
+            frequence: FREQUENCE_MESURE,
+            boucle: boucle.clone(),
+            demarrages: Default::default(),
+        }),
+        Some(frequence) => Arc::new(MicroACadence {
+            nom: MICRO.into(),
+            frequence,
+            derive_ppm: 0.0,
+            frequence_zone: FREQUENCE_MESURE,
+            boucle: boucle.clone(),
+        }),
+    };
+    let dossier = tune_core::test_scratch::scratch_dir(&format!("tune-calibration-niveau-{nom}"));
+    let controleur = Controleur::new(
+        peripheriques,
+        hote,
+        fournisseur,
+        dossier.path().to_path_buf(),
+    );
+    let zone_simulee = Arc::new(ZoneSimulee {
+        fournisseur: controleur.niveaux.fournisseur.clone(),
+        boucle,
+        asio: false,
+        en_lecture: AtomicBool::new(false),
+        panique: AtomicBool::new(false),
+        vivant: Mutex::default(),
+        journal: Mutex::default(),
+        contournee_au_jeu: Mutex::default(),
+    });
+    controleur.niveaux.brancher(zone_simulee);
+    let id = controleur
+        .tester_niveau(DemandeNiveau::signal(zone, MICRO))
+        .expect("lancé");
+    assert_eq!(
+        attendre_fin(&controleur, &id, Duration::from_secs(30)),
+        EtatTest::Terminee,
+        "{nom}"
+    );
+    controleur.test_niveau(&id).unwrap().avancement()
+}
+
+#[test]
+fn le_test_de_niveau_a_44_1_et_96_khz() {
+    let reference = tester_a(None, 711, "cadence-48k");
+    let vr = reference.verdict.clone().expect("verdict 48 kHz");
+    for (frequence, zone) in [(44_100, 712), (96_000, 713)] {
+        let a = tester_a(Some(frequence), zone, &format!("cadence-{frequence}"));
+        let v = a.verdict.clone().expect("verdict");
+        eprintln!("{frequence} Hz : {v:?} (48 kHz : {vr:?})");
+        assert_eq!(v.jugement, Jugement::Bon, "{frequence} Hz : {v:?}");
+        assert!(
+            !a.avertissements.iter().any(|m| m.contains("Hz")),
+            "{frequence} Hz : {:?}",
+            a.avertissements
+        );
+        assert!(
+            (v.signal.rms_dbfs - vr.signal.rms_dbfs).abs() < 1.0,
+            "{frequence} Hz : signal {} dBFS, 48 kHz {} dBFS",
+            v.signal.rms_dbfs,
+            vr.signal.rms_dbfs
+        );
+        assert!(
+            (v.rsb_db - vr.rsb_db).abs() < 3.0,
+            "{frequence} Hz : RSB {} dB, 48 kHz {} dB",
+            v.rsb_db,
+            vr.rsb_db
+        );
+    }
+}
+
+/// Une fréquence hors de la liste reste signalée, avec la liste.
+#[test]
+fn le_test_de_niveau_signale_une_frequence_non_prise_en_charge() {
+    let a = tester_a(Some(32_000), 714, "cadence-32k");
+    assert!(
+        a.avertissements
+            .iter()
+            .any(|m| m.contains("32000 Hz")
+                && m.contains("44100, 48000, 88200, 96000, 176400, 192000")),
+        "{:?}",
+        a.avertissements
+    );
+}

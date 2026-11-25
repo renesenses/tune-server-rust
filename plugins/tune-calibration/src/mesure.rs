@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tune_calibration::analysis::BandRt60;
 use tune_calibration::deconv;
 use tune_calibration::fft;
-use tune_calibration::level::{LevelDecision, LevelPolicy, ProbeResult, peak_dbfs};
+use tune_calibration::level::{LevelDecision, LevelPolicy, ProbeResult};
 use tune_calibration::mic_cal::MicCalibration;
 use tune_calibration::{MeasurementSpec, analyse_capture};
 use tune_entree_audio::peripheriques::Peripheriques;
@@ -705,7 +705,7 @@ impl Controleur {
             // rc14 — l'écoute est comptée en trames d'analyse (48 kHz), celles du générateur.
             let cadence = crate::cadence::Cadence::de(tampon.format().frequence);
             deroule.cadencer_sur_l_ecoute(
-                Arc::new(move || cadence.vers_analyse(t.trames())),
+                cadence.horloge(move || t.trames()),
                 (AVANCE_SUR_L_ECOUTE_S * FREQUENCE_MESURE as f64) as u64,
             );
         }
@@ -749,7 +749,9 @@ impl Controleur {
             let em = self.attendre_emission(mesure, &tampon, &deroule, emissions)?;
             emissions += 1;
             let capte = self.capter_segment(mesure, &tampon, voie, depart, &em)?;
-            let crete = peak_dbfs(&capte);
+            // rc14 (#9538) — la crête se lit sur la capture NATIVE, avant le
+            // rééchantillonnage : c'est elle qui dit l'écrêtage du micro.
+            let crete = fft::to_db(tampon.crete_depuis(voie, depart));
             // Déconvolution de la salve : le RSB sur la RI, comme pour la
             // mesure finale.
             let ri = deconv::deconvolve(
