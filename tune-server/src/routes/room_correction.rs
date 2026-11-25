@@ -301,16 +301,17 @@ async fn apply_profile_handler(
     // ne décrit plus la chaîne n'est plus marqué « ACTIVE » (T17).
     let mut avertissements: Vec<String> = Vec::new();
     if let Some((id, p)) = &pose {
-        if p
-            .bilan
+        if p.bilan
             .cles_modifiees
             .contains(&tune_core::tess::egaliseurs_en_serie::cle_ordre_tess(*id))
         {
             state.orchestrator.appliquer_ordre_tess(*id).await;
         }
-        avertissements.extend(super::zones::tess_prereglages::oublier_le_prereglage_s_il_differe(
-            &state, *id, &p.chaine,
-        ));
+        avertissements.extend(
+            super::zones::tess_prereglages::oublier_le_prereglage_s_il_differe(
+                &state, *id, &p.chaine,
+            ),
+        );
         if !p.en_serie.is_empty() {
             avertissements.push("other_equalizers_in_series".to_owned());
         }

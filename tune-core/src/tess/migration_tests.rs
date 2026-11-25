@@ -2900,9 +2900,10 @@ fn la_facade_d_une_ancienne_ecriture_suit_la_lecture_de_la_chaine() {
 #[test]
 fn appliquer_un_profil_remplace_une_ancienne_correction_devenue_parametrique() {
     let (_b, s) = base();
+    // R1 : l'ancien profil (différent du profil actuel, R2).
     let r1 = vec![
-        bande(52.0, -6.5, 4.0, "peak", None),
-        bande(118.0, -3.0, 2.5, "peak", None),
+        bande(60.0, -5.0, 3.0, "peak", None),
+        bande(140.0, -2.0, 2.0, "peak", None),
     ];
     let r2 = crate::room_correction::profil_eq_de_correction(&filtres_de_piece());
     let p_autre = vec![bande(1000.0, 2.0, 1.0, "peak", None)];
@@ -2921,8 +2922,11 @@ fn appliquer_un_profil_remplace_une_ancienne_correction_devenue_parametrique() {
             _ => None,
         };
         if let Some(cle) = cle {
-            s.set(&cle, &serde_json::to_string(&profil(true, r1.clone())).unwrap())
-                .unwrap();
+            s.set(
+                &cle,
+                &serde_json::to_string(&profil(true, r1.clone())).unwrap(),
+            )
+            .unwrap();
         }
         poser_la_piece(&s, z, "Calibration xyz", None);
         // `poser_la_piece` écrit `eq_profile` comme l'ancienne route : on
@@ -2949,7 +2953,11 @@ fn appliquer_un_profil_remplace_une_ancienne_correction_devenue_parametrique() {
             assert_eq!(pose.en_serie, vec![ID_EQ_PARAMETRIQUE.to_owned()]);
             assert_eq!(pose.remplacee, None);
         } else {
-            assert_eq!(ids(&l.chaine), vec![(ID_CORRECTION_PIECE, true)], "{source}");
+            assert_eq!(
+                ids(&l.chaine),
+                vec![(ID_CORRECTION_PIECE, true)],
+                "{source}"
+            );
             assert!(pose.en_serie.is_empty(), "{source}");
             assert_eq!(pose.remplacee.as_deref(), Some(ID_EQ_PARAMETRIQUE));
             let b: Vec<EqBandSpec> = serde_json::from_value(
