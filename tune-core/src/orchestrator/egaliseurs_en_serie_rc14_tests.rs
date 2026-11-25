@@ -553,7 +553,11 @@ async fn bypass_all_ne_relance_la_cadence_fixe_que_si_elle_s_applique_9520() {
     };
     chaine.bypass_all = true;
     ecrire_chaine(&s, z, &chaine).unwrap();
-    assert_eq!(demandee_active(&o.db, z), None, "Bypass all coupe la cadence fixe");
+    assert_eq!(
+        demandee_active(&o.db, z),
+        None,
+        "Bypass all coupe la cadence fixe"
+    );
     assert_eq!(
         demandee_active_hors_bypass(&o.db, z),
         Some(96_000),

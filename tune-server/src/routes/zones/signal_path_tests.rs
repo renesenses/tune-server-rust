@@ -6250,6 +6250,10 @@ fn le_panneau_historique_suit_la_serie_le_bypass_et_le_droit_9520() {
             &serde_json::json!({"version": 1, "plugins": [graphique, p]}).to_string(),
         )
         .unwrap();
-    assert_eq!(bandes(true), Some(3), "Premium : le paramétrique est recoché");
+    assert_eq!(
+        bandes(true),
+        Some(3),
+        "Premium : le paramétrique est recoché"
+    );
     assert_eq!(bandes(false), Some(1), "Free : il ne l'est pas");
 }

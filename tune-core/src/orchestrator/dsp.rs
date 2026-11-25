@@ -2816,27 +2816,26 @@ impl PlaybackOrchestrator {
         let cadence_change =
             crate::audio::frequence_fixe::demandee_active_hors_bypass(&self.db, zone_id).is_some();
         let etat = self.playback.get_state(zone_id).await;
-        let portee = if etat.now_playing.is_none()
-            || etat.state == crate::playback::PlayState::Stopped
-        {
-            PorteeDuReglage::RienNeJoue
-        } else if !(choix_change || cadence_change) {
-            PorteeDuReglage::Immediate
-        } else if etat.state != crate::playback::PlayState::Playing {
-            PorteeDuReglage::PisteSuivante
-        } else {
-            if choix_change {
-                self.surech_replay_en_attente
-                    .lock()
-                    .unwrap()
-                    .insert(zone_id);
-            }
-            if self.schedule_replay_pour(zone_id, RaisonDeRelance::BasculePure) {
-                PorteeDuReglage::Relance
-            } else {
+        let portee =
+            if etat.now_playing.is_none() || etat.state == crate::playback::PlayState::Stopped {
+                PorteeDuReglage::RienNeJoue
+            } else if !(choix_change || cadence_change) {
+                PorteeDuReglage::Immediate
+            } else if etat.state != crate::playback::PlayState::Playing {
                 PorteeDuReglage::PisteSuivante
-            }
-        };
+            } else {
+                if choix_change {
+                    self.surech_replay_en_attente
+                        .lock()
+                        .unwrap()
+                        .insert(zone_id);
+                }
+                if self.schedule_replay_pour(zone_id, RaisonDeRelance::BasculePure) {
+                    PorteeDuReglage::Relance
+                } else {
+                    PorteeDuReglage::PisteSuivante
+                }
+            };
         info!(
             zone_id,
             choix_change,

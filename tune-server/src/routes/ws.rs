@@ -151,15 +151,17 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
         let signal_path = crate::routes::zones::signal_path_sous_licence_lang(
             lang,
             &state.license,
-            crate::routes::zones::avec_le_droit(premium_du_compte, || crate::routes::zones::build_signal_path_lang(
-                lang,
-                &ps,
-                z,
-                &state.backend,
-                renderer_label,
-                audio_backend_de_la_zone,
-                wire.as_ref(),
-            )),
+            crate::routes::zones::avec_le_droit(premium_du_compte, || {
+                crate::routes::zones::build_signal_path_lang(
+                    lang,
+                    &ps,
+                    z,
+                    &state.backend,
+                    renderer_label,
+                    audio_backend_de_la_zone,
+                    wire.as_ref(),
+                )
+            }),
         )
         .await;
         let output_capabilities =
