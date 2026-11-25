@@ -2566,7 +2566,7 @@ impl PlaybackOrchestrator {
             .get(&format!("ir_path_{zone_id}"))
             .ok()
             .flatten()
-            .filter(|p| !p.is_empty())
+            .filter(|p| !p.trim().is_empty())
     }
 
     /// Les octets de la réponse impulsionnelle, pour l'empreinte du cache de

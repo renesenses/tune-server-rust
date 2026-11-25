@@ -1523,12 +1523,11 @@ fn projeter_convolution(
     let voulu = match chaine.plugins.iter().find(|m| m.id == ID_CONVOLUTION) {
         Some(m) if m.enabled => match m.settings.get("ir_path").and_then(Value::as_str) {
             Some(p) if !p.trim().is_empty() => Some(p.to_owned()),
-            _ => {
-                return Err(ErreurMigration::ReglagesInvalides {
-                    id: m.id.clone(),
-                    raison: "settings.ir_path is missing".into(),
-                });
-            }
+            // Cochée sans fichier choisi (ajoutée depuis « + Ajouter ») :
+            // acceptée, inactive à la résolution (`no_filter_selected`). Comme
+            // décochée : un `ir_path_{zone}` déjà posé est effacé, sinon le
+            // DSP convoluerait encore un fichier que l'écran dit absent.
+            _ => None,
         },
         // Décochée ou retirée : la convolution n'a pas d'état « décoché »
         // dans les anciennes clés ; le chemin reste dans la chaîne.

@@ -86,6 +86,11 @@ pub enum MotifEtape {
     UnknownPlugin,
     /// Paquet désinstallé ou désactivé.
     PluginUnavailable,
+    /// Paquet facultatif pas encore installé, que l'utilisateur peut
+    /// installer (`POST /plugins/{paquet}/install`) : `install_package` dans
+    /// `GET /tess/catalog`, et `params.install_package` dans une étape du
+    /// chemin du signal (le serveur précise ainsi `plugin_unavailable`).
+    PluginNotInstalled,
     /// Droit Premium absent (ou perdu en cours de route).
     PremiumRequired,
     /// Greffon stéréo seulement, flux d'un autre nombre de canaux.
@@ -109,8 +114,22 @@ pub enum MotifEtape {
     /// T12b — famille UPnP : la lecture réseau n'applique cet étage sur
     /// aucune voie (upsampling, headroom, repli mono, réaffectation).
     NotAppliedOnTransport,
+    /// Convolution cochée sans fichier de réponse impulsionnelle choisi :
+    /// acceptée, mais elle ne traite rien tant qu'aucun filtre n'est choisi.
+    NoFilterSelected,
     #[serde(other)]
     Unknown,
+}
+
+/// Détail d'une convolution cochée sans fichier choisi.
+pub const DETAIL_AUCUN_FILTRE: &str = "No filter selected";
+
+/// La convolution désigne-t-elle un fichier (`settings.ir_path` non vide) ?
+pub fn convolution_a_un_filtre(m: &MaillonGreffon) -> bool {
+    m.settings
+        .get("ir_path")
+        .and_then(Value::as_str)
+        .is_some_and(|p| !p.trim().is_empty())
 }
 
 /// Qui règle le volume de la zone.
@@ -544,6 +563,12 @@ impl ChaineTess {
                 )
             {
                 upsampling.eteindre(MotifEtape::UnknownValue, None);
+            } else if !(ctx.greffon_disponible)(super::chaine::ID_UPSAMPLING) {
+                // rc14 — le moteur `upsampler` n'est ni installé ni activé
+                // (facultatif : jamais posé par la migration) : rien ne
+                // suréchantillonne, comme pour un greffon (le serveur précise
+                // `plugin_not_installed` quand il suffit de l'installer).
+                upsampling.eteindre(MotifEtape::PluginUnavailable, None);
             } else if !ctx.premium {
                 upsampling.eteindre(MotifEtape::PremiumRequired, None);
             }
@@ -698,6 +723,14 @@ impl ChaineTess {
             && !super::migration::correction_estimee(m)
         {
             e.eteindre(MotifEtape::PremiumRequired, None);
+        } else if m.id == super::migration::ID_CONVOLUTION && !convolution_a_un_filtre(m) {
+            // Ajoutée cochée avant qu'un fichier soit choisi : rien à
+            // convoluer, et rien n'est chargé (la projection ne pose aucun
+            // `ir_path_{zone}`).
+            e.eteindre(
+                MotifEtape::NoFilterSelected,
+                Some(DETAIL_AUCUN_FILTRE.to_owned()),
+            );
         } else {
             match d.placement.channels {
                 Canaux::StereoOnly | Canaux::Unknown => {
@@ -755,8 +788,41 @@ mod tests {
         MaillonGreffon {
             id: id.into(),
             enabled,
-            settings: Value::Null,
+            // rc14 : une convolution sans fichier ne traite rien
+            // (`no_filter_selected`) ; celle des maquettes en a un.
+            settings: if id == "convolution" {
+                json!({ "ir_path": "/ir/salon.wav" })
+            } else {
+                Value::Null
+            },
         }
+    }
+
+    #[test]
+    fn une_convolution_sans_fichier_ne_traite_rien_rc14() {
+        let x = ctx(TransportZone::Local);
+        for reglages in [Value::Null, json!({}), json!({ "ir_path": " " })] {
+            let c = ChaineTess {
+                plugins: vec![MaillonGreffon {
+                    id: "convolution".into(),
+                    enabled: true,
+                    settings: reglages.clone(),
+                }],
+                ..ChaineTess::default()
+            };
+            let r = c.resoudre(&catalogue_de_reference(), &x);
+            let e = greffon(&r, "convolution");
+            assert!(e.requested && !e.effective, "{reglages}");
+            assert_eq!(e.reason, Some(MotifEtape::NoFilterSelected), "{reglages}");
+            assert_eq!(e.detail.as_deref(), Some(DETAIL_AUCUN_FILTRE));
+        }
+        // Contre-épreuve : avec un fichier, elle traite.
+        let c = ChaineTess {
+            plugins: vec![maillon("convolution", true)],
+            ..ChaineTess::default()
+        };
+        let r = c.resoudre(&catalogue_de_reference(), &x);
+        assert!(greffon(&r, "convolution").effective);
     }
 
     fn maquette_a1() -> ChaineTess {
@@ -1131,7 +1197,8 @@ mod tests {
 
     #[test]
     fn une_chaine_plus_recente_s_eteint_avec_un_motif() {
-        let texte = r#"{"version":2,"plugins":[{"id":"convolution","enabled":true}],
+        let texte = r#"{"version":2,"plugins":[{"id":"convolution","enabled":true,
+            "settings":{"ir_path":"/ir/salon.wav"}}],
             "fixed":{"upsampling":{"mode":"oversample_x3"}}}"#;
         let c: ChaineTess = serde_json::from_str(texte).unwrap();
         let r = resoudre(&c, &ctx(TransportZone::Local));
