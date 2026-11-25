@@ -4888,12 +4888,58 @@ async fn reprendre_la_zone(
             // #7974 — la reprise après pause refusée par le bail d'écoute.
             if let Some(reponse) = refus_du_bail_parental(&error.to_string(), &lang) {
                 reponse
+            } else if let Some(reponse) = reponse_piste_disparue(&error) {
+                reponse
             } else if session_perdue.load(std::sync::atomic::Ordering::Relaxed) {
                 output_command_error_response(error)
             } else {
                 echec_de_sortie_7823::reponse_d_echec_de_zone(&state, zone_id, error)
             }
         }
+    }
+}
+
+/// Fil 3075 — la reprise d'une zone navigateur refusée parce que la piste a
+/// disparu : 410 avec un code stable, au lieu du 502 « session perdue ».
+/// Le corps garde les clés `error`, `command` et `message` du 502, pour un
+/// client qui ne lit que `message`.
+fn reponse_piste_disparue(error: &OutputCommandError) -> Option<axum::response::Response> {
+    use tune_core::orchestrator::reprise_piste_disparue_3075::{
+        CODE_PISTE_DISPARUE_A_LA_REPRISE, message_de_piste_disparue,
+    };
+    let OutputCommandError::Failed { command, message } = error else {
+        return None;
+    };
+    let phrase = message_de_piste_disparue(message)?;
+    Some(
+        (
+            StatusCode::GONE,
+            Json(json!({
+                "error": CODE_PISTE_DISPARUE_A_LA_REPRISE,
+                "code": CODE_PISTE_DISPARUE_A_LA_REPRISE,
+                "command": command,
+                "message": phrase,
+            })),
+        )
+            .into_response(),
+    )
+}
+
+#[cfg(test)]
+mod reponse_piste_disparue_3075_tests {
+    use super::*;
+
+    #[test]
+    fn la_piste_disparue_rend_410_et_les_autres_echecs_passent() {
+        let disparue = OutputCommandError::failed(
+            tune_core::outputs::OutputCommand::Resume,
+            "resume_track_unavailable: La piste n'est plus disponible.".to_string(),
+        );
+        let reponse = reponse_piste_disparue(&disparue).expect("reconnue");
+        assert_eq!(reponse.status(), StatusCode::GONE);
+
+        let autre = OutputCommandError::failed(tune_core::outputs::OutputCommand::Resume, "session perdue".into());
+        assert!(reponse_piste_disparue(&autre).is_none());
     }
 }
 
