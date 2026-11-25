@@ -16,6 +16,7 @@
 //! la langue de la requête (`refusal_text`).
 
 use serde_json::{Map, Value, json};
+use tune_core::tess::chaine::{ChaineTess, Upsampling};
 use tune_core::tess::resolution::{CodeEtape, EtapeResolue, MotifEtape};
 
 /// L'étape est-elle demandée, et active selon la résolution, ou déjà éteinte
@@ -47,11 +48,20 @@ pub(crate) fn eteindre_avec_la_raison(e: &mut EtapeResolue, code: &str, texte: &
 /// Pose la raison du refus sur l'étape Upsampling (voir
 /// [`eteindre_avec_la_raison`]). `refus` : le code publié par la sortie,
 /// `None` = rien à dire.
+///
+/// Seulement quand la chaîne demande le suréchantillonnage PCM : le refus
+/// vient du greffon PCM de la sortie. Vers le DSD (#9518), ce greffon est
+/// éteint par projection et la sortie le déclare refusé (`disabled`) alors
+/// que le modulateur, lui, tourne : l'étape ne doit pas se dire inactive.
 pub(crate) fn avec_le_refus_du_surechantillonneur<'a>(
     etapes: impl IntoIterator<Item = &'a mut EtapeResolue>,
+    chaine: &ChaineTess,
     refus: Option<&str>,
 ) {
-    let Some(raison) = refus.filter(|r| !r.is_empty()) else {
+    if !matches!(chaine.fixed.upsampling, Upsampling::Pcm { .. }) {
+        return;
+    }
+    let Some(raison) = refus.filter(|r| !r.is_empty() && *r != "disabled") else {
         return;
     };
     let texte = super::description_du_refus_surechantillonnage(raison);
@@ -62,11 +72,29 @@ pub(crate) fn avec_le_refus_du_surechantillonneur<'a>(
     }
 }
 
-/// Les greffons portés par le convolueur de la zone (`ir_path_{zone}`).
-const GREFFONS_DU_CONVOLUEUR: [&str; 2] = [
-    tune_core::tess::migration::ID_CONVOLUTION,
-    tune_core::tess::migration::ID_CORRECTION_PIECE,
-];
+/// Le maillon `id` de la chaîne est-il porté par le CONVOLUEUR ?
+///
+/// `convolution`, toujours. `room-correction` seulement s'il désigne un
+/// filtre (`ir_path` ou `filter`) sans bandes : le plus souvent, c'est une
+/// façade d'ÉGALISEUR (bandes), que la cadence du filtre de convolution ne
+/// concerne pas — elle s'applique, et doit rester « active ».
+fn porte_par_le_convolueur(chaine: &ChaineTess, id: &str) -> bool {
+    if id == tune_core::tess::migration::ID_CONVOLUTION {
+        return true;
+    }
+    if id != tune_core::tess::migration::ID_CORRECTION_PIECE {
+        return false;
+    }
+    chaine.plugins.iter().filter(|m| m.id == id).any(|m| {
+        let filtre = ["ir_path", "filter"].iter().any(|k| {
+            m.settings
+                .get(*k)
+                .and_then(Value::as_str)
+                .is_some_and(|f| !f.trim().is_empty())
+        });
+        filtre && m.settings.get("bands").is_none()
+    })
+}
 
 /// Rémi (fil 3097) — un préréglage rechargé affichait la Convolution
 /// « active » alors que son filtre (384 kHz) ne s'applique pas au flux
@@ -74,6 +102,7 @@ const GREFFONS_DU_CONVOLUEUR: [&str; 2] = [
 /// `(code, phrase)` de la correction de pièce non appliquée.
 pub(crate) fn avec_la_raison_de_la_convolution<'a>(
     etapes: impl IntoIterator<Item = &'a mut EtapeResolue>,
+    chaine: &ChaineTess,
     raison: Option<(&str, &str)>,
 ) {
     let Some((code, texte)) = raison else {
@@ -84,7 +113,7 @@ pub(crate) fn avec_la_raison_de_la_convolution<'a>(
             && e
                 .plugin_id
                 .as_deref()
-                .is_some_and(|id| GREFFONS_DU_CONVOLUEUR.contains(&id));
+                .is_some_and(|id| porte_par_le_convolueur(chaine, id));
         if du_convolueur && eteignable(e) {
             eteindre_avec_la_raison(e, code, texte);
         }

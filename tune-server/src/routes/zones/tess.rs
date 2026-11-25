@@ -437,6 +437,7 @@ pub(super) async fn reponse_de_zone(
     // piste en cours : l'étape ne se dit plus active, et dit pourquoi.
     super::refus_surechantillonnage_tess::avec_le_refus_du_surechantillonneur(
         reponse.signal_path.iter_mut(),
+        &reponse.chain,
         super::refus_surechantillonnage_tess::refus_de_la_sortie_locale(
             zone.output_type.as_deref(),
             &etat,
@@ -444,6 +445,7 @@ pub(super) async fn reponse_de_zone(
     );
     super::refus_surechantillonnage_tess::avec_la_raison_de_la_convolution(
         reponse.signal_path.iter_mut(),
+        &reponse.chain,
         convolution.as_ref().map(|(c, t)| (*c, t.as_str())),
     );
     reponse

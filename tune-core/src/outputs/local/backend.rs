@@ -622,6 +622,14 @@ pub(super) fn cadence_pour_le_surechantillonneur_selon_l_hote(
         |r| r == melangeur,
     )
     .map_err(|refus| match refus {
+        // Mélangeur à la cadence de la source (ou en dessous) : il n'y a rien
+        // au-dessus vers quoi suréchantillonner. Le geste diffère : monter la
+        // cadence du mélangeur, pas seulement en changer.
+        RefusDeCadenceDuGreffon::AucuneCandidateAcceptee { .. } if melangeur <= source_sr => {
+            RefusDeCadenceDuGreffon::CadenceDuMelangeurPasAuDessus {
+                cadence_du_melangeur: melangeur,
+            }
+        }
         RefusDeCadenceDuGreffon::AucuneCandidateAcceptee { .. } => {
             RefusDeCadenceDuGreffon::CadenceDuMelangeurInadaptee {
                 cadence_du_melangeur: melangeur,
@@ -666,6 +674,9 @@ pub(super) enum RefusDeCadenceDuGreffon {
     /// mélangeur du système, qui n'est pas un multiple entier (supérieur) de
     /// la source. Le geste : régler le format par défaut du périphérique.
     CadenceDuMelangeurInadaptee { cadence_du_melangeur: u32 },
+    /// rc14 — mode partagé (WASAPI) : le mélangeur tourne à la cadence de la
+    /// source (ou en dessous) ; elle doit lui être supérieure.
+    CadenceDuMelangeurPasAuDessus { cadence_du_melangeur: u32 },
     /// Cadence source inconnue (0).
     SourceInconnue,
     /// Aucun multiple entier de la source n'est accepté par l'énumération
@@ -686,6 +697,7 @@ impl RefusDeCadenceDuGreffon {
             Self::BitPerfectStrict => "strict_bitperfect",
             Self::CadencesNonMesurees => "rates_not_measured",
             Self::CadenceDuMelangeurInadaptee { .. } => "shared_mixer_rate_not_a_multiple",
+            Self::CadenceDuMelangeurPasAuDessus { .. } => "shared_mixer_rate_not_above_source",
             Self::SourceInconnue => "source_rate_unknown",
             Self::AucuneCandidateAcceptee { .. } => "no_candidate_rate_accepted_by_device",
             Self::RefuseesParLaMachine { .. } => "machine_test_rejects_accepted_rates",
@@ -1600,10 +1612,10 @@ mod refus_de_cadence_du_greffon_8149_tests {
             Ok(176_400)
         );
         // Mélangeur à la cadence de la source (cas de Xavier) : refus qui
-        // nomme le geste, plus « cadences non mesurées ».
+        // nomme le geste (« doit être supérieure »), plus « non mesurées ».
         assert_eq!(
             selon_l_hote(&c, non_mesuree, Some(44_100), false, 44_100, |_| true),
-            Err(RefusDeCadenceDuGreffon::CadenceDuMelangeurInadaptee {
+            Err(RefusDeCadenceDuGreffon::CadenceDuMelangeurPasAuDessus {
                 cadence_du_melangeur: 44_100
             })
         );
@@ -1636,6 +1648,10 @@ mod refus_de_cadence_du_greffon_8149_tests {
         let codes = [
             RefusDeCadenceDuGreffon::BitPerfectStrict.code(),
             RefusDeCadenceDuGreffon::CadenceDuMelangeurInadaptee {
+                cadence_du_melangeur: 0,
+            }
+            .code(),
+            RefusDeCadenceDuGreffon::CadenceDuMelangeurPasAuDessus {
                 cadence_du_melangeur: 0,
             }
             .code(),
