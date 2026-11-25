@@ -720,6 +720,37 @@ struct ContexteZone {
     /// Aucune chaîne enregistrée : c'est la migration (D2 ne s'applique
     /// qu'à ce moment-là).
     premiere_lecture: bool,
+    /// Les bandes de `zone_{id}_eq_profile` à la dernière synchronisation
+    /// (l'ombre), quand elles se lisent.
+    bandes_synchronisees: Option<Vec<EqBandSpec>>,
+}
+
+/// La façade que garde l'égaliseur principal quand une ancienne route
+/// réécrit `zone_{id}_eq_profile` SANS en changer la courbe (l'éteindre, le
+/// rallumer, changer sa réserve) : la sienne. Seule une nouvelle courbe se
+/// reclasse ([`classer_egaliseur`]).
+///
+/// Sans cela, une correction de pièce dont les bandes ne sont pas (ou plus)
+/// celles de `room_profile_{id}` (ajoutée à la main, sans profil de pièce ;
+/// profil de pièce remplacé depuis) devenait « Égaliseur graphique » ou
+/// « paramétrique » dès que l'égaliseur était éteint par l'écran de
+/// l'égaliseur ou un client mobile : la correction disparaissait du chemin
+/// du signal.
+///
+/// Les bandes d'avant sont celles des réglages du maillon, sinon (réglages
+/// `null`, maillon ajouté sans réglages) celles de l'ombre.
+fn facade_gardee(
+    principal: Option<&MaillonGreffon>,
+    profil: &EqProfile,
+    ctx: &ContexteZone,
+) -> Option<&'static str> {
+    let m = principal?;
+    let facade = FACADES_EQ.iter().copied().find(|f| *f == m.id)?;
+    let avant: Vec<EqBandSpec> = match &m.settings {
+        Value::Null => ctx.bandes_synchronisees.clone()?,
+        s => serde_json::from_value(s.get("bands")?.clone()).ok()?,
+    };
+    memes_bandes(&avant, &profil.bands).then_some(facade)
 }
 
 fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, ctx: &ContexteZone) {
@@ -727,11 +758,14 @@ fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, ctx: &Co
         (Partie::Egaliseur, Decodee::Egaliseur(m, profil)) => {
             let principal = egaliseur_principal(chaine);
             let precedente = principal.map(|i| chaine.plugins[i].id.clone());
-            let id = classer_egaliseur(
-                &profil,
-                ctx.piece.as_ref().map(|(p, _)| p),
-                precedente.as_deref(),
-            );
+            let id = facade_gardee(principal.map(|i| &chaine.plugins[i]), &profil, ctx)
+                .unwrap_or_else(|| {
+                    classer_egaliseur(
+                        &profil,
+                        ctx.piece.as_ref().map(|(p, _)| p),
+                        precedente.as_deref(),
+                    )
+                });
             let mut settings = sans_enabled(m);
             if id == ID_CORRECTION_PIECE
                 && let (Value::Object(s), Some((_, origine))) = (&mut settings, &ctx.piece)
@@ -1076,6 +1110,11 @@ pub fn lire_zone(
         piece: profil_de_piece(settings, zone_id),
         sortie_locale,
         premiere_lecture: depuis_les_anciennes_cles,
+        bandes_synchronisees: ombre_lue
+            .get(&Partie::Egaliseur.nom())
+            .and_then(|o| o.as_deref())
+            .and_then(|brut| serde_json::from_str::<EqProfile>(brut).ok())
+            .map(|p| p.bands),
     };
     // Les parties disparues depuis l'ombre (un réglage tiers effacé) : on les
     // applique comme absentes.
