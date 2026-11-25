@@ -1,0 +1,19 @@
+[package]
+name = "tune-dsp-contextuel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Greffons DSP « contextuels » (vague 1, gratuite) : un moteur de profils qui
+# choisit, pour chaque album, de petites corrections techniques d'après ses
+# métadonnées et les mesures du fichier, et les neuf traitements qu'il pilote.
+# Contrat : `coordination/dsp-contextuels/contrat-moteur.md`.
+#
+# Caisse AUTONOME : elle lit `tune-core` (trait `EtageTess`, crête vraie,
+# constante de rampe) sans rien y modifier. Le branchement sur TESS viendra
+# après la fusion des lots TESS en cours.
+
+[dependencies]
+tune-core = { path = "../../tune-core", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
