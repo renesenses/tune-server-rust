@@ -434,6 +434,8 @@ const ECHEANCE_FIL_A_LA_DESTRUCTION: std::time::Duration = std::time::Duration::
 /// `stop()`, il n'y a plus ni canal ni fil : rien à faire.
 impl Drop for LocalOutput {
     fn drop(&mut self) {
+        // rc14 — l'ordre TESS posé pour cette sortie part avec elle.
+        OrdreLocal::oublier_la_sortie(&self.pure_bypass);
         let fil = self
             .play_thread
             .get_mut()
@@ -2140,6 +2142,14 @@ impl LocalOutput {
             drop(a_liberer);
         }
         avant != autorisee
+    }
+
+    /// rc14 — l'ordre des étages (égaliseurs, convolution, crossfeed, repli
+    /// mono) suit celui de la chaîne TESS de la zone qui joue. Posé par
+    /// l'orchestrateur à chaque lecture et quand la chaîne change ; pris au
+    /// bloc suivant. Une chaîne jamais réordonnée rend l'ordre historique.
+    pub fn set_ordre_tess(&self, chaine: &crate::tess::ChaineTess) {
+        OrdreLocal::poser_pour_la_sortie(&self.pure_bypass, OrdreLocal::depuis_chaine(chaine));
     }
 
     /// Enable/disable PURE (audiophile) bypass of the room-correction convolver
@@ -4150,7 +4160,7 @@ impl LocalPcmProcessor<'_> {
                 self.pure_bypass,
                 self.mono_downmix,
             ),
-            OrdreLocal::HISTORIQUE,
+            OrdreLocal::de_la_sortie(self.pure_bypass),
             spec.canaux(),
             dop,
         );
@@ -4933,7 +4943,8 @@ fn flush_local_dsp(
         pure_bypass,
         mono_downmix,
     };
-    executeur_tess::vidanger_chaine_locale(&moteurs, OrdreLocal::HISTORIQUE, channels, dop)
+    let ordre = OrdreLocal::de_la_sortie(moteurs.pure_bypass);
+    executeur_tess::vidanger_chaine_locale(&moteurs, ordre, channels, dop)
 }
 
 // Un argument par étage de traitement (EQ, convolution, crossfeed…), chacun
@@ -4954,7 +4965,7 @@ fn apply_local_dsp(
     executeur_tess::executer_chaine_locale_f32(
         samples,
         &moteurs_locaux(eq, convolver, crossfeed, pure_bypass, mono_downmix),
-        OrdreLocal::HISTORIQUE,
+        OrdreLocal::de_la_sortie(pure_bypass),
         channels,
         dop,
     );
@@ -5558,7 +5569,7 @@ fn prepare_windows_native_pcm(
             bytes,
             bit_depth,
             &moteurs_locaux(eq, convolver, crossfeed, pure_bypass, mono_downmix),
-            OrdreLocal::HISTORIQUE,
+            OrdreLocal::de_la_sortie(pure_bypass),
             channels,
             false,
         );

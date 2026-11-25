@@ -2598,6 +2598,11 @@ impl PlaybackOrchestrator {
                     .downcast_ref::<crate::outputs::local::LocalOutput>()
                 {
                     local_output.set_pure_bypass(zone_audiophile);
+                    // rc14 — l'ordre des étages suit la chaîne TESS de la zone.
+                    local_output.set_ordre_tess(&crate::tess::egaliseurs_en_serie::chaine_de_zone(
+                        &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+                        zone_id,
+                    ));
                     local_output.set_fixed_sample_rate(crate::audio::frequence_fixe::active(
                         &self.db, zone_id,
                     ));

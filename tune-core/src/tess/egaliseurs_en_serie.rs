@@ -209,6 +209,29 @@ pub fn combiner_en_serie(profils: &[EqProfile]) -> Option<EqProfile> {
     Some(p)
 }
 
+/// rc14 — la clé que rend [`super::migration::ecrire_chaine`] quand l'ordre
+/// des greffons cochés change : la route qui écrit pose alors le nouvel
+/// ordre sur la sortie locale vivante. Ce n'est pas un réglage enregistré.
+pub fn cle_ordre_tess(zone_id: i64) -> String {
+    format!("{}#order", super::cle_chaine_zone(zone_id))
+}
+
+/// Les greffons cochés, dans l'ordre de la chaîne.
+pub fn ordre_des_coches(chaine: &ChaineTess) -> Vec<&str> {
+    chaine
+        .plugins
+        .iter()
+        .filter(|m| m.enabled)
+        .map(|m| m.id.as_str())
+        .collect()
+}
+
+/// La chaîne ENREGISTRÉE de la zone, sans la relire (rapide) ; la chaîne par
+/// défaut (vide) si elle est absente ou illisible.
+pub fn chaine_de_zone(settings: &SettingsRepo, zone_id: i64) -> ChaineTess {
+    chaine_brute(settings, zone_id).unwrap_or_default()
+}
+
 /// La chaîne ENREGISTRÉE de la zone, sans la relire (rapide).
 fn chaine_brute(settings: &SettingsRepo, zone_id: i64) -> Option<ChaineTess> {
     let brut = settings

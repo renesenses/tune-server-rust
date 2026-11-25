@@ -720,6 +720,10 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     if est(Partie::Convolution) {
         rafraichir_le_convolueur(state, zone).await;
     }
+    // rc14 — l'ordre des greffons cochés a changé : la sortie locale suit.
+    if cles.contains(&tune_core::tess::egaliseurs_en_serie::cle_ordre_tess(id)) {
+        state.orchestrator.appliquer_ordre_tess(id).await;
+    }
     // rc14 — le mode PURE basculé par un préréglage (« Pure » l'allume), ou
     // « Bypass all » basculé (`ecrire_chaine` rend alors la clé de la chaîne) :
     // même garde dans le moteur (`traitements_contournes`), même bascule.

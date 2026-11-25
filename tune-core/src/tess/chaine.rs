@@ -25,7 +25,13 @@ use crate::audio::surechantillonnage::greffon::{DEFAULT_FILTER, OFFERED_FILTERS,
 pub const VERSION_CHAINE: u32 = 1;
 
 /// Headroom automatique dès qu'un greffon ou l'upsampler est actif (T07).
-pub const HEADROOM_AUTO_DB: f64 = -3.0;
+///
+/// rc14 — 0 dB : en Auto, la seule marge est celle que les égaliseurs
+/// réservent sur leur cascade entière (`EqProfile::reserve_db_at`). Le
+/// moteur n'a pas d'étage Headroom séparé ; annoncer −3 dB décrivait une
+/// baisse que rien n'appliquait. Un headroom MANUEL, lui, devient la marge
+/// des égaliseurs (`tess::egaliseurs_en_serie`).
+pub const HEADROOM_AUTO_DB: f64 = 0.0;
 /// Bornes d'un headroom manuel, en dB.
 pub const HEADROOM_MANUEL_MIN_DB: f64 = -24.0;
 pub const HEADROOM_MANUEL_MAX_DB: f64 = 0.0;

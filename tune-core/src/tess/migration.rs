@@ -1772,8 +1772,9 @@ fn ecrire_chaine_avec(
     // rc14 — le moteur lit aussi la chaîne : un égaliseur en série (2ᵉ façade
     // cochée, réglée ou déplacée) ou un headroom manuel changé change le son
     // sans toucher `eq_profile` ; « Bypass all » change tout sans toucher
-    // aucune ancienne clé. La route qui écrit rafraîchit d'après ces clés
-    // (l'égaliseur, et la chaîne elle-même pour « Bypass all »).
+    // aucune ancienne clé ; l'ordre des greffons cochés règle celui des
+    // étages de la sortie locale. La route qui écrit rafraîchit d'après ces
+    // clés (l'égaliseur, la chaîne pour « Bypass all », l'ordre).
     if let Some(r) = &reference {
         let cle_eq = Partie::Egaliseur.cle(zone_id);
         if super::egaliseurs_en_serie::signature(r) != super::egaliseurs_en_serie::signature(chaine)
@@ -1783,6 +1784,13 @@ fn ecrire_chaine_avec(
         }
         if r.bypass_all != chaine.bypass_all {
             bilan.cles_modifiees.push(super::cle_chaine_zone(zone_id));
+        }
+        if super::egaliseurs_en_serie::ordre_des_coches(r)
+            != super::egaliseurs_en_serie::ordre_des_coches(chaine)
+        {
+            bilan
+                .cles_modifiees
+                .push(super::egaliseurs_en_serie::cle_ordre_tess(zone_id));
         }
     }
 

@@ -1998,6 +1998,47 @@ impl PlaybackOrchestrator {
     /// [`Self::refresh_zone_eq`], qui rend `true` si un égaliseur est actif :
     /// entrer en PURE éteint tout, donc un `false` de ce genre signifierait
     /// « rien reçu » alors que tout vient d'être appliqué.
+    /// rc14 — pose l'ordre de la chaîne TESS de la zone sur sa sortie locale
+    /// vivante (pris au bloc suivant, sans relance). Rend `true` si une
+    /// sortie locale l'a reçu ; sinon la prochaine lecture le posera.
+    pub async fn appliquer_ordre_tess(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+                .filter(|d| d.starts_with("local:"))
+            else {
+                return false;
+            };
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let chaine = crate::tess::egaliseurs_en_serie::chaine_de_zone(
+                &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+                zone_id,
+            );
+            let output = output_arc.lock().await;
+            match output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            {
+                Some(local) => {
+                    local.set_ordre_tess(&chaine);
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
     pub async fn refresh_zone_pure_dsp(&self, zone_id: i64) -> bool {
         #[cfg(not(feature = "local-audio"))]
         {
