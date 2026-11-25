@@ -519,7 +519,11 @@ async fn post_eq_rallumer_une_correction_mesuree_402_sans_droit() {
         ]);
         let uri = format!("/api/v1/room-correction/profiles/{}", b.zone);
         let (s, v) = b
-            .appel(Method::POST, &uri, Some(json!({"name": nom, "filters": filtres})))
+            .appel(
+                Method::POST,
+                &uri,
+                Some(json!({"name": nom, "filters": filtres})),
+            )
             .await;
         assert!(s.is_success(), "{s} {v}");
         if estimee {
@@ -534,9 +538,9 @@ async fn post_eq_rallumer_une_correction_mesuree_402_sans_droit() {
         assert_eq!(s, StatusCode::OK, "{v}");
         let (s, v) = b.eq(json!({"enabled": false})).await;
         assert_eq!(s, StatusCode::OK, "{v}");
-        let bandes = serde_json::from_str::<Value>(&b.profil_enregistre().unwrap()).unwrap()
-            ["bands"]
-            .clone();
+        let bandes =
+            serde_json::from_str::<Value>(&b.profil_enregistre().unwrap()).unwrap()["bands"]
+                .clone();
 
         b.premium(false).await;
         let (s, v) = b.eq(json!({"enabled": true, "bands": bandes})).await;

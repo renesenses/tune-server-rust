@@ -78,7 +78,11 @@ fn bandes_des_prereglages_casque(settings: &SettingsRepo) -> Vec<Vec<EqBandSpec>
 /// `nouveau` porte-t-il les bandes d'un profil de pièce CALCULÉ SANS MICRO
 /// de la zone (D1, Free) ? Toute autre correction de pièce est mesurée, donc
 /// Premium (même règle que `origines_par_le_serveur`).
-fn correction_estimee_de_la_zone(settings: &SettingsRepo, zone_id: i64, nouveau: &EqProfile) -> bool {
+fn correction_estimee_de_la_zone(
+    settings: &SettingsRepo,
+    zone_id: i64,
+    nouveau: &EqProfile,
+) -> bool {
     let Some(brut) = settings
         .get(&format!("room_profile_{zone_id}"))
         .ok()
