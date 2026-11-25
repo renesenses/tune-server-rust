@@ -583,7 +583,15 @@ fn marques_par_le_serveur(reference: Option<&ChaineTess>, chaine: &ChaineTess) -
                 || valeur
                     .as_str()
                     .is_some_and(|g| coches.iter().any(|id| id == g));
-            if (m.enabled || !deja_posee || !gagnant_coche)
+            // Revue #9520 v2 — la marque d'une façade de l'égaliseur écartée au
+            // profit d'une autre façade (exclusivité du 24/11, #9512) est une
+            // marque du serveur : gardée sur une façade décochée, pour qu'un
+            // compte gratuit ne recoche pas un paramétrique qu'il n'entendait
+            // pas ([`normaliser_les_egaliseurs`]).
+            let marque_egaliseur = marque == MARQUE_REMPLACE
+                && FACADES_EQ.contains(&m.id.as_str())
+                && valeur.as_str().is_some_and(|g| FACADES_EQ.contains(&g));
+            if (m.enabled || !(deja_posee || marque_egaliseur) || !gagnant_coche)
                 && let Value::Object(s) = &mut m.settings
             {
                 s.remove(marque);
