@@ -3096,10 +3096,17 @@ mod reprise_au_redemarrage_6380;
 /// réseau à la position de la pause.
 #[cfg(test)]
 mod reprise_dlna_position_2095;
+/// Fil 3075 — épreuves de la reprise d'une zone navigateur après la purge de
+/// sa session (historique, piste disparue, autres zones inchangées).
+#[cfg(test)]
+mod reprise_navigateur_3075_tests;
 /// #8967 — Lecture sur une zone navigateur dont la session a expiré
 /// pendant la pause : la piste repart au lieu d'une erreur.
 #[cfg(test)]
 mod reprise_navigateur_8967_tests;
+/// Fil 3075 — reprise d'une zone navigateur impossible parce que la piste a
+/// disparu : un code stable au lieu du 502 générique.
+pub mod reprise_piste_disparue_3075;
 /// Fil 2125 — le saut de la reprise après décrochage attend que le renderer
 /// ait ouvert le flux.
 #[cfg(test)]

@@ -4054,6 +4054,18 @@ impl PlaybackOrchestrator {
                             .await
                         {
                             Ok(()) => Ok(()),
+                            // Fil 3075 — la piste n'existe plus (ligne
+                            // retirée, fichier supprimé, titre retiré du
+                            // service) : un code stable, pas le 502 générique.
+                            Err(e) if super::reprise_piste_disparue_3075::piste_disparue(&e) => {
+                                Err(self.dire_piste_disparue(
+                                    zone_id,
+                                    &np.title,
+                                    position_mesuree,
+                                    &e,
+                                    session_message(&np.title, position_mesuree, Some(&e)),
+                                ))
+                            }
                             Err(e) => Err(self.dire_session_perdue(
                                 zone_id,
                                 &np.title,
