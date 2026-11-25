@@ -666,6 +666,9 @@ impl PlaybackOrchestrator {
                     db: 0.0,
                 },
                 replaygain_actif: false,
+                // (#9523) Voies du réglage des enceintes : celles de la
+                // source, comme une résolution sans sortie connue.
+                voies_de_sortie: None,
             };
             let r = lecture
                 .chaine
