@@ -16,6 +16,8 @@
 //!        │       excédentaire facultative) et sa RI `.wav`, déposée par le web
 //! modes.rs       C5 : modes de basse d'une pièce rectangulaire sans micro,
 //!        │       réponse estimée, correction C2 plus prudente
+//! niveau.rs      rc14 : test de niveau du micro avant la mesure (écoute
+//!        │       seule, bruit de fond, bruit rose, vumètre, verdict)
 //! session.rs     C4 : session à plusieurs positions (3 à 9), moyenne
 //!        │       pondérée, rejet des aberrantes, A/B ; format versionné
 //! routes.rs      /api/v1/ext/calibration/…
@@ -39,6 +41,7 @@ pub mod generateur;
 pub mod hote;
 pub mod mesure;
 pub mod modes;
+pub mod niveau;
 pub mod routes;
 pub mod session;
 pub mod simulation;
@@ -130,6 +133,20 @@ impl TunePlugin for CalibrationPlugin {
             pile = controleur.peripheriques.pile(),
             "calibration_greffon_pret"
         );
+        // rc14 — le test de niveau : sa source PCM et la zone réelle.
+        self.services.orchestrator.sources_pcm().inscrire(
+            niveau::SOURCE_NIVEAU,
+            controleur.niveaux.fournisseur.clone(),
+        );
+        controleur
+            .niveaux
+            .brancher(Arc::new(niveau::ZoneOrchestrateur {
+                affichages_avant: Default::default(),
+                backend: self.services.backend.clone(),
+                orchestrator: self.services.orchestrator.clone(),
+                playback: self.services.playback.clone(),
+                runtime: tokio::runtime::Handle::current(),
+            }));
         if !ctx.feature_licensed(routes::DROIT).await {
             // Chargé quand même : le refus porte sur les routes, et l'écran
             // doit pouvoir dire pourquoi il reste verrouillé.
@@ -145,6 +162,10 @@ impl TunePlugin for CalibrationPlugin {
 
     async fn teardown(&mut self) -> Result<(), String> {
         self.services.orchestrator.sources_pcm().retirer(SOURCE);
+        self.services
+            .orchestrator
+            .sources_pcm()
+            .retirer(niveau::SOURCE_NIVEAU);
         if let Some(c) = self.controleur.take() {
             c.annuler_tout();
         }

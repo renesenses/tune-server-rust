@@ -377,6 +377,8 @@ pub struct Controleur {
     pub simulations: crate::modes::Magasin,
     /// Les sessions à plusieurs positions (C4), gardées en mémoire.
     pub sessions: crate::session::Magasin,
+    /// rc14 — les tests de niveau du micro, et la source de leur signal.
+    pub niveaux: crate::niveau::Magasin,
 }
 
 impl Controleur {
@@ -398,6 +400,7 @@ impl Controleur {
             delai_premiere_trame: DELAI_PREMIERE_TRAME,
             simulations: Default::default(),
             sessions: Default::default(),
+            niveaux: Default::default(),
         })
     }
 
@@ -438,6 +441,7 @@ impl Controleur {
         for m in self.mesures() {
             m.annuler();
         }
+        self.niveaux.annuler_tout();
     }
 
     /// Le texte d'un étalonnage déposé.
@@ -477,6 +481,18 @@ impl Controleur {
     /// Vérifie, prépare, puis lance la mesure sur son fil. Rend son id.
     pub fn lancer(self: &Arc<Self>, demande: Demande) -> Result<String, String> {
         let demande = demande.borner();
+        // rc14 — un test de niveau tient le micro ou la zone : la mesure attend.
+        // Vérification et enregistrement sous le verrou d'admission, partagé
+        // avec le test de niveau (relecture m6) : tenu jusqu'à la fin.
+        let _admission = self.niveaux.admission();
+        if let Some(t) = self
+            .niveaux
+            .occupant(&demande.entree, Some(demande.zone_id))
+        {
+            return Err(format!(
+                "un test de niveau est déjà en cours sur ce micro ou cette zone ({t})"
+            ));
+        }
         if let Some(m) = self.en_cours(demande.zone_id) {
             return Err(format!(
                 "une mesure est déjà en cours sur cette zone ({})",
