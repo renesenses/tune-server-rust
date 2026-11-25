@@ -63,13 +63,23 @@ pub fn detecter() -> Option<&'static str> {
 /// `container=` dans l'environnement du processus 1, et un cgroup v2 à la
 /// racine (`0::/`, espace de noms cgroup privé — mais aussi un Linux sans
 /// systemd : dans le doute, conteneur).
-pub fn conteneur_probable(i: &Indices<'_>, systemd_container: bool, environ_container: bool) -> bool {
+pub fn conteneur_probable(
+    i: &Indices<'_>,
+    systemd_container: bool,
+    environ_container: bool,
+) -> bool {
     moteur(i).is_some()
         || systemd_container
         || environ_container
-        || ["/lxc", "lxc.payload", "machine.slice", "libpod", "containerd"]
-            .iter()
-            .any(|m| i.cgroup.contains(m))
+        || [
+            "/lxc",
+            "lxc.payload",
+            "machine.slice",
+            "libpod",
+            "containerd",
+        ]
+        .iter()
+        .any(|m| i.cgroup.contains(m))
         || i.cgroup.lines().any(|l| l.trim() == "0::/")
 }
 
