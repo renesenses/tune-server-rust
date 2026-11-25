@@ -544,6 +544,22 @@ pub fn facade_d_un_profil_ecrit(
     let precedente = lire_zone(settings, zone_id, true)
         .ok()
         .and_then(|l| egaliseur_principal(&l.chaine).map(|i| l.chaine.plugins[i].id.clone()));
+    // Même courbe que l'égaliseur en service (l'éteindre, le rallumer,
+    // changer sa réserve) : la façade principale est gardée. C'est la règle
+    // de la lecture après #9532 (`facade_d_une_ecriture`) ; une fois
+    // #9532/#9534 intégrées, cette fonction doit appeler
+    // `facade_d_une_ancienne_ecriture`.
+    let actuel = settings
+        .get(&Partie::Egaliseur.cle(zone_id))
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_str::<EqProfile>(&b).ok());
+    if let Some(p) = precedente.as_deref()
+        && let Some(facade) = FACADES_EQ.iter().copied().find(|f| *f == p)
+        && actuel.is_some_and(|a| memes_bandes(&a.bands, &profil.bands))
+    {
+        return facade;
+    }
     let piece = profil_de_piece(settings, zone_id);
     classer_egaliseur(
         profil,

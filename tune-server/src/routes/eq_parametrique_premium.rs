@@ -36,7 +36,10 @@ use serde_json::Value;
 use tune_core::audio::eq::{EqBandSpec, EqProfile};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::license::Feature;
-use tune_core::tess::migration::{ID_EQ_PARAMETRIQUE, facade_d_un_profil_ecrit, memes_bandes};
+use tune_core::tess::migration::{
+    ID_CORRECTION_PIECE, ID_EQ_PARAMETRIQUE, ORIGINE_ESTIMATION, facade_d_un_profil_ecrit,
+    memes_bandes, origine_de_la_piece,
+};
 
 use crate::state::AppState;
 
@@ -72,19 +75,51 @@ fn bandes_des_prereglages_casque(settings: &SettingsRepo) -> Vec<Vec<EqBandSpec>
         .collect()
 }
 
-/// Écrire `nouveau` dans `zone_{id}_eq_profile` pose-t-il un NOUVEAU réglage
-/// d'égaliseur paramétrique ?
-///
-/// Non si les bandes enregistrées restent les mêmes sans que le profil soit
-/// rallumé (une zone qui avait déjà un paramétrique n'est bloquée dans aucun
-/// autre geste), ni si la courbe est graphique, casque ou de pièce.
-pub(crate) fn pose_un_parametrique(
+/// `nouveau` porte-t-il les bandes d'un profil de pièce CALCULÉ SANS MICRO
+/// de la zone (D1, Free) ? Toute autre correction de pièce est mesurée, donc
+/// Premium (même règle que `origines_par_le_serveur`).
+fn correction_estimee_de_la_zone(
     settings: &SettingsRepo,
     zone_id: i64,
     nouveau: &EqProfile,
 ) -> bool {
-    if nouveau.bands.is_empty() {
+    let Some(brut) = settings
+        .get(&format!("room_profile_{zone_id}"))
+        .ok()
+        .flatten()
+    else {
         return false;
+    };
+    let (Ok(v), Ok(piece)) = (
+        serde_json::from_str::<Value>(&brut),
+        serde_json::from_str::<tune_core::room_correction::RoomProfile>(&brut),
+    ) else {
+        return false;
+    };
+    origine_de_la_piece(&v) == ORIGINE_ESTIMATION
+        && memes_bandes(
+            &tune_core::room_correction::profil_eq_de_correction(&piece.filters).bands,
+            &nouveau.bands,
+        )
+}
+
+/// Le droit Premium qu'écrire `nouveau` dans `zone_{id}_eq_profile` demande,
+/// ou `None`.
+///
+/// Rien si les bandes enregistrées restent les mêmes sans que le profil soit
+/// rallumé (une zone qui avait déjà un paramétrique ou une correction n'est
+/// bloquée dans aucun autre geste), ni pour une courbe graphique ou casque.
+/// [`Feature::ParametricEq`] pour un paramétrique ; [`Feature::RoomCorrection`]
+/// pour une correction de pièce MESURÉE (posée ou RALLUMÉE : sans cela, un
+/// compte gratuit rallumait par `POST /zones/{id}/eq` une correction mesurée
+/// éteinte). Une correction calculée sans micro reste libre (D1).
+pub(crate) fn droit_demande(
+    settings: &SettingsRepo,
+    zone_id: i64,
+    nouveau: &EqProfile,
+) -> Option<Feature> {
+    if nouveau.bands.is_empty() {
+        return None;
     }
     let enregistre: Option<EqProfile> = settings
         .get(&format!("zone_{zone_id}_eq_profile"))
@@ -95,18 +130,22 @@ pub(crate) fn pose_un_parametrique(
         && memes_bandes(&e.bands, &nouveau.bands)
         && (e.enabled || !nouveau.enabled)
     {
-        return false;
+        return None;
     }
-    if facade_d_un_profil_ecrit(settings, zone_id, nouveau) != ID_EQ_PARAMETRIQUE {
-        return false;
+    match facade_d_un_profil_ecrit(settings, zone_id, nouveau) {
+        ID_EQ_PARAMETRIQUE => (!bandes_des_prereglages_casque(settings)
+            .iter()
+            .any(|b| memes_bandes(b, &nouveau.bands)))
+        .then_some(Feature::ParametricEq),
+        ID_CORRECTION_PIECE => (!correction_estimee_de_la_zone(settings, zone_id, nouveau))
+            .then_some(Feature::RoomCorrection),
+        _ => None,
     }
-    !bandes_des_prereglages_casque(settings)
-        .iter()
-        .any(|b| memes_bandes(b, &nouveau.bands))
 }
 
-/// Le refus 402 de [`Feature::ParametricEq`] quand `nouveau` pose un réglage
-/// paramétrique sans ce droit. Même corps que les autres routes
+/// Le refus 402 du droit que `nouveau` demande ([`droit_demande`] :
+/// [`Feature::ParametricEq`] ou [`Feature::RoomCorrection`]) quand le compte
+/// ne l'a pas. Même corps que les autres routes
 /// (`premium_guard`), message dans la langue de la requête.
 pub(crate) async fn exiger_le_droit(
     state: &AppState,
@@ -114,13 +153,12 @@ pub(crate) async fn exiger_le_droit(
     nouveau: &EqProfile,
     headers: &HeaderMap,
 ) -> Result<(), Response> {
-    if state.license.check_feature(Feature::ParametricEq).await {
-        return Ok(());
-    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    if !pose_un_parametrique(&settings, zone_id, nouveau) {
+    let Some(droit) = droit_demande(&settings, zone_id, nouveau) else {
+        return Ok(());
+    };
+    if state.license.check_feature(droit).await {
         return Ok(());
     }
-    crate::premium_guard::require_premium_localise(&state.license, Feature::ParametricEq, headers)
-        .await
+    crate::premium_guard::require_premium_localise(&state.license, droit, headers).await
 }

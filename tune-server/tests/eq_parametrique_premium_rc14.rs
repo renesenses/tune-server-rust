@@ -505,3 +505,59 @@ async fn tess_marque_replaced_in_group_n_est_pas_un_reglage() {
     assert_eq!(apres["enabled"], json!(false), "{apres}");
     assert_eq!(apres["settings"]["replaced_in_group"], json!("equalizer-graphic"), "{apres}");
 }
+
+/// rc14 — une correction de pièce MESURÉE éteinte ne se rallume pas par
+/// `POST /zones/{id}/eq` sans le Premium (402 `room_correction`) ; elle se
+/// rallume avec. Une correction calculée sans micro (Free, D1) se rallume
+/// sans droit.
+#[tokio::test]
+async fn post_eq_rallumer_une_correction_mesuree_402_sans_droit() {
+    for (nom, estimee) in [("Calibration abc", false), ("Estimation sim-1", true)] {
+        let b = Banc::nouveau(true).await;
+        let filtres = json!([
+            {"frequency_hz": 52.0, "gain_db": -6.5, "q_factor": 4.0, "filter_type": "peaking"},
+            {"frequency_hz": 118.0, "gain_db": -3.0, "q_factor": 2.5, "filter_type": "peaking"}
+        ]);
+        let uri = format!("/api/v1/room-correction/profiles/{}", b.zone);
+        let (s, v) = b
+            .appel(
+                Method::POST,
+                &uri,
+                Some(json!({"name": nom, "filters": filtres})),
+            )
+            .await;
+        assert!(s.is_success(), "{s} {v}");
+        if estimee {
+            // L'origine que le serveur pose à un profil calculé sans micro.
+            let cle = format!("room_profile_{}", b.zone);
+            let mut p: Value =
+                serde_json::from_str(&b.settings().get(&cle).unwrap().unwrap()).unwrap();
+            p["origin"] = json!("estimation");
+            b.settings().set(&cle, &p.to_string()).unwrap();
+        }
+        let (s, v) = b.appel(Method::POST, &format!("{uri}/apply"), None).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (s, v) = b.eq(json!({"enabled": false})).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let bandes =
+            serde_json::from_str::<Value>(&b.profil_enregistre().unwrap()).unwrap()["bands"]
+                .clone();
+
+        b.premium(false).await;
+        let (s, v) = b.eq(json!({"enabled": true, "bands": bandes})).await;
+        if estimee {
+            assert_eq!(s, StatusCode::OK, "{nom} : {v}");
+            continue;
+        }
+        assert_eq!(s, StatusCode::PAYMENT_REQUIRED, "{v}");
+        assert_eq!(v["error"], json!("premium_required"), "{v}");
+        assert_eq!(v["code"], json!("room_correction"), "{v}");
+        let eq: Value = serde_json::from_str(&b.profil_enregistre().unwrap()).unwrap();
+        assert_eq!(eq["enabled"], json!(false), "rien n'est écrit : {eq}");
+
+        // Contre-épreuve : avec le droit, le même geste passe.
+        b.premium(true).await;
+        let (s, v) = b.eq(json!({"enabled": true, "bands": bandes})).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+}
