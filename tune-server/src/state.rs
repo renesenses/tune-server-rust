@@ -87,6 +87,10 @@ pub struct AppState {
     /// correction), lue par le SERVEUR et copiée dans `<données>/cache/autoeq`.
     /// Champ public : un banc d'essai y pose un catalogue à faux réseau.
     pub autoeq: Arc<tune_core::audio::autoeq_base::CatalogueAutoEq>,
+    /// rc14 — la base OPRA (greffon TESS « Casque »), lue par le SERVEUR et
+    /// copiée dans `<données>/cache/opra`. Champ public : un banc d'essai y
+    /// pose un catalogue à faux réseau.
+    pub opra: Arc<tune_core::audio::opra_base::CatalogueOpra>,
     /// #7858 — le dossier des titres de démonstration, `<données>/demo-tracks`.
     /// `None` pour une base en mémoire. Champ public : un banc y pose un
     /// dossier temporaire.
@@ -778,6 +782,9 @@ impl AppState {
             ),
             autoeq: Arc::new(tune_core::audio::autoeq_base::CatalogueAutoEq::production(
                 dossier_autoeq(db_path),
+            )),
+            opra: Arc::new(tune_core::audio::opra_base::CatalogueOpra::production(
+                dossier_autoeq(db_path).and_then(|d| d.parent().map(|c| c.join("opra"))),
             )),
             dossier_titres_demo: crate::routes::titres_demo::dossier_par_defaut(db_path),
             verrou_titres_demo: Arc::new(tokio::sync::Mutex::new(())),

@@ -657,6 +657,11 @@ pub fn router() -> Router<AppState> {
             "/{id}/tess",
             get(tess::get_zone_tess).put(tess::put_zone_tess),
         )
+        // rc14 — le greffon « Casque » : une correction OPRA, par la voie du PUT.
+        .route(
+            "/{id}/tess/headphone",
+            get(tess_casque::lire_le_casque).put(tess_casque::regler_le_casque),
+        )
         // TESS T17 — charger un préréglage sur la zone (même voie que le PUT).
         .route(
             "/{id}/tess/presets/{preset_id}/apply",
@@ -765,6 +770,8 @@ pub use dsp::*;
 pub mod tess;
 // TESS T17 — préréglages de chaîne globaux et mode d'application.
 pub mod tess_prereglages;
+// rc14 — le greffon TESS « Casque » tiré d'OPRA.
+pub mod tess_casque;
 
 mod lecture;
 pub use lecture::*;
