@@ -45,7 +45,7 @@ use axum::response::Response;
 use tune_core::tess::TauxDsd;
 use tune_core::tess::api::{RefusTess, ReponseCatalogue, ReponseTessZone};
 use tune_core::tess::chaine::{
-    ChaineTess, ContexteValidation, ErreurChaine, MaillonGreffon, Upsampling,
+    ChaineTess, ContexteValidation, ErreurChaine, ID_UPSAMPLING, MaillonGreffon, Upsampling,
 };
 use tune_core::tess::greffon::{
     Canaux, Catalogue, Categorie, ContraintesPlace, DescripteurGreffon, Droit,
@@ -55,10 +55,11 @@ use tune_core::tess::greffon::{
 use tune_core::tess::migration::{
     ErreurMigration, ID_CONVOLUTION, ID_CORRECTION_PIECE, ID_CROSSFEED, ID_EQ_CASQUE,
     ID_EQ_GRAPHIQUE, ID_EQ_PARAMETRIQUE, ID_MONO, ID_REAFFECTATION, LectureZone, Partie,
-    correction_estimee, ecrire_chaine, lecture_dsd, lire_zone, origines_par_le_serveur,
+    corps_coche_deux_egaliseurs, correction_estimee, ecrire_chaine, lecture_dsd, lire_zone,
+    origines_par_le_serveur,
 };
 use tune_core::tess::resolution::{
-    ContexteExecution, ControleVolume, LectureDsd, SourceFlux, VolumeZone,
+    CodeEtape, ContexteExecution, ControleVolume, LectureDsd, MotifEtape, SourceFlux, VolumeZone,
 };
 use tune_core::tess::zones::TransportZone;
 
@@ -178,10 +179,29 @@ pub fn greffon_disponible(settings: &SettingsRepo, id: &str) -> bool {
         ID_CROSSFEED => enabled(settings, "crossfeed"),
         ID_REAFFECTATION => enabled(settings, "channel-remap"),
         ID_CONVOLUTION | ID_MONO => true,
+        // rc14 — l'étage fixe de suréchantillonnage : le moteur `upsampler`.
+        ID_UPSAMPLING => enabled(settings, tune_core::audio::premium_plugins::UPSAMPLER),
         // Le moteur existe (T13) ; l'hôte ne le fait pas encore tourner.
         ID_DECLICK_LIVE => false,
         autre => tune_core::audio::natifs_tiers::actif(settings, autre),
     }
+}
+
+/// Le paquet facultatif qui manque à ce greffon et que l'utilisateur peut
+/// installer (`POST /plugins/{paquet}/install`), ou `None`. Depuis la
+/// v0.9.156, l'égaliseur et la réaffectation des canaux ne sont plus installés
+/// par la migration : sur une base neuve, ils sont « à installer », pas
+/// « indisponibles ». Un paquet installé mais désactivé, ou en échec de
+/// chargement, reste `plugin_unavailable`.
+pub fn paquet_a_installer(settings: &SettingsRepo, id: &str) -> Option<&'static str> {
+    use tune_core::audio::premium_plugins::installed;
+    let paquet = match id {
+        ID_EQ_GRAPHIQUE | ID_EQ_PARAMETRIQUE | ID_EQ_CASQUE | ID_CORRECTION_PIECE => "equalizer",
+        ID_REAFFECTATION => "channel-remap",
+        ID_UPSAMPLING => tune_core::audio::premium_plugins::UPSAMPLER,
+        _ => return None,
+    };
+    (!installed(settings, paquet)).then_some(paquet)
 }
 
 /// `GET /tess/catalog`
@@ -189,10 +209,12 @@ pub async fn catalogue_tess_route(State(state): State<AppState>) -> impl IntoRes
     let premium = state.license.is_premium().await;
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let disponible = |id: &str| greffon_disponible(&settings, id);
-    Json(ReponseCatalogue::depuis(
+    let a_installer = |id: &str| paquet_a_installer(&settings, id).map(str::to_owned);
+    Json(ReponseCatalogue::depuis_avec_installation(
         catalogue_du_serveur(),
         premium,
         &disponible,
+        &a_installer,
     ))
 }
 
@@ -395,14 +417,44 @@ pub(super) async fn reponse_de_zone(
                 .map(|l| l.get(p).is_some())
                 .unwrap_or(true)
         });
-    ReponseTessZone::depuis_avec_le_lecteur(
+    let mut reponse = ReponseTessZone::depuis_avec_le_lecteur(
         zone_id,
         lecture.chaine,
         actif,
         catalogue,
         &ctx,
         lecteur.as_ref(),
-    )
+    );
+    preciser_les_paquets_a_installer(&mut reponse, &settings);
+    reponse
+}
+
+/// rc14 — dans le chemin du signal, une étape éteinte `plugin_unavailable`
+/// dont le paquet facultatif n'est simplement pas installé (base neuve :
+/// égaliseur, réaffectation, suréchantillonneur) devient
+/// `plugin_not_installed`, avec `params.install_package`.
+fn preciser_les_paquets_a_installer(reponse: &mut ReponseTessZone, settings: &SettingsRepo) {
+    for e in &mut reponse.signal_path {
+        if e.reason != Some(MotifEtape::PluginUnavailable) {
+            continue;
+        }
+        let id = match e.code {
+            CodeEtape::Upsampling => ID_UPSAMPLING,
+            _ => match e.plugin_id.as_deref() {
+                Some(id) => id,
+                None => continue,
+            },
+        };
+        if let Some(paquet) = paquet_a_installer(settings, id) {
+            e.reason = Some(MotifEtape::PluginNotInstalled);
+            let mut p = match e.params.take() {
+                Some(Value::Object(m)) => m,
+                _ => serde_json::Map::new(),
+            };
+            p.insert("install_package".into(), Value::String(paquet.into()));
+            e.params = Some(Value::Object(p));
+        }
+    }
 }
 
 /// T12b — ce qui joue, pour les faits du lecteur ; rien quand la zone est
@@ -595,7 +647,7 @@ pub(super) fn appliquer_le_put(
     })?;
     // Lecture stricte du corps tel qu'envoyé : 400 sur tout champ ou valeur
     // inconnus, avant toute fusion.
-    ChaineTess::depuis_corps(texte).map_err(|e| refus(&e))?;
+    let corps_lu = ChaineTess::depuis_corps(texte).map_err(|e| refus(&e))?;
     let brut: Value = serde_json::from_str(texte)
         .map_err(|e| refus(&ErreurChaine::CorpsIllisible(e.to_string())))?;
 
@@ -620,6 +672,12 @@ pub(super) fn appliquer_le_put(
     }
     // D1 : l'origine d'une correction de pièce vient de `room_profile_{id}`,
     // jamais du corps ; `ecrire_chaine` la réécrit de même.
+    // rc14 — égaliseurs exclusifs : une chaîne enregistrée avant la règle
+    // (deux façades cochées) est NORMALISÉE, pas refusée ; seul un corps qui
+    // coche lui-même une seconde façade reçoit le 409.
+    if !corps_coche_deux_egaliseurs(&corps_lu, &enregistree) {
+        tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine);
+    }
     let chaine = origines_par_le_serveur(settings, zone_id, &chaine);
     valider_le_put(&chaine, &enregistree, catalogue, premium).map_err(|e| refus(&e))?;
     let chaine = chaine.mettre_a_niveau();
@@ -627,6 +685,12 @@ pub(super) fn appliquer_le_put(
     let bilan = ecrire_chaine(settings, zone_id, &chaine).map_err(|e| erreur_migration(&e))?;
     let lecture = lire_zone(settings, zone_id, premium).map_err(|e| erreur_migration(&e))?;
     Ok((lecture, bilan.cles_modifiees))
+}
+
+/// rc14 — la clé du mode PURE de la zone (hors chaîne), que le chargement
+/// d'un préréglage bascule ; [`rafraichir`] l'applique à la sortie vivante.
+pub(super) fn cle_mode_pure(zone_id: i64) -> String {
+    format!("zone_{zone_id}_audiophile")
 }
 
 /// Chaque ancienne clé réécrite atteint la sortie vivante, comme par son
@@ -654,6 +718,10 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     }
     if est(Partie::Convolution) {
         rafraichir_le_convolueur(state, zone).await;
+    }
+    // rc14 — le mode PURE basculé par un préréglage (« Pure » l'allume).
+    if cles.contains(&cle_mode_pure(id)) {
+        let _ = state.orchestrator.apply_audiophile_change_portee(id).await;
     }
 }
 
@@ -717,7 +785,13 @@ pub async fn put_zone_tess(
             .await;
     let (lecture, cles) = match resultat {
         Ok(Ok(x)) => x,
-        Ok(Err(r)) => return r,
+        Ok(Err(r)) => {
+            // rc14 (recette .18) : un refus laisse sa trace au journal ; sans
+            // elle, « rien ne se passe » ne se distinguait pas d'un PUT jamais
+            // parti.
+            info!(zone_id = id, status = %r.status(), "tess_put_refuse");
+            return r;
+        }
         Err(e) => return erreur_migration(&ErreurMigration::Stockage(e.to_string())),
     };
     // T17 : la chaîne a changé à la main ; le préréglage chargé n'est plus
