@@ -2336,3 +2336,9 @@ path = "tests/radios_doublons_7773.rs"
 [[test]]
 name = "pays_edition_8668"
 path = "tests/pays_edition_8668.rs"
+
+# #9485 — le support retente avec la clé de licence quand le site refuse la
+# session SSO en `premium_required` (faux site monté dans le test).
+[[test]]
+name = "support_repli_licence_9485"
+path = "tests/support_repli_licence_9485.rs"
