@@ -15,6 +15,11 @@ mod reprise_apres_redemarrage_dlna_6380_tests;
 #[cfg(test)]
 #[path = "playback/reprise_service_titre_seul_6380_tests.rs"]
 mod reprise_service_titre_seul_6380_tests;
+#[path = "playback/saut_relatif.rs"]
+mod saut_relatif;
+#[cfg(test)]
+#[path = "playback/saut_relatif_tests.rs"]
+mod saut_relatif_tests;
 #[cfg(test)]
 #[path = "playback/seek_en_double_193_tests.rs"]
 mod seek_en_double_193_tests;
@@ -2187,6 +2192,8 @@ pub fn router() -> Router<AppState> {
             post(erreur_media_navigateur::signaler_erreur_media_navigateur),
         )
         .route("/{id}/seek", post(seek))
+        // rc15 (fil 3009) — reculer / avancer de N secondes (podcasts).
+        .route("/{id}/seek/relative", post(saut_relatif::seek_relatif))
         .route("/{id}/volume", post(set_volume))
         .route("/{id}/shuffle", post(toggle_shuffle))
         .route("/{id}/repeat", post(set_repeat))
@@ -5396,7 +5403,19 @@ async fn seek(
     if let Err(refus) = refuser_un_entier_negatif("position_ms", body.position_ms) {
         return refus;
     }
-    let position_ms = body.position_ms as u64;
+    seek_a_la_position(&state, zone_id, body.position_ms as u64).await
+}
+
+/// Le corps commun de `POST /seek` et de `POST /seek/relative` (rc15, fil
+/// 3009) : une position ABSOLUE déjà validée part vers l'orchestrateur, avec
+/// la garde du doublon (ticket 193) et le relais aux suiveuses d'un groupe
+/// (#7759). Un seul chemin, pour que le saut relatif ne puisse pas oublier
+/// une de ces deux règles.
+pub(super) async fn seek_a_la_position(
+    state: &AppState,
+    zone_id: i64,
+    position_ms: u64,
+) -> axum::response::Response {
     // Ticket 193 — relevé à l'ARRIVÉE, avant d'attendre la sortie : le doublon
     // arrive pendant que le premier `Seek` tient encore le renderer.
     let en_double = {
@@ -5415,7 +5434,7 @@ async fn seek(
         info!(zone_id, position_ms, "seek_en_double_ignore");
         return Json(json!({ "position_ms": position_ms })).into_response();
     }
-    let device_id = get_zone_device_id(&state, zone_id);
+    let device_id = get_zone_device_id(state, zone_id);
     match state
         .orchestrator
         .seek(zone_id, position_ms, device_id.as_deref())
