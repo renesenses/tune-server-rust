@@ -258,6 +258,17 @@ async fn apply_profile_handler(
         )
         .map_err(AppError::internal)?;
 
+    // rc14 — la chaîne TESS de la zone est enregistrée tout de suite, avec la
+    // façade « Correction de pièce » que lui donne ce profil. Sans cela, la
+    // chaîne n'était relue qu'à la volée d'après `room_profile_{id}` : un
+    // nouveau profil enregistré ensuite (nouvelle mesure, pas encore
+    // appliquée) changeait la correction en « Égaliseur paramétrique ».
+    if let Ok(id) = zone_id.parse::<i64>()
+        && let Err(e) = tune_core::tess::migration::migrer_zone(&settings, id)
+    {
+        tracing::warn!(zone_id = id, erreur = %e, "correction_piece_chaine_tess_non_enregistree");
+    }
+
     // Persister ne suffit pas : sans ceci la correction n'atteint le son qu'a
     // la piste SUIVANTE sur une zone locale, alors que la reponse annonce deja
     // `applied: true` (#1725). Une correction de piece se juge a l'oreille,

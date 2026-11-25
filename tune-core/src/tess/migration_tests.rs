@@ -2654,3 +2654,87 @@ fn d1_une_chaine_de_version_future_est_relue_avec_l_origine_du_serveur() {
     assert!(!l.conversion_piece);
     assert!(correction_estimee(&l.chaine.plugins[0]));
 }
+
+/// rc14 (retours rc13.90) — une correction de pièce ajoutée à la main dans
+/// TESS (réglages `null`, aucun profil de pièce : mesures ratées) reste une
+/// correction de pièce quand une ancienne route (`POST /zones/{id}/eq`,
+/// écran de l'égaliseur, client mobile) ne fait que l'éteindre ou la
+/// rallumer. Elle devenait « Égaliseur graphique » décoché.
+#[test]
+fn une_correction_de_piece_eteinte_par_une_ancienne_route_reste_une_correction_de_piece() {
+    let (_b, s) = base();
+    let z = 41;
+    let cle = format!("zone_{z}_eq_profile");
+    let mut c = ChaineTess::default();
+    c.plugins.push(MaillonGreffon {
+        id: ID_CORRECTION_PIECE.into(),
+        enabled: true,
+        settings: Value::Null,
+    });
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, true)]
+    );
+
+    // Éteinte par une ancienne route : même courbe, interrupteur coupé.
+    let mut p: EqProfile = serde_json::from_str(&s.get(&cle).unwrap().unwrap()).unwrap();
+    p.enabled = false;
+    s.set(&cle, &serde_json::to_string(&p).unwrap()).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, false)]
+    );
+    // Enregistrée ainsi (redémarrage : migration T03).
+    assert_eq!(
+        ids(&migrer_zone(&s, z).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, false)]
+    );
+
+    // Rallumée par l'ancienne route.
+    p.enabled = true;
+    s.set(&cle, &serde_json::to_string(&p).unwrap()).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, true)]
+    );
+
+    // Contre-épreuve : une NOUVELLE courbe graphique écrite par l'écran de
+    // l'égaliseur prend bien la façade graphique (un seul moteur).
+    let g = profil(true, graphique(10, |i| if i == 3 { 2.0 } else { 0.0 }, &[None]));
+    s.set(&cle, &serde_json::to_string(&g).unwrap()).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_EQ_GRAPHIQUE, true)]
+    );
+}
+
+/// Même règle pour une correction de pièce APPLIQUÉE dont le profil de pièce
+/// a été remplacé depuis (nouvelle mesure enregistrée, pas encore
+/// appliquée) : l'éteindre par une ancienne route ne la change pas en
+/// « Égaliseur paramétrique ».
+#[test]
+fn une_correction_appliquee_reste_une_correction_apres_un_nouveau_profil_de_piece() {
+    let (_b, s) = base();
+    let z = 42;
+    poser_la_piece(&s, z, "Calibration abc", None);
+    let b = migrer_zone(&s, z).unwrap();
+    assert_eq!(ids(&b.chaine), vec![(ID_CORRECTION_PIECE, true)]);
+
+    // Nouveau profil de pièce, pas appliqué.
+    let mut autre = serde_json::from_str::<Value>(
+        &s.get(&format!("room_profile_{z}")).unwrap().unwrap(),
+    )
+    .unwrap();
+    autre["filters"][0]["gain_db"] = json!(-2.0);
+    s.set(&format!("room_profile_{z}"), &autre.to_string()).unwrap();
+
+    let cle = format!("zone_{z}_eq_profile");
+    let mut p: EqProfile = serde_json::from_str(&s.get(&cle).unwrap().unwrap()).unwrap();
+    p.enabled = false;
+    s.set(&cle, &serde_json::to_string(&p).unwrap()).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, false)]
+    );
+}

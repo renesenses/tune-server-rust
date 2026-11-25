@@ -219,3 +219,51 @@ async fn un_profil_pose_par_l_api_enregistre_une_origine_mesuree() {
         "measured"
     );
 }
+
+/// rc14 (retours rc13.90) — après `apply`, la chaîne TESS de la zone porte
+/// « Correction de pièce » ET la garde quand un nouveau profil de pièce est
+/// enregistré sans être appliqué (nouvelle mesure). Elle était relue à la
+/// volée d'après `room_profile_{id}` et devenait « Égaliseur paramétrique ».
+#[tokio::test]
+async fn la_correction_appliquee_reste_dans_la_chaine_tess_apres_un_nouveau_profil() {
+    let (state, app) = serveur().await;
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .create("Salon", Some("local"), Some("local:DAC"))
+        .unwrap();
+    let profil = |gain: f64| {
+        json!({
+            "name": "Salon",
+            "filters": [{"frequency_hz": 63.0, "gain_db": gain, "q_factor": 1.0, "filter_type": "peaking"}],
+        })
+    };
+    let facades = |v: &Value| -> Vec<(String, bool)> {
+        v["chain"]["plugins"]
+            .as_array()
+            .expect("chaîne")
+            .iter()
+            .map(|m| (m["id"].as_str().unwrap().to_owned(), m["enabled"] == true))
+            .collect()
+    };
+
+    let chemin = format!("/api/v1/room-correction/profiles/{zone}");
+    let (status, corps) = appel(&app, "POST", &chemin, Some(profil(-8.0))).await;
+    assert!(status.is_success(), "{status} {corps}");
+    let (status, corps) = appel(&app, "POST", &format!("{chemin}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+
+    let tess = format!("/api/v1/zones/{zone}/tess");
+    let (status, v) = appel(&app, "GET", &tess, None).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(facades(&v), vec![("room-correction".to_owned(), true)], "{v}");
+
+    // Nouvelle mesure enregistrée, pas encore appliquée.
+    let (status, corps) = appel(&app, "POST", &chemin, Some(profil(-3.0))).await;
+    assert!(status.is_success(), "{status} {corps}");
+    let (status, v) = appel(&app, "GET", &tess, None).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        facades(&v),
+        vec![("room-correction".to_owned(), true)],
+        "la correction appliquée a changé de façade : {v}"
+    );
+}
