@@ -71,19 +71,30 @@ async fn faux_tidal() -> (TidalService, Journal) {
     (svc, journal)
 }
 
+/// Depuis #9486, l'absence d'albums pour le pays (404, sous-statut 2001) est
+/// une liste vide et non plus une erreur : la page du genre montre ses
+/// playlists, demandées aussitôt pour savoir si le genre a de la matière.
+/// Un AUTRE refus de TIDAL reste une erreur, jamais une page vide.
 #[tokio::test]
 async fn un_genre_refuse_par_tidal_est_une_erreur_pas_une_page_vide_9119() {
     let (svc, journal) = faux_tidal().await;
-    let resultat = svc.get_genre_albums("Polish", 50).await;
-    match resultat {
-        Err(TuneError::Streaming(m)) => assert!(m.contains("404"), "statut de TIDAL : {m}"),
-        autre => panic!("le refus de TIDAL doit remonter, pas {autre:?}"),
-    }
+    let albums = svc
+        .get_genre_albums("Polish", 50)
+        .await
+        .expect("404/2001 : catégorie absente, pas une panne (#9486)");
+    assert!(albums.is_empty());
     assert_eq!(
         journal.lock().unwrap().as_slice(),
-        ["Polish/albums?countryCode=PL"],
-        "le pays du catalogue part dans la requête"
+        [
+            "Polish/albums?countryCode=PL",
+            "Polish/playlists?countryCode=PL"
+        ],
+        "le pays du catalogue part dans les requêtes"
     );
+    match svc.get_genre_albums("Inconnu", 50).await {
+        Err(TuneError::Streaming(m)) => assert!(m.contains("400"), "statut de TIDAL : {m}"),
+        autre => panic!("le refus de TIDAL doit remonter, pas {autre:?}"),
+    }
 }
 
 #[tokio::test]

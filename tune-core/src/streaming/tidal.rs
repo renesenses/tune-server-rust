@@ -279,6 +279,11 @@ pub struct TidalService {
     /// une lecture lancée avant une déconnexion ou un changement de pays n'y
     /// réécrit pas l'ancienne page.
     pour_vous_generation: std::sync::atomic::AtomicU64,
+    /// #9486 — les catégories (genres) que TIDAL ne propose pas pour le pays
+    /// du catalogue (`404`, sous-statut `2001`), avec `true` quand la
+    /// catégorie est entièrement absente (ni albums ni playlists) et donc
+    /// masquée de la liste. Vidé au changement de pays.
+    categories_absentes: std::sync::Mutex<HashMap<String, bool>>,
     enabled_override: Option<bool>,
     /// Racine de l'API, déplacée par les seuls témoins vers un serveur factice
     /// (#4803). `None` partout ailleurs : [`API_BASE`].
@@ -361,6 +366,7 @@ impl TidalService {
             mixes_cache: std::sync::Mutex::new(None),
             pour_vous_cache: std::sync::Mutex::new(None),
             pour_vous_generation: std::sync::atomic::AtomicU64::new(0),
+            categories_absentes: std::sync::Mutex::new(HashMap::new()),
             enabled_override: None,
             base_forcee: None,
             auth_forcee: None,
@@ -1693,6 +1699,9 @@ impl TidalService {
         if let Ok(mut cache) = self.featured_cache.lock() {
             *cache = None;
         }
+        if let Ok(mut absentes) = self.categories_absentes.lock() {
+            absentes.clear();
+        }
         self.vider_le_cache_des_mixes();
         if let Ok(mut urls) = self.url_cache.try_lock() {
             *urls = UrlCache::new(240);
@@ -2072,6 +2081,23 @@ impl TidalService {
             .unwrap_or_default();
         Some(format!("tidal {statut}{sous_statut}: {message}"))
     }
+    /// #9486 — le refus « catégorie introuvable » de TIDAL : `404`, sous-statut
+    /// `2001` (« Category not found »). La catégorie n'existe pas pour le pays
+    /// du catalogue : c'est une absence, pas une panne.
+    fn categorie_introuvable(data: &serde_json::Value) -> bool {
+        data["items"].is_null()
+            && data["status"].as_u64() == Some(404)
+            && data["subStatus"].as_u64() == Some(2001)
+    }
+
+    /// #9486 — `Some(masquée)` si la catégorie est déjà connue absente.
+    fn categorie_absente(&self, genre_id: &str) -> Option<bool> {
+        self.categories_absentes
+            .lock()
+            .ok()
+            .and_then(|a| a.get(genre_id).copied())
+    }
+
     fn map_genre(item: &serde_json::Value) -> StreamGenre {
         StreamGenre {
             id: item["path"].as_str().unwrap_or("").into(),
@@ -3102,7 +3128,15 @@ impl StreamingService for TidalService {
         let data = self.api_get("/genres").await?;
         let genres = data
             .as_array()
-            .map(|items| items.iter().map(Self::map_genre).collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(Self::map_genre)
+                    // #9486 — une catégorie que TIDAL ne propose pas pour ce
+                    // pays n'est plus offerte.
+                    .filter(|g| self.categorie_absente(&g.id) != Some(true))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(genres)
     }
@@ -3112,13 +3146,44 @@ impl StreamingService for TidalService {
         genre_id: &str,
         limit: usize,
     ) -> Result<Vec<StreamAlbum>, TuneError> {
+        // #9486 — une catégorie déjà connue absente n'est pas redemandée.
+        if self.categorie_absente(genre_id).is_some() {
+            return Ok(vec![]);
+        }
         let data = self
             .api_get(&format!(
                 "/genres/{}/albums?limit={limit}",
                 urlencoding::encode(genre_id)
             ))
             .await?;
-        // #9119 — un refus de TIDAL est une erreur, pas un genre vide.
+        // #9486 — une catégorie que TIDAL ne propose pas pour ce pays (404,
+        // sous-statut 2001) est MASQUÉE, pas affichée en erreur : liste vide
+        // (200 côté route), et retirée de la liste des genres si elle n'a pas
+        // non plus de playlists. Un genre qui en a (#9119, « Polish » en PL)
+        // garde sa place : sa page a de la matière. Noté une fois au journal.
+        if Self::categorie_introuvable(&data) {
+            let masquee = match self.get_featured_playlists(None, Some(genre_id)).await {
+                Ok(playlists) => playlists.is_empty(),
+                // Panne réseau : on ne retire rien de la liste.
+                Err(_) => false,
+            };
+            let nouvelle = self
+                .categories_absentes
+                .lock()
+                .map(|mut a| a.insert(genre_id.to_string(), masquee).is_none())
+                .unwrap_or(false);
+            if nouvelle {
+                warn!(
+                    genre = %genre_id,
+                    pays = %self.pays_effectif(),
+                    pays_du_compte = %self.country_code,
+                    masquee,
+                    "tidal_categorie_absente_pour_le_pays"
+                );
+            }
+            return Ok(vec![]);
+        }
+        // #9119 — un autre refus de TIDAL est une erreur, pas un genre vide.
         if let Some(refus) = Self::refus_de_tidal(&data) {
             warn!(genre = %genre_id, pays = %self.pays_effectif(), refus = %refus, "tidal_genre_albums_refuse");
             return Err(TuneError::Streaming(refus));
@@ -6104,6 +6169,10 @@ mod mixes_7822_tests;
 #[cfg(test)]
 #[path = "tidal_genres_du_pays_9119_tests.rs"]
 mod genres_du_pays_9119_tests;
+// #9486 — une catégorie que TIDAL ne propose pas (404/2001) est masquée.
+#[cfg(test)]
+#[path = "tidal_categorie_absente_9486_tests.rs"]
+mod categorie_absente_9486_tests;
 
 // #8481 — le pays du catalogue choisi dans les Réglages.
 #[cfg(test)]
