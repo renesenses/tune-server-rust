@@ -764,7 +764,27 @@ impl PlaybackOrchestrator {
         } else {
             guess_mime_from_url(audio_url)
         };
-        let is_radio = source == "radio";
+        // #9502 (fils 3049 et 3066) — une piste `upnp` qui est un DIRECT (une
+        // radio qu'un point de contrôle pousse à la façade MediaRenderer) se
+        // joue par le chemin radio, comme la même station lancée depuis Tune.
+        // Sur le chemin fichier, la sortie locale la lisait comme un fichier
+        // compressé : démarrage figé, relance, et le même cycle. Sa source
+        // reste `upnp` : la façade reconnaît sa lecture à elle. Un DSD brut
+        // garde ses bras à lui (#8052), sans requête de plus.
+        let direct_upnp = if source == "upnp" && !est_dsd_brut(mime_type) {
+            super::flux_en_direct_9502::indice_du_direct(req, audio_url).await
+        } else {
+            None
+        };
+        if let Some(indice) = direct_upnp {
+            info!(
+                zone_id = req.zone_id,
+                url = %crate::confidentialite::masquer_url(audio_url),
+                indice = indice.code(),
+                "upnp_flux_en_direct_par_le_chemin_radio"
+            );
+        }
+        let is_radio = source == "radio" || direct_upnp.is_some();
         let is_bandcamp = source == "bandcamp";
         // Fil 2121 — la page de la piste Bandcamp, pour resigner son URL de
         // flux. Portée par la demande quand elle vient de la file ou de la
@@ -852,6 +872,7 @@ impl PlaybackOrchestrator {
         // entière (`temoins_du_refus_oaat`, et le banc de route), ce qui est le
         // seul contrôle qui aurait rougi.
         if source == "upnp"
+            && !is_radio
             && !crate::orchestrator::verdict_upnp::SortieD4::Oaat.joue_un_flux_compresse()
             && is_oaat_output
             && !est_du_wav(mime_type)
@@ -953,7 +974,7 @@ impl PlaybackOrchestrator {
         // Fil 2062 / #5550 — un serveur UPnP qui n'annonce aucune durée (la
         // Freebox) : on la lit dans les en-têtes du flux, et seulement alors.
         // Une durée connue passe telle quelle, sans une requête de plus.
-        let duration_ms = if source == "upnp" {
+        let duration_ms = if source == "upnp" && !is_radio {
             self.duree_d_une_piste_upnp(req, audio_url).await
         } else {
             duration_ms

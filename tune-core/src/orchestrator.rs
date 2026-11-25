@@ -2710,6 +2710,11 @@ mod sortie_occupee_8006_tests;
 mod duree_du_flux_2062;
 #[cfg(test)]
 mod duree_du_flux_2062_tests;
+/// #9502 — un direct poussé au MediaRenderer se joue par le chemin radio.
+mod flux_en_direct_9502;
+#[cfg(test)]
+mod flux_en_direct_9502_tests;
+pub use flux_en_direct_9502::{annoncer_une_diffusion, classe_de_diffusion};
 #[cfg(test)]
 mod prefetch_fiche_qobuz_m3u_8229_tests;
 #[cfg(test)]
