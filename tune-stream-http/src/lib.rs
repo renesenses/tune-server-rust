@@ -3092,8 +3092,52 @@ fn rogner_pour_la_phase(
 // ─── HTTPS→HTTP proxy ───────────────────────────────────────────
 
 /// Max number of transparent upstream re-connections after a mid-stream
-/// body error before we give up and end the response.
+/// body error before we give up and end the response. Ne compte que des
+/// échecs RAPPROCHÉS : voir [`ReprisesRapprochees`].
 const PROXY_MAX_RESUMES: u32 = 5;
+
+/// Une connexion amont a « fait progresser la lecture » si elle a livré au
+/// moins 1 Mio de corps : environ une minute d'un MP3 à 128 kb/s, bien plus
+/// que les quelques Kio qu'une source en boucle d'échecs rend avant de couper.
+const PROXY_PROGRES_OCTETS: u64 = 1 << 20;
+
+/// … ou si elle a tenu au moins 30 s en rendant au moins
+/// [`PROXY_PROGRES_OCTETS_MIN`] : un flux lent (podcast bas débit, radio) qui
+/// n'atteint pas 1 Mio avant sa coupure périodique progresse quand même. Le
+/// plancher d'octets écarte la connexion qui reste ouverte sans rien rendre.
+const PROXY_PROGRES_DUREE: std::time::Duration = std::time::Duration::from_secs(30);
+const PROXY_PROGRES_OCTETS_MIN: u64 = 16 << 10;
+
+/// Compte les reprises consécutives SANS progression (fil 3100). Un hôte de
+/// podcast qui coupe le corps toutes les ~10 minutes provoquait six
+/// incidents en une heure, tous réparés par un 206, et la sixième coupure
+/// abandonnait un flux sain. Une connexion qui a progressé remet le compte à
+/// zéro : le plafond ne vaut que pour des échecs rapprochés.
+#[derive(Default)]
+struct ReprisesRapprochees {
+    consecutives: u32,
+}
+
+impl ReprisesRapprochees {
+    /// La connexion qui vient de se rompre a-t-elle fait avancer la lecture ?
+    fn a_progresse(octets: u64, duree: std::time::Duration) -> bool {
+        octets >= PROXY_PROGRES_OCTETS
+            || (duree >= PROXY_PROGRES_DUREE && octets >= PROXY_PROGRES_OCTETS_MIN)
+    }
+
+    /// Note une coupure de corps. `None` : plafond atteint, on abandonne.
+    /// `Some(n)` : on reprend, c'est la n-ième reprise rapprochée.
+    fn incident(&mut self, octets: u64, duree: std::time::Duration) -> Option<u32> {
+        if Self::a_progresse(octets, duree) {
+            self.consecutives = 0;
+        }
+        if self.consecutives >= PROXY_MAX_RESUMES {
+            return None;
+        }
+        self.consecutives += 1;
+        Some(self.consecutives)
+    }
+}
 
 /// Max number of URL re-resolutions when a signed CDN URL has expired.
 /// Bounded so a genuinely-dead track can't loop forever.
@@ -3304,7 +3348,11 @@ fn resumable_proxy_body(
         // Absolute file offset of the next byte we expect to yield.
         let mut pos = abs_offset;
         let mut a_sauter = sauter;
+        let mut reprises = ReprisesRapprochees::default();
         let mut resumes: u32 = 0;
+        // Début de la connexion amont courante : de quoi mesurer sa progression.
+        let mut pos_connexion = pos;
+        let mut debut_connexion = std::time::Instant::now();
         loop {
             let mut stream = resp.bytes_stream();
             let mut clean_eof = true;
@@ -3347,12 +3395,13 @@ fn resumable_proxy_body(
                 bilan.fin = "corps_complet";
                 break;
             }
-            if resumes >= PROXY_MAX_RESUMES {
+            let Some(n) = reprises.incident(pos - pos_connexion, debut_connexion.elapsed())
+            else {
                 warn!(pos, "proxy_resume_giveup");
                 bilan.fin = "amont_abandonne";
                 break;
-            }
-            resumes += 1;
+            };
+            resumes = n;
             // Backoff before reconnecting: the CDN just dropped us.
             tokio::time::sleep(std::time::Duration::from_millis(
                 200u64 * u64::from(resumes),
@@ -3369,6 +3418,8 @@ fn resumable_proxy_body(
                     }
                     info!(pos, resumes, "proxy_resume_reconnect_206");
                     resp = r;
+                    pos_connexion = pos;
+                    debut_connexion = std::time::Instant::now();
                 }
                 Ok((r, _)) => {
                     warn!(status = %r.status(), pos, "proxy_resume_bad_status");
@@ -7707,5 +7758,184 @@ mod lecture_disque_lente_6478 {
             "{journal}"
         );
         assert!(journal.contains("lectures_lentes=10"), "{journal}");
+    }
+
+    // ─── Fil 3100 — le plafond de reprises ne compte que les échecs rapprochés ───
+
+    use super::{PROXY_MAX_RESUMES, ReprisesRapprochees, StreamInfo, StreamSession};
+
+    #[test]
+    fn le_plafond_vaut_pour_des_echecs_sans_progression() {
+        let mut r = ReprisesRapprochees::default();
+        for n in 1..=PROXY_MAX_RESUMES {
+            assert_eq!(r.incident(100, Duration::from_secs(1)), Some(n));
+        }
+        assert_eq!(r.incident(100, Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn une_connexion_qui_a_progresse_remet_le_compte_a_zero() {
+        let mut r = ReprisesRapprochees::default();
+        for _ in 0..3 * PROXY_MAX_RESUMES {
+            // 1 Mio pile : progression.
+            assert_eq!(r.incident(1 << 20, Duration::from_secs(5)), Some(1));
+        }
+        // Lente mais longue : 30 s et 16 Kio.
+        assert_eq!(r.incident(16 << 10, Duration::from_secs(30)), Some(1));
+        // Trop peu d'octets, même longtemps ; trop court, même avec des octets.
+        assert!(!ReprisesRapprochees::a_progresse(
+            100,
+            Duration::from_secs(600)
+        ));
+        assert!(!ReprisesRapprochees::a_progresse(
+            (1 << 20) - 1,
+            Duration::from_secs(29)
+        ));
+    }
+
+    #[test]
+    fn des_echecs_rapproches_apres_une_progression_comptent_de_nouveau() {
+        let mut r = ReprisesRapprochees::default();
+        assert_eq!(r.incident(5 << 20, Duration::from_secs(600)), Some(1));
+        for n in 2..=PROXY_MAX_RESUMES {
+            assert_eq!(r.incident(0, Duration::from_millis(50)), Some(n));
+        }
+        assert_eq!(r.incident(0, Duration::from_millis(50)), None);
+    }
+
+    /// Amont factice : sert `total` octets (`i % 251`). Chaque connexion
+    /// (200, ou 206 si `Range`) annonce la suite entière puis coupe après
+    /// `segment` octets pour les `coupures` premières ; `ignore_range` rend
+    /// un 200 depuis 0, comme un direct. Rend l'URL et le nombre de connexions.
+    async fn amont_qui_coupe(
+        total: usize,
+        segment: usize,
+        coupures: usize,
+        ignore_range: bool,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/podcast.mp3", ecoute.local_addr().unwrap());
+        let connexions = std::sync::Arc::new(AtomicUsize::new(0));
+        let c = connexions.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = ecoute.accept().await else {
+                    return;
+                };
+                let numero = c.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut tampon = vec![0u8; 4096];
+                    let n = sock.read(&mut tampon).await.unwrap_or(0);
+                    let requete = String::from_utf8_lossy(&tampon[..n]).to_lowercase();
+                    let debut = if ignore_range {
+                        0
+                    } else {
+                        requete
+                            .split("range: bytes=")
+                            .nth(1)
+                            .and_then(|r| r.split('-').next())
+                            .and_then(|d| d.trim().parse::<usize>().ok())
+                            .unwrap_or(0)
+                    };
+                    let reste = total - debut;
+                    let entete = if debut > 0 {
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mpeg\r\n\
+                             Content-Range: bytes {debut}-{}/{total}\r\nContent-Length: {reste}\r\n\r\n",
+                            total - 1
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {reste}\r\n\r\n"
+                        )
+                    };
+                    let a_envoyer = if numero < coupures {
+                        segment.min(reste)
+                    } else {
+                        reste
+                    };
+                    let corps: Vec<u8> = (debut..debut + a_envoyer)
+                        .map(|i| (i % 251) as u8)
+                        .collect();
+                    let _ = sock.write_all(entete.as_bytes()).await;
+                    let _ = sock.write_all(&corps).await;
+                    let _ = sock.flush().await;
+                    // Fermeture avant la fin annoncée : « error decoding response body ».
+                });
+            }
+        });
+        (url, connexions)
+    }
+
+    async fn lire_le_mandataire(url: &str) -> Vec<u8> {
+        let client: &'static reqwest::Client = Box::leak(Box::new(
+            tune_core::http::client::builder().build().unwrap(),
+        ));
+        let initial = client
+            .get(url)
+            .header("Accept-Encoding", "identity")
+            .send()
+            .await
+            .unwrap();
+        let session = std::sync::Arc::new(StreamSession::new(
+            "podcast".into(),
+            StreamInfo::default(),
+            false,
+            4,
+        ));
+        let bilan = super::BilanDeConnexion::mandataire("podcast", &axum::http::HeaderMap::new());
+        let corps = super::resumable_proxy_body(
+            client,
+            url.to_string(),
+            initial,
+            0,
+            0,
+            None,
+            session,
+            bilan,
+            None,
+        );
+        axum::body::to_bytes(corps, usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    /// Le podcast du fil 3100 : huit coupures, toutes réparées en 206, chaque
+    /// connexion ayant livré bien plus de 1 Mio. Le flux va jusqu'au bout,
+    /// octet pour octet.
+    #[tokio::test]
+    async fn huit_coupures_avec_progression_le_flux_va_jusqu_au_bout() {
+        let segment = 1_500_000;
+        let total = 9 * segment;
+        let (url, connexions) = amont_qui_coupe(total, segment, 8, false).await;
+        let recu = lire_le_mandataire(&url).await;
+        assert_eq!(recu.len(), total);
+        assert!(recu.iter().enumerate().all(|(i, &o)| o == (i % 251) as u8));
+        assert_eq!(connexions.load(std::sync::atomic::Ordering::SeqCst), 9);
+    }
+
+    /// Six coupures sans progression : abandon comme avant (première
+    /// connexion + cinq reprises), flux tronqué.
+    #[tokio::test]
+    async fn six_coupures_sans_progression_abandonnent_comme_avant() {
+        let (url, connexions) = amont_qui_coupe(1_000_000, 100, 100, false).await;
+        let recu = lire_le_mandataire(&url).await;
+        assert_eq!(recu.len(), 6 * 100);
+        assert_eq!(connexions.load(std::sync::atomic::Ordering::SeqCst), 6);
+    }
+
+    /// Direct : l'amont ignore le `Range` et rend un 200. La reprise est
+    /// refusée (`amont_mauvais_statut`) : le flux s'arrête sans boucle ni
+    /// octets rejoués, progression ou non.
+    #[tokio::test]
+    async fn un_direct_qui_ignore_le_range_n_est_pas_rejoue() {
+        let segment = 1_500_000;
+        let (url, connexions) = amont_qui_coupe(10 * segment, segment, 100, true).await;
+        let recu = lire_le_mandataire(&url).await;
+        assert_eq!(recu.len(), segment);
+        assert_eq!(connexions.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }
