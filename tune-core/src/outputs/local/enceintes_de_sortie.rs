@@ -90,6 +90,7 @@ pub(crate) fn agit(cle: &AtomicBool, dop: bool) -> bool {
 }
 
 /// Les réglages posés sur cette sortie (`None` : aucun).
+#[cfg(test)]
 pub(crate) fn reglages(cle: &AtomicBool) -> Option<ReglagesEnceintes> {
     creneau(cle).and_then(|c| c.lock().ok().map(|p| p.reglages().clone()))
 }
