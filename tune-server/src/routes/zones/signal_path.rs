@@ -85,11 +85,13 @@ pub(super) fn active_zone_eq_profile(
         return None;
     }
     // rc14 (revue #9520, règle #1548) — la même lecture que le moteur : tous
-    // les égaliseurs cochés de la série, ou le headroom manuel. Le droit n'est
-    // pas connu ici : vue d'un compte gratuit (une façade Premium écartée par
-    // l'exclusivité du 24/11 n'y est pas recochée).
-    let profile =
-        tune_core::tess::egaliseurs_en_serie::profil_du_moteur(&settings, zone_id, false)?;
+    // les égaliseurs cochés de la série, ou le headroom manuel, avec le droit
+    // que le moteur a lu (`droit_du_moteur`).
+    let profile = tune_core::tess::egaliseurs_en_serie::profil_du_moteur(
+        &settings,
+        zone_id,
+        tune_core::tess::egaliseurs_en_serie::droit_du_moteur(),
+    )?;
     // 44100/2 n'est qu'une sonde : is_enabled() dépend des gains, pas du débit.
     tune_core::audio::eq::EqProcessor::new(&profile, 44100, 2)
         .is_enabled()

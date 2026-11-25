@@ -378,14 +378,37 @@ pub fn egaliseurs_de_zone(
     if brute.version > VERSION_CHAINE || (facades < 2 && !manuel) {
         return None;
     }
-    let mut chaine = lire_zone(settings, zone_id, true).ok()?.chaine;
+    let lecture = lire_zone(settings, zone_id, true).ok()?;
+    let locale = lecture.sortie_locale;
+    let mut chaine = lecture.chaine;
     super::migration::normaliser_les_egaliseurs(&mut chaine, premium);
     let principal: Option<EqProfile> = settings
         .get(&format!("zone_{zone_id}_eq_profile"))
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok());
-    Some(profil_de_la_chaine(&chaine, principal.as_ref()))
+    // Revue #9520 v2 — le gain fixe du headroom manuel seul ne vit que sur
+    // la SORTIE LOCALE : ailleurs il rendrait l'égaliseur « actif », ferait
+    // transcoder un flux DLNA bit-perfect ou passer HQPlayer par le flux
+    // traité, pour un niveau que la compensation (#4685) rend aussitôt.
+    Some(profil_de_la_chaine(&chaine, principal.as_ref()).filter(|p| locale || !est_un_gain_fixe(p)))
+}
+
+/// Ce profil n'est-il que le gain fixe du headroom manuel ([`gain_fixe`]) ?
+pub fn est_un_gain_fixe(p: &EqProfile) -> bool {
+    p.reserve_imposee_db.is_some() && bandes_jouees(p).is_empty()
+}
+
+/// La zone sort-elle sur une sortie locale ? Zone inconnue : locale, comme
+/// la lecture de la chaîne (`LectureZone::sortie_locale`).
+fn sortie_locale(settings: &SettingsRepo, zone_id: i64) -> bool {
+    crate::db::zone_repo::ZoneRepo::with_backend(settings.backend().clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .is_none_or(|z| {
+            crate::audio::mono_downmix::mono_downmix_runs_on_output(z.output_device_id.as_deref())
+        })
 }
 
 /// L'égaliseur ACTIVÉ que le moteur applique à la zone, PURE et « Bypass
@@ -401,7 +424,9 @@ pub fn profil_du_moteur(settings: &SettingsRepo, zone_id: i64, premium: bool) ->
             if installe {
                 Some(p)
             } else {
-                p.reserve_imposee_db.filter(|d| *d < 0.0).map(gain_fixe)
+                p.reserve_imposee_db
+                    .filter(|d| *d < 0.0 && sortie_locale(settings, zone_id))
+                    .map(gain_fixe)
             }
         });
     }
@@ -414,6 +439,21 @@ pub fn profil_du_moteur(settings: &SettingsRepo, zone_id: i64, premium: bool) ->
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())?;
     profil.enabled.then_some(profil)
+}
+
+/// Revue #9520 v2 — le droit Premium que le moteur a lu la dernière fois
+/// qu'il a chargé un égaliseur (`PlaybackOrchestrator::eq_profile_configure`,
+/// instantané de la licence). Le panneau historique, qui n'a pas la licence,
+/// lit ce même droit : il décrit ce que le moteur applique. Faux tant que le
+/// moteur n'a rien chargé (le panneau ne décrit qu'une zone qui joue).
+static DROIT_DU_MOTEUR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn retenir_le_droit_du_moteur(premium: bool) {
+    DROIT_DU_MOTEUR.store(premium, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn droit_du_moteur() -> bool {
+    DROIT_DU_MOTEUR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Ce qui, dans une chaîne, change l'égaliseur du moteur : les façades

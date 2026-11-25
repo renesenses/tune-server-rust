@@ -1308,3 +1308,28 @@ async fn sortie_de_pure_libre_avec_le_verrou_de_volume_rc14() {
         "{v}"
     );
 }
+
+/// Revue #9520 v2 — un préréglage posé par son corps (`chain`) est une
+/// nouvelle édition : un gain hors des bornes publiées est refusé (409),
+/// sans rien enregistrer ; dans les bornes, il passe.
+#[tokio::test]
+async fn un_prereglage_par_son_corps_suit_les_bornes_de_gain_9520() {
+    let b = Banc::nouveau(true).await;
+    let corps = |g: f64| {
+        json!({"name": "Faux", "chain": {"version": 1, "plugins": [
+            {"id": "equalizer-parametric", "enabled": true, "settings": profil(json!([
+                {"freq": 3000.0, "gain": g, "q": 4.0, "type": "peak"}
+            ]))}
+        ]}})
+    };
+    let (s, v) = b
+        .brut(Method::POST, "/api/v1/tess/presets", Some(corps(-40.0)))
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["error"], json!("invalid_settings"), "{v}");
+    assert_eq!(ids(&b.liste().await), vec!["pure"]);
+    let (s, v) = b
+        .brut(Method::POST, "/api/v1/tess/presets", Some(corps(-30.0)))
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+}

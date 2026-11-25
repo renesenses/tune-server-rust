@@ -837,6 +837,11 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// Revue #9520 v2 — PURE ou mesure de pièce, SANS « Bypass all »
+    /// (`audiophile::pure_ou_mesure`) : ce que lisent les gardes de niveau
+    /// (#8074). `set_pure_bypass` le pose aussi ; l'orchestrateur le précise
+    /// ensuite par [`Self::set_pure_ou_mesure`].
+    pure_ou_mesure: AtomicBool,
     /// #8074 — vrai dès qu'un volume a été POSÉ sur cette sortie (`set_volume`
     /// ou la sourdine : la graine de zone, un geste, une restauration). Une
     /// sortie naît à pleine échelle (`user_volume` à l'unité) ; tant que ce
@@ -1531,6 +1536,7 @@ impl LocalOutput {
             convolver: Arc::new(std::sync::Mutex::new(None)),
             convolution_autorisee: Arc::new(AtomicBool::new(false)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
+            pure_ou_mesure: AtomicBool::new(false),
             volume_pose: AtomicBool::new(false),
             flux_sans_fin: AtomicBool::new(false),
             volume_avant_egaliseur: AtomicU32::new(u32::MAX),
@@ -2144,6 +2150,13 @@ impl LocalOutput {
         avant != autorisee
     }
 
+    /// Revue #9520 v2 — PURE ou mesure de pièce de la zone qui joue, sans
+    /// « Bypass all » (`audiophile::pure_ou_mesure`), posé après
+    /// [`Self::set_pure_bypass`].
+    pub fn set_pure_ou_mesure(&self, pure: bool) {
+        self.pure_ou_mesure.store(pure, Ordering::Relaxed);
+    }
+
     /// rc14 — l'ordre des étages (égaliseurs, convolution, crossfeed, repli
     /// mono) suit celui de la chaîne TESS de la zone qui joue. Posé par
     /// l'orchestrateur à chaque lecture et quand la chaîne change ; pris au
@@ -2175,6 +2188,7 @@ impl LocalOutput {
                 .store(false, Ordering::Relaxed);
         }
         self.pure_bypass.store(bypass, Ordering::Relaxed);
+        self.pure_ou_mesure.store(bypass, Ordering::Relaxed);
         // #4685 — un DSP contourné ne change aucun niveau : sa compensation
         // doit tomber avec lui.
         self.recalculer_la_compensation();
@@ -2291,8 +2305,10 @@ impl LocalOutput {
     /// pas toucher au signal, et leur volume (100 %) est posé par la graine.
     /// Rend vrai quand la garde a abaissé le gain.
     pub(crate) async fn partir_bas_si_aucun_volume_pose(&self) -> bool {
+        // Revue #9520 v2 — PURE (ou mesure), jamais « Bypass all » : la garde
+        // de départ bas (#8074) reste armée sous lui, comme #8813.
         if self.volume_pose.load(Ordering::SeqCst)
-            || self.pure_bypass.load(Ordering::Relaxed)
+            || self.pure_ou_mesure.load(Ordering::Relaxed)
             || self.strict_bitperfect.load(Ordering::Relaxed)
         {
             return false;

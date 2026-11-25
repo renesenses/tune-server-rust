@@ -193,6 +193,13 @@ pub async fn enregistrer_prereglage(State(state): State<AppState>, corps: Bytes)
             ) {
                 return refus(&e);
             }
+            // Revue #9520 v2 — un préréglage posé par son corps est une
+            // NOUVELLE édition : les bornes de gain publiées valent pour lui
+            // (sinon il les contournerait au chargement, où ses façades sont
+            // « connues »).
+            if let Err(e) = tune_core::tess::egaliseurs_en_serie::verifier_les_gains(&c, &[]) {
+                return refus(&e);
+            }
             c
         }
         _ => {

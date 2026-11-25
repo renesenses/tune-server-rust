@@ -2611,6 +2611,11 @@ impl PlaybackOrchestrator {
                     // lecture comme le strict : `play_url` la lit une fois.
                     local_output.set_secondes_sorties(secondes_sorties);
                     local_output.set_retard_de_depart_ms(retard_de_depart_ms);
+                    // Revue #9520 v2 — PURE ou mesure, sans « Bypass all » :
+                    // ce que lit la garde de départ bas (#8074).
+                    local_output.set_pure_ou_mesure(crate::audio::audiophile::pure_ou_mesure(
+                        &self.db, zone_id,
+                    ));
                     // rc14 — l'ordre des étages suit la chaîne TESS de la zone.
                     local_output.set_ordre_tess(&crate::tess::egaliseurs_en_serie::chaine_de_zone(
                         &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),

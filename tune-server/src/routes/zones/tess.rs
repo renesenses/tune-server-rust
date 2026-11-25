@@ -750,10 +750,11 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
         let _ = state.orchestrator.apply_audiophile_change_portee(id).await;
     }
     // Revue #9520 — « Bypass all » coupe aussi le suréchantillonneur et la
-    // cadence fixe (sortie locale ; aucune voie réseau ne les applique, ni le
-    // repli mono ni la réaffectation) : même rafraîchissement que leur route.
+    // cadence fixe ; une cadence fixe réglée relance le flux (v2). Aucune voie
+    // réseau n'applique le suréchantillonneur, le repli mono ni la
+    // réaffectation.
     if bypass && !est(Partie::Surechantillonnage) {
-        let _ = state.orchestrator.apply_upsampler_change_portee(id).await;
+        let _ = state.orchestrator.apply_bypass_all_portee(id).await;
     }
 }
 

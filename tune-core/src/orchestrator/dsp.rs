@@ -1189,7 +1189,18 @@ impl PlaybackOrchestrator {
         let eq = self
             .eq_profile_configure(zone_id)
             .filter(|p| crate::audio::eq::EqProcessor::new(p, 44100, 2).is_enabled())
-            .map(|p| serde_json::to_string(&p).unwrap_or_else(|_| format!("{p:?}")))
+            .map(|p| {
+                let mut e = serde_json::to_string(&p).unwrap_or_else(|_| format!("{p:?}"));
+                // Revue #9520 v2 — la marge manuelle de TESS et la réserve L1
+                // d'une série changent les octets sans être sérialisées.
+                if let Some(db) = p.reserve_imposee_db {
+                    e.push_str(&format!("|marge={}", db.to_bits()));
+                }
+                if p.reserve_l1_toujours {
+                    e.push_str("|l1");
+                }
+                e
+            })
             .unwrap_or_default();
         let ir = self
             .chemin_ir_configure(zone_id)
@@ -2090,6 +2101,9 @@ impl PlaybackOrchestrator {
                 if local_output.flux_en_demarrage() {
                     let pure = self.zone_audiophile(zone_id);
                     local_output.set_pure_bypass(pure);
+                    local_output.set_pure_ou_mesure(crate::audio::audiophile::pure_ou_mesure(
+                        &self.db, zone_id,
+                    ));
                     self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
                     info!(zone_id, pure, "zone_pure_reportee_au_flux_qui_demarre");
                     return true;
@@ -2099,6 +2113,9 @@ impl PlaybackOrchestrator {
 
             let pure = self.zone_audiophile(zone_id);
             local_output.set_pure_bypass(pure);
+            local_output.set_pure_ou_mesure(crate::audio::audiophile::pure_ou_mesure(
+                &self.db, zone_id,
+            ));
             // #6522, #6524 — le verdict PURE suit les RÉGLAGES, que la bascule
             // ne change pas ; la chaîne, elle, va être vidée juste en dessous.
             self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
@@ -2354,6 +2371,7 @@ impl PlaybackOrchestrator {
             .license
             .as_ref()
             .is_none_or(|license| license.premium_snapshot());
+        crate::tess::egaliseurs_en_serie::retenir_le_droit_du_moteur(premium);
         Self::eq_profile_configure_with(&self.db, zone_id, premium)
     }
 
@@ -2776,6 +2794,27 @@ impl PlaybackOrchestrator {
     ///   remettrait en lecture, #7556) ou position inconnue (#2595) ;
     /// - [`PorteeDuReglage::RienNeJoue`] : la prochaine lecture partira avec
     ///   ce réglage.
+    /// Revue #9520 v2 — « Bypass all » basculé : le suréchantillonneur et la
+    /// cadence fixe suivent. Comme [`Self::apply_upsampler_change_portee`],
+    /// et une cadence fixe réglée sur la zone relance aussi (elle est prise à
+    /// l'ouverture du flux). Même anti-rebond que toute relance de réglage
+    /// (`schedule_replay_pour`, génération par zone) : une bascule, une relance.
+    pub async fn apply_bypass_all_portee(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+    ) -> PorteeDuReglage {
+        self.refresh_zone_upsampler(zone_id).await;
+        let change = match self.surechantillonneur_du_flux_et_choix(zone_id).await {
+            Some((du_flux, choix)) => du_flux != choix,
+            None => false,
+        } || crate::audio::frequence_fixe::lire(&self.db, zone_id).is_some();
+        let portee = self
+            .portee_du_reglage_du_surechantillonneur(zone_id, change)
+            .await;
+        info!(zone_id, portee = ?portee, "tess_bypass_all_portee");
+        portee
+    }
+
     pub async fn apply_upsampler_change_portee(
         self: &std::sync::Arc<Self>,
         zone_id: i64,
