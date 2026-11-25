@@ -391,7 +391,9 @@ pub fn egaliseurs_de_zone(
     // la SORTIE LOCALE : ailleurs il rendrait l'égaliseur « actif », ferait
     // transcoder un flux DLNA bit-perfect ou passer HQPlayer par le flux
     // traité, pour un niveau que la compensation (#4685) rend aussitôt.
-    Some(profil_de_la_chaine(&chaine, principal.as_ref()).filter(|p| locale || !est_un_gain_fixe(p)))
+    Some(
+        profil_de_la_chaine(&chaine, principal.as_ref()).filter(|p| locale || !est_un_gain_fixe(p)),
+    )
 }
 
 /// Ce profil n'est-il que le gain fixe du headroom manuel ([`gain_fixe`]) ?

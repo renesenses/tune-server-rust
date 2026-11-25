@@ -500,7 +500,10 @@ async fn le_headroom_manuel_seul_garde_le_reseau_bit_perfect_9520() {
     let mut chaine = ChaineTess::default();
     chaine.fixed.headroom = Headroom::Manual { db: -6.0 };
     ecrire_chaine(&settings(&o), z, &chaine).unwrap();
-    assert!(!o.zone_has_active_eq(z), "égaliseur annoncé actif sur le réseau");
+    assert!(
+        !o.zone_has_active_eq(z),
+        "égaliseur annoncé actif sur le réseau"
+    );
     assert!(!o.zone_traite_le_flux_hors_tess(z), "flux traité hors TESS");
     assert!(o.load_eq_profile(z).is_none());
     assert_eq!(servi(&o, z), avant, "octets changés par le headroom seul");
@@ -519,8 +522,9 @@ async fn l_empreinte_voit_le_headroom_manuel_9520() {
         ],
         ..ChaineTess::default()
     };
-    let empreinte =
-        |o: &PlaybackOrchestrator| o.empreinte_du_traitement(z, crate::audio::replaygain::PisteRg::AUCUNE);
+    let empreinte = |o: &PlaybackOrchestrator| {
+        o.empreinte_du_traitement(z, crate::audio::replaygain::PisteRg::AUCUNE)
+    };
     chaine.fixed.headroom = Headroom::Manual { db: -3.0 };
     ecrire_chaine(&settings(&o), z, &chaine).unwrap();
     let a = empreinte(&o);

@@ -2113,9 +2113,8 @@ impl PlaybackOrchestrator {
 
             let pure = self.zone_audiophile(zone_id);
             local_output.set_pure_bypass(pure);
-            local_output.set_pure_ou_mesure(crate::audio::audiophile::pure_ou_mesure(
-                &self.db, zone_id,
-            ));
+            local_output
+                .set_pure_ou_mesure(crate::audio::audiophile::pure_ou_mesure(&self.db, zone_id));
             // #6522, #6524 — le verdict PURE suit les RÉGLAGES, que la bascule
             // ne change pas ; la chaîne, elle, va être vidée juste en dessous.
             self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
