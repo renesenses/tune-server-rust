@@ -7304,9 +7304,21 @@ async fn get_eq(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     let bands = eq_bands_json(&profile);
+    // rc14 (revue #9520) — avec une série d'égaliseurs TESS, « activé » dit ce
+    // que le moteur applique (tous les égaliseurs cochés), pas le seul
+    // principal que cette route expose.
+    let premium = state.license.is_premium().await;
+    let enabled = match tune_core::tess::egaliseurs_en_serie::egaliseurs_de_zone(
+        &settings, zone_id, premium,
+    ) {
+        Some(serie) => serie.is_some_and(|p| {
+            !p.bands.is_empty() || p.effective_gains() != (0.0, 0.0, 0.0)
+        }),
+        None => profile.enabled && !bands.is_empty(),
+    };
     Json(json!({
         "zone_id": zone_id,
-        "enabled": profile.enabled && !bands.is_empty(),
+        "enabled": enabled,
         "preset": if bands.is_empty() { "flat" } else { "custom" },
         "bands": bands,
         // #5171 — toujours présent : sa présence dit au client que ce serveur

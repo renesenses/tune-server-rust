@@ -1204,40 +1204,61 @@ async fn deux_egaliseurs_coches_passent_et_s_enchainent_rc14() {
 }
 
 /// rc14 — une zone enregistrée sous l'exclusivité du 24/11 (paramétrique
-/// décoché avec `replaced_in_group` vers le graphique) le retrouve coché à
-/// la lecture, sans marque.
+/// décoché avec `replaced_in_group` vers le graphique) : un compte Premium le
+/// retrouve coché (vue, moteur, puis enregistré au `PUT` suivant) ; un compte
+/// gratuit ne l'entendait pas et ne l'entend toujours pas (revue #9520).
 #[tokio::test]
 async fn une_zone_normalisee_par_l_exclusivite_retrouve_ses_egaliseurs_rc14() {
-    let b = Banc::nouveau(true).await;
-    let (s, v) = b
-        .put(json!({"version": 1, "plugins": [
-            {"id": "equalizer-graphic", "enabled": true, "settings": profil(json!([]))},
-            {"id": "equalizer-parametric", "enabled": true, "settings": profil(bandes_parametriques())}
-        ]}))
-        .await;
-    assert_eq!(s, StatusCode::OK, "{v}");
-    // La chaîne telle que #9512 l'aurait enregistrée.
-    let mut brute: Value = serde_json::from_str(&b.enregistree().unwrap()).unwrap();
-    for m in brute["plugins"].as_array_mut().unwrap() {
-        if m["id"] == json!("equalizer-parametric") {
-            m["enabled"] = json!(false);
-            m["settings"]["replaced_in_group"] = json!("equalizer-graphic");
+    for premium in [true, false] {
+        let b = Banc::nouveau(true).await;
+        let (s, v) = b
+            .put(json!({"version": 1, "plugins": [
+                {"id": "equalizer-graphic", "enabled": true, "settings": profil(json!([]))},
+                {"id": "equalizer-parametric", "enabled": true, "settings": profil(bandes_parametriques())}
+            ]}))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        // La chaîne telle que #9512 l'aurait enregistrée.
+        let mut brute: Value = serde_json::from_str(&b.enregistree().unwrap()).unwrap();
+        for m in brute["plugins"].as_array_mut().unwrap() {
+            if m["id"] == json!("equalizer-parametric") {
+                m["enabled"] = json!(false);
+                m["settings"]["replaced_in_group"] = json!("equalizer-graphic");
+            }
+        }
+        b.settings()
+            .set(&cle_chaine_zone(b.zone), &brute.to_string())
+            .unwrap();
+        b.premium(premium).await;
+        let (_, v) = b.get().await;
+        let p = v["chain"]["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == json!("equalizer-parametric"))
+            .unwrap()
+            .clone();
+        assert_eq!(p["enabled"], json!(premium), "premium={premium} : {p}");
+        let moteur = tune_core::tess::egaliseurs_en_serie::profil_du_moteur(
+            &b.settings(),
+            b.zone,
+            premium,
+        );
+        let bandes = moteur.map_or(0, |p| p.bands.len());
+        assert_eq!(bandes, if premium { 2 } else { 0 }, "premium={premium}");
+        if premium {
+            // Renvoyée telle quelle, la vue s'enregistre recochée.
+            let (s, v) = b.put(v["chain"].clone()).await;
+            assert_eq!(s, StatusCode::OK, "{v}");
+            let c = b.chaine();
+            let m = c
+                .plugins
+                .iter()
+                .find(|m| m.id == "equalizer-parametric")
+                .unwrap();
+            assert!(m.enabled && m.settings.get("replaced_in_group").is_none(), "{m:?}");
         }
     }
-    b.settings()
-        .set(&cle_chaine_zone(b.zone), &brute.to_string())
-        .unwrap();
-    let (_, v) = b.get().await;
-    let p = etape(&v, "equalizer-parametric");
-    assert_eq!(p["effective"], json!(true), "{p}");
-    let c = b.chaine();
-    let m = c
-        .plugins
-        .iter()
-        .find(|m| m.id == "equalizer-parametric")
-        .unwrap();
-    assert!(m.enabled);
-    assert!(m.settings.get("replaced_in_group").is_none(), "{m:?}");
 }
 
 /// rc14 — bornes de gain publiées au chemin que lit le web, et tenues au
