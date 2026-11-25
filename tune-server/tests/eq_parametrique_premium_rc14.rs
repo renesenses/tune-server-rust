@@ -498,12 +498,20 @@ async fn tess_marque_replaced_in_group_n_est_pas_un_reglage() {
             .unwrap()
     };
     assert_eq!(p(&chaine)["enabled"], json!(false), "{chaine}");
-    assert_eq!(p(&chaine)["settings"]["replaced_in_group"], json!("equalizer-graphic"), "{chaine}");
+    assert_eq!(
+        p(&chaine)["settings"]["replaced_in_group"],
+        json!("equalizer-graphic"),
+        "{chaine}"
+    );
     let (s, v) = b.appel(Method::PUT, &uri, Some(chaine)).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let apres = p(&v["chain"]);
     assert_eq!(apres["enabled"], json!(false), "{apres}");
-    assert_eq!(apres["settings"]["replaced_in_group"], json!("equalizer-graphic"), "{apres}");
+    assert_eq!(
+        apres["settings"]["replaced_in_group"],
+        json!("equalizer-graphic"),
+        "{apres}"
+    );
 }
 
 /// rc14 — une correction de pièce MESURÉE éteinte ne se rallume pas par
