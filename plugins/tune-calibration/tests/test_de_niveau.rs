@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 use tune_calibration::sim::RoomSim;
 use tune_calibration_greffon::fournisseur::FournisseurBalayage;
 use tune_calibration_greffon::generateur::Voies;
+use tune_calibration_greffon::hote::{
+    ElementBalayage, HoteZone, SortieInactive, TraitementsDeZone,
+};
 use tune_calibration_greffon::mesure::{Controleur, Demande, Etat, FREQUENCE_MESURE};
 use tune_calibration_greffon::niveau::{
     DemandeNiveau, EtatTest, FournisseurNiveau, Jugement, RefusNiveau, ZoneDeTest,
@@ -35,7 +38,6 @@ const ZONE_PANIQUE: i64 = 702;
 struct ZoneSimulee {
     fournisseur: Arc<FournisseurNiveau>,
     boucle: Arc<Boucle>,
-    inactive: Option<String>,
     /// La zone sort en ASIO et, comme on le soupçonne chez Didier, l'entrée
     /// Windows de la même interface cesse de capter dès que la zone joue.
     asio: bool,
@@ -49,10 +51,6 @@ struct ZoneSimulee {
 }
 
 impl ZoneDeTest for ZoneSimulee {
-    fn sortie_inactive(&self, _zone_id: i64) -> Option<String> {
-        self.inactive.clone()
-    }
-
     fn jouer_signal(&self, zone_id: i64, e: &ElementDeTest) -> Result<(), String> {
         if self.panique.load(Ordering::SeqCst) {
             panic!("panique simulée du fil de test");
@@ -103,6 +101,39 @@ impl ZoneDeTest for ZoneSimulee {
     }
 }
 
+/// L'hôte simulé, plus une sortie inactive au besoin (fil 3094).
+struct HoteOrphelin {
+    simule: Arc<HoteSimule>,
+    inactive: Option<SortieInactive>,
+}
+
+impl HoteZone for HoteOrphelin {
+    fn volume(&self, zone_id: i64) -> Option<f64> {
+        self.simule.volume(zone_id)
+    }
+    fn regler_volume(&self, zone_id: i64, volume_pct: f64) -> Result<(), String> {
+        self.simule.regler_volume(zone_id, volume_pct)
+    }
+    fn jouer(&self, zone_id: i64, element: ElementBalayage) -> Result<(), String> {
+        self.simule.jouer(zone_id, element)
+    }
+    fn arreter(&self, zone_id: i64) {
+        self.simule.arreter(zone_id)
+    }
+    fn traitements(&self, zone_id: i64) -> TraitementsDeZone {
+        self.simule.traitements(zone_id)
+    }
+    fn sortie_inactive(&self, _zone_id: i64) -> Option<SortieInactive> {
+        self.inactive.clone()
+    }
+    fn enregistrer_profil_piece(
+        &self,
+        profil: &tune_core::room_correction::RoomProfile,
+    ) -> Result<(), String> {
+        self.simule.enregistrer_profil_piece(profil)
+    }
+}
+
 struct Banc {
     controleur: Arc<Controleur>,
     hote: Arc<HoteSimule>,
@@ -126,6 +157,14 @@ fn banc_asio(
     let boucle = Boucle::new(PieceEnDirect::depuis(sim, gain_micro), VITESSE);
     let fournisseur = FournisseurBalayage::new();
     let hote = HoteSimule::new(fournisseur.clone(), boucle.clone(), Some(50.0));
+    // Fil 3094 (#9528) — la zone orpheline vient de l'hôte de la mesure.
+    let hote_zone: Arc<dyn HoteZone> = Arc::new(HoteOrphelin {
+        simule: hote.clone(),
+        inactive: inactive.map(|d| SortieInactive {
+            device_id: d.to_string(),
+            porteuse: Some((3, "Salon (DAC)".into())),
+        }),
+    });
     let micro = Arc::new(MicroSimule {
         nom: MICRO.into(),
         frequence: FREQUENCE_MESURE,
@@ -136,14 +175,13 @@ fn banc_asio(
     let dossier = tune_core::test_scratch::scratch_dir(&format!("tune-calibration-niveau-{nom}"));
     let controleur = Controleur::new(
         peripheriques,
-        hote.clone(),
+        hote_zone,
         fournisseur,
         dossier.path().to_path_buf(),
     );
     let zone = Arc::new(ZoneSimulee {
         fournisseur: controleur.niveaux.fournisseur.clone(),
         boucle: boucle.clone(),
-        inactive: inactive.map(str::to_string),
         asio,
         en_lecture: AtomicBool::new(false),
         panique: AtomicBool::new(false),
@@ -616,7 +654,8 @@ fn une_zone_orpheline_est_refusee_avant_tout() {
     let Err(e @ RefusNiveau::SortieInactive(_)) = r else {
         panic!("{r:?}")
     };
-    assert!(e.message().contains("« SmartDX1 »"), "{}", e.message());
+    // #9528 : le refus nomme la zone qui porte l'appareil.
+    assert!(e.message().contains("« Salon (DAC) »"), "{}", e.message());
     assert_eq!(demarrages(&b), 0);
     assert!(b.hote.journal().volumes.is_empty());
     assert!(b.zone.journal.lock().unwrap().is_empty());
@@ -809,7 +848,6 @@ fn le_signal_de_test_ne_passe_ni_par_la_file_ni_par_l_historique() {
         playback: playback.clone(),
         runtime: rt.handle().clone(),
     };
-    assert_eq!(zone.sortie_inactive(zone_id), None);
     // Relecture m3 — la zone, arrêtée, affiche le titre 1 à 42 s.
     let titre_1 = tune_core::playback::NowPlaying {
         title: "Titre 1".into(),
@@ -889,12 +927,6 @@ fn le_signal_de_test_ne_passe_ni_par_la_file_ni_par_l_historique() {
         .and_then(|r| r.first().and_then(|v| v.as_i64()))
         .unwrap_or(-1);
     assert_eq!(lignes, 0, "le signal de test est entré dans l'historique");
-
-    // Une zone dont l'appareil n'est pas enregistré : orpheline.
-    let orpheline = zones
-        .create("Bureau", Some("local"), Some("local:Absent"))
-        .unwrap();
-    assert_eq!(zone.sortie_inactive(orpheline), Some("local:Absent".into()));
 }
 
 /// Exploration (non lancée d'office) : pour des bruits de fond croissants,
