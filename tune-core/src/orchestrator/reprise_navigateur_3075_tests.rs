@@ -99,7 +99,10 @@ async fn zone_navigateur_a_95_s() -> (
         })
         .await
         .expect("prémisse : la zone navigateur joue la piste");
-    assert!(resultat.stream_url.is_some(), "prémisse : un flux est servi");
+    assert!(
+        resultat.stream_url.is_some(),
+        "prémisse : un flux est servi"
+    );
     let sid = orch
         .playback
         .get_state(zone_id)
@@ -108,7 +111,8 @@ async fn zone_navigateur_a_95_s() -> (
         .and_then(|np| np.stream_id)
         .expect("prémisse : la piste porte un flux");
     orch.signaler_lecture_navigateur(zone_id, &sid, 1_000).await;
-    orch.signaler_lecture_navigateur(zone_id, &sid, 95_000).await;
+    orch.signaler_lecture_navigateur(zone_id, &sid, 95_000)
+        .await;
     assert_eq!(
         orch.playback.get_state(zone_id).await.position_ms,
         95_000,
@@ -121,13 +125,22 @@ async fn zone_navigateur_a_95_s() -> (
 async fn pause_puis_purge(orch: &PlaybackOrchestrator, zone_id: i64, sid: &str) {
     orch.pause(zone_id, None).await.expect("pause");
     orch.streamer.remove_session(sid).await;
-    assert!(!orch.streamer.session_alive(sid).await, "prémisse : session purgée");
+    assert!(
+        !orch.streamer.session_alive(sid).await,
+        "prémisse : session purgée"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reprise_apres_purge_meme_piste_meme_position_nouveau_flux_3075() {
     let (orch, zone_id, sid, _dir, _fichier) = zone_navigateur_a_95_s().await;
+    // Le sondeur valide l'écoute (seuil franchi à 95 s) : une ligne.
+    orch.valider_l_ecoute(&orch.playback.get_state(zone_id).await);
     let historique_avant = lignes_d_historique(&orch);
+    assert_eq!(
+        historique_avant, 1,
+        "prémisse : la lecture confirmée a écrit sa ligne d'historique"
+    );
     pause_puis_purge(&orch, zone_id, &sid).await;
 
     orch.resume(zone_id, None)
@@ -143,10 +156,13 @@ async fn reprise_apres_purge_meme_piste_meme_position_nouveau_flux_3075() {
     assert!(orch.streamer.session_alive(&nouveau).await);
     assert_eq!(etat.position_ms, 95_000, "reprise à la position mémorisée");
 
-    // Le lecteur recharge le nouveau flux et le confirme : la reprise n'est
-    // pas une nouvelle écoute.
-    orch.signaler_lecture_navigateur(zone_id, &nouveau, 96_000).await;
-    orch.signaler_lecture_navigateur(zone_id, &nouveau, 101_000).await;
+    // Le lecteur recharge le nouveau flux et le confirme, puis le sondeur
+    // repasse : la reprise n'est pas une nouvelle écoute.
+    orch.signaler_lecture_navigateur(zone_id, &nouveau, 96_000)
+        .await;
+    orch.signaler_lecture_navigateur(zone_id, &nouveau, 101_000)
+        .await;
+    orch.valider_l_ecoute(&orch.playback.get_state(zone_id).await);
     assert_eq!(
         lignes_d_historique(&orch),
         historique_avant,

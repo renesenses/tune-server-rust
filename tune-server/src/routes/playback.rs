@@ -4938,7 +4938,10 @@ mod reponse_piste_disparue_3075_tests {
         let reponse = reponse_piste_disparue(&disparue).expect("reconnue");
         assert_eq!(reponse.status(), StatusCode::GONE);
 
-        let autre = OutputCommandError::failed(tune_core::outputs::OutputCommand::Resume, "session perdue".into());
+        let autre = OutputCommandError::failed(
+            tune_core::outputs::OutputCommand::Resume,
+            "session perdue".to_string(),
+        );
         assert!(reponse_piste_disparue(&autre).is_none());
     }
 }
