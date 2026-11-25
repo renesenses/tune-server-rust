@@ -47,3 +47,32 @@ fn une_ir_mono_rend_un_seul_canal_1427() {
     assert!(reponse_du_convolueur(&[], 44_100).is_err());
     assert!(reponse_du_convolueur(&[vec![1.0f32]], 0).is_err());
 }
+
+/// rc14 (Rémi) — 512 points par FFT ; une impulsion retardée différemment
+/// sur chaque canal : chaque canal publie SON retard, et sa phase déroulée
+/// hors retard est nulle (phase linéaire pure).
+#[test]
+fn la_courbe_fft_publie_la_phase_deroulee_hors_retard_par_canal_rc14() {
+    let mut gauche = vec![0.0f32; 2048];
+    gauche[10] = 1.0;
+    let mut droit = vec![0.0f32; 2048];
+    droit[480] = -0.5;
+    let corps = reponse_du_convolueur(&[gauche, droit], 48_000).unwrap();
+    assert_eq!(corps["grid_points"], 512);
+    let canaux = corps["channels"].as_array().unwrap();
+    for (canal, retard) in [(0usize, 10u64), (1, 480)] {
+        let c = &canaux[canal];
+        assert_eq!(c["phase_delay_samples"], retard);
+        assert_eq!(c["phase_delay_ms"], (retard as f64 / 48.0 * 100.0).round() / 100.0);
+        let points = c["points"].as_array().unwrap();
+        assert_eq!(points.len(), 512);
+        for p in points {
+            let ex = p["phase_unwrapped_deg"].as_f64().expect("phase publiée");
+            // Le droit est inversé (−0,5) : ±180° hors retard, constant.
+            let attendu = if canal == 0 { 0.0 } else { 180.0 };
+            let ecart = (ex.abs() - attendu).abs();
+            assert!(ecart < 0.01, "canal {canal}, {} Hz : {ex}°", p["f"]);
+        }
+    }
+    assert!((canaux[1]["points"][100]["db"].as_f64().unwrap() + 6.02).abs() < 0.01);
+}
