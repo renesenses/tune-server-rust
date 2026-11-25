@@ -260,6 +260,12 @@ pub(crate) fn chemin_tess_de_la_zone(
         chemin.steps.iter_mut().map(|n| &mut n.etape),
         super::refus_surechantillonnage_tess::refus_du_chemin_historique(sp),
     );
+    // Rémi (fil 3097) — la convolution sautée à cette cadence, de même.
+    let convolution = super::refus_surechantillonnage_tess::raison_de_la_convolution_du_chemin(sp);
+    super::refus_surechantillonnage_tess::avec_la_raison_de_la_convolution(
+        chemin.steps.iter_mut().map(|n| &mut n.etape),
+        convolution.as_ref().map(|(c, t)| (c.as_str(), t.as_str())),
+    );
     serde_json::to_value(chemin).ok()
 }
 

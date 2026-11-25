@@ -188,3 +188,116 @@ fn chaque_refus_de_la_sortie_a_une_phrase_dans_chaque_langue() {
     let geste = super::description_du_refus_surechantillonnage("output_path_not_supported");
     assert!(geste.contains("exclusif") && geste.contains("ASIO"), "{geste}");
 }
+
+// ── Rémi (fil 3097) : la convolution sautée à cette cadence ─────────
+
+/// Un WAV mono en flottants 32 bits : une impulsion de Dirac.
+fn ecrire_ri(chemin: &std::path::Path, cadence: u32, taps: usize) {
+    let donnees = taps * 4;
+    let mut w = Vec::with_capacity(44 + donnees);
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&((36 + donnees) as u32).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&3u16.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&cadence.to_le_bytes());
+    w.extend_from_slice(&(cadence * 4).to_le_bytes());
+    w.extend_from_slice(&4u16.to_le_bytes());
+    w.extend_from_slice(&32u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&(donnees as u32).to_le_bytes());
+    for i in 0..taps {
+        let v: f32 = if i == 0 { 1.0 } else { 0.0 };
+        w.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(chemin, w).unwrap();
+}
+
+#[test]
+fn une_convolution_sautee_a_cette_cadence_le_dit_dans_les_deux_chemins() {
+    let (backend, zone, mut ps) = zone_locale();
+    ps.transformations_reelles = None;
+    let zid = zone.id.unwrap();
+    // Filtre à 384 kHz, flux (radio) à 48 kHz, rééchantillonnage du filtre
+    // refusé par la zone : le convolueur saute.
+    let ri = tune_core::test_scratch::scratch_file("ri-3097-384k", ".wav");
+    ecrire_ri(ri.path(), 384_000, 256);
+    let s = SettingsRepo::with_backend(backend.clone());
+    s.set(&format!("ir_path_{zid}"), &ri.as_str()).unwrap();
+    s.set(&format!("ir_resample_{zid}"), "false").unwrap();
+    let fil = StreamInfo {
+        format: "flac".into(),
+        sample_rate: 48_000,
+        bit_depth: 16,
+        ..Default::default()
+    };
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "ALSA", Some(&fil)).unwrap();
+
+    // Chemin historique : inactif, avec les deux cadences en kHz.
+    let rc = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["code"] == "room_correction")
+        .expect("étape correction de pièce");
+    assert_eq!(rc["applied"], false, "{rc}");
+    let d = rc["description"].as_str().unwrap();
+    assert!(
+        d.contains("inactive à cette fréquence") && d.contains("filtre 384 kHz, flux 48 kHz"),
+        "{d}"
+    );
+
+    // Bloc TESS : la ligne du greffon dit la même chose.
+    let tess =
+        super::chemin_tess_t16::chemin_tess_de_la_zone(&backend, &zone, &ps, &sp, true).unwrap();
+    let conv = tess["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["plugin_id"] == "convolution")
+        .unwrap_or_else(|| panic!("greffon convolution : {tess}"));
+    assert_eq!(conv["requested"], true, "{conv}");
+    assert_eq!(conv["effective"], false, "{conv}");
+    assert_eq!(conv["params"]["refusal"], "rate_mismatch", "{conv}");
+    assert_eq!(conv["params"]["refusal_text"], d, "{conv}");
+}
+
+#[test]
+fn l_ecran_tess_eteint_la_convolution_sautee() {
+    let mut etapes = vec![EtapeResolue {
+        code: CodeEtape::Plugin,
+        plugin_id: Some("convolution".into()),
+        fixed: false,
+        requested: true,
+        effective: true,
+        reason: None,
+        detail: None,
+        params: None,
+        latency_frames: None,
+    }];
+    super::refus_surechantillonnage_tess::avec_la_raison_de_la_convolution(
+        etapes.iter_mut(),
+        Some(("rate_mismatch", "inactive à cette fréquence")),
+    );
+    assert!(!etapes[0].effective);
+    assert_eq!(etapes[0].reason, Some(MotifEtape::NotInService));
+    assert_eq!(
+        etapes[0].params.as_ref().unwrap()["refusal_text"],
+        "inactive à cette fréquence"
+    );
+    // Témoin : un autre greffon n'est pas touché.
+    let mut eq = vec![EtapeResolue {
+        plugin_id: Some("equalizer-graphic".into()),
+        ..etapes[0].clone()
+    }];
+    eq[0].effective = true;
+    eq[0].reason = None;
+    eq[0].params = None;
+    let avant = eq.clone();
+    super::refus_surechantillonnage_tess::avec_la_raison_de_la_convolution(
+        eq.iter_mut(),
+        Some(("rate_mismatch", "x")),
+    );
+    assert_eq!(eq, avant);
+}

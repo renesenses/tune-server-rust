@@ -145,6 +145,15 @@ impl CorrectionPiece {
     }
 }
 
+/// Une cadence en kHz, lisible : 384000 → « 384 », 44100 → « 44.1 ».
+fn khz_lisible(hz: u32) -> String {
+    if hz % 1000 == 0 {
+        (hz / 1000).to_string()
+    } else {
+        format!("{:.1}", f64::from(hz) / 1000.0)
+    }
+}
+
 /// Latence du convolueur partitionné : un bloc de 1024 trames (codé en dur
 /// dans `load_convolver`), en millisecondes à la cadence du flux.
 fn latence_convolueur_ms(sample_rate: u32) -> f64 {
@@ -257,7 +266,8 @@ pub(super) fn zone_correction_piece_lang(
             description: fs(
                 lang,
                 "correction_piece_cadence",
-                &[&ir.to_string(), &fil.to_string()],
+                // Rémi (fil 3097) — « filtre 384 kHz, flux 48 kHz ».
+                &[&khz_lisible(ir), &khz_lisible(fil)],
             ),
             reason: Some(format!("ir_sample_rate {ir} != stream_sample_rate {fil}")),
             ir_sample_rate: ir_sr,
