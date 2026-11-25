@@ -262,8 +262,11 @@ async fn apply_profile_handler(
         Ok(id) => {
             let verrou = super::zones::tess::verrou_des_put(id);
             let _garde = verrou.lock().await;
-            match tune_core::tess::migration::poser_la_correction_de_piece(&settings, id, &eq_profile)
-            {
+            match tune_core::tess::migration::poser_la_correction_de_piece(
+                &settings,
+                id,
+                &eq_profile,
+            ) {
                 Ok(_) => true,
                 Err(e) => {
                     tracing::warn!(zone_id = id, erreur = %e, "correction_piece_hors_chaine_tess");

@@ -2770,7 +2770,8 @@ fn eteindre_puis_rallumer_par_l_ancienne_cle_garde_la_correction_de_piece_decoch
     let piece = crate::room_correction::profil_eq_de_correction(&filtres_de_piece()).bands;
     let g = graphique(10, |i| if i == 2 { 3.0 } else { 0.0 }, &[None]);
     let mut c = ChaineTess::default();
-    c.plugins.push(maillon_eq(ID_CORRECTION_PIECE, false, piece));
+    c.plugins
+        .push(maillon_eq(ID_CORRECTION_PIECE, false, piece));
     c.plugins.push(maillon_eq(ID_EQ_GRAPHIQUE, true, g.clone()));
     ecrire_chaine(&s, z, &c).unwrap();
 
@@ -2802,7 +2803,10 @@ fn un_parametrique_aux_bandes_du_profil_de_piece_redevient_une_correction_de_pie
     ecrire_chaine(&s, z, &c).unwrap();
     let l = lire_zone(&s, z, true).unwrap();
     assert_eq!(ids(&l.chaine), vec![(ID_CORRECTION_PIECE, true)]);
-    assert_eq!(maillon(&l.chaine, ID_CORRECTION_PIECE).settings["origin"], json!("measured"));
+    assert_eq!(
+        maillon(&l.chaine, ID_CORRECTION_PIECE).settings["origin"],
+        json!("measured")
+    );
 
     let z = 45;
     poser_la_piece(&s, z, "Calibration abc", None);
@@ -2874,7 +2878,13 @@ fn la_facade_d_une_ancienne_ecriture_suit_la_lecture_de_la_chaine() {
     let mut p: EqProfile =
         serde_json::from_str(&s.get(&format!("zone_{z}_eq_profile")).unwrap().unwrap()).unwrap();
     p.enabled = true;
-    assert_eq!(facade_d_une_ancienne_ecriture(&s, z, &p), ID_CORRECTION_PIECE);
+    assert_eq!(
+        facade_d_une_ancienne_ecriture(&s, z, &p),
+        ID_CORRECTION_PIECE
+    );
     let autre = profil(true, vec![bande(1000.0, 2.0, 1.0, "peak", None)]);
-    assert_eq!(facade_d_une_ancienne_ecriture(&s, z, &autre), ID_EQ_PARAMETRIQUE);
+    assert_eq!(
+        facade_d_une_ancienne_ecriture(&s, z, &autre),
+        ID_EQ_PARAMETRIQUE
+    );
 }

@@ -285,8 +285,12 @@ async fn appliquer_un_profil_garde_le_graphique_de_la_serie() {
     let tess = format!("/api/v1/zones/{zone}/tess");
     let (status, v) = appel(&app, "GET", &tess, None).await;
     assert_eq!(status, StatusCode::OK, "{v}");
-    let gains: Vec<Value> = (0..10).map(|i| json!(if i == 4 { 3.0 } else { 0.0 })).collect();
-    let grille = [31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
+    let gains: Vec<Value> = (0..10)
+        .map(|i| json!(if i == 4 { 3.0 } else { 0.0 }))
+        .collect();
+    let grille = [
+        31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+    ];
     let bandes: Vec<Value> = grille
         .iter()
         .zip(&gains)
@@ -324,5 +328,9 @@ async fn appliquer_un_profil_garde_le_graphique_de_la_serie() {
         vec![("equalizer-graphic", true), ("room-correction", true)],
         "le graphique de la série a été perdu : {v}"
     );
-    assert_eq!(plugins[1]["settings"]["bands"][0]["freq"], json!(63.0), "{v}");
+    assert_eq!(
+        plugins[1]["settings"]["bands"][0]["freq"],
+        json!(63.0),
+        "{v}"
+    );
 }

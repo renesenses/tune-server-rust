@@ -767,10 +767,7 @@ fn bandes_du_maillon(
 /// `[correction de pièce décochée, graphique décoché]` éteinte par un ancien
 /// client faisait reprendre la correction de pièce au rallumage : elle était
 /// reclassée en graphique et le vrai graphique supprimé comme doublon.
-fn facade_de_l_ancienne_cle(
-    chaine: &ChaineTess,
-    bandes: Option<&[EqBandSpec]>,
-) -> Option<usize> {
+fn facade_de_l_ancienne_cle(chaine: &ChaineTess, bandes: Option<&[EqBandSpec]>) -> Option<usize> {
     let facades = || {
         chaine
             .plugins
@@ -782,9 +779,8 @@ fn facade_de_l_ancienne_cle(
         .find(|(_, m)| m.enabled)
         .or_else(|| {
             let b = bandes?;
-            facades().find(|(_, m)| {
-                bandes_du_maillon(m, Some(b)).is_some_and(|x| memes_bandes(&x, b))
-            })
+            facades()
+                .find(|(_, m)| bandes_du_maillon(m, Some(b)).is_some_and(|x| memes_bandes(&x, b)))
         })
         .or_else(|| facades().next())
         .map(|(i, _)| i)
@@ -801,9 +797,8 @@ pub fn facade_d_une_ecriture(
     profil: &EqProfile,
     piece: Option<&EqProfile>,
 ) -> &'static str {
-    facade_gardee(principal, profil, bandes_synchronisees).unwrap_or_else(|| {
-        classer_egaliseur(profil, piece, principal.map(|m| m.id.as_str()))
-    })
+    facade_gardee(principal, profil, bandes_synchronisees)
+        .unwrap_or_else(|| classer_egaliseur(profil, piece, principal.map(|m| m.id.as_str())))
 }
 
 /// [`facade_d_une_ecriture`] pour la zone, d'après ce qu'elle porte
@@ -822,9 +817,9 @@ pub fn facade_d_une_ancienne_ecriture(
         .and_then(|b| serde_json::from_str::<EqProfile>(&b).ok())
         .map(|p| p.bands);
     let chaine = lire_zone(settings, zone_id, true).ok().map(|l| l.chaine);
-    let principal = chaine.as_ref().and_then(|c| {
-        facade_de_l_ancienne_cle(c, actuel.as_deref()).map(|i| &c.plugins[i])
-    });
+    let principal = chaine
+        .as_ref()
+        .and_then(|c| facade_de_l_ancienne_cle(c, actuel.as_deref()).map(|i| &c.plugins[i]));
     let piece = profil_de_piece(settings, zone_id);
     facade_d_une_ecriture(
         principal,
@@ -893,8 +888,7 @@ pub fn poser_la_correction_de_piece(
 fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, ctx: &ContexteZone) {
     match (partie, valeur) {
         (Partie::Egaliseur, Decodee::Egaliseur(m, profil)) => {
-            let principal =
-                facade_de_l_ancienne_cle(chaine, ctx.bandes_synchronisees.as_deref());
+            let principal = facade_de_l_ancienne_cle(chaine, ctx.bandes_synchronisees.as_deref());
             let id = facade_d_une_ecriture(
                 principal.map(|i| &chaine.plugins[i]),
                 ctx.bandes_synchronisees.as_deref(),
