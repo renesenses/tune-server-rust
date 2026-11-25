@@ -261,7 +261,10 @@ pub(crate) fn chemin_tess_de_la_zone(
     };
     let resolution = lecture.chaine.resoudre(&catalogue, &ctx);
     let mut en_service = en_service_d_apres_le_chemin(sp, volume_logiciel);
-    en_service.headroom_db = marge_manuelle_en_service(&lecture.chaine, sp);
+    // Une valeur déjà constatée (modulation DSD de #9518) prime.
+    en_service.headroom_db = en_service
+        .headroom_db
+        .or_else(|| marge_manuelle_en_service(&lecture.chaine, sp));
     let intact = sp.get("bit_perfect").and_then(Value::as_bool);
     let chemin = chemin_du_signal(
         &lecture.chaine,
