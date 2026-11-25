@@ -293,6 +293,25 @@ async fn update_preset(
         Some(i) => {
             let bands_json: Vec<Value> = body.bands.iter().map(|b| b.to_json()).collect();
             presets[i]["name"] = json!(body.name);
+            // rc14 — des bandes modifiées ne sont plus le profil importé
+            // (AutoEQ, OPRA) : la source part avec elles, et le préréglage
+            // suit la règle du paramétrique à l'activation.
+            let specs = |v: &Value| -> Vec<tune_core::audio::eq::EqBandSpec> {
+                v.as_array()
+                    .map(|b| {
+                        b.iter()
+                            .filter_map(|x| serde_json::from_value(x.clone()).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            if !tune_core::tess::migration::memes_bandes(
+                &specs(&presets[i]["bands"]),
+                &specs(&json!(bands_json)),
+            ) && let Some(p) = presets[i].as_object_mut()
+            {
+                p.remove("source");
+            }
             presets[i]["bands"] = json!(bands_json);
             if let Some(t) = &body.eq_type {
                 presets[i]["eq_type"] = json!(t);

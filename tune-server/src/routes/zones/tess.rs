@@ -583,8 +583,17 @@ pub fn valider_le_put(
         if !premium_requis || correction_estimee(m) {
             continue;
         }
+        // La marque `replaced_in_group`, posée par le serveur
+        // (`normaliser_les_egaliseurs`), n'est pas un réglage.
+        let sans_marque = |v: &Value| {
+            let mut v = v.clone();
+            if let Value::Object(o) = &mut v {
+                o.remove(tune_core::tess::migration::MARQUE_REMPLACE);
+            }
+            v
+        };
         let reglages_changes = match enregistree.plugins.iter().find(|e| e.id == m.id) {
-            Some(e) => e.settings != m.settings,
+            Some(e) => sans_marque(&e.settings) != sans_marque(&m.settings),
             None => !m.settings.is_null(),
         };
         if reglages_changes {
