@@ -14,7 +14,15 @@ use tower::ServiceExt;
 use tune_server::auth::ouvrir_la_premiere_configuration;
 use tune_server::state::AppState;
 
+/// Machine ordinaire, quel que soit l'environnement de l'épreuve. Même
+/// valeur partout dans ce binaire.
+fn hors_conteneur() {
+    // SAFETY: même valeur dans toutes les épreuves de ce binaire.
+    unsafe { std::env::set_var("TUNE_TEST_HORS_CONTENEUR", "1") };
+}
+
 fn installation_neuve() -> AppState {
+    hors_conteneur();
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     assert!(ouvrir_la_premiere_configuration(&state));
     state

@@ -63,6 +63,7 @@ async fn appliance_et_conteneur() {
     // --- Tune OS, relais du port 80 : toute connexion arrive de 127.0.0.1.
     // SAFETY: seule épreuve de ce binaire ; rien d'autre ne lit ces variables.
     unsafe {
+        std::env::set_var("TUNE_TEST_HORS_CONTENEUR", "1");
         std::env::set_var("TUNE_APPLIANCE", "1");
         std::env::set_var("TUNE_WEB80_RELAIS", "1");
     }
@@ -118,12 +119,40 @@ async fn appliance_et_conteneur() {
         assert_eq!(st, StatusCode::FORBIDDEN, "{passerelle} {v}");
         assert!(!active(&state));
     }
-    // Un appareil du LAN dont l'adresse est conservée (réseau de l'hôte,
-    // redirection qui garde la source) reste accepté.
+    // Sans autorisation de l'exploitant, la voie sans code est fermée dans un
+    // conteneur, même pour une adresse du LAN.
     let state = nouvel_etat();
     assert!(ouvrir_la_premiere_configuration(&state));
     let (st, v) = appel(&state, "192.168.1.50:50000", Method::POST, &[], Some(CORPS)).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "conteneur_sans_autorisation {v}");
+    let (_, v) = appel(&state, "192.168.1.50:50000", Method::GET, &[], None).await;
+    assert_eq!(v["code_required"], true, "{v}");
+    // `network_mode: host` + TUNE_FIRST_SETUP_IN_CONTAINER=1 : un appareil
+    // du LAN, adresse conservée, est accepté (legitime_reseau_de_l_hote_ipv4).
+    unsafe {
+        std::env::set_var("TUNE_FIRST_SETUP_IN_CONTAINER", "1");
+    }
+    let state = nouvel_etat();
+    assert!(ouvrir_la_premiere_configuration(&state));
+    let (st, v) = appel(
+        &state,
+        "192.168.1.50:50000",
+        Method::POST,
+        &[("host", "192.168.1.10:8888")],
+        Some(CORPS),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(active(&state));
+    // Autorisé, mais depuis la passerelle : refus.
+    let state = nouvel_etat();
+    assert!(ouvrir_la_premiere_configuration(&state));
+    let (st, v) = appel(&state, "172.17.0.1:50000", Method::POST, &[], Some(CORPS)).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    // Autorisé, mais `Host` à un seul label donné par un mandataire : refus.
+    let (st, v) = appel(&state, "172.17.0.5:50000", Method::POST, &[("host", "tune:8888")], Some(CORPS)).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert!(!active(&state));
     // Passerelle illisible dans un conteneur : refus.
     unsafe {
         std::env::set_var("TUNE_TEST_PASSERELLE_CONTENEUR", "");
@@ -134,5 +163,6 @@ async fn appliance_et_conteneur() {
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
     unsafe {
         std::env::remove_var("TUNE_TEST_PASSERELLE_CONTENEUR");
+        std::env::remove_var("TUNE_FIRST_SETUP_IN_CONTAINER");
     }
 }

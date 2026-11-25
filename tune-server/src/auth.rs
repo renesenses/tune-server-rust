@@ -2280,6 +2280,15 @@ pub fn ouvrir_la_premiere_configuration(state: &AppState) -> bool {
          setup: the administrator password can be created in the setup assistant, from the \
          local network, for {minutes} min."
     );
+    if passerelles_du_conteneur().is_some() && !premiere_configuration_autorisee_en_conteneur() {
+        eprintln!(
+            "Tune : conteneur détecté — sans {VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR}=1 \
+             (réseau de l'hôte), le mot de passe administrateur se crée avec le code \
+             d'activation du journal. / Container detected: without \
+             {VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR}=1 (host network), the administrator \
+             password is created with the activation code from the log."
+        );
+    }
     tracing::info!(minutes, "premiere_configuration_ouverte");
     true
 }
@@ -2360,6 +2369,7 @@ pub fn premiere_configuration_restante(state: &AppState) -> Option<std::time::Du
 
 /// Pour les épreuves : fait comme si la fenêtre avait été ouverte `il_y_a`
 /// plus tôt, sur les deux horloges.
+#[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub fn vieillir_la_premiere_configuration(state: &AppState, il_y_a: std::time::Duration) {
     vieillir_les_horloges(state, il_y_a, il_y_a);
@@ -2367,6 +2377,7 @@ pub fn vieillir_la_premiere_configuration(state: &AppState, il_y_a: std::time::D
 
 /// Pour les épreuves : recule séparément l'horloge monotone et l'heure murale
 /// de l'ouverture.
+#[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub fn vieillir_les_horloges(
     state: &AppState,
@@ -2389,6 +2400,7 @@ pub fn vieillir_les_horloges(
 
 /// Pour les épreuves : oublie l'heure d'ouverture gardée en mémoire, comme
 /// après un redémarrage du serveur.
+#[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub fn oublier_l_horloge_de_la_premiere_configuration(state: &AppState) {
     state
@@ -2428,29 +2440,40 @@ pub fn passerelles_par_defaut(route_v4: &str, route_v6: &str) -> Vec<std::net::I
     passerelles
 }
 
+/// Variable par laquelle l'exploitant autorise la première configuration
+/// sans code dans un conteneur, quand celui-ci voit l'adresse réelle des
+/// appareils du réseau local (`network_mode: host`).
+pub const VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR: &str = "TUNE_FIRST_SETUP_IN_CONTAINER";
+
+fn premiere_configuration_autorisee_en_conteneur() -> bool {
+    std::env::var(VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR)
+        .is_ok_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+}
+
 /// Le conteneur et ses passerelles : `None` hors conteneur. En développement
 /// et sous test, `TUNE_TEST_PASSERELLE_CONTENEUR` (adresses séparées par des
-/// virgules) simule un conteneur.
+/// virgules) simule un conteneur, et `TUNE_TEST_HORS_CONTENEUR=1` une machine
+/// ordinaire.
 fn passerelles_du_conteneur() -> Option<Vec<std::net::IpAddr>> {
-    if cfg!(debug_assertions)
-        && let Ok(v) = std::env::var("TUNE_TEST_PASSERELLE_CONTENEUR")
-    {
-        return Some(v.split(',').filter_map(|a| a.trim().parse().ok()).collect());
+    if cfg!(debug_assertions) {
+        if let Ok(v) = std::env::var("TUNE_TEST_PASSERELLE_CONTENEUR") {
+            return Some(v.split(',').filter_map(|a| a.trim().parse().ok()).collect());
+        }
+        if std::env::var("TUNE_TEST_HORS_CONTENEUR").is_ok_and(|v| v == "1") {
+            return None;
+        }
     }
-    crate::conteneur::detecter()?;
+    if !crate::conteneur::dans_un_conteneur() {
+        return None;
+    }
     let v4 = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
     let v6 = std::fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default();
     Some(passerelles_par_defaut(&v4, &v6))
 }
 
-/// Dans un conteneur (Docker en pont, Docker Desktop, sans privilèges,
-/// Podman), une connexion relayée par le moteur arrive de la passerelle : on
-/// ne sait plus d'où elle vient. Dans un conteneur dont la passerelle est
-/// illisible, la réponse est oui (refus).
-fn source_passerelle_du_conteneur(ip: std::net::IpAddr) -> bool {
-    let Some(passerelles) = passerelles_du_conteneur() else {
-        return false;
-    };
+/// Dans un conteneur, une connexion relayée par le moteur arrive de la
+/// passerelle : on ne sait plus d'où elle vient. Passerelle illisible : oui.
+fn source_passerelle(ip: std::net::IpAddr, passerelles: &[std::net::IpAddr]) -> bool {
     if passerelles.is_empty() {
         return true;
     }
@@ -2464,9 +2487,15 @@ fn source_passerelle_du_conteneur(ip: std::net::IpAddr) -> bool {
 }
 
 /// L'appel vient-il du RÉSEAU LOCAL, au sens de la première configuration ?
-/// [`appel_depuis_le_reseau_local`], et en plus : jamais derrière le relais du
-/// port 80 d'une appliance (le bouclage n'y prouve rien), jamais depuis la
-/// passerelle d'un conteneur. Extracteur infaillible, sans trace.
+/// [`appel_depuis_le_reseau_local`], et en plus :
+///
+/// - jamais derrière le relais du port 80 d'une appliance ;
+/// - jamais dans un conteneur, sauf si l'exploitant l'autorise
+///   ([`VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR`]), et alors jamais
+///   depuis la passerelle du conteneur ;
+/// - jamais avec un `Host` à un seul label étranger à cette machine.
+///
+/// Extracteur infaillible, sans trace.
 pub struct DepuisLeReseauLocal(pub bool);
 
 impl FromRequestParts<AppState> for DepuisLeReseauLocal {
@@ -2482,10 +2511,19 @@ impl FromRequestParts<AppState> for DepuisLeReseauLocal {
         if !appel_depuis_le_reseau_local(parts, state).await {
             return Ok(Self(false));
         }
+        if crate::garde_origine::hote_de_la_requete_a_un_seul_label_etranger(&parts.headers) {
+            return Ok(Self(false));
+        }
         let Some(ip) = adresse_de_l_appelant(parts, state).await else {
             return Ok(Self(false));
         };
-        Ok(Self(!source_passerelle_du_conteneur(ip)))
+        Ok(Self(match passerelles_du_conteneur() {
+            None => true,
+            Some(passerelles) => {
+                premiere_configuration_autorisee_en_conteneur()
+                    && !source_passerelle(ip, &passerelles)
+            }
+        }))
     }
 }
 
@@ -2631,7 +2669,8 @@ struct ActivationRequest {
 }
 
 /// Un seul hachage d'activation à la fois (argon2 est coûteux).
-static HACHAGE_ACTIVATION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static HACHAGE_ACTIVATION: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
 
 /// Une seule activation à la fois : l'état est relu sous ce verrou.
 static VERROU_ACTIVATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2754,7 +2793,8 @@ async fn activer_l_authentification(
     }
     // Un seul hachage à la fois, hors de l'exécuteur asynchrone. L'état est
     // relu une fois la place obtenue, AVANT de hacher.
-    let _place = match HACHAGE_ACTIVATION.acquire().await {
+    // La place suit le hachage jusqu'au bout, même si la connexion tombe.
+    let place = match HACHAGE_ACTIVATION.clone().acquire_owned().await {
         Ok(p) => p,
         Err(_) => {
             return (
@@ -2771,7 +2811,10 @@ async fn activer_l_authentification(
         return refus_premiere_configuration_fermee();
     }
     let mot_de_passe = body.password.clone();
-    let hachage = match tokio::task::spawn_blocking(move || hash_password(&mot_de_passe))
+    let hachage = match tokio::task::spawn_blocking(move || {
+        let _place = place;
+        hash_password(&mot_de_passe)
+    })
         .await
         .unwrap_or_else(|e| Err(e.to_string()))
     {

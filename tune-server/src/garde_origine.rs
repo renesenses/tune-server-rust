@@ -290,6 +290,35 @@ pub fn hote_accepte(hote: &str) -> bool {
     hote_accepte_parmi(hote, &declares, Some(nom_de_la_machine()))
 }
 
+/// `Host` à un seul label (`tune:8888`) qui n'est ni `localhost`, ni une
+/// adresse, ni le nom de cette machine : un nom donné par un tiers (réseau
+/// de conteneurs, mandataire). Jugement pur.
+pub fn hote_a_un_seul_label_etranger(hote: &str, machine: Option<&str>) -> bool {
+    let Some(nom) = nom_de_l_hote(hote) else {
+        return true;
+    };
+    if est_ip_litterale(&nom) || nom == "localhost" || nom.contains('.') {
+        return false;
+    }
+    let machine = machine
+        .map(|m| m.trim().trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_default();
+    // Le nom court de la machine (`tune` pour `tune.lan`).
+    let court = machine.split('.').next().unwrap_or("");
+    machine.is_empty() || (nom != machine && nom != court)
+}
+
+/// Le `Host` de la requête est-il un nom à un seul label étranger à cette
+/// machine ([`hote_a_un_seul_label_etranger`]) ? Absent : non.
+pub fn hote_de_la_requete_a_un_seul_label_etranger(entetes: &HeaderMap) -> bool {
+    entetes
+        .get(axum::http::header::HOST)
+        .is_some_and(|v| {
+            v.to_str()
+                .map_or(true, |h| hote_a_un_seul_label_etranger(h, Some(nom_de_la_machine())))
+        })
+}
+
 /// L'en-tête `Host` de la requête est-il absent ou accepté ?
 pub fn hote_de_la_requete_accepte(entetes: &HeaderMap) -> bool {
     match entetes.get(axum::http::header::HOST) {

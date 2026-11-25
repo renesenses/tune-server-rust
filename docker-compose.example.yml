@@ -5,11 +5,7 @@ services:
     image: renesenses/tune:latest
     container_name: tune
     # Reseau de l'hote : Tune voit l'adresse reelle des appareils du reseau
-    # local. Indispensable a la decouverte (UPnP, AirPlay) et a la premiere
-    # configuration : sans lui (pont Docker, Docker Desktop, Podman sans
-    # privileges), les connexions arrivent de la passerelle du conteneur et
-    # le mot de passe administrateur se cree avec le code d'activation du
-    # journal (`docker logs tune | grep TUNE-ACTIVATION-CODE`).
+    # local (indispensable a la decouverte UPnP et AirPlay).
     network_mode: host
     restart: unless-stopped
     volumes:
@@ -52,6 +48,15 @@ services:
       - TUNE_PORT=8888
       - TUNE_AUTO_SCAN=true
       - TUNE_LOG=info
+      # Premiere configuration : dans un conteneur, le mot de passe
+      # administrateur se cree par defaut avec le code d'activation du journal
+      # (`docker logs tune | grep TUNE-ACTIVATION-CODE`). Avec le reseau de
+      # l'hote (`network_mode: host` ci-dessus) ET sans mandataire inverse
+      # devant Tune, cette variable permet de le creer dans l'assistant, sans
+      # code, depuis le reseau local, dans les 45 minutes qui suivent le
+      # premier demarrage. A NE PAS poser en mode pont, sous Docker Desktop,
+      # derriere un mandataire ou dans une VM en NAT.
+      # - TUNE_FIRST_SETUP_IN_CONTAINER=1
       # Spotify Connect (librespot)
       # - LIBRESPOT_NAME=Tune
       # - LIBRESPOT_BITRATE=320

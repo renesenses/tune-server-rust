@@ -27,7 +27,15 @@ const AUTRE_HOTE_DU_LAN: &str = "192.168.1.51:50000";
 const INTERNET: &str = "203.0.113.5:50000";
 const CGNAT: &str = "100.64.1.2:50000";
 
+/// Machine ordinaire, quel que soit l'environnement de l'épreuve. Même
+/// valeur partout dans ce binaire.
+fn hors_conteneur() {
+    // SAFETY: même valeur dans toutes les épreuves de ce binaire.
+    unsafe { std::env::set_var("TUNE_TEST_HORS_CONTENEUR", "1") };
+}
+
 fn new_state() -> AppState {
+    hors_conteneur();
     AppState::new(":memory:", 0, Default::default()).unwrap()
 }
 
@@ -653,4 +661,26 @@ async fn le_patch_generique_ne_rouvre_pas_la_fenetre() {
     let (st, _) = creer(&state, HOTE_DU_LAN, &[], "intrus-1234").await;
     assert_eq!(st, StatusCode::FORBIDDEN);
     rien_n_a_change(&state);
+}
+
+#[tokio::test]
+async fn refus_d_un_hote_a_un_seul_label_etranger() {
+    // Un nom donné par un tiers (réseau de conteneurs, mandataire).
+    let state = installation_neuve();
+    let (st, v) = creer(&state, HOTE_DU_LAN, &[("host", "tune-mandataire-x:8888")], "intrus-1234").await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    rien_n_a_change(&state);
+}
+
+#[test]
+fn hote_a_un_seul_label() {
+    use tune_server::garde_origine::hote_a_un_seul_label_etranger as etranger;
+    assert!(etranger("tune:8888", Some("hulk")));
+    assert!(etranger("tune", None));
+    assert!(!etranger("hulk:8888", Some("hulk")));
+    assert!(!etranger("tune:8888", Some("tune.lan")));
+    assert!(!etranger("tune.local:8888", Some("hulk")));
+    assert!(!etranger("192.168.1.20:8888", Some("hulk")));
+    assert!(!etranger("[fe80::1]:8888", Some("hulk")));
+    assert!(!etranger("localhost:8888", Some("hulk")));
 }
