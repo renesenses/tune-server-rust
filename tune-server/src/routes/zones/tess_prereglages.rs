@@ -6,6 +6,8 @@
 //! - `POST /tess/presets` ← `{ "name", "zone_id" }` (la chaîne courante de la
 //!   zone) ou `{ "name", "chain" }` → 201, le préréglage créé ;
 //! - `PATCH /tess/presets/{preset_id}` ← `{ "name" }` → le préréglage renommé ;
+//! - `PUT /tess/presets/{preset_id}` ← `{ "zone_id" }` ou `{ "chain" }` → le
+//!   préréglage ÉCRASÉ (rc14 ; 409 `builtin_preset_read_only` sur « Pure ») ;
 //! - `DELETE /tess/presets/{preset_id}` → 204 ;
 //! - `PUT /tess/apply-mode` ← `{ "apply_mode": "immediately" | "at_next_playback" }` ;
 //! - `POST /zones/{id}/tess/presets/{preset_id}/apply` → la zone, le mode
@@ -49,8 +51,9 @@ use tune_core::tess::prereglages::{self, ModeApplication, PreReglage};
 use tune_core::tess::resolution::MotifEtape;
 
 use super::tess::{
-    appliquer_le_put, catalogue_du_serveur, cle_mode_pure, cle_prereglage_actif, erreur_migration,
-    rafraichir, refus, reponse_de_zone, verrou_des_put, zone_de,
+    appliquer_le_put, catalogue_du_serveur, cle_mode_pure, cle_prereglage_actif,
+    cle_prereglage_de_base, erreur_migration, rafraichir, refus, reponse_de_zone, verrou_des_put,
+    zone_de,
 };
 use super::*;
 
@@ -261,6 +264,11 @@ pub async fn enregistrer_prereglage(State(state): State<AppState>, corps: Bytes)
 /// l'ancien marqueur est effacé au mieux (aucun marqueur plutôt qu'un
 /// marqueur faux) et un avertissement est rendu, jamais une erreur.
 fn poser_le_marqueur(settings: &SettingsRepo, zone_id: i64, preset_id: &str) -> Option<String> {
+    // rc14 (Rémi) — l'origine de la chaîne suit le marqueur, au mieux : sans
+    // elle, l'écran ne propose simplement pas « Enregistrer » après retouche.
+    if let Err(e) = settings.set(&cle_prereglage_de_base(zone_id), preset_id) {
+        warn!(zone_id, preset_id, erreur = %e, "tess_origine_non_posee");
+    }
     let cle = cle_prereglage_actif(zone_id);
     let e = settings.set(&cle, preset_id).err()?;
     warn!(zone_id, preset_id, erreur = %e, "tess_marqueur_actif_non_pose");
@@ -405,6 +413,140 @@ pub async fn renommer_prereglage(
         return stockage(e);
     }
     Json(p).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorpsEcraser {
+    #[serde(default)]
+    pub zone_id: Option<i64>,
+    #[serde(default)]
+    pub chain: Option<Value>,
+}
+
+/// Refus d'écraser un préréglage livré avec Tune (« Pure ») : l'écran
+/// propose « Enregistrer sous… » (`POST /tess/presets`).
+pub const CODE_PREREGLAGE_LIVRE: &str = "builtin_preset_read_only";
+
+/// `PUT /tess/presets/{preset_id}` ← `{ "zone_id" }` ou `{ "chain" }` — rc14
+/// (Rémi) : « Enregistrer » ÉCRASE la chaîne du préréglage, sans recréer de
+/// ligne ; l'identifiant et le nom restent. La chaîne se lit comme à
+/// l'enregistrement (`POST`) : celle de la zone, ou la chaîne fournie, lue
+/// strictement. Un préréglage livré (`builtin`, « Pure ») est refusé (409
+/// [`CODE_PREREGLAGE_LIVRE`]). Écrasé depuis une zone, le préréglage y
+/// redevient « ACTIVE » ; les AUTRES zones qui le marquaient « ACTIVE » ne le
+/// décrivent plus : leur marqueur s'efface (elles le gardent comme origine,
+/// donc « modifié », avec « Recharger »).
+pub async fn ecraser_prereglage(
+    State(state): State<AppState>,
+    Path(preset_id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    let corps: CorpsEcraser = match serde_json::from_slice(&corps) {
+        Ok(c) => c,
+        Err(e) => return refus(&ErreurChaine::CorpsIllisible(e.to_string())),
+    };
+    let settings = settings_de(&state);
+    // Même ordre des verrous qu'à l'enregistrement : liste, puis zone.
+    let _liste = verrou_de_la_liste().lock().await;
+    let verrou_zone = corps.zone_id.map(verrou_des_put);
+    let _zone = match &verrou_zone {
+        Some(v) => Some(v.lock().await),
+        None => None,
+    };
+    let mut liste = match prereglages::lire(&settings) {
+        Ok(l) => l,
+        Err(e) => return stockage(e),
+    };
+    let Some(existant) = liste.get(&preset_id).cloned() else {
+        return introuvable(&preset_id);
+    };
+    if existant.builtin {
+        return erreur(
+            StatusCode::CONFLICT,
+            CODE_PREREGLAGE_LIVRE,
+            "This preset ships with Tune and cannot be overwritten. Save it under a new name.",
+            Some(&preset_id),
+        );
+    }
+    let chaine = match (corps.zone_id, corps.chain) {
+        (Some(zone_id), None) => {
+            if let Err(r) = zone_de(&state, zone_id) {
+                return r;
+            }
+            // La chaîne ENREGISTRÉE de la zone, neutre vis-à-vis du droit,
+            // comme à l'enregistrement.
+            match lire_zone(&settings, zone_id, true) {
+                Ok(l) => l.chaine,
+                Err(e) => return erreur_migration(&e),
+            }
+        }
+        (None, Some(chain)) => {
+            let c = match ChaineTess::depuis_corps(&chain.to_string()) {
+                Ok(c) => c,
+                Err(e) => return refus(&e),
+            };
+            if let Err(e) = c.valider(
+                &catalogue_du_serveur(),
+                tune_core::tess::ContexteValidation { premium: true },
+            ) {
+                return refus(&e);
+            }
+            c
+        }
+        _ => {
+            return erreur(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                "Give either zone_id (save the zone's current chain) or chain.",
+                Some(&preset_id),
+            );
+        }
+    };
+    if chaine.version > tune_core::tess::VERSION_CHAINE {
+        return refus(&ErreurChaine::VersionNonPriseEnCharge {
+            trouvee: chaine.version,
+            attendue: tune_core::tess::VERSION_CHAINE,
+        });
+    }
+    let Some(p) = liste.presets.iter_mut().find(|p| p.id == preset_id) else {
+        return introuvable(&preset_id);
+    };
+    p.chain = sans_champs_du_serveur(&chaine);
+    let p = p.clone();
+    if let Err(e) = prereglages::ecrire(&settings, &liste) {
+        return stockage(e);
+    }
+    // Le préréglage est écrasé : un échec d'un marqueur ne le défait pas.
+    let mut avertissements = Vec::new();
+    for zone in ZoneRepo::with_backend(state.backend.clone())
+        .list()
+        .unwrap_or_default()
+    {
+        let Some(id) = zone.id else { continue };
+        if Some(id) == corps.zone_id {
+            continue;
+        }
+        let cle = cle_prereglage_actif(id);
+        if settings.get(&cle).ok().flatten().as_deref() == Some(preset_id.as_str())
+            && !effacer_le_marqueur(&settings, id)
+        {
+            warn!(zone_id = id, preset_id = %preset_id, "tess_marqueur_actif_perime");
+        }
+    }
+    if let Some(zone_id) = corps.zone_id
+        && let Some(a) = poser_le_marqueur(&settings, zone_id, &p.id)
+    {
+        avertissements.push(a);
+    }
+    info!(preset_id = %p.id, zone_id = ?corps.zone_id, "tess_prereglage_ecrase");
+    let mut v = serde_json::to_value(&p).unwrap_or_else(|_| json!({}));
+    if !avertissements.is_empty()
+        && let Some(o) = v.as_object_mut()
+    {
+        o.insert("warnings".into(), json!(avertissements));
+    }
+    Json(v).into_response()
 }
 
 /// `DELETE /tess/presets/{preset_id}` — supprime (Pure compris : la croix de

@@ -540,6 +540,7 @@ pub fn router_with_plugins(
         .route(
             "/tess/presets/{preset_id}",
             axum::routing::patch(zones::tess_prereglages::renommer_prereglage)
+                .put(zones::tess_prereglages::ecraser_prereglage)
                 .delete(zones::tess_prereglages::supprimer_prereglage),
         )
         .route(
