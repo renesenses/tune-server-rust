@@ -12,9 +12,10 @@
 //!   réaffectation) ; une RI que le convolueur a retirée est connue éteinte.
 //!   Tant que l'exécuteur TESS (T03, T04) n'est pas branché, c'est une
 //!   [`GreffonsEnService::Sonde`] ; il publiera la liste exacte ;
-//! - **headroom** : l'étage de T07 n'est pas encore branché dans la lecture,
-//!   donc rien n'est en service (le headroom automatique s'affiche « not in
-//!   service » plutôt qu'appliqué) ;
+//! - **headroom** : l'étage de T07 n'est pas branché dans la lecture ; la
+//!   marge MANUELLE l'est par l'étage des égaliseurs (#9520), et se lit en
+//!   service quand l'étape « DSP » altère le signal
+//!   ([`marge_manuelle_en_service`], rc14) ;
 //! - **upsampling** : `upsampling.active` du chemin historique ;
 //! - **volume** : la sonde locale (`OutputVolumeState::Applied`), sinon un
 //!   gain logiciel de zone différent de l'unité, sortie locale seulement.
@@ -98,6 +99,24 @@ pub(crate) fn en_service_d_apres_le_chemin(sp: &Value, volume_logiciel: bool) ->
         volume_logiciel,
         latences: Vec::new(),
     }
+}
+
+/// rc14 (Rémi) — la marge MANUELLE que la lecture applique : depuis #9520,
+/// elle est posée par l'étage des égaliseurs (elle remplace leur réserve, ou
+/// devient un gain fixe sur la sortie locale). Elle est donc en service quand
+/// le chemin historique dit cet étage actif (« DSP » qui altère le signal).
+/// PURE, « Bypass all » et une sortie qui ne l'exécute pas ne montrent pas
+/// d'étape DSP active : rien n'est annoncé. L'automatique (0 dB depuis
+/// #9520) n'est jamais un gain à part : sa réserve se lit dans l'étape DSP.
+pub(crate) fn marge_manuelle_en_service(
+    chaine: &tune_core::tess::ChaineTess,
+    sp: &Value,
+) -> Option<f64> {
+    let tune_core::tess::Headroom::Manual { db } = chaine.fixed.headroom else {
+        return None;
+    };
+    let dsp_actif = etapes(sp).iter().any(|e| a_le_nom(e, "DSP") && altere(e));
+    (db.is_finite() && db < 0.0 && dsp_actif).then_some(db)
 }
 
 fn taux_dsd(sample_rate: u32) -> TauxDsd {
@@ -241,7 +260,8 @@ pub(crate) fn chemin_tess_de_la_zone(
         }),
     };
     let resolution = lecture.chaine.resoudre(&catalogue, &ctx);
-    let en_service = en_service_d_apres_le_chemin(sp, volume_logiciel);
+    let mut en_service = en_service_d_apres_le_chemin(sp, volume_logiciel);
+    en_service.headroom_db = marge_manuelle_en_service(&lecture.chaine, sp);
     let intact = sp.get("bit_perfect").and_then(Value::as_bool);
     let chemin = chemin_du_signal(
         &lecture.chaine,

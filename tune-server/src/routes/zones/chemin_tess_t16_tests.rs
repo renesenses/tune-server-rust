@@ -556,3 +556,23 @@ fn crossfeed_pro_installe_mais_non_charge_reste_indisponible_9160() {
     assert_eq!(cp["effective"], false, "{tess}");
     assert_eq!(cp["reason"], "plugin_unavailable", "{cp}");
 }
+
+/// rc14 (Rémi) — le chemin du signal affiche la marge MANUELLE quand l'étage
+/// des égaliseurs tourne, et rien sous PURE (étape DSP contournée).
+#[test]
+fn la_marge_manuelle_est_en_service_quand_l_etage_dsp_tourne_rc14() {
+    use super::chemin_tess_t16::marge_manuelle_en_service;
+    use tune_core::tess::{ChaineTess, Headroom};
+    let mut c = ChaineTess::default();
+    c.fixed.headroom = Headroom::Manual { db: -7.5 };
+    let applique = json!({"steps": [{"name": "DSP", "bit_perfect": false}]});
+    let pure = json!({"steps": [{"name": "DSP", "bit_perfect": true}]});
+    assert_eq!(marge_manuelle_en_service(&c, &applique), Some(-7.5));
+    assert_eq!(marge_manuelle_en_service(&c, &pure), None, "PURE la contourne");
+    assert_eq!(marge_manuelle_en_service(&c, &json!({"steps": []})), None);
+    // Automatique, ou 0 dB : jamais un gain à part.
+    c.fixed.headroom = Headroom::Manual { db: 0.0 };
+    assert_eq!(marge_manuelle_en_service(&c, &applique), None);
+    c.fixed.headroom = Headroom::Auto {};
+    assert_eq!(marge_manuelle_en_service(&c, &applique), None);
+}
