@@ -1275,7 +1275,7 @@ impl EqProcessor {
             enabled,
             headroom_mode: profile.headroom_mode,
             limiteur: (enabled && profile.headroom_mode == HeadroomMode::Realistic)
-            .then(|| tune_plugin_audio_support::limiteur::Limiteur::new(sample_rate)),
+                .then(|| tune_plugin_audio_support::limiteur::Limiteur::new(sample_rate)),
             trame: vec![0.0; usize::from(channels.max(1))],
             limiteur_premier_dit: false,
         }
