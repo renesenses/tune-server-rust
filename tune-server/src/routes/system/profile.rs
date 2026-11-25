@@ -336,10 +336,11 @@ mod tests {
                 .any(|(k, _)| *k == "lyrics_lrclib_enabled"),
             "sans cette cle, un ticket « panneau Paroles vide » reste indecidable"
         );
-        // Absent du store = ACTIVE depuis le retour de Remi sur la rc13,
-        // exactement la regle du serveur (`lrclib_consentement_depuis`).
+        // Absent du store = eteint, exactement la regle du serveur
+        // (`lrclib_consentement_depuis`) ; une base neuve, elle, nait avec
+        // le reglage pose a « true » (rc14).
         let out = support_settings(|_| None);
-        assert_eq!(out["lyrics_lrclib_enabled"], json!(true));
+        assert_eq!(out["lyrics_lrclib_enabled"], json!(false));
         // Un refus pose reste un refus.
         let out = support_settings(|k| (k == "lyrics_lrclib_enabled").then(|| "false".to_string()));
         assert_eq!(out["lyrics_lrclib_enabled"], json!(false));

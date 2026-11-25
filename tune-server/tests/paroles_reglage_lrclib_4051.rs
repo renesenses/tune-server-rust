@@ -26,8 +26,8 @@
 //! ## Les quatre témoins
 //!
 //! 1. Sur une base vierge, `GET /system/config` **publie** le réglage — à
-//!    `true` depuis la rc14 (retour de Rémi : paroles en ligne actives tant
-//!    que personne ne les a décochées), `false` avant. Il l'omettait : une clé absente se lit « je ne sais pas », pas
+//!    `true` depuis la rc14 (une base NEUVE naît avec le réglage posé à
+//!    « true »), `false` avant. Il l'omettait : une clé absente se lit « je ne sais pas », pas
 //!    « non » — la règle que ce même fichier applique déjà à
 //!    `local_exclusive_mode_supported` et `replaygain_analysis_enabled`, et que
 //!    `GET /system/profile` respecte pour CETTE clé-ci depuis #3577.
@@ -202,7 +202,7 @@ async fn le_reglage_lrclib_se_lit_et_son_refus_se_dit() {
     // ROUGE avant : les deux routes rendaient `404 no_lyrics` sans une ligne
     // de journal, exactement comme un titre réellement sans paroles.
     //
-    // rc14 : un réglage jamais posé vaut accord. Le refus se pose donc ici,
+    // rc14 : une base neuve naît avec le réglage activé. Le refus se pose donc ici,
     // comme l'interface le pose quand on décoche la case.
     let (st, reponse) = patch(&app, "/api/v1/system/config", json!({ CLE: false })).await;
     assert_eq!(st, StatusCode::OK, "le PATCH est accepté : {reponse}");

@@ -608,17 +608,16 @@ impl FillOptions<'static> {
     }
 }
 
-/// Valeur d'un réglage LRCLIB JAMAIS posé : activé.
+/// Valeur d'un réglage LRCLIB JAMAIS posé : désactivé.
 ///
-/// Retour de Rémi sur la rc13 (GO de Bertrand) : une installation neuve doit
-/// montrer tout de suite ce que Tune sait faire, paroles comprises. Seul un
-/// réglage ABSENT prend ce défaut ; un `"false"` écrit par l'interface — un
-/// utilisateur qui a décoché la case — reste un refus, et rien n'est réécrit
-/// en base.
-pub const LRCLIB_DEFAUT: bool = true;
+/// Décision de Bertrand (rc14) : une installation NEUVE reçoit le réglage
+/// POSÉ à `"true"` à la naissance de sa base (`db::migrations`). Une
+/// installation existante qui n'a jamais touché la case reste désactivée :
+/// aucun envoi nouveau à lrclib.net.
+pub const LRCLIB_DEFAUT: bool = false;
 
 /// Lecture pure du réglage : absent → [`LRCLIB_DEFAUT`], `"true"` → oui,
-/// toute autre valeur posée → non (le doute penche du côté qui n'envoie rien).
+/// toute autre valeur posée → non.
 pub fn lrclib_consentement_depuis(brut: Option<&str>) -> bool {
     match brut {
         None => LRCLIB_DEFAUT,
@@ -875,10 +874,9 @@ pub async fn rattraper_un_lot(db: &Arc<dyn DbBackend>, http: &reqwest::Client) -
 
 /// La boucle de fond. Miroir de `audio::replaygain::spawn`.
 ///
-/// Elle ne fait rien quand `lyrics_lrclib_enabled` est refusé. Depuis la
-/// rc14 (retour de Rémi), un réglage jamais posé vaut accord
-/// ([`LRCLIB_DEFAUT`]) : seule une case décochée l'arrête. L'accord vaut
-/// pour chaque nouveau lot d'albums importés, sans geste à reposer.
+/// Elle ne fait rien tant que `lyrics_lrclib_enabled` ne vaut pas `"true"`.
+/// Depuis la rc14, une installation neuve naît avec le réglage posé à
+/// `"true"` ; une installation existante garde son choix (absent = refus).
 pub fn spawn(backend: Arc<dyn DbBackend>, http: reqwest::Client) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(DELAI_DE_DEMARRAGE_SECS)).await;

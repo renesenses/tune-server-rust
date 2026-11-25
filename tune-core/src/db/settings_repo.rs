@@ -463,6 +463,10 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
+        // rc14 : une base neuve naît avec `lyrics_lrclib_enabled` posé
+        // (`db::premier_lancement_rc14_tests`). Ces témoins comptent les
+        // lignes d'une table VIDE : la ligne de naissance est retirée.
+        db.execute_batch("DELETE FROM settings").unwrap();
         SettingsRepo::new(db)
     }
 

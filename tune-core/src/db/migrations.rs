@@ -4311,6 +4311,16 @@ pub(crate) const SEMIS_DE_RADIOS_SQLITE: [i32; 3] = [33, 90, 98];
 #[cfg(feature = "postgres")]
 pub(crate) const SEMIS_DE_RADIOS_PG: [i32; 2] = [42, 54];
 
+/// LRCLIB (paroles en ligne) activé à la NAISSANCE de la base — décision de
+/// Bertrand, rc14. `OR IGNORE` : jamais d'écrasement d'un choix posé.
+const SQL_LRCLIB_ACTIVE_A_LA_NAISSANCE_SQLITE: &str =
+    "INSERT OR IGNORE INTO settings (key, value) VALUES ('lyrics_lrclib_enabled', 'true')";
+
+/// Jumelle PostgreSQL de [`SQL_LRCLIB_ACTIVE_A_LA_NAISSANCE_SQLITE`].
+#[cfg(feature = "postgres")]
+const SQL_LRCLIB_ACTIVE_A_LA_NAISSANCE_PG: &str = "INSERT INTO settings (key, value) \
+     VALUES ('lyrics_lrclib_enabled', 'true') ON CONFLICT (key) DO NOTHING";
+
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     executer_les_migrations(db, false)
 }
@@ -4859,6 +4869,14 @@ fn executer_les_migrations(db: &SqliteDb, semer_meme_sur_base_neuve: bool) -> Re
             ms = step_started.elapsed().as_millis() as u64,
             "migration_applied"
         );
+    }
+
+    if installation_neuve {
+        // Décision de Bertrand (rc14) : LRCLIB activé d'office sur une
+        // installation NEUVE seulement. Le réglage est POSÉ à la naissance de
+        // la base ; une base existante sans réglage reste désactivée.
+        db.execute_batch(SQL_LRCLIB_ACTIVE_A_LA_NAISSANCE_SQLITE)?;
+        info!("paroles_en_ligne_activees_installation_neuve");
     }
 
     migration_status::advance("contrôles finaux", done);
@@ -6687,6 +6705,24 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
             ms = step_started.elapsed().as_millis() as u64,
             "pg_migration_applied"
         );
+    }
+
+    if installation_neuve {
+        // Même décision que côté SQLite. Une conversion SQLite → PostgreSQL
+        // passe aussi ici avec une base « neuve » au sens des migrations, mais
+        // ses réglages y sont déjà copiés : seule une table `settings` VIDE
+        // désigne une vraie installation neuve.
+        let reglages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM settings")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("pg lecture settings: {e}"))?;
+        if reglages == 0 {
+            sqlx::raw_sql(SQL_LRCLIB_ACTIVE_A_LA_NAISSANCE_PG)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("pg lrclib à la naissance: {e}"))?;
+            info!("paroles_en_ligne_activees_installation_neuve");
+        }
     }
 
     migration_status::advance("contrôles finaux", done);

@@ -2185,7 +2185,7 @@ async fn browser_zone_without_device_is_not_rejected_as_orphan() {
 // Cascade: sidecar .lrc → embedded tag → LRCLIB (opt-in). These tests cover
 // the local sources and the clean-404 paths (no network involved: the
 // cascade stops on a local source, or on the missing artist guard before
-// LRCLIB — an unset lyrics_lrclib_enabled means ON since rc14).
+// LRCLIB — a fresh base is born with lyrics_lrclib_enabled ON since rc14).
 
 fn insert_track_with_file(state: &tune_server::state::AppState, title: &str, path: &str) -> i64 {
     let repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
