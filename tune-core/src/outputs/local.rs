@@ -1605,6 +1605,15 @@ impl LocalOutput {
                     .as_ref()
                     .and_then(|p| p.reporter_le_preampli_garde());
             }
+            // rc14 (série TESS) — un égaliseur actif qui succède à un étage
+            // qui retenait une hausse de marge (maillon décoché, volume monté)
+            // la reprend : la piste suivante ne saute pas au-dessus du niveau
+            // d'avant l'égaliseur.
+            if !self.pure_bypass.load(Ordering::Relaxed)
+                && let (Some(neuf), Some(precedent)) = (eq.as_mut(), emplacement.as_ref())
+            {
+                neuf.reprendre_la_retenue_de(precedent);
+            }
             self.eteindre_si_flux_sans_fin(&mut eq);
             self.borner_la_remontee(&mut eq);
             *emplacement = eq;

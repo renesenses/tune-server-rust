@@ -134,6 +134,10 @@ impl EqEnVol {
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 );
+                // rc14 (série TESS) — un égaliseur actif qui retient une
+                // hausse de marge la rend jusqu'à cette borne, jamais au-delà
+                // (`EqProcessor::retenir_la_hausse_de`).
+                eq.borner_la_remontee(self.borne_de_remontee());
             }
             Some(eq) => eq.borner_la_remontee(self.borne_de_remontee()),
         }
