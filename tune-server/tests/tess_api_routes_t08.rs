@@ -1295,7 +1295,7 @@ async fn les_bornes_de_gain_sont_publiees_et_tenues_rc14() {
         ]}))
         .await;
     assert_eq!(s, StatusCode::CONFLICT, "{v}");
-    refus_conforme(&v, 409, "invalid_settings");    // #9519 — une correction casque OPRA à +20 dB passe.
+    refus_conforme(&v, 409, "invalid_settings"); // #9519 — une correction casque OPRA à +20 dB passe.
     let (s, v) = b
         .put(json!({"version": 1, "plugins": [
             {"id": "equalizer-headphone", "enabled": true,

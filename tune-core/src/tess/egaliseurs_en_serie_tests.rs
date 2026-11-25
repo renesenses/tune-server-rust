@@ -291,15 +291,16 @@ fn l_ordre_des_familles_ne_change_qu_au_deplacement_rc14() {
 /// catalogue, et joué tel quel par le moteur (plafond +24 dB).
 #[test]
 fn un_profil_casque_a_plus_20_db_est_accepte_rc14() {
+    let opra = EqProfile {
+        enabled: true,
+        bands: vec![
+            bande(9000.0, 20.0, 2.0, "peak"),
+            bande(40.0, -30.0, 0.7, "low_shelf"),
+        ],
+        ..Default::default()
+    };
     let casque = ChaineTess {
-        plugins: vec![MaillonGreffon {
-            id: "equalizer-headphone".into(),
-            enabled: true,
-            settings: json!({"bands": [
-                {"freq": 9000.0, "gain": 20.0, "q": 2.0, "type": "peak"},
-                {"freq": 40.0, "gain": -30.0, "q": 0.7, "type": "low_shelf"}
-            ]}),
-        }],
+        plugins: vec![maillon("equalizer-headphone", true, &opra)],
         ..ChaineTess::default()
     };
     verifier_les_gains(&casque, &ChaineTess::default()).unwrap();
@@ -309,7 +310,10 @@ fn un_profil_casque_a_plus_20_db_est_accepte_rc14() {
     .unwrap();
     borner_le_schema("equalizer-headphone", &mut s);
     let g = &s["properties"]["bands"]["items"]["properties"]["gain"];
-    assert_eq!((g["minimum"].clone(), g["maximum"].clone()), (json!(-30.0), json!(20.0)));
+    assert_eq!(
+        (g["minimum"].clone(), g["maximum"].clone()),
+        (json!(-30.0), json!(20.0))
+    );
     let p = profil_du_maillon(&casque.plugins[0]).unwrap();
     let r = courbe_db(&p, &[9000.0]);
     assert!((r[0][0] - 20.0).abs() < 0.3, "{}", r[0][0]);
