@@ -79,8 +79,18 @@ pub fn volume_lock_override(db: &Arc<dyn DbBackend>, zone_id: i64) -> Option<boo
 /// #8920 — jamais sur une zone Devialet AIR : « plein volume en PURE »
 /// enverrait le haut de la course à l'ampli. Le volume y est tenu par
 /// l'ampli, sous les limites de confort et de sécurité, PURE ou non.
+///
+/// Retour de Didier (rc13.90) — jamais non plus pendant le balayage d'une
+/// mesure de pièce ([`super::mesure_nue`]) : la mesure règle elle-même un
+/// volume MODÉRÉ, et le verrou refusait cette baisse (« le mode PURE de
+/// cette zone tient le volume à 100 % ») : la mesure échouait en PURE.
+/// Le réglage PURE n'est pas touché ; le verrou revient avec la fin de la
+/// mesure, qui rend alors le volume d'avant (100 %).
 pub fn volume_lock_enabled(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
     if crate::outputs::devialet_air::reglages::zone_air(db, zone_id) {
+        return false;
+    }
+    if super::mesure_nue::active(zone_id) {
         return false;
     }
     volume_lock_override(db, zone_id).unwrap_or_else(|| global_volume_lock_enabled(db))
@@ -147,6 +157,32 @@ mod tests {
             traitements_contournes(&db, 851_311),
             "PURE contourne toujours"
         );
+    }
+
+    /// Retour de Didier (rc13.90) — PURE verrouillé : la mesure baisse le
+    /// volume à sa valeur de mesure, sans que PURE soit désactivé, puis le
+    /// verrou revient tel quel.
+    #[test]
+    fn une_mesure_leve_le_verrou_de_volume_pure_le_temps_du_balayage() {
+        let db = mem_db();
+        set(
+            &db,
+            "zone_851312_audiophile",
+            r#"{"enabled":true,"lock_volume":true}"#,
+        );
+        assert!(volume_lock_enabled(&db, 851_312));
+        assert_eq!(effective_volume(&db, 851_312, 0.4), 1.0);
+        let g = super::super::mesure_nue::Contournement::poser(851_312);
+        assert!(
+            zone_enabled(&db, 851_312),
+            "PURE ne doit pas être désactivé"
+        );
+        assert!(!volume_lock_enabled(&db, 851_312));
+        assert_eq!(effective_volume(&db, 851_312, 0.4), 0.4);
+        drop(g);
+        assert!(zone_enabled(&db, 851_312));
+        assert!(volume_lock_enabled(&db, 851_312), "verrou non rétabli");
+        assert_eq!(effective_volume(&db, 851_312, 0.4), 1.0);
     }
 
     #[test]
