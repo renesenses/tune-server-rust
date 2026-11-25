@@ -567,6 +567,13 @@ async fn fix_years_from_path(State(state): State<AppState>) -> impl IntoResponse
         .into_response()
 }
 
+#[cfg(test)]
+mod edition_lecture_seule_tests_9340;
+
+/// #9340 — code stable du refus d'écrire un fichier en lecture seule (le
+/// fichier, son dossier ou son volume).
+pub(crate) const CODE_FICHIER_LECTURE_SEULE: &str = "fichier_lecture_seule";
+
 pub(crate) async fn edit_track(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -599,6 +606,19 @@ pub(crate) async fn edit_track(
         };
 
         if let Err(e) = write_metadata(std::path::Path::new(file_path), &update) {
+            // #9340 — fichier ou volume en lecture seule : un refus explicite,
+            // avec un code stable, et non un 500 « os error 30 ».
+            if tune_core::metadata::tag_writer::est_un_refus_lecture_seule(&e) {
+                tracing::warn!(track_id = id, path = file_path.as_str(), motif = %e, "edit_track_fichier_lecture_seule");
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": format!("Le fichier n'a pas pu être modifié : {e}"),
+                        "code": CODE_FICHIER_LECTURE_SEULE,
+                    })),
+                )
+                    .into_response();
+            }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("tag write failed: {e}"),

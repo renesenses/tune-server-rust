@@ -237,6 +237,9 @@ fn ecrire_par_tag(
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
 
+    // #9340 — « lecture seule » dit comme tel, avant de lire quoi que ce soit.
+    verifier_inscriptible(Path::new(file_path))?;
+
     let ouvrir = || {
         std::fs::OpenOptions::new()
             .read(true)
@@ -1224,6 +1227,30 @@ fn motif_io(e: &std::io::Error, motif_droits: &str, quoi: &str) -> String {
     }
 }
 
+/// #9340 — le refus est-il « lecture seule » (fichier, dossier ou volume) ?
+/// Les routes s'en servent pour rendre un refus explicite (409) plutôt
+/// qu'une erreur interne.
+pub fn est_un_refus_lecture_seule(motif: &str) -> bool {
+    [
+        MOTIF_FICHIER_LECTURE_SEULE,
+        MOTIF_VOLUME_LECTURE_SEULE,
+        MOTIF_DOSSIER_LECTURE_SEULE,
+    ]
+    .contains(&motif)
+}
+
+/// #9340 — avant toute écriture EN PLACE (écrivains génériques, édition
+/// d'une piste) : un fichier en lecture seule, ou sur un volume monté en
+/// lecture seule (disque NTFS sous macOS, partage en lecture seule), est
+/// refusé avec un motif qui le dit, au lieu de « open: Read-only file system
+/// (os error 30) ». Un fichier introuvable passe : l'écrivain le dira.
+pub fn verifier_inscriptible(chemin: &Path) -> Result<(), String> {
+    match std::fs::metadata(chemin) {
+        Ok(meta) => refuser_si_lecture_seule(chemin, &meta),
+        Err(_) => Ok(()),
+    }
+}
+
 /// Le fichier se laisse-t-il écrire ? Refuse un fichier en lecture seule
 /// (droits, ou droits refusés au service) et un volume monté en lecture
 /// seule, AVANT toute copie. L'ouverture en écriture, sans troncature, ne
@@ -2177,6 +2204,53 @@ mod tests {
         assert_eq!(std::fs::read(&cible).unwrap(), avant);
         assert!(copies_de_travail(dir.path()).is_empty());
         std::fs::set_permissions(&cible, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// #9340 — les écrivains EN PLACE (`write_tags`, `write_metadata_to_file`,
+    /// `metadata::write_metadata`) disent « lecture seule » au lieu de
+    /// « open: Permission denied » / « Read-only file system (os error 30) ».
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ecrivains_en_place_9340_fichier_en_lecture_seule_le_disent() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, cible) = banc_6635("tune-9340-ro", "test.flac");
+        std::fs::set_permissions(&cible, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let avant = std::fs::read(&cible).unwrap();
+        let chemin = cible.to_str().unwrap();
+        let e1 = write_tags(chemin, &maj_pop_rock()).await.unwrap_err();
+        let mut champs = HashMap::new();
+        champs.insert("label".to_string(), "Essai".to_string());
+        let e2 = write_metadata_to_file(chemin, &champs).await.unwrap_err();
+        let maj = crate::metadata::MetadataUpdate {
+            title: Some("Essai".into()),
+            artist: None,
+            album: None,
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            year: None,
+            composer: None,
+            label: None,
+            musicbrainz_recording_id: None,
+        };
+        let e3 = crate::metadata::write_metadata(&cible, &maj).unwrap_err();
+        std::fs::set_permissions(&cible, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for e in [&e1, &e2, &e3] {
+            assert!(
+                est_un_refus_lecture_seule(e),
+                "🔴 #9340 — refus non explicite : {e}"
+            );
+            assert!(e.contains("lecture seule"), "{e}");
+        }
+        assert_eq!(std::fs::read(&cible).unwrap(), avant, "original intact");
+        // Le motif d'un volume monté en lecture seule (EROFS).
+        let erofs = std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem);
+        assert_eq!(
+            motif_io(&erofs, MOTIF_FICHIER_LECTURE_SEULE, "open"),
+            MOTIF_VOLUME_LECTURE_SEULE
+        );
+        assert!(est_un_refus_lecture_seule(MOTIF_VOLUME_LECTURE_SEULE));
     }
 
     #[cfg(unix)]
