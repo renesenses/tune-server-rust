@@ -246,7 +246,13 @@ pub async fn garde_du_relais(
     if chemin_relayable(request.method(), &chemin, auth_active(&state)) {
         return next.run(request).await;
     }
-    tracing::info!(methode = %request.method(), "requete_relayee_refusee");
+    // Diagnostic rc14 (#8963) : QUELLE route le téléphone demandait. Le
+    // chemin seul (jamais la requête `?…`), passé par `masquer_url`.
+    tracing::info!(
+        methode = %request.method(),
+        chemin = %tune_core::confidentialite::masquer_url(&chemin),
+        "requete_relayee_refusee"
+    );
     if chemin
         .strip_prefix("/api/v1")
         .is_some_and(|api| sous(api, "/ext/circle"))

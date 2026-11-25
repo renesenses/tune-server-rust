@@ -192,12 +192,38 @@ async fn un_renderer_allume_avant_le_serveur_sur_un_autre_port_remet_sa_zone_en_
 /// annonce un AUTRE appareil ne remet pas la zone en ligne.
 #[tokio::test]
 async fn le_recours_unicast_ignore_un_autre_appareil() {
-    let ancienne = format!("http://127.0.0.1:{}/description.xml", port_ferme());
+    // Garder ce port réservé jusqu'à la fin du runtime : un port obtenu
+    // puis fermé peut être repris par le serveur HTTP suivant ou un voisin,
+    // et faire réussir la sonde initiale sans passer par le recours unicast.
+    let ancien_port = servir_la_description_quand(Arc::new(AtomicBool::new(false))).await;
+    let ancienne = format!("http://127.0.0.1:{ancien_port}/description.xml");
     let actuelle = format!(
         "http://127.0.0.1:{}/description.xml",
         servir_la_description().await
     );
-    let port_ssdp = repondre_aux_msearch(actuelle).await;
+    assert_ne!(
+        ancienne, actuelle,
+        "les deux adresses du banc restent distinctes"
+    );
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port_ssdp = socket.local_addr().unwrap().port();
+    let reponses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let compte = reponses.clone();
+    let repondeur = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, de)) = socket.recv_from(&mut buf).await {
+            if !buf[..n].starts_with(b"M-SEARCH") {
+                continue;
+            }
+            let reponse = format!(
+                "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nLOCATION: {actuelle}\r\n\
+                 USN: {UDN}::urn:schemas-upnp-org:device:MediaRenderer:1\r\nST: {UDN}\r\n\r\n"
+            );
+            compte.fetch_add(1, Ordering::SeqCst);
+            socket.send_to(reponse.as_bytes(), de).await.unwrap();
+            break;
+        }
+    });
     let kr = KnownRenderer {
         device_id: "uuid:un-autre-appareil".into(),
         location: ancienne,
@@ -213,6 +239,11 @@ async fn le_recours_unicast_ignore_un_autre_appareil() {
     let sondes =
         sonder_les_renderers_en_parallele(vec![kr], std::time::Duration::from_secs(5), recours)
             .await;
+    assert!(
+        reponses.load(Ordering::SeqCst) > 0,
+        "#6961 : le répondeur unicast doit avoir reçu une recherche"
+    );
+    repondeur.await.expect("envoi de la réponse unicast");
     assert!(
         sondes[0].1.is_none(),
         "un répondeur d'un autre UDN ne doit pas être pris pour l'appareil mémorisé"

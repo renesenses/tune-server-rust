@@ -115,7 +115,48 @@ impl CompensationReseau {
         if pcm.is_empty() {
             return;
         }
-        let crete = crete_relative(pcm, bit_depth);
+        self.retenir_pour_crete(crete_relative(pcm, bit_depth));
+        crate::audio::replaygain::apply_gain_pcm_compte(
+            pcm,
+            bit_depth,
+            self.gain,
+            &mut self.ecretage,
+        );
+    }
+
+    /// Le gain linéaire retenu à ce point du flux.
+    pub fn gain_lineaire(&self) -> f64 {
+        self.gain
+    }
+
+    /// TESS T04 — la compensation EN `f64`, sans quantification : `y` est la
+    /// sortie de la chaîne (pleine échelle ±1,0), la quantification unique
+    /// vient après. Le gain est d'abord retenu pour la crête du bloc
+    /// ([`Self::retenir_pour_crete`], par l'appelant, qui voit le bloc
+    /// entier). Compte ce que le gain pousserait au-delà du rail de
+    /// `bit_depth` — zéro par construction, comme avant.
+    pub fn appliquer_f64(&mut self, y: &mut [f64], bit_depth: u16) {
+        let echelle = (1u64 << (bit_depth.clamp(2, 32) - 1)) as f64;
+        let max = echelle - 1.0;
+        let base = self.ecretage.echantillons_vus;
+        for (i, s) in y.iter_mut().enumerate() {
+            *s *= self.gain;
+            let v = *s * echelle;
+            if v > max {
+                self.ecretage
+                    .noter_ecrete(base + i as u64, v - max, v / echelle);
+            } else if v < -echelle {
+                self.ecretage
+                    .noter_ecrete(base + i as u64, -echelle - v, -v / echelle);
+            }
+        }
+        self.ecretage.noter_vus(y.len() as u64);
+    }
+
+    /// La règle de la réserve : si la crête du bloc (0,0 à 1,0 et plus), une
+    /// fois compensée, dépasserait [`PLAFOND_DBFS`], le gain descend à
+    /// `PLAFOND / crête`. Il ne remonte jamais.
+    pub fn retenir_pour_crete(&mut self, crete: f64) {
         let plafond = plafond_lineaire();
         if crete > 0.0 && crete * self.gain > plafond {
             let avant = self.gain_applique_db();
@@ -129,12 +170,6 @@ impl CompensationReseau {
                 "compensation_reseau_rabotee_a_la_crete"
             );
         }
-        crate::audio::replaygain::apply_gain_pcm_compte(
-            pcm,
-            bit_depth,
-            self.gain,
-            &mut self.ecretage,
-        );
     }
 }
 

@@ -973,6 +973,17 @@ pub(super) fn pull_output_needs_dsp_transcode(
         && source_format != Some(AudioFormat::Dsd)
 }
 
+/// TESS T12c — les sorties qui vont chercher le flux elles-mêmes et dont
+/// Tune FABRIQUE le flux qu'elles émettent : AirPlay 1 et 2 (RTP fabriqué par
+/// Tune), Devialet AIR. La chaîne TESS entière s'y applique, étage casque
+/// (crossfeed, greffons natifs tiers) compris.
+pub(super) fn sortie_tess_qui_tire_le_flux(output_type: Option<&str>) -> bool {
+    matches!(
+        crate::tess::TransportZone::depuis_type_de_sortie(output_type),
+        crate::tess::TransportZone::AirPlay | crate::tess::TransportZone::DevialetAir
+    )
+}
+
 /// Les sorties qui reçoivent une URI et peuvent repartir de l'octet 0 sur un
 /// envoi redondant (Revox S100) — la porte de coalescence de #1129.
 ///
@@ -1416,7 +1427,7 @@ pub(crate) fn fichier_a_mesurer_apres_avance(
 /// end (Patricia Barber / Qobuz on an Eversolo DMP-A8: `bytes_sent=0`,
 /// `peak_pos=30000`, zone force-stopped). Callers only consult this for network
 /// outputs, so local gapless (which serves the buffer) is unaffected.
-pub(super) fn prefetch_buffer_truncated(buffered_ms: u64, duration_ms: u64) -> bool {
+pub(crate) fn prefetch_buffer_truncated(buffered_ms: u64, duration_ms: u64) -> bool {
     duration_ms == 0 || buffered_ms + 2000 < duration_ms
 }
 

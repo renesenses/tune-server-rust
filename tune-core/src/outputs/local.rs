@@ -550,6 +550,11 @@ mod bras_alsa_natif;
 #[cfg(target_os = "linux")]
 mod bras_alsa_dsd;
 
+// TESS T03 — la chaîne DSP locale passe par l'exécuteur TESS en `f64`
+// (ordre libre, « Bypass all », adaptateurs provisoires des moteurs `f32`).
+mod executeur_tess;
+use executeur_tess::{MoteursLocaux, OrdreLocal};
+
 // REF-8 (#2219) : l'étage natif des bras Windows exclusifs — octets source
 // → mots `i32` alignés à gauche → `PuitsNatif` — et le puits de tout
 // `NativePcmRing`. Même `cfg` que les aides qu'il appelle : jugé sur Shrek.
@@ -1976,6 +1981,7 @@ impl LocalOutput {
         let current_format = self
             .current_format()
             .filter(|_| self.convolution_autorisee.load(Ordering::Relaxed));
+        let fondu = Self::trames_de_fondu(current_format);
         let active = match current_format {
             Some((sample_rate, channels)) => {
                 match config.build_for(1024, sample_rate, channels as usize) {
@@ -1983,15 +1989,16 @@ impl LocalOutput {
                     Err(error) => {
                         // La configuration reste mémorisée pour une prochaine
                         // piste compatible, mais l'ancien moteur ne doit jamais
-                        // continuer à corriger le format courant.
-                        *self.convolver.lock().unwrap() = None;
+                        // continuer à corriger le format courant : il s'éteint
+                        // (en fondu s'il joue, T09b).
+                        self.installer_moteur(None, fondu);
                         return Err(error);
                     }
                 }
             }
             None => None,
         };
-        *self.convolver.lock().unwrap() = active;
+        self.installer_moteur(active, fondu);
         tracing::info!(
             path,
             device = %self.device_name,
@@ -2007,8 +2014,103 @@ impl LocalOutput {
 
     pub fn clear_convolver(&self) {
         *self.convolver_config.lock().unwrap() = None;
-        *self.convolver.lock().unwrap() = None;
+        // T09b — flux en cours, le filtre retiré s'éteint en fondu (le moteur
+        // reste un simple retard jusqu'à la piste suivante, qui ne le
+        // reconstruit pas) : ni clic ni saut de temps.
+        self.installer_moteur(None, Self::trames_de_fondu(self.current_format()));
         tracing::info!(device = %self.device_name, "convolver_cleared");
+    }
+
+    /// T09b — durée des fondus de changement de filtre : 20 ms à la cadence du
+    /// flux en cours ; 0 sans flux (remplacement immédiat, rien ne joue).
+    fn trames_de_fondu(format: Option<(u32, u16)>) -> usize {
+        format
+            .map(|(taux, _)| (taux as usize / 50).max(1))
+            .unwrap_or(0)
+    }
+
+    /// T09b — poser le moteur de convolution SANS discontinuité.
+    ///
+    /// Flux en cours (`fondu > 0`) et moteur en service : un nouveau filtre
+    /// le remplace par [`Convolver::remplacer_en_fondu`] (réchauffe muette,
+    /// puis fondu de 20 ms à latence égale) ; un retrait l'éteint en fondu
+    /// ([`Convolver::eteindre_en_fondu`]). Sinon (rien ne joue, ou moteur
+    /// incompatible : canaux ou bloc), remplacement direct, comme avant.
+    fn installer_moteur(
+        &self,
+        nouveau: Option<super::super::audio::convolver::Convolver>,
+        fondu: usize,
+    ) {
+        // Ce qui est retiré sort du verrou et n'est libéré qu'après : le fil
+        // audio, qui prend ce verrou à chaque bloc, n'attend jamais une
+        // libération.
+        let mut a_liberer: [Option<Box<super::super::audio::convolver::Convolver>>; 2] =
+            [None, None];
+        let mut remplace = None;
+        let mut refuse = None;
+        let joue = fondu > 0;
+        // Le moteur de retard d'une pose en lecture est bâti AVANT le verrou
+        // (allocation et FFT hors du verrou de la boucle de lecture) ; libéré
+        // après s'il ne sert pas.
+        let mut retard = match (&nouveau, joue) {
+            (Some(n), true) => Some(super::super::audio::convolver::Convolver::retard_seul(
+                n.channels(),
+                n.block_size(),
+            )),
+            _ => None,
+        };
+        {
+            let mut actif = self.convolver.lock().unwrap();
+            // Le droit est relu SOUS le verrou : un retrait du Premium
+            // concurrent (`set_convolution_autorisee`) n'est jamais ignoré.
+            let nouveau = match nouveau {
+                Some(n) if !self.convolution_autorisee.load(Ordering::Relaxed) => {
+                    refuse = Some(n);
+                    None
+                }
+                n => n,
+            };
+            match nouveau {
+                Some(n) if joue && actif.is_some() => {
+                    let resultat = match actif.as_mut() {
+                        Some(ancien) => ancien.remplacer_en_fondu_en_rendant(n, fondu),
+                        None => Err(n),
+                    };
+                    match resultat {
+                        Ok(r) => a_liberer = r,
+                        Err(n) => remplace = actif.replace(n),
+                    }
+                }
+                None if joue && actif.is_some() => {
+                    if let Some(ancien) = actif.as_mut() {
+                        a_liberer = ancien.eteindre_en_fondu_en_rendant(fondu);
+                    }
+                }
+                // Flux en cours SANS moteur : d'abord un moteur ÉTEINT, qui
+                // retarde seulement l'entrée de sa latence — le SEUL saut de
+                // temps, un bloc de silence à la pose, sans aucun échantillon
+                // rejoué —, puis le vrai filtre lui succède par réchauffe et
+                // fondu. Radio comprise : rien n'attend une jonction.
+                Some(n) if joue => {
+                    let pose = match retard.take() {
+                        Some(mut r) => match r.remplacer_en_fondu_en_rendant(n, fondu) {
+                            Ok(rendus) => {
+                                a_liberer = rendus;
+                                r
+                            }
+                            Err(n) => n,
+                        },
+                        None => n,
+                    };
+                    remplace = actif.replace(pose);
+                }
+                n => remplace = std::mem::replace(&mut *actif, n),
+            }
+        }
+        drop(retard);
+        drop(refuse);
+        drop(remplace);
+        drop(a_liberer);
     }
 
     /// #7632 — accorder ou retirer le droit de convoluer (Premium
@@ -2027,12 +2129,15 @@ impl LocalOutput {
                 .current_format()
                 .map(|(taux, _)| (taux as usize / 50).max(1))
                 .unwrap_or(0);
+            // Les moteurs retirés sortent du verrou avant d'être libérés.
+            let mut a_liberer = [None, None];
             if let Ok(mut c) = self.convolver.lock()
                 && let Some(conv) = c.as_mut()
             {
-                conv.eteindre_en_fondu(trames);
+                a_liberer = conv.eteindre_en_fondu_en_rendant(trames);
                 tracing::info!(device = %self.device_name, trames, "convolution_eteinte_sans_licence");
             }
+            drop(a_liberer);
         }
         avant != autorisee
     }
@@ -3417,6 +3522,21 @@ impl RingBuf {
 #[cfg(test)]
 mod ringbuf_tests;
 
+// TESS T03 — mémoire du chemin compressé (relecture de #9024).
+#[cfg(test)]
+mod memoire_chemin_compresse_t03;
+
+/// TESS T03 — pour le banc des natifs tiers de l'orchestrateur : le même
+/// étage casque par la chaîne TESS et par l'ancien chemin, bloc par bloc
+/// (panique au premier écart). Rend le nombre de blocs comparés.
+#[cfg(test)]
+pub(crate) fn comparer_un_etage_casque_a_l_ancien_pour_test(
+    nouveau: crate::audio::crossfeed::CrossfeedProcessor,
+    ancien: crate::audio::crossfeed::CrossfeedProcessor,
+) -> usize {
+    executeur_tess::tests::comparer_un_etage_casque_a_l_ancien(nouveau, ancien)
+}
+
 // #3814 — le rappel cpal partagé rend-il son dû à l'horloge du pilote quand
 // il se tait ? Le banc appelle le rappel réel, période par période, et fait
 // juger le résultat par le `SuiviFamine` du sondeur.
@@ -4017,15 +4137,20 @@ impl LocalPcmProcessor<'_> {
             sync_volume_to_dop(self.volume, self.user_volume, self.rg_factor, dop);
         }
 
-        let mut samples =
-            pcm_bytes_to_f32(bloc.octets_alignes(), spec.profondeur().bits_declares());
-        apply_local_dsp(
-            &mut samples,
-            self.eq,
-            self.convolver,
-            self.crossfeed,
-            self.pure_bypass,
-            self.mono_downmix,
+        // TESS T03 — décodé en `f64`, traité par l'exécuteur, puis rangé en
+        // `f32` à la frontière provisoire de l'anneau (engagement § 8 du
+        // contrat : anneau `f64` et quantification unique au rendu).
+        let samples = executeur_tess::decoder_par_la_chaine_tess(
+            bloc.octets_alignes(),
+            spec.profondeur().bits_declares(),
+            &moteurs_locaux(
+                self.eq,
+                self.convolver,
+                self.crossfeed,
+                self.pure_bypass,
+                self.mono_downmix,
+            ),
+            OrdreLocal::HISTORIQUE,
             spec.canaux(),
             dop,
         );
@@ -4722,18 +4847,24 @@ fn rebuild_local_convolver(
         Some(config) => match config.build_for(1024, sample_rate, channels as usize) {
             Ok(convolver) => Some(convolver),
             Err(error) => {
-                if let Ok(mut current) = active.lock() {
-                    *current = None;
-                }
+                // L'ancien moteur sort du verrou avant d'être libéré.
+                let ancien = active.lock().ok().and_then(|mut c| c.take());
+                drop(ancien);
                 return Err(error);
             }
         },
         None => None,
     };
     let enabled = next.is_some();
-    *active
-        .lock()
-        .map_err(|_| "verrou du convolveur actif empoisonné".to_string())? = next;
+    // Le moteur est bâti AVANT le verrou (ci-dessus) ; sous le verrou, un
+    // simple échange, et l'ancien moteur est libéré après.
+    let ancien = std::mem::replace(
+        &mut *active
+            .lock()
+            .map_err(|_| "verrou du convolveur actif empoisonné".to_string())?,
+        next,
+    );
+    drop(ancien);
     Ok(enabled)
 }
 
@@ -4791,35 +4922,18 @@ fn flush_local_dsp(
     channels: u16,
     dop: bool,
 ) -> Vec<f32> {
-    // Mêmes exemptions qu'`apply_local_dsp` : ce que la chaîne n'a pas traité,
-    // elle n'a rien à en rendre.
-    if dop || pure_bypass.load(Ordering::Relaxed) {
-        return Vec::new();
-    }
-    let mut queue = match convolver.lock() {
-        Ok(mut c) => match c.as_mut() {
-            Some(conv) => conv.flush(),
-            None => return Vec::new(),
-        },
-        Err(_) => return Vec::new(),
+    // TESS T03 — la queue passe par les étages qui SUIVENT le convolveur dans
+    // l'ordre de la chaîne (ici l'ordre historique : crossfeed, puis repli
+    // mono, #2362 : sans lui la queue sortirait en stéréo pendant que le corps
+    // de la piste sort en mono). Mêmes exemptions qu'`apply_local_dsp`.
+    let moteurs = MoteursLocaux {
+        eq: None,
+        convolver,
+        crossfeed,
+        pure_bypass,
+        mono_downmix,
     };
-    if queue.is_empty() {
-        return queue;
-    }
-    if channels == 2
-        && let Ok(mut cf) = crossfeed.lock()
-        && let Some(c) = cf.as_mut()
-    {
-        c.process_interleaved(&mut queue);
-    }
-    // Même ordre que `apply_local_dsp` : sans ceci la queue du convolveur
-    // sortirait en stéréo pendant que le corps de la piste sort en mono, et
-    // l'auditeur à une seule enceinte entendrait la fin de chaque piste
-    // s'appauvrir (#2362).
-    if channels == 2 && mono_downmix.load(Ordering::Relaxed) {
-        crate::audio::channels::fold_stereo_to_mono_in_place(&mut queue);
-    }
-    queue
+    executeur_tess::vidanger_chaine_locale(&moteurs, OrdreLocal::HISTORIQUE, channels, dop)
 }
 
 // Un argument par étage de traitement (EQ, convolution, crossfeed…), chacun
@@ -4835,40 +4949,79 @@ fn apply_local_dsp(
     channels: u16,
     dop: bool,
 ) {
-    if dop || pure_bypass.load(Ordering::Relaxed) {
-        return;
+    // L'entrée `f32` (flux compressé décodé en bloc, témoins) : la chaîne
+    // TESS en `f64`, tranche par tranche, sans copie de la piste.
+    executeur_tess::executer_chaine_locale_f32(
+        samples,
+        &moteurs_locaux(eq, convolver, crossfeed, pure_bypass, mono_downmix),
+        OrdreLocal::HISTORIQUE,
+        channels,
+        dop,
+    );
+}
+
+/// Les moteurs de la chaîne locale, sous leurs verrous historiques.
+fn moteurs_locaux<'a>(
+    eq: &'a std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &'a std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &'a std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &'a AtomicBool,
+    mono_downmix: &'a AtomicBool,
+) -> MoteursLocaux<'a> {
+    MoteursLocaux {
+        eq: Some(eq),
+        convolver,
+        crossfeed,
+        pure_bypass,
+        mono_downmix,
     }
-    if let Ok(mut e) = eq.lock()
-        && let Some(ref mut p) = *e
-    {
-        p.process_interleaved(samples);
-        // #5215 — l'égaliseur coupé a fini son fondu et ne garde aucun
-        // préampli : on le retire, la chaîne redevient celle d'un EQ absent.
-        if p.est_neutre_au_repos() {
-            *e = None;
+}
+
+/// Octets par échantillon d'une profondeur (`0` = flottant 32 bits ; une
+/// profondeur inconnue est lue en 16 bits, comme [`pcm_bytes_to_f32`]).
+fn octets_par_echantillon(bit_depth: u16) -> usize {
+    match bit_depth {
+        0 | 32 => 4,
+        24 => 3,
+        _ => 2,
+    }
+}
+
+/// TESS T03 — octets PCM → `f64` dans `sortie`, sans perte à toutes les
+/// profondeurs : un mot 32 bits garde ses 32 bits, qu'un `f32` arrondit à 24.
+/// Même sémantique de `bit_depth` que [`pcm_bytes_to_f32`].
+fn decoder_f64_dans(octets: &[u8], bit_depth: u16, sortie: &mut [f64]) {
+    match bit_depth {
+        0 => {
+            for (d, c) in sortie.iter_mut().zip(octets.as_chunks::<4>().0) {
+                *d = f64::from(f32::from_le_bytes(*c));
+            }
+        }
+        24 => {
+            for (d, c) in sortie.iter_mut().zip(octets.as_chunks::<3>().0) {
+                let mot = ((c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16)) << 8 >> 8;
+                *d = f64::from(mot) / 8_388_608.0;
+            }
+        }
+        32 => {
+            for (d, c) in sortie.iter_mut().zip(octets.as_chunks::<4>().0) {
+                *d = f64::from(i32::from_le_bytes(*c)) / 2_147_483_648.0;
+            }
+        }
+        _ => {
+            for (d, c) in sortie.iter_mut().zip(octets.as_chunks::<2>().0) {
+                *d = f64::from(i16::from_le_bytes(*c)) / 32_768.0;
+            }
         }
     }
-    if let Ok(mut conv) = convolver.lock()
-        && let Some(ref mut c) = *conv
-    {
-        c.process_interleaved(samples);
-    }
-    // Crossfeed is a headphone (local DAC) effect and only makes sense on a
-    // stereo stream — the difference-based algorithm needs L/R pairs.
-    if channels == 2
-        && let Ok(mut cf) = crossfeed.lock()
-        && let Some(ref mut c) = *cf
-    {
-        c.process_interleaved(samples);
-    }
-    // Repli mono EN DERNIER (#2362) : les trois traitements ci-dessus ont tous
-    // besoin de leur contexte stéréo — le crossfeed travaille sur la
-    // DIFFÉRENCE des voies et n'aurait plus rien à traiter après la somme, le
-    // convolveur applique une IR par canal, l'égaliseur des gains par canal.
-    // La duplication tombe donc juste avant l'adaptation au périphérique.
-    if channels == 2 && mono_downmix.load(Ordering::Relaxed) {
-        crate::audio::channels::fold_stereo_to_mono_in_place(samples);
-    }
+}
+
+/// Octets PCM → `f64` d'un tenant : la forme des témoins.
+#[cfg(test)]
+fn pcm_bytes_to_f64(bytes: &[u8], bit_depth: u16) -> Vec<f64> {
+    let mut sortie = vec![0.0; bytes.len() / octets_par_echantillon(bit_depth)];
+    decoder_f64_dans(bytes, bit_depth, &mut sortie);
+    sortie
 }
 
 /// Convert raw PCM bytes to f32 samples.
@@ -4878,6 +5031,9 @@ fn apply_local_dsp(
 ///   - 24: signed 24-bit little-endian integer (3 bytes per sample)
 ///   - 32: signed 32-bit little-endian integer
 ///   -  0: IEEE 754 32-bit float (already in [-1, 1] range)
+///
+/// TESS T03 : c'est aussi le décodage du producteur quand aucun étage de la
+/// chaîne n'agit (`executeur_tess::decoder_par_la_chaine_tess`).
 fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
     match bit_depth {
         0 => {
@@ -5395,14 +5551,14 @@ fn prepare_windows_native_pcm(
     let samples = if bit_perfect {
         pcm_bytes_to_native_i32(bytes, bit_depth)
     } else {
-        let mut float = pcm_bytes_to_f32(bytes, bit_depth);
-        apply_local_dsp(
-            &mut float,
-            eq,
-            convolver,
-            crossfeed,
-            pure_bypass,
-            mono_downmix,
+        // TESS T03 — décodé en `f64`, traité par l'exécuteur ; la frontière
+        // `f32` reste celle de l'adaptation des voies et du volume d'avant
+        // (quantification unique depuis le `f64` : suite de T03 et T07).
+        let mut float = executeur_tess::decoder_par_la_chaine_tess(
+            bytes,
+            bit_depth,
+            &moteurs_locaux(eq, convolver, crossfeed, pure_bypass, mono_downmix),
+            OrdreLocal::HISTORIQUE,
             channels,
             false,
         );
@@ -5823,12 +5979,21 @@ impl EtageDeConversion<'_> {
             // #7614 — le greffon porte la cadence ; rubato ne tourne pas.
             mots = etage.traiter(&mots);
         } else if self.needs_resample {
+            let debut = std::time::Instant::now();
             mots = rubato_resample_chunk(
                 &mut self.resampler,
                 &mots,
                 self.sortie.canaux,
                 false,
                 &mut self.resample_leftover,
+            );
+            // #9391 — un rééchantillonnage qui mange le temps réel se dit.
+            crate::audio::resample::surveiller_le_cout(
+                "sortie_locale",
+                debut,
+                mots.len(),
+                self.sortie.canaux,
+                self.sortie.cadence,
             );
         }
         mots
@@ -8224,6 +8389,9 @@ impl OutputTarget for LocalOutput {
                     // partagé : le natif lui cède, comme à un DSP actif.
                     surechantillonnage_voulu: greffon
                         == diagnostic_surechantillonnage_8259::GreffonAvantLeNatif::Voulu,
+                    // #9187 — les sorties suiveuses (#6132) ne sont branchées
+                    // que sur le chemin partagé : le natif leur cède.
+                    sortie_double: !seconde_sortie.is_empty(),
                 };
                 match bras_alsa_natif::chemin_natif_s32(&conditions) {
                     Ok(()) => {
@@ -9021,6 +9189,11 @@ impl OutputTarget for LocalOutput {
                     LocalOutput::pack_format(sample_rate, channels),
                     Ordering::Relaxed,
                 );
+                // Un format qui change à la jonction : le moteur est rebâti
+                // pour le nouveau format (le rééchantillonnage du filtre est
+                // en cache, préparé en tâche de fond dès la pose du jeu).
+                // S'il n'y avait pas de moteur, le flux prend ici sa latence
+                // (un bloc, 21 ms à 48 kHz), à cette jonction précise.
                 if convolver_format_changed {
                     match rebuild_local_convolver(
                         &convolver_config,

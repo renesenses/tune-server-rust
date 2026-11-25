@@ -16,6 +16,21 @@ thread_local! {
     // qui mesurent en même temps ne doivent ni s'additionner, ni se remettre
     // à zéro l'un l'autre — un faux vert aussi bien qu'un faux rouge.
     static TRACKED_ALLOCATOR_CALLS: Cell<usize> = const { Cell::new(0) };
+    // TESS T03 — octets vivants et leur pic pendant la mesure (même armement).
+    static TRACKED_LIVE_BYTES: Cell<isize> = const { Cell::new(0) };
+    static TRACKED_PEAK_BYTES: Cell<isize> = const { Cell::new(0) };
+}
+
+fn record_bytes(delta: isize) {
+    TRACK_ALLOCATIONS.with(|tracking| {
+        if tracking.get() {
+            let vivants = TRACKED_LIVE_BYTES.with(|v| {
+                v.set(v.get() + delta);
+                v.get()
+            });
+            TRACKED_PEAK_BYTES.with(|p| p.set(p.get().max(vivants)));
+        }
+    });
 }
 
 fn record_allocator_call() {
@@ -29,20 +44,24 @@ fn record_allocator_call() {
 unsafe impl GlobalAlloc for AllocationTracker {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record_allocator_call();
+        record_bytes(layout.size() as isize);
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        record_bytes(-(layout.size() as isize));
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         record_allocator_call();
+        record_bytes(layout.size() as isize);
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         record_allocator_call();
+        record_bytes(new_size as isize - layout.size() as isize);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -59,6 +78,18 @@ fn count_allocator_calls<T>(operation: impl FnOnce() -> T) -> (T, usize) {
     let result = operation();
     TRACK_ALLOCATIONS.with(|tracking| tracking.set(false));
     (result, TRACKED_ALLOCATOR_CALLS.with(Cell::get))
+}
+
+/// TESS T03 — le pic d'octets alloués (et pas encore rendus) par ce fil
+/// pendant `operation`, au-dessus de ce qui vivait avant elle.
+pub(super) fn pic_d_octets_alloues<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+    TRACK_ALLOCATIONS.with(|tracking| tracking.set(false));
+    TRACKED_LIVE_BYTES.with(|v| v.set(0));
+    TRACKED_PEAK_BYTES.with(|p| p.set(0));
+    TRACK_ALLOCATIONS.with(|tracking| tracking.set(true));
+    let result = operation();
+    TRACK_ALLOCATIONS.with(|tracking| tracking.set(false));
+    (result, TRACKED_PEAK_BYTES.with(Cell::get).max(0) as usize)
 }
 
 pub(super) fn assert_no_allocation<T>(operation: impl FnOnce() -> T) -> T {

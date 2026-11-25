@@ -202,6 +202,37 @@ pub struct AirplayOutput {
     depart_muet: Arc<AtomicBool>,
 }
 
+/// Diagnostic rc14 (#8906) : ce que le récepteur a répondu au SETUP.
+///
+/// Up2Stream Mini V4 (Linkplay) : le premier paquet RTP part, et l'envoi
+/// suivant échoue 1 ms plus tard en `Connection refused` (ICMP « port
+/// injoignable » sur la socket connectée). Le port audio lu ici, et les noms
+/// de paramètres tels que reçus (un espace après `;` ferait lire
+/// `server_port` à 0), départagent un port mal lu d'un port que le récepteur
+/// n'a pas encore ouvert. Aucune adresse : les seuls noms et ports.
+pub(crate) fn journaliser_le_transport(
+    transport: Option<&str>,
+    session: bool,
+    server_port: u16,
+    control_port: u16,
+    timing_port: u16,
+) {
+    let parametres: Vec<&str> = transport
+        .unwrap_or_default()
+        .split(';')
+        .map(|p| p.split('=').next().unwrap_or(p))
+        .collect();
+    info!(
+        transport_present = transport.is_some(),
+        session,
+        server_port,
+        control_port,
+        timing_port,
+        parametres = ?parametres,
+        "airplay_setup_transport"
+    );
+}
+
 struct RtspSession {
     stream: tokio::net::TcpStream,
     cseq: u32,
@@ -612,11 +643,13 @@ impl RtspSession {
             return Err(setup_failure_message(code));
         }
 
+        let mut transport_recu = None;
         for (k, v) in &headers {
             if k.eq_ignore_ascii_case("Session") {
                 self.session_id = Some(v.clone());
             }
             if k.eq_ignore_ascii_case("Transport") {
+                transport_recu = Some(v.clone());
                 for param in v.split(';') {
                     if let Some(port_str) = param.strip_prefix("server_port=") {
                         self.server_port = port_str.parse().unwrap_or(0);
@@ -630,6 +663,13 @@ impl RtspSession {
                 }
             }
         }
+        journaliser_le_transport(
+            transport_recu.as_deref(),
+            self.session_id.is_some(),
+            self.server_port,
+            self.control_port,
+            self.timing_port,
+        );
 
         Ok(())
     }
@@ -965,11 +1005,14 @@ pub(crate) async fn url_to_local_path(
         // Client partagé (voir `crate::http::client`) : TLS webpki plutôt que
         // le vérificateur de plateforme, et un délai d'attente — une piste
         // entière transite ici, d'où `long_timeout`.
-        let resp = crate::http::client::long_timeout()
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| format!("download {url}: {e}"))?;
+        let resp = crate::http::client::marquer_si_flux_de_tune(
+            crate::http::client::long_timeout().get(url),
+            url,
+            "airplay",
+        )
+        .send()
+        .await
+        .map_err(|e| format!("download {url}: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("download {url}: HTTP {}", resp.status()));
         }
@@ -2429,3 +2472,59 @@ mod volume_de_depart_tests_8855;
 #[cfg(test)]
 #[path = "airplay_premier_paquet_tests_8855.rs"]
 mod premier_paquet_tests_8855;
+
+#[cfg(test)]
+mod diagnostic_rc14_8906_tests {
+    #[derive(Clone, Default)]
+    struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Journal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Journal;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #8906 — la réponse au SETUP est écrite : ports lus et noms de
+    /// paramètres tels que reçus (un espace après `;` s'y voit).
+    #[test]
+    fn le_transport_du_setup_est_journalise_8906() {
+        crate::journal_de_test::fiabiliser_la_capture();
+        let journal = Journal::default();
+        let _garde = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(journal.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+        super::journaliser_le_transport(
+            Some("RTP/AVP/UDP;unicast;mode=record; server_port=0;control_port=37773"),
+            true,
+            0,
+            37773,
+            0,
+        );
+        let texte = String::from_utf8_lossy(&journal.0.lock().unwrap()).into_owned();
+        let l = texte
+            .lines()
+            .find(|l| l.contains("airplay_setup_transport"))
+            .unwrap_or_else(|| panic!("aucune ligne : {texte}"));
+        for attendu in [
+            "server_port=0",
+            "control_port=37773",
+            "session=true",
+            "\" server_port\"",
+        ] {
+            assert!(l.contains(attendu), "« {attendu} » absent : {l}");
+        }
+    }
+}

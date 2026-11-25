@@ -323,7 +323,7 @@ jobs:
     needs: impact
     if: needs.impact.outputs.rust == 'true'
     runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: ${{ vars.RUNNER_LINUX && 180 || 75 }}  # test — 37 à 45 min observées début novembre (45 dépassé, PR #7711 et #7727) ; > 75 min sur Shrek à 4 cœurs (run 44792749729) : 180 sur runner auto-hébergé
+    timeout-minutes: ${{ vars.RUNNER_LINUX && 180 || 120 }}  # test — 75 min dépassées sur les runners GitHub depuis la disparition de RUNNER_LINUX (24/11), d où 120 ; 37 à 45 min observées début novembre (45 dépassé, PR #7711 et #7727) ; > 75 min sur Shrek à 4 cœurs (run 44792749729) : 180 sur runner auto-hébergé
     # 02/11 (train rc10) : le runner tuait le job en pleine compilation (143)
     # ou le coupait a 45 min. Sans info de debogage et a 2 compilations en
     # parallele, memoire et disque restent sous les limites du runner.
@@ -440,7 +440,7 @@ jobs:
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.livre == 'true'
     runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 75  # compilation + suite complete : coupures observees a 45 min
+    timeout-minutes: ${{ vars.RUNNER_LINUX && 180 || 120 }}  # compilation + suite complete : coupures observees a 45 min ; même calcul que `test` (#9476) : 120 sur runners GitHub, 180 sur runner auto-hébergé
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1

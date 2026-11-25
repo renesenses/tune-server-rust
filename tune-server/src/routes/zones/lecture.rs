@@ -422,6 +422,10 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     let zones = super::zones_a_montrer(&state).await;
     // DUP-1 (phase 2) : l'age de la derniere reponse, une requete pour toutes.
     let ages = repo.ages_depuis_derniere_vue().unwrap_or_default();
+    // #9044 (rc14) — les appareils oubliés, lus une fois pour toute la liste.
+    let oublis = crate::routes::devices::oubli_auto_9044::lire_oublis(
+        &tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone()),
+    );
     let devices = state.scanner.devices().await;
     // Manually-added devices (e.g. legacy DLNA renderers that never appear in
     // SSDP discovery) are registered as outputs but absent from `devices`.
@@ -458,6 +462,7 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             );
             obj.insert("current_track".into(), json!(ps.now_playing));
             inject_metadata_anchor(obj, &ps);
+            inject_dsd_porte(obj, "current_track", &ps);
             inject_session_context(obj, &ps);
             obj.insert(
                 "device_volume_observation".into(),
@@ -579,6 +584,10 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 signal_path,
             )
             .await;
+            // TESS T16 — la vue TESS (A4), rapprochée de ce qui tourne.
+            let signal_path =
+                super::avec_le_chemin_tess(&state.license, &state.backend, z, &ps, signal_path)
+                    .await;
             obj.insert("signal_path".into(), json!(signal_path));
             // #8419 — en lecture groupée, chaque sortie et son étage final.
             super::signal_path_groupe_8419::injecter_les_sorties_du_groupe(&state, zone_id, obj)
@@ -657,6 +666,12 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                     .unwrap_or(false),
             };
             obj.insert("online".into(), json!(online));
+            crate::routes::devices::oubli_auto_9044::injecter_oubli(
+                obj,
+                z.output_device_id.as_deref(),
+                online,
+                &oublis,
+            );
             for (cle, valeur) in
                 super::presence::Presence::qualifier(online, ages.get(&zone_id).copied()).champs()
             {
@@ -724,6 +739,7 @@ pub(crate) async fn get_zone(
                     json!(mode_exclusif_applique(&state, zone.output_device_id.as_deref()).await),
                 );
                 inject_metadata_anchor(obj, &ps);
+                inject_dsd_porte(obj, "current_track", &ps);
                 inject_session_context(obj, &ps);
                 obj.insert(
                     "device_volume_observation".into(),
@@ -833,6 +849,15 @@ pub(crate) async fn get_zone(
                     signal_path,
                 )
                 .await;
+                // TESS T16 — voir la note au site jumeau (`list_zones`).
+                let signal_path = super::avec_le_chemin_tess(
+                    &state.license,
+                    &state.backend,
+                    &zone,
+                    &ps,
+                    signal_path,
+                )
+                .await;
                 obj.insert("signal_path".into(), json!(signal_path));
                 // #8419 — en lecture groupée, chaque sortie et son étage final.
                 super::signal_path_groupe_8419::injecter_les_sorties_du_groupe(&state, id, obj)
@@ -889,6 +914,16 @@ pub(crate) async fn get_zone(
                         .unwrap_or(false),
                 };
                 obj.insert("online".into(), json!(online));
+                crate::routes::devices::oubli_auto_9044::injecter_oubli(
+                    obj,
+                    zone.output_device_id.as_deref(),
+                    online,
+                    &crate::routes::devices::oubli_auto_9044::lire_oublis(
+                        &tune_core::db::settings_repo::SettingsRepo::with_backend(
+                            state.backend.clone(),
+                        ),
+                    ),
+                );
                 let age = ZoneRepo::with_backend(state.backend.clone())
                     .ages_depuis_derniere_vue()
                     .unwrap_or_default()

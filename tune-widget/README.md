@@ -84,6 +84,27 @@ permission: `tauri-plugin-global-shortcut` is a
 Play/Pause, Next, Previous media keys. A test keeps the plugin out of every
 other section of `Cargo.toml` and out of the capabilities.
 
+### Media keys and Control Center on macOS (rc14)
+
+On macOS the keyboard's ⏯ ⏭ ⏮ keys (and the Control Center / menu bar
+*Now Playing* panel) work again, **with no permission at all**: the app
+declares itself as a player to the system through the public MediaPlayer API,
+like Music or Spotify — no `CGEventTap`, so no *Accessibility* nor *Input
+Monitoring* entry, and nothing added to `Info.plist`.
+
+- `src-tauri/src/centre_multimedia.rs` (`#[cfg(target_os = "macos")]`):
+  `MPRemoteCommandCenter` receives Play/Pause, Play, Pause, Next, Previous
+  and the position slider; `MPNowPlayingInfoCenter` shows title, artist,
+  album, cover, duration, position and playback state of the zone the app
+  targets (`zone_visee`), read from `GET /api/v1/widget/data` every 2 s
+  (re-announced only when something changes or the position drifts > 2 s).
+- `src-tauri/src/lecteur_systeme.rs` (all platforms, tested): command →
+  server route (`POST /api/v1/zones/<id>/pause|resume|next|previous|seek`),
+  shared with the *Lecture* menu entries.
+- Bindings: `objc2-media-player` (same `objc2` family Tauri already uses).
+
+Windows (global shortcuts above) and Linux are unchanged.
+
 ## Server status, start / stop, open at login (#9244)
 
 Tune Server has no menu bar / tray icon of its own (decision of 20 Nov 2026,

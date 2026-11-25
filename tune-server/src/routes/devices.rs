@@ -23,6 +23,7 @@ use crate::state::AppState;
 
 mod jumelage_airplay_7447;
 mod oubli_9044;
+pub(crate) mod oubli_auto_9044;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -65,6 +66,11 @@ pub fn router() -> Router<AppState> {
         )
         // #9044 — oublier un appareil parti du réseau, et sa zone.
         .route("/absent", get(oubli_9044::list_absent_devices))
+        // #9044 (rc14) — la durée d'absence avant l'oubli automatique.
+        .route(
+            "/forget-policy",
+            get(oubli_auto_9044::lire_la_regle).put(oubli_auto_9044::ecrire_la_regle),
+        )
         .route(
             "/{device_id}",
             axum::routing::delete(oubli_9044::delete_device),

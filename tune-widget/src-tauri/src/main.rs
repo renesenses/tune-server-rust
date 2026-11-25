@@ -1,7 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(target_os = "macos")]
+mod centre_multimedia;
 mod decouverte;
 mod etat_serveur;
+mod lecteur_systeme;
 mod ouverture_session;
 mod raccourcis;
 #[cfg(windows)]
@@ -364,30 +367,20 @@ async fn executer_lecture(app: tauri::AppHandle, action: raccourcis::Action) {
     let url = state.server_url.read().await.clone();
     let zone_id = zone_visee(&state).await;
     let http = state.http.clone();
+    let commande = match action {
+        Action::PisteSuivante => Some(lecteur_systeme::Commande::Suivante),
+        Action::PistePrecedente => Some(lecteur_systeme::Commande::Precedente),
+        Action::LecturePause => Some(lecteur_systeme::Commande::LecturePause),
+        _ => None,
+    };
+    if let Some(commande) = commande {
+        // La même route que les touches multimédia de macOS (`centre_multimedia`).
+        if let Err(e) = lecteur_systeme::envoyer(&http, &url, zone_id, commande).await {
+            tracing::warn!(?action, zone_id, error = %e, "action_lecture_echouee");
+        }
+        return;
+    }
     match action {
-        Action::PisteSuivante => {
-            let _ = http
-                .post(format!("{url}/api/v1/zones/{zone_id}/next"))
-                .send()
-                .await;
-        }
-        Action::PistePrecedente => {
-            let _ = http
-                .post(format!("{url}/api/v1/zones/{zone_id}/previous"))
-                .send()
-                .await;
-        }
-        Action::LecturePause => {
-            let playing = fetch_widget_data(&http, &url, Some(zone_id))
-                .await
-                .map(|d| d["state"].as_str() == Some("playing"))
-                .unwrap_or(false);
-            let endpoint = if playing { "pause" } else { "resume" };
-            let _ = http
-                .post(format!("{url}/api/v1/zones/{zone_id}/{endpoint}"))
-                .send()
-                .await;
-        }
         Action::VolumePlus | Action::VolumeMoins => {
             // Le gain et la courbe de la zone sont dans `GET /zones`, pas à la
             // racine de `/widget/data` (voir `volume::zone_dans`). Sans eux,
@@ -1903,6 +1896,10 @@ fn main() {
 
             #[cfg(windows)]
             raccourcis_globaux::enregistrer(app.handle());
+            // macOS : les touches multimédia et le Centre de contrôle, par
+            // MediaPlayer, sans aucune autorisation (rc14).
+            #[cfg(target_os = "macos")]
+            centre_multimedia::installer(app.handle());
 
             // #8934 — un lancement par l'utilisateur MONTRE le widget, dans le
             // mode qu'il avait laissé. Avant, seule l'icône de la zone de

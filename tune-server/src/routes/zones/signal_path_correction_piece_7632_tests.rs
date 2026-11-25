@@ -253,6 +253,7 @@ fn appliquer_profil_de_piece(backend: &Arc<dyn tune_core::db::backend::DbBackend
             .collect(),
         created_at: "2026-11-04T10:00:00Z".into(),
         measurement_data: None,
+        origin: None,
     };
     tune_core::room_correction::save_profile(backend, &profil).unwrap();
     let eq = tune_core::room_correction::profil_eq_de_correction(&profil.filters);

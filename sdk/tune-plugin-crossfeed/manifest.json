@@ -40,6 +40,14 @@
         "minor": 1
       },
       "required": true
+    },
+    {
+      "id": "audio-f64",
+      "version": {
+        "major": 0,
+        "minor": 1
+      },
+      "required": false
     }
   ]
 }

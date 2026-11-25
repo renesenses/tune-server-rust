@@ -23,6 +23,30 @@
 //!   `"expert": true` (#8332), maxima d'une mesure, défauts inchangés ;
 //! * `POST /simulations/{id}/correction/profil` — la même, enregistrée comme
 //!   profil de pièce de la zone (`zone_id` de la simulation ou du corps).
+//! * `POST /zones/{zone}/sessions` — session à plusieurs positions (C4) :
+//!   `{ "positions": 3..9, "centrale", "ponderation", "moyenne", "rejet" }`
+//!   (201) ;
+//! * `GET  /sessions` — les sessions connues ;
+//! * `GET  /sessions/{id}` — positions, état de chaque mesure, verdicts de
+//!   rejet et moyenne pondérée (dès 3 positions dont la centrale) ;
+//! * `POST /sessions/{id}/positions` — mesurer une position : corps de
+//!   `POST /zones/{zone}/mesures`, plus `index` (défaut : la première libre ;
+//!   une position mesurée se refait en la nommant) et `etiquette` (202) ;
+//! * `GET  /sessions/{id}/export` — le document versionné (v2) ;
+//! * `POST /sessions/import` — relire un document v2, ou v1 (le résultat
+//!   mono-position de `GET /mesures/{id}/resultat`) (201) ; une version plus
+//!   récente donne 409 `unsupported_version` ;
+//! * `POST /sessions/{id}/correction` et `/correction/profil` — C2 sur la
+//!   moyenne (défauts d'une moyenne spatiale : 20–500 Hz, 10 bandes) ;
+//! * `POST /mesures/{id}/correction/fir` et `/sessions/{id}/correction/fir`
+//!   — FIR de correction (C3, T10b) : cible et bornes comme C2, plus
+//!   relance, longueur, phase excédentaire (mesure seulement), format ; rend
+//!   la description (latence exacte, courbes prévues) ; rien n'est écrit ;
+//! * `POST /mesures/{id}/correction/fir.wav` et `/sessions/{id}/correction/fir.wav`
+//!   — le même calcul, rendu en RI `.wav` (flottant 64 ou 32 bits), à déposer
+//!   par `POST /api/v1/room-correction/ir/upload/{zone}?per_rate=1` ;
+//! * `POST /comparaisons` — A/B : `{ "avant", "apres" }` (ids de mesure ou de
+//!   session), `f_min_hz`, `f_max_hz`, `cible` facultatifs.
 //!
 //! Aucune lecture ne part sans le `POST` explicite de l'utilisateur.
 //!
@@ -34,7 +58,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -45,9 +69,11 @@ use serde_json::{Value, json};
 use tune_core::license::{Feature, LicenseManager};
 
 use crate::correction::{DemandeCorrection, Proposition, proposer};
+use crate::correction_fir::{DemandeFir, PropositionFir, proposer_fir};
 use crate::generateur::Voies;
 use crate::mesure::{Controleur, Demande};
 use crate::modes::{Entree, proposer_estimation, simuler};
+use crate::session::{DemandeComparaison, DemandeSession, ErreurLecture};
 
 #[derive(Clone)]
 pub struct EtatRoutes {
@@ -108,6 +134,25 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
         .route("/mesures/{id}/ri.wav", get(ri_wav))
         .route("/mesures/{id}/correction", post(correction))
         .route("/mesures/{id}/correction/profil", post(correction_profil))
+        .route("/mesures/{id}/correction/fir", post(mesure_fir))
+        .route("/mesures/{id}/correction/fir.wav", post(mesure_fir_wav))
+        .route("/zones/{zone}/sessions", post(creer_session))
+        .route("/sessions", get(sessions))
+        .route(
+            "/sessions/import",
+            post(importer_session).layer(DefaultBodyLimit::max(crate::session::IMPORT_MAX_OCTETS)),
+        )
+        .route("/sessions/{id}", get(vue_session))
+        .route("/sessions/{id}/positions", post(mesurer_position))
+        .route("/sessions/{id}/export", get(exporter_session))
+        .route("/sessions/{id}/correction", post(session_correction))
+        .route(
+            "/sessions/{id}/correction/profil",
+            post(session_correction_profil),
+        )
+        .route("/sessions/{id}/correction/fir", post(session_fir))
+        .route("/sessions/{id}/correction/fir.wav", post(session_fir_wav))
+        .route("/comparaisons", post(comparer))
         .route("/simulations", post(simulation))
         .route("/simulations/{id}/correction", post(simulation_correction))
         .route(
@@ -211,28 +256,26 @@ struct DemandeMesure {
     max_play_dbfs: Option<f64>,
 }
 
-async fn lancer(
-    State(etat): State<EtatRoutes>,
-    Path(zone): Path<i64>,
-    Json(d): Json<DemandeMesure>,
-) -> Response {
+// Le refus est la réponse HTTP prête, comme `proposition_pour`.
+#[allow(clippy::result_large_err)]
+fn demande_de(zone: i64, d: DemandeMesure) -> Result<Demande, Response> {
     if d.entree.trim().is_empty() {
-        return refus(
+        return Err(refus(
             StatusCode::BAD_REQUEST,
             "entree_requise",
             "préciser l'entrée audio du micro".into(),
-        );
+        ));
     }
     let voies = match d.voies.as_deref() {
         None => Voies::LesDeux,
         Some(v) => match Voies::depuis(v) {
             Some(v) => v,
             None => {
-                return refus(
+                return Err(refus(
                     StatusCode::BAD_REQUEST,
                     "voies_invalides",
                     "voies : gauche, droite ou deux".into(),
-                );
+                ));
             }
         },
     };
@@ -252,6 +295,18 @@ async fn lancer(
         demande.politique.max_play_dbfs = p;
     }
     demande.voies = voies;
+    Ok(demande)
+}
+
+async fn lancer(
+    State(etat): State<EtatRoutes>,
+    Path(zone): Path<i64>,
+    Json(d): Json<DemandeMesure>,
+) -> Response {
+    let demande = match demande_de(zone, d) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     let c = etat.controleur.clone();
     let r = tokio::task::spawn_blocking(move || c.lancer(demande))
         .await
@@ -468,7 +523,7 @@ async fn enregistrer_le_profil(
             "aucune bande à enregistrer : rien à couper dans la zone".into(),
         );
     }
-    let profil = p.profil_de_zone(zone_id, nom, &chrono::Utc::now().to_rfc3339());
+    let profil = p.profil_de_zone(zone_id, nom, &chrono::Utc::now().to_rfc3339(), estimation);
     let hote = etat.controleur.hote.clone();
     let a_ecrire = profil.clone();
     let ecrit = tokio::task::spawn_blocking(move || hote.enregistrer_profil_piece(&a_ecrire))
@@ -597,4 +652,341 @@ async fn simulation_correction_profil(
     };
     let nom = nom_du_profil(d.nom, || format!("Estimation {id}"));
     enregistrer_le_profil(&etat, &id, zone_id, &nom, p, true).await
+}
+
+// ── C4 : sessions à plusieurs positions ────────────────────────────────────
+
+fn session_inconnue(id: &str) -> Response {
+    refus(
+        StatusCode::NOT_FOUND,
+        "session_inconnue",
+        format!("aucune session « {id} »"),
+    )
+}
+
+async fn creer_session(
+    State(etat): State<EtatRoutes>,
+    Path(zone): Path<i64>,
+    Json(d): Json<DemandeSession>,
+) -> Response {
+    match etat.controleur.creer_session(zone, d) {
+        Ok(id) => match etat.controleur.vue_session(&id) {
+            Some(v) => (StatusCode::CREATED, Json(v)).into_response(),
+            None => session_inconnue(&id),
+        },
+        Err(e) => refus(StatusCode::BAD_REQUEST, "session_invalide", e),
+    }
+}
+
+async fn sessions(State(etat): State<EtatRoutes>) -> Response {
+    let c = &etat.controleur;
+    let liste: Vec<Value> = c
+        .sessions
+        .ids()
+        .iter()
+        .filter_map(|id| c.vue_session(id))
+        .map(|v| serde_json::to_value(v).unwrap_or(Value::Null))
+        .collect();
+    Json(json!({ "sessions": liste })).into_response()
+}
+
+async fn vue_session(State(etat): State<EtatRoutes>, Path(id): Path<String>) -> Response {
+    match etat.controleur.vue_session(&id) {
+        Some(v) => Json(v).into_response(),
+        None => session_inconnue(&id),
+    }
+}
+
+#[derive(Deserialize)]
+struct DemandePosition {
+    #[serde(flatten)]
+    mesure: DemandeMesure,
+    index: Option<usize>,
+    etiquette: Option<String>,
+}
+
+async fn mesurer_position(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandePosition>,
+) -> Response {
+    let Some(s) = etat.controleur.sessions.session(&id) else {
+        return session_inconnue(&id);
+    };
+    let Some(zone_id) = s.zone_id else {
+        return refus(
+            StatusCode::CONFLICT,
+            "session_sans_zone",
+            "session importée sans zone : on ne peut pas y mesurer".into(),
+        );
+    };
+    let demande = match demande_de(zone_id, d.mesure) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let c = etat.controleur.clone();
+    let (index, etiquette) = (d.index, d.etiquette);
+    let session_id = id.clone();
+    let r = tokio::task::spawn_blocking(move || {
+        c.mesurer_position(&session_id, index, etiquette, demande)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    match r {
+        Ok((position, mesure)) => (
+            StatusCode::ACCEPTED,
+            Json(
+                json!({ "session": id, "position": position, "id": mesure, "zone_id": s.zone_id }),
+            ),
+        )
+            .into_response(),
+        Err(e) if e.contains("déjà en cours") => {
+            refus(StatusCode::CONFLICT, "mesure_en_cours", e)
+        }
+        Err(e) => refus(StatusCode::UNPROCESSABLE_ENTITY, "mesure_refusee", e),
+    }
+}
+
+async fn exporter_session(State(etat): State<EtatRoutes>, Path(id): Path<String>) -> Response {
+    match etat.controleur.session(&id) {
+        Some(s) => Json(s).into_response(),
+        None => session_inconnue(&id),
+    }
+}
+
+async fn importer_session(State(etat): State<EtatRoutes>, Json(doc): Json<Value>) -> Response {
+    match etat.controleur.importer_session(doc) {
+        Ok((id, version)) => match etat.controleur.vue_session(&id) {
+            Some(v) => {
+                let mut v = serde_json::to_value(v).unwrap_or(Value::Null);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("version_lue".into(), json!(version));
+                }
+                (StatusCode::CREATED, Json(v)).into_response()
+            }
+            None => session_inconnue(&id),
+        },
+        Err(ErreurLecture::VersionNonPrise(v)) => refus(
+            StatusCode::CONFLICT,
+            "unsupported_version",
+            format!(
+                "session au format {v} : ce serveur lit jusqu'au format {}",
+                crate::session::VERSION_SESSION
+            ),
+        ),
+        Err(ErreurLecture::Invalide(e)) => refus(StatusCode::BAD_REQUEST, "session_invalide", e),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn proposition_session(
+    etat: &EtatRoutes,
+    id: &str,
+    demande: &DemandeCorrection,
+) -> Result<(Option<i64>, Proposition), Response> {
+    if etat.controleur.sessions.session(id).is_none() {
+        return Err(session_inconnue(id));
+    }
+    etat.controleur
+        .proposer_session(id, demande)
+        .map_err(|e| refus(StatusCode::UNPROCESSABLE_ENTITY, "correction_refusee", e))
+}
+
+async fn session_correction(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeCorrection>,
+) -> Response {
+    match proposition_session(&etat, &id, &d) {
+        Ok((zone_id, p)) => {
+            let mut v = serde_json::to_value(&p).unwrap_or(Value::Null);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("id".into(), json!(id));
+                o.insert("zone_id".into(), json!(zone_id));
+            }
+            Json(v).into_response()
+        }
+        Err(r) => r,
+    }
+}
+
+async fn session_correction_profil(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeProfil>,
+) -> Response {
+    let (zone_id, p) = match proposition_session(&etat, &id, &d.demande) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    // Un document v1 importé sans `zone_id` ne vise aucune zone : pas de
+    // zone 0 par défaut.
+    let Some(zone_id) = zone_id else {
+        return refus(
+            StatusCode::BAD_REQUEST,
+            "zone_requise",
+            "session sans zone (mesure importée sans zone_id) : aucun profil à enregistrer".into(),
+        );
+    };
+    let nom = nom_du_profil(d.nom, || format!("Calibration {id}"));
+    enregistrer_le_profil(&etat, &id, zone_id, &nom, p, false).await
+}
+
+async fn comparer(State(etat): State<EtatRoutes>, Json(d): Json<DemandeComparaison>) -> Response {
+    for id in [&d.avant, &d.apres] {
+        if etat.controleur.sessions.session(id).is_none() && etat.controleur.mesure(id).is_none() {
+            return refus(
+                StatusCode::NOT_FOUND,
+                "inconnue",
+                format!("aucune mesure ni session « {id} »"),
+            );
+        }
+    }
+    match etat.controleur.comparer(&d) {
+        Ok(ab) => Json(ab).into_response(),
+        Err(e) => refus(StatusCode::UNPROCESSABLE_ENTITY, "comparaison_refusee", e),
+    }
+}
+
+// ── C3 : FIR de correction (T10b) ──────────────────────────────────────────
+
+/// Le FIR d'une mesure terminée (RI comprise) ou de la moyenne d'une
+/// session ; calcul hors de la boucle asynchrone.
+async fn fir_pour(
+    etat: &EtatRoutes,
+    id: &str,
+    session: bool,
+    demande: DemandeFir,
+) -> Result<(Option<i64>, PropositionFir), Response> {
+    let refusee = |e: String| refus(StatusCode::UNPROCESSABLE_ENTITY, "correction_refusee", e);
+    let (zone, reponse, ri, positions, avert) = if session {
+        if etat.controleur.sessions.session(id).is_none() {
+            return Err(session_inconnue(id));
+        }
+        let zone = etat.controleur.sessions.session(id).and_then(|s| s.zone_id);
+        let (r, n) = etat.controleur.reponse_de(id).map_err(refusee)?;
+        (zone, r, None, n, Vec::new())
+    } else {
+        let Some(m) = etat.controleur.mesure(id) else {
+            return Err(refus(
+                StatusCode::NOT_FOUND,
+                "mesure_inconnue",
+                format!("aucune mesure « {id} »"),
+            ));
+        };
+        let (Some(r), Some(ri)) = (m.resultat(), m.reponse_impulsionnelle()) else {
+            return Err(refus(
+                StatusCode::CONFLICT,
+                "mesure_sans_resultat",
+                "la mesure n'est pas terminée".into(),
+            ));
+        };
+        let mut avert = Vec::new();
+        let t = &r.traitements_zone;
+        if t.egaliseur || t.correction_ir {
+            avert.push(
+                "l'égaliseur ou la correction IR de la zone était actif pendant la mesure : le filtre s'y ajoute, refaire la mesure sans eux"
+                    .to_string(),
+            );
+        }
+        if t.pure {
+            avert.push(
+                "la zone est en PURE : aucune correction ne s'y entend tant que PURE est actif"
+                    .to_string(),
+            );
+        }
+        let reponse = tune_calibration::analysis::LogResponse {
+            freqs: r.reponse.freqs_hz.clone(),
+            magnitude_db: r.reponse.db.clone(),
+        };
+        (Some(m.demande.zone_id), reponse, Some(ri), 1, avert)
+    };
+    let calcul = tokio::task::spawn_blocking(move || {
+        proposer_fir(&reponse, ri.as_deref(), &demande, positions)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    let mut p = calcul.map_err(refusee)?;
+    p.avertissements.extend(avert);
+    Ok((zone, p))
+}
+
+fn fir_json(id: &str, zone_id: Option<i64>, p: &PropositionFir) -> Response {
+    let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("id".into(), json!(id));
+        o.insert("zone_id".into(), json!(zone_id));
+        // Le dépôt est un second geste, par la route du serveur.
+        o.insert(
+            "deposer".into(),
+            json!(zone_id.map(|z| format!("/api/v1/room-correction/ir/upload/{z}?per_rate=1"))),
+        );
+    }
+    Json(v).into_response()
+}
+
+fn fir_wav(id: &str, p: &PropositionFir) -> Response {
+    match p.wav() {
+        Ok(octets) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "audio/wav".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", p.nom_de_fichier(id)),
+                ),
+                (
+                    header::HeaderName::from_static("x-tune-latence-trames"),
+                    p.latence_trames.to_string(),
+                ),
+            ],
+            octets,
+        )
+            .into_response(),
+        Err(e) => refus(StatusCode::INTERNAL_SERVER_ERROR, "fir_non_ecrit", e),
+    }
+}
+
+async fn mesure_fir(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeFir>,
+) -> Response {
+    match fir_pour(&etat, &id, false, d).await {
+        Ok((zone, p)) => fir_json(&id, zone, &p),
+        Err(r) => r,
+    }
+}
+
+async fn mesure_fir_wav(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeFir>,
+) -> Response {
+    match fir_pour(&etat, &id, false, d).await {
+        Ok((_, p)) => fir_wav(&id, &p),
+        Err(r) => r,
+    }
+}
+
+async fn session_fir(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeFir>,
+) -> Response {
+    match fir_pour(&etat, &id, true, d).await {
+        Ok((zone, p)) => fir_json(&id, zone, &p),
+        Err(r) => r,
+    }
+}
+
+async fn session_fir_wav(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeFir>,
+) -> Response {
+    match fir_pour(&etat, &id, true, d).await {
+        Ok((_, p)) => fir_wav(&id, &p),
+        Err(r) => r,
+    }
 }

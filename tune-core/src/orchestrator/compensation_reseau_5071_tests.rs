@@ -216,10 +216,18 @@ async fn jouer(m: &Montage) -> Servi {
 }
 
 /// L'étalon : la source passée par l'égaliseur SEUL — les octets que le code
-/// d'avant #5071 servait.
+/// d'avant #5071 servait. TESS T04 : l'égaliseur seul passe, lui aussi, par
+/// la chaîne réseau en `f64` à quantification unique (`StreamingDsp`), et non
+/// plus par l'écriture d'octets propre à l'égaliseur.
 fn egaliseur_seul(m: &Montage) -> Vec<u8> {
     let mut pcm = pcm_source(m.amplitude);
-    crate::audio::eq::EqProcessor::new(&profil(), SR, 2).process_pcm(&mut pcm, 16);
+    let mut chaine = super::StreamingDsp {
+        eq: Some(crate::audio::eq::EqProcessor::new(&profil(), SR, 2)),
+        channels: 2,
+        sample_rate: SR,
+        ..Default::default()
+    };
+    chaine.process(&mut pcm, 16);
     pcm
 }
 

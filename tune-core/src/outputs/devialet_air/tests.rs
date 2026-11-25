@@ -1292,6 +1292,10 @@ mod demarrage_borne_6911;
 #[path = "retours_8920_tests.rs"]
 mod retours_8920;
 
+// TESS T12c — la chaîne TESS sur Devialet AIR, garde de volume inchangée.
+#[path = "tess_t12c_tests.rs"]
+mod tess_t12c;
+
 // ─── #8536 — la session de la sortie, l'écoute à côté de Roon ───────────────
 
 /// #8536 — un Roon a ouvert la session annoncée : l'ampli lui renvoie les
@@ -1399,4 +1403,76 @@ async fn air_l_ecoute_refusee_rend_une_erreur_qui_nomme_le_port_8536() {
     let e = ecoute.demarrer(port).unwrap_err();
     assert!(e.contains(&format!(":{port}")), "{e}");
     assert!(!ecoute.en_ecoute());
+}
+
+/// #9380 — l'écoute compte ce qu'elle reçoit et garde la forme du dernier
+/// datagramme écarté : une annonce d'une taille inconnue de Tune (autre
+/// modèle, autre micrologiciel) était jetée sans une trace, et la fiche ne
+/// disait que `0 device(s)`.
+#[test]
+fn air_l_ecoute_dit_ce_qu_elle_a_recu_et_ecarte_9380() {
+    let ecoute = Ecoute::nouvelle();
+    let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 40));
+    assert_eq!(ecoute.bilan(), super::ecoute::BilanEcoute::default());
+
+    let mut autre_forme = vec![0u8; 361];
+    autre_forme[0..2].copy_from_slice(b"Da");
+    assert!(ecoute.noter(ip, &autre_forme).is_none());
+    assert!(ecoute.noter(ip, &[0xde, 0xad, 0xbe]).is_none());
+    let valide = annonce(&annonce_de_test());
+    assert!(ecoute.noter(ip, &valide).is_some());
+
+    let bilan = ecoute.bilan();
+    assert_eq!(bilan.datagrammes, 3);
+    assert_eq!(bilan.annonces, 1);
+    assert_eq!(bilan.ecartes, 2);
+    let dernier = bilan.dernier_ecarte.expect("dernier datagramme écarté");
+    assert_eq!(dernier.taille, 3);
+    assert_eq!(dernier.entete, "dead");
+
+    ecoute.noter(ip, &autre_forme);
+    let dernier = ecoute.bilan().dernier_ecarte.unwrap();
+    assert_eq!((dernier.taille, dernier.entete.as_str()), (361, "Da"));
+    assert!(dernier.raison.contains("361"), "{}", dernier.raison);
+
+    // Fermer l'écoute remet le bilan à zéro : il vaut pour une ouverture.
+    ecoute.arreter();
+    assert_eq!(ecoute.bilan(), super::ecoute::BilanEcoute::default());
+}
+
+/// #9380 — la phrase de la fiche : option coupée (rien n'est attendu), rien
+/// reçu, ou des datagrammes écartés avec la forme du dernier.
+#[test]
+fn air_la_phrase_de_la_fiche_distingue_les_cas_9380() {
+    use super::ecoute::{BilanEcoute, DatagrammeEcarte};
+    use super::fournisseur::resume_du_bilan;
+    let vide = BilanEcoute::default();
+    assert_eq!(
+        resume_du_bilan(false, false, 45454, &vide),
+        "option off — nothing is searched, no amplifier expected"
+    );
+    assert!(resume_du_bilan(true, true, 45454, &vide).contains("nothing received"));
+    let refus = BilanEcoute {
+        ouverture_refusee: Some("devialet_air: bind 0.0.0.0:45454: Address in use".into()),
+        ..BilanEcoute::default()
+    };
+    assert!(resume_du_bilan(true, false, 45454, &refus).starts_with("cannot listen on UDP 45454"));
+    let ecartes = BilanEcoute {
+        datagrammes: 40,
+        annonces: 0,
+        ecartes: 40,
+        dernier_ecarte: Some(DatagrammeEcarte {
+            ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 40)),
+            taille: 361,
+            entete: "Da".into(),
+            raison: "taille 361 au lieu de 345".into(),
+        }),
+        ouverture_refusee: None,
+    };
+    let phrase = resume_du_bilan(true, true, 45454, &ecartes);
+    assert!(
+        phrase.contains("40 datagram(s) received, 0 valid announcement(s), 40 ignored"),
+        "{phrase}"
+    );
+    assert!(phrase.contains("361 bytes, header \"Da\""), "{phrase}");
 }

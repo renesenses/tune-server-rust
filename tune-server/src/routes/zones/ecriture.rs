@@ -234,7 +234,7 @@ fn valider_le_patch(
     }
     // #8920 — une zone Devialet AIR : jamais de volume fixe (l'ampli tient
     // le volume, sous les limites de confort et de sécurité), 192 kHz au
-    // plus, DSD en DoP ou en PCM seulement.
+    // plus, DSD converti en PCM seulement (DoP débranché, TESS T12c).
     if tune_core::outputs::devialet_air::reglages::est_air(Some(type_sortie)) {
         use tune_core::outputs::devialet_air::reglages::{FREQUENCE_MAX_AIR, MODES_DSD_AIR};
         if body.fixed_volume == Some(true) {
@@ -263,7 +263,7 @@ fn valider_le_patch(
                 "dsd_mode",
                 mode,
                 &format!(
-                    "Devialet AIR: DSD64 as DoP or PCM only (expected: {})",
+                    "Devialet AIR: DSD is converted to PCM; DoP is disabled until it is tested on an amplifier (expected: {})",
                     MODES_DSD_AIR.join(", ")
                 ),
             ));
@@ -1010,6 +1010,25 @@ async fn persister_le_son(
             settings.delete(&key)
         };
         ecrire!("strict_bitperfect", enabled, r);
+    }
+    if let Some(enabled) = body.dsd_volume_protection {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = tune_core::audio::dop_ecarte_7265::cle_protection_du_niveau(id);
+        let r = if enabled {
+            settings.delete(&key)
+        } else {
+            settings.set(&key, "false")
+        };
+        ecrire!("dsd_volume_protection", enabled, r);
+        if enabled && let Err(message) = state.orchestrator.proteger_le_dop_en_lecture(id).await {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": message, "code": "dsd_volume_protection_failed"
+                })),
+            )
+                .into_response());
+        }
     }
     // #8869 — silence de verrouillage → setting zone_{id}_silence_verrouillage_ms,
     // borné à 0..=2000 ; 0 supprime la clé. Lu à chaque lecture.

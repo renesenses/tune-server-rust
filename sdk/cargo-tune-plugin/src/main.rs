@@ -7,7 +7,7 @@ use tune_plugin_sdk::manifest::{Manifest, valid_id};
 
 mod packaging;
 const USAGE: &str = "Tune premium audio SDK (ABI 1)\n\
-cargo tune-plugin new <id> --template <dsp|batch|equalizer|crossfeed|converter|declick> --sdk-path <sdk> --output <new-directory>\n\
+cargo tune-plugin new <id> --template <dsp|dsp-f64|batch|equalizer|crossfeed|converter|declick> --sdk-path <sdk> --output <new-directory>\n\
 cargo tune-plugin check <plugin-directory>\n\
 cargo tune-plugin test <plugin-directory>\n\
 cargo tune-plugin pack <plugin-directory> --target <triple> --output <new.tuneplugin>\n\
@@ -57,7 +57,7 @@ fn scaffold(args: &[String]) -> Result<(), String> {
         value => value.to_string(),
     };
     let sdk = fs::canonicalize(sdk.ok_or(USAGE)?).map_err(|e| e.to_string())?;
-    let concrete = !matches!(template.as_str(), "dsp" | "batch");
+    let concrete = !matches!(template.as_str(), "dsp" | "dsp-f64" | "batch");
     let catalog: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(sdk.join("plugins.json")).map_err(|e| e.to_string())?,
     )
@@ -90,6 +90,8 @@ fn scaffold(args: &[String]) -> Result<(), String> {
             .as_str()
             .filter(|k| matches!(*k, "dsp" | "batch"))
             .ok_or("invalid template kind")?
+    } else if template == "dsp-f64" {
+        "dsp"
     } else {
         template.as_str()
     };
@@ -125,6 +127,12 @@ fn scaffold(args: &[String]) -> Result<(), String> {
             }
         }
         (lib, tests)
+    } else if template == "dsp-f64" {
+        // TESS T05: the same gain, computed in f64, requesting `audio-f64`.
+        (
+            include_str!("../templates/dsp_f64.rs").to_string(),
+            include_str!("../templates/dsp_f64_tests.rs").to_string(),
+        )
     } else if kind == "dsp" {
         (
             include_str!("../templates/dsp.rs").to_string(),
@@ -146,6 +154,16 @@ fn scaffold(args: &[String]) -> Result<(), String> {
         "config_version": 1, "entitlement": format!("plugin.{id}"), "distribution": "source",
         "capabilities": [{"id": capability, "version": {"major": 0, "minor": 1}, "required": true}]
     });
+    if template == "dsp-f64" {
+        manifest["capabilities"]
+            .as_array_mut()
+            .ok_or("invalid template manifest")?
+            .push(serde_json::json!({
+                "id": tune_plugin_sdk::manifest::AUDIO_F64,
+                "version": {"major": 0, "minor": 1},
+                "required": false
+            }));
+    }
     if concrete {
         manifest = serde_json::from_str(
             &fs::read_to_string(reference.join("manifest.json")).map_err(|e| e.to_string())?,

@@ -1148,13 +1148,13 @@ async fn reseau_local_en_http_1_0_la_liaison_est_refusee() {
     assert!(attente_du_serveur(&b.state).is_empty(), "rien de préparé");
 }
 
-/// Les phrases du refus de liaison existent dans les seize langues.
+/// Les phrases du refus de liaison existent dans les vingt langues.
 #[test]
-fn les_phrases_du_refus_de_liaison_existent_dans_les_seize_langues() {
+fn les_phrases_du_refus_de_liaison_existent_dans_les_vingt_langues() {
     let catalogue: Value = serde_json::from_str(include_str!("../i18n_server.json")).unwrap();
     for l in [
         "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi", "nb", "pl", "el",
-        "tr",
+        "tr", "nl", "zh-Hant", "ru", "uk",
     ] {
         let t = catalogue["api.machine.reservedOutsideLanAccount"][l]
             .as_str()

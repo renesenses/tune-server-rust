@@ -116,6 +116,7 @@ async fn lire_en_dop(seek_ms: Option<u64>) -> (Vec<serde_json::Value>, String) {
     );
     let (orch, bus) = orchestrateur();
     let (zone_id, track_id) = piste_et_zone(&orch, dsf.to_str().unwrap());
+    orch.playback.set_volume(zone_id, 1.0).await; // témoin DoP sans atténuation
     let mut rx = bus.subscribe();
     orch.playback.play(zone_id, NowPlaying::default()).await;
     if let Some(seek) = seek_ms {

@@ -52,6 +52,7 @@ const APE: &str = concat!(
 
 struct Banc {
     orch: PlaybackOrchestrator,
+    playback: Arc<PlaybackManager>,
     db: Arc<dyn DbBackend>,
     zone_id: i64,
     file: PlayQueueRepo,
@@ -64,9 +65,10 @@ async fn banc(output_type: &str, device_id: &str) -> Banc {
     sqlite.init_schema().expect("schéma");
     run_migrations(&sqlite).expect("migrations");
     let db: Arc<dyn DbBackend> = Arc::new(sqlite);
+    let playback = Arc::new(PlaybackManager::new());
     let orch = PlaybackOrchestrator::new(
         db.clone(),
-        Arc::new(PlaybackManager::new()),
+        playback.clone(),
         Arc::new(AudioStreamer::new(0)),
         Arc::new(Mutex::new(ServiceRegistry::new())),
         Arc::new(Mutex::new(OutputRegistry::new())),
@@ -77,6 +79,7 @@ async fn banc(output_type: &str, device_id: &str) -> Banc {
         .expect("zone");
     Banc {
         orch,
+        playback,
         zone_id,
         file: PlayQueueRepo::with_backend(db.clone()),
         db,
@@ -133,6 +136,8 @@ fn extension(url: &str) -> &str {
 #[tokio::test]
 async fn un_dsd_en_dop_sur_une_sortie_locale_est_resolu_avant_toute_decision() {
     let b = banc("local", "local:default").await;
+    // Le témoin DoP porte sur un gain unité ; une atténuation protège le niveau en PCM.
+    b.playback.set_volume(b.zone_id, 1.0).await;
     b.zones()
         .update_dsd_mode(b.zone_id, "dop")
         .expect("dsd_mode");
@@ -157,6 +162,25 @@ async fn un_dsd_en_dop_sur_une_sortie_locale_est_resolu_avant_toute_decision() {
         "le flux DoP est produit au fil de l'eau : aucune taille annoncée"
     );
     assert!(r.stream_id.is_some());
+}
+
+/// #8813 : la même porte publique respecte une atténuation demandée.
+#[tokio::test]
+async fn un_dsd_en_dop_avec_volume_attenue_est_resolu_en_pcm_8813() {
+    let b = banc("local", "local:default").await;
+    b.zones()
+        .update_dsd_mode(b.zone_id, "dop")
+        .expect("dsd_mode");
+    b.playback.set_volume(b.zone_id, 0.5).await;
+    let id = b.piste(DSF, "dsf", 2_822_400, 1);
+    let r = b.resoudre(id).await.expect("résolution");
+    assert_eq!(r.mime_type, "audio/wav");
+    assert_eq!(
+        r.bit_depth,
+        Some(32),
+        "#8813 : une atténuation exige le PCM, pas des trames DoP 24 bits"
+    );
+    assert_eq!(r.channels, Some(2));
 }
 
 /// Bloc `dsd_passthrough` : une zone réseau réglée « native » reçoit le DSD

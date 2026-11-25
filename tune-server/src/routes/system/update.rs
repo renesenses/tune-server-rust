@@ -5110,7 +5110,8 @@ fn marqueur_de_langue(line: &str) -> Option<String> {
         .trim()
         .strip_prefix("lang:")?;
     let tag = crate::i18n::base_tag(inner);
-    (!tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphabetic())).then_some(tag)
+    // `zh-Hant` (rc14) : la seule langue servie qui porte un tiret.
+    (!tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphabetic() || c == '-')).then_some(tag)
 }
 
 /// Découpe un corps de release en blocs `(langue, texte)`, dans l'ordre.

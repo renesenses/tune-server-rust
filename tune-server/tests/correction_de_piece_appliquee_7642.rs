@@ -188,3 +188,34 @@ async fn le_profil_ecrit_porte_tous_les_champs_obligatoires() {
     assert!(p.enabled);
     assert_eq!(p.bands.len(), 1);
 }
+
+/// D1 (TESS, 18/11 soir) : un profil posé à la main par l'API enregistre son
+/// origine, toujours « mesurée » (Premium), même s'il porte le nom d'une
+/// estimation C5 ou que le corps se dit « estimation ».
+#[tokio::test]
+async fn un_profil_pose_par_l_api_enregistre_une_origine_mesuree() {
+    let (state, app) = serveur().await;
+    let (status, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/room-correction/profiles/{ZONE}"),
+        Some(json!({
+            "name": "Estimation 9",
+            "origin": "estimation",
+            "filters": [{"frequency_hz": 63.0, "gain_db": -8.0}],
+        })),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {corps}");
+    assert_eq!(corps["origin"], "measured", "{corps}");
+    let brut = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get(&format!("room_profile_{ZONE}"))
+        .unwrap()
+        .expect("profil enregistré");
+    let v: Value = serde_json::from_str(&brut).unwrap();
+    assert_eq!(v["origin"], "measured", "{brut}");
+    assert_eq!(
+        tune_core::tess::migration::origine_de_la_piece(&v),
+        "measured"
+    );
+}

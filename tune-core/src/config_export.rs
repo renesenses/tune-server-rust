@@ -42,6 +42,15 @@
 //!   confirmation que la restauration ne rencontre pas.
 //! - Aucun secret ne sort : [`crate::secrets::retirer_les_secrets`] s'applique
 //!   aux réglages et aux réglages de chaque zone.
+//! - TESS (décision B du 19/11) : la chaîne de chaque zone part avec elle
+//!   ([`GABARIT_CHAINE_TESS`]) et l'import la RÉÉCRIT par
+//!   [`crate::tess::migration::ecrire_chaine`] sous le numéro d'arrivée
+//!   (origine et marques recalculées par le serveur) ; son ombre ne voyage
+//!   pas. Le profil de pièce de la zone est restauré comme MESURÉ (D1).
+//! - TESS T17 : les préréglages de chaîne (`tess_presets`, globaux) partent
+//!   avec les réglages ; à l'import, une liste illisible ou incohérente est
+//!   écartée avec un avertissement. Le préréglage actif de chaque zone
+//!   (`zone_{id}_tess_active_preset`) voyage dans sa zone.
 //!
 //! # Aperçu
 //!
@@ -130,6 +139,38 @@ fn champs_lus_par_le_depot(repo: &ZoneRepo, id: i64, obj: &mut Map<String, Value
     );
 }
 
+/// TESS (T02, décision B du 19/11) : la chaîne d'une zone part avec elle,
+/// sous ce gabarit, et l'import la RÉÉCRIT par
+/// [`crate::tess::migration::ecrire_chaine`] (origine des corrections et
+/// marques recalculées par le serveur, zone remappée).
+pub const GABARIT_CHAINE_TESS: &str = "zone_{id}_tess_chain";
+/// L'ombre de la chaîne (`zone_{id}_tess_chain_sync`) : propre à la base qui
+/// l'a écrite, elle ne part pas et ne s'importe jamais ; l'écriture de la
+/// chaîne à l'import la reconstruit.
+pub const GABARIT_OMBRE_TESS: &str = "zone_{id}_tess_chain_sync";
+/// Le profil de pièce d'une zone : importé comme MESURÉ (TESS D1), zone
+/// remappée, comme la restauration Premium ([`crate::config_backup`]).
+pub const GABARIT_PROFIL_DE_PIECE: &str = "room_profile_{id}";
+/// TESS T17 : le préréglage « ACTIVE » d'une zone (id d'un préréglage global).
+pub const GABARIT_PREREGLAGE_ACTIF: &str = "zone_{id}_tess_active_preset";
+
+/// La chaîne exportée est celle que le serveur LIT pour la zone
+/// ([`crate::tess::migration::lire_zone`], neutre vis-à-vis du droit) : la
+/// chaîne enregistrée, mise à jour des anciennes clés qu'une ancienne route a
+/// pu écrire depuis, ou tirée des anciennes clés pour une zone jamais
+/// migrée. Elle s'accorde donc toujours avec les anciennes clés qui partent
+/// avec elle. Une zone illisible ne bloque pas l'export : ses anciennes clés
+/// partent seules, et la restauration en reconstruira la chaîne.
+fn chaine_tess_exportee(backend: &Arc<dyn DbBackend>, id: i64, reglages: &mut Map<String, Value>) {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    match crate::tess::migration::lire_zone(&settings, id, true).and_then(|l| l.textes()) {
+        Ok((chaine, _ombre)) => {
+            reglages.insert(GABARIT_CHAINE_TESS.into(), valeur_exportee(&chaine));
+        }
+        Err(e) => tracing::warn!(zone_id = id, erreur = %e, "config_export_chaine_tess_illisible"),
+    }
+}
+
 /// Les zones VISIBLES, au format de l'export, réglages de zone compris.
 ///
 /// Une zone masquée est une zone que l'utilisateur a supprimée : elle ne part
@@ -146,6 +187,9 @@ fn zones_exportees(
         if let Some((id, gabarit)) = gabarit_de_cle_de_zone(cle)
             && visibles.contains(&id)
             && !crate::playback::radio_fin_de_file::cle_de_marques(cle)
+            // La chaîne TESS est relue par le serveur, l'ombre ne part pas.
+            && gabarit != GABARIT_CHAINE_TESS
+            && gabarit != GABARIT_OMBRE_TESS
         {
             par_zone
                 .entry(id)
@@ -173,6 +217,7 @@ fn zones_exportees(
         obj.remove("autoplay_enabled");
         champs_lus_par_le_depot(&repo, id, obj);
         let mut leurs_reglages = par_zone.remove(&id).unwrap_or_default();
+        chaine_tess_exportee(backend, id, &mut leurs_reglages);
         // Toujours, même avec `include_secrets` : un réglage de zone n'a
         // aucune raison de porter un secret, et s'il en portait un il partirait
         // vers une autre machine sous un autre numéro.
@@ -339,6 +384,11 @@ pub struct ZonePlanifiee {
     identite_sure: bool,
     source_id: Option<i64>,
     donnees: Map<String, Value>,
+    /// TESS : la chaîne du fichier, écrite par `ecrire_chaine`.
+    chaine: Option<crate::tess::ChaineTess>,
+    /// TESS D1 : le profil de pièce du fichier, déjà rendu MESURÉ ; son
+    /// `zone_id` est posé à l'application.
+    piece: Option<crate::room_correction::RoomProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -496,20 +546,127 @@ fn volume_restaurable(zone: &Map<String, Value>) -> bool {
 /// Un gabarit de réglage de zone, une fois l'identifiant posé, doit rester une
 /// clé de CETTE zone et ne rien porter de secret : un fichier ne peut pas
 /// écrire n'importe quoi par ce chemin.
+/// TESS D1 : un gabarit de réglage de zone que seul le serveur écrit (profil
+/// de pièce, chaîne TESS et son ombre) ; l'import l'ignore.
+fn gabarit_tenu_par_le_serveur(gabarit: &str) -> bool {
+    crate::tess::migration::cle_tenue_par_le_serveur(&gabarit.replace("{id}", "0"))
+}
+
 fn cle_de_zone_valide(gabarit: &str, id: i64) -> Option<String> {
     let cle = gabarit.replace("{id}", &id.to_string());
     match gabarit_de_cle_de_zone(&cle) {
         // Fil 2694 — les marques de la radio de fin de file ne s'importent pas.
+        // TESS D1 — ni les clés tenues par le serveur.
         Some((zid, g))
             if zid == id
                 && g == gabarit
                 && !est_secret(&cle)
-                && !crate::playback::radio_fin_de_file::cle_de_marques(&cle) =>
+                && !crate::playback::radio_fin_de_file::cle_de_marques(&cle)
+                && !crate::tess::migration::cle_tenue_par_le_serveur(&cle) =>
         {
             Some(cle)
         }
         _ => None,
     }
+}
+
+/// Une valeur de réglage du fichier, en texte JSON (une chaîne telle quelle,
+/// un objet sérialisé).
+fn texte_json(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        autre => autre.to_string(),
+    }
+}
+
+/// TESS : retire des réglages d'une zone du fichier sa chaîne, son ombre et
+/// son profil de pièce, qui ne passent JAMAIS par l'écriture générique.
+/// La chaîne est lue strictement (comme le corps d'un `PUT`) ; le profil de
+/// pièce est rendu MESURÉ (D1). Ce qui ne se lit pas est écarté et dit.
+fn extraire_tess(
+    donnees: &mut Map<String, Value>,
+    nom: &str,
+    avertissements: &mut Vec<String>,
+) -> (
+    Option<crate::tess::ChaineTess>,
+    Option<crate::room_correction::RoomProfile>,
+) {
+    let Some(r) = donnees.get_mut("settings").and_then(Value::as_object_mut) else {
+        return (None, None);
+    };
+    // L'ombre est propre à la base qui l'a écrite : jamais importée, sans
+    // avertissement (l'écriture de la chaîne la reconstruit).
+    r.remove(GABARIT_OMBRE_TESS);
+    let chaine = r.remove(GABARIT_CHAINE_TESS).and_then(|v| {
+        match crate::tess::ChaineTess::depuis_corps(&texte_json(&v)) {
+            Ok(c) if c.version > crate::tess::chaine::VERSION_CHAINE => {
+                avertissements.push(format!(
+                    "zone '{nom}': TESS chain version {} is newer than this server ({}); not imported, the chain is rebuilt from the zone settings",
+                    c.version,
+                    crate::tess::chaine::VERSION_CHAINE
+                ));
+                None
+            }
+            Ok(c) => Some(c),
+            Err(e) => {
+                avertissements.push(format!(
+                    "zone '{nom}': TESS chain is not readable ({e}); not imported, the chain is rebuilt from the zone settings"
+                ));
+                None
+            }
+        }
+    });
+    let piece = r.remove(GABARIT_PROFIL_DE_PIECE).and_then(|v| {
+        match serde_json::from_str::<crate::room_correction::RoomProfile>(&texte_json(&v)) {
+            Ok(mut p) => {
+                // D1 : l'origine d'un profil est enregistrée par le serveur à
+                // la création ; celle d'un fichier ne se vérifie pas.
+                p.origin = Some(crate::room_correction::ORIGINE_MESUREE.into());
+                avertissements.push(format!(
+                    "zone '{nom}': room correction profile restored as measured (the origin of a profile is recorded by the server, not read from a file)"
+                ));
+                Some(p)
+            }
+            Err(e) => {
+                avertissements.push(format!(
+                    "zone '{nom}': room correction profile is not readable ({e}); skipped"
+                ));
+                None
+            }
+        }
+    });
+    // Ceinture : toute autre clé tenue par le serveur reste écartée.
+    let avant = r.len();
+    r.retain(|gabarit, _| !gabarit_tenu_par_le_serveur(gabarit));
+    let ecartes = avant - r.len();
+    if ecartes > 0 {
+        avertissements.push(format!(
+            "zone '{nom}': {ecartes} server-managed setting(s) skipped"
+        ));
+    }
+    (chaine, piece)
+}
+
+/// La chaîne sans l'origine D1 de ses maillons (champ tenu par le serveur),
+/// pour comparer une chaîne du fichier à celle de la zone.
+fn sans_origine(c: &crate::tess::ChaineTess) -> crate::tess::ChaineTess {
+    let mut c = c.clone();
+    for m in &mut c.plugins {
+        if let Value::Object(r) = &mut m.settings {
+            r.remove("origin");
+        }
+    }
+    c
+}
+
+/// Le profil de pièce tel qu'il serait écrit pour la zone `id`.
+fn piece_pour(
+    piece: &crate::room_correction::RoomProfile,
+    id: i64,
+) -> crate::room_correction::RoomProfile {
+    let mut p = piece.clone();
+    p.zone_id = id.to_string();
+    p
 }
 
 /// Calcule ce que l'import du fichier ferait, SANS RIEN ÉCRIRE.
@@ -522,6 +679,18 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     let mut avertissements = Vec::new();
+
+    // TESS T17 : les préréglages qui existeront après l'import (ceux du
+    // fichier s'il en porte une liste lisible, sinon ceux de la machine).
+    // Un marqueur « ACTIVE » de zone qui n'en désigne aucun est écarté.
+    let prereglages_apres: HashSet<String> = fichier
+        .settings
+        .iter()
+        .find(|(cle, _)| cle == crate::tess::prereglages::CLE_PREREGLAGES)
+        .and_then(|(_, v)| crate::tess::prereglages::lire_texte_tolerant(&texte_json(v)).ok())
+        .or_else(|| crate::tess::prereglages::lire(&settings).ok())
+        .map(|l| l.presets.into_iter().map(|p| p.id).collect())
+        .unwrap_or_default();
 
     // ── Zones ──
     let mut zones: Vec<ZonePlanifiee> = Vec::new();
@@ -605,6 +774,21 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
                     "zone '{nom}': no device identity; volume settings were not restored"
                 ));
             }
+            // TESS (décision B du 19/11) et D1 : la chaîne et le profil de
+            // pièce sont mis de côté, puis réécrits par le serveur à
+            // l'application ; l'ombre ne s'importe jamais.
+            let (chaine, piece) = extraire_tess(&mut donnees, &nom, &mut avertissements);
+            if let Some(r) = donnees.get_mut("settings").and_then(Value::as_object_mut)
+                && let Some(v) = r.get(GABARIT_PREREGLAGE_ACTIF)
+            {
+                let id = texte_json(v);
+                if !id.is_empty() && !prereglages_apres.contains(&id) {
+                    r.remove(GABARIT_PREREGLAGE_ACTIF);
+                    avertissements.push(format!(
+                        "zone '{nom}': active TESS preset {id:?} does not exist after import; skipped"
+                    ));
+                }
+            }
             let zone = &donnees;
             if let Some(id) = existante
                 && !cibles_vues.insert(id)
@@ -648,6 +832,26 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
                             }
                         }
                     }
+                    if let Some(p) = &piece {
+                        let a_ecrire = serde_json::to_value(piece_pour(p, id)).ok();
+                        let actuel = settings
+                            .get(&GABARIT_PROFIL_DE_PIECE.replace("{id}", &id.to_string()))?
+                            .and_then(|b| serde_json::from_str::<Value>(&b).ok());
+                        if a_ecrire.is_none() || a_ecrire != actuel {
+                            changements.push(GABARIT_PROFIL_DE_PIECE.into());
+                        }
+                    }
+                    if let Some(c) = &chaine {
+                        // Comparée à la chaîne que le serveur lit pour la zone.
+                        // L'origine des corrections ne compte pas : le serveur
+                        // la recalcule de toute façon.
+                        let lue = crate::tess::migration::lire_zone(&settings, id, true)
+                            .ok()
+                            .map(|l| sans_origine(&l.chaine));
+                        if lue.as_ref() != Some(&sans_origine(&c.clone().mettre_a_niveau())) {
+                            changements.push(GABARIT_CHAINE_TESS.into());
+                        }
+                    }
                     if !identite_sure {
                         // L'aperçu annonce aussi ce que l'application retire.
                         for gabarit in crate::audio::reglages_de_volume::GABARITS_DE_VOLUME {
@@ -689,6 +893,8 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
                 identite_sure,
                 source_id,
                 donnees: zone.clone(),
+                chaine,
+                piece,
             });
         }
     }
@@ -709,7 +915,66 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
     // ── Réglages ──
     let mut reglages = Vec::new();
     let mut ignores_de_zone = 0usize;
+    let mut tenus_par_le_serveur: Vec<&str> = Vec::new();
     for (cle, brute) in &fichier.settings {
+        // L'index des profils de pièce se reconstruit avec les profils
+        // restaurés dans leur zone (format 2) : ignoré sans avertissement.
+        if fichier.format_version >= 2 && cle == "room_profile_index" {
+            continue;
+        }
+        // TESS T17 : la liste des préréglages part comme tout réglage global.
+        // Relue avec la MÊME tolérance que la base (aucune entrée écartée,
+        // même un nom que les règles d'entrée refuseraient aujourd'hui) ;
+        // seule une liste qui ne se relit pas du tout (JSON) n'écrase pas
+        // celle de la machine. Les droits se vérifient au chargement : un
+        // préréglage Premium importé n'ouvre rien.
+        let mut corrigee: Option<Value> = None;
+        if cle == crate::tess::prereglages::CLE_PREREGLAGES {
+            use crate::tess::prereglages::{
+                ID_PREREGLAGE_PURE, PREREGLAGES_IMPORT_MAX, PreReglage, lire_texte_tolerant,
+            };
+            let mut l = match lire_texte_tolerant(&texte_json(brute)) {
+                Ok(l) => l,
+                Err(e) => {
+                    avertissements.push(format!(
+                        "TESS presets are not readable ({e}); the presets of this server are kept"
+                    ));
+                    continue;
+                }
+            };
+            // Tolérant sur les noms, mais borné : un fichier démesuré n'entre pas.
+            if l.presets.len() > PREREGLAGES_IMPORT_MAX {
+                avertissements.push(format!(
+                    "TESS presets: the file holds {} presets, more than {PREREGLAGES_IMPORT_MAX}; not imported, the presets of this server are kept",
+                    l.presets.len()
+                ));
+                continue;
+            }
+            // « Pure » reste sans traitement : une entrée modifiée est remplacée
+            // par le Pure standard.
+            let pure = PreReglage::pure();
+            let mut modifie = false;
+            for p in l
+                .presets
+                .iter_mut()
+                .filter(|p| p.id == ID_PREREGLAGE_PURE && p.chain != pure.chain)
+            {
+                *p = pure.clone();
+                modifie = true;
+            }
+            if modifie {
+                avertissements.push(
+                    "TESS presets: the \"pure\" preset of the file was modified; the standard Pure preset is kept".into(),
+                );
+                corrigee = Some(serde_json::to_value(&l).map_err(|e| e.to_string())?);
+            }
+        }
+        let brute = corrigee.as_ref().unwrap_or(brute);
+        // TESS D1 : mêmes clés que celles que `PATCH /system/config` refuse.
+        if crate::tess::migration::cle_tenue_par_le_serveur(cle) {
+            tenus_par_le_serveur.push(cle);
+            continue;
+        }
         // L'ancien format à plat ne porte aucune identité d'appareil.
         if fichier.format_version < 2
             && gabarit_de_cle_de_zone(cle).is_some_and(|(_, gabarit)| {
@@ -757,6 +1022,12 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
     if ignores_de_zone > 0 {
         avertissements.push(format!(
             "{ignores_de_zone} zone setting(s) outside their zone were skipped"
+        ));
+    }
+    if !tenus_par_le_serveur.is_empty() {
+        avertissements.push(format!(
+            "server-managed setting(s) skipped (room correction profiles and TESS chains are written by their own routes): {}",
+            tenus_par_le_serveur.join(", ")
         ));
     }
 
@@ -985,6 +1256,33 @@ pub fn appliquer(backend: &Arc<dyn DbBackend>, plan: &Plan) -> Result<Bilan, Str
                 settings.set(&cle, &texte).map_err(|e| etape(&bilan, e))?;
             }
         }
+        let a_ecrire =
+            |gabarit: &str| nouvelle || zone.changements.iter().any(|c| c.as_str() == gabarit);
+        // D1 : le profil de pièce d'abord, MESURÉ, sous le numéro d'arrivée
+        // (l'index suit) ; la chaîne écrite ensuite en tire son origine.
+        if let Some(p) = &zone.piece
+            && a_ecrire(GABARIT_PROFIL_DE_PIECE)
+        {
+            crate::room_correction::save_profile(backend, &piece_pour(p, id))
+                .map_err(|e| etape(&bilan, e))?;
+        }
+        // TESS : la chaîne passe par `ecrire_chaine`, comme un `PUT` :
+        // origine des corrections et marques recalculées par le serveur,
+        // anciennes clés et ombre réécrites pour la zone d'arrivée.
+        if let Some(c) = &zone.chaine
+            && a_ecrire(GABARIT_CHAINE_TESS)
+        {
+            match crate::tess::migration::ecrire_chaine(&settings, id, c) {
+                Ok(_) => {}
+                Err(crate::tess::migration::ErreurMigration::Stockage(e)) => {
+                    return Err(etape(&bilan, e));
+                }
+                Err(e) => bilan.avertissements.push(format!(
+                    "zone '{}': TESS chain not restored ({e}); it is rebuilt from the zone settings",
+                    zone.nom
+                )),
+            }
+        }
         if nouvelle {
             bilan.zones_creees.push(id);
         } else {
@@ -1118,3 +1416,7 @@ mod tests {
 #[cfg(test)]
 #[path = "config_export/volume_6774_tests.rs"]
 mod volume_6774_tests;
+
+#[cfg(test)]
+#[path = "config_export/tess_export_tests.rs"]
+mod tess_export_tests;

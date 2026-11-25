@@ -3,6 +3,7 @@
 //! the same persisted profile and producer locations (including radio).
 use super::ecretage::{CompteurDEcretage, EtageEcretant, Portee, REGISTRE, dire_fin, dire_premier};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tune_plugin_audio_support::echantillon::Echantillon;
 pub use tune_plugin_equalizer::{
     DEBIT_DE_REFERENCE_HZ, EqBandSpec, EqProcessStats, EqProfile, HeadroomMode, ListeningMode,
     RoomSize, SpeakerPlacement,
@@ -89,6 +90,69 @@ struct Fondu {
     total: usize,
     fait: usize,
     tampon: Vec<f32>,
+    /// TESS T06 — le même tampon pour le chemin `f64` de l'exécuteur : un
+    /// fondu n'arrondit jamais le signal vers `f32`.
+    tampon_f64: Vec<f64>,
+}
+
+/// TESS T06 — ce que la façade de l'égaliseur sait traiter : `f32` (chemins
+/// historiques, au bit près comme avant) et `f64` (exécuteur TESS, sans aucun
+/// aller-retour par `f32`). Les boucles sont écrites une fois.
+trait EchantillonHote: Echantillon {
+    fn tampon_du_fondu(f: &mut Fondu) -> &mut Vec<Self>;
+    /// `min(n / d, 1)`, calculé dans ce type (en `f32` comme avant pour
+    /// `f32`).
+    fn rapport_borne(n: usize, d: usize) -> Self;
+    fn moteur_integre(p: &mut tune_plugin_equalizer::EqProcessor, s: &mut [Self])
+    -> EqProcessStats;
+    fn moteur_natif(
+        p: &mut Stage,
+        s: &mut [Self],
+    ) -> Result<tune_plugin_sdk::audio::ProcessReport, tune_plugin_sdk::Error>;
+}
+
+impl EchantillonHote for f32 {
+    fn tampon_du_fondu(f: &mut Fondu) -> &mut Vec<Self> {
+        &mut f.tampon
+    }
+    fn rapport_borne(n: usize, d: usize) -> Self {
+        (n as f32 / d as f32).min(1.0)
+    }
+    fn moteur_integre(
+        p: &mut tune_plugin_equalizer::EqProcessor,
+        s: &mut [Self],
+    ) -> EqProcessStats {
+        p.process_interleaved(s)
+    }
+    fn moteur_natif(
+        p: &mut Stage,
+        s: &mut [Self],
+    ) -> Result<tune_plugin_sdk::audio::ProcessReport, tune_plugin_sdk::Error> {
+        p.process_f32(s)
+    }
+}
+
+impl EchantillonHote for f64 {
+    fn tampon_du_fondu(f: &mut Fondu) -> &mut Vec<Self> {
+        &mut f.tampon_f64
+    }
+    fn rapport_borne(n: usize, d: usize) -> Self {
+        (n as f64 / d as f64).min(1.0)
+    }
+    fn moteur_integre(
+        p: &mut tune_plugin_equalizer::EqProcessor,
+        s: &mut [Self],
+    ) -> EqProcessStats {
+        p.process_interleaved_f64(s)
+    }
+    /// Un greffon natif qui demande `audio-f64` reçoit le `f64` tel quel ;
+    /// un paquet `F32` plus ancien est converti à SA frontière (T05).
+    fn moteur_natif(
+        p: &mut Stage,
+        s: &mut [Self],
+    ) -> Result<tune_plugin_sdk::audio::ProcessReport, tune_plugin_sdk::Error> {
+        p.process_f64(s)
+    }
 }
 
 /// #6741 — le gain qu'un égaliseur COUPÉ applique encore (voir
@@ -298,6 +362,7 @@ impl EqProcessor {
             total,
             fait: 0,
             tampon: Vec::new(),
+            tampon_f64: Vec::new(),
         });
     }
 
@@ -642,26 +707,44 @@ impl EqProcessor {
         stats
     }
     pub fn process_interleaved(&mut self, samples: &mut [f32]) -> EqProcessStats {
+        self.traiter(samples)
+    }
+
+    /// TESS T06 — [`Self::process_interleaved`] sur le tampon **`f64`** de
+    /// l'exécuteur TESS : mêmes fondus (#5215), même extinction du préampli
+    /// gardé (#6211, #6741), même compensation portée (#5227), sans aucun
+    /// arrondi du signal vers `f32`. Un greffon natif `F32` ancien est
+    /// converti à sa propre frontière ([`Stage::process_f64`]).
+    pub fn process_interleaved_f64(&mut self, samples: &mut [f64]) -> EqProcessStats {
+        self.traiter(samples)
+    }
+
+    fn traiter<T: EchantillonHote>(&mut self, samples: &mut [T]) -> EqProcessStats {
         let Some(mut fondu) = self.fondu.take() else {
             return self.traiter_sans_fondu(samples);
         };
-        fondu.tampon.clear();
-        fondu.tampon.extend_from_slice(samples);
+        // Le tampon sort du fondu le temps du bloc (aucune allocation une
+        // fois sa capacité atteinte) : le départ le traite sans conflit
+        // d'emprunt.
+        let mut tampon = std::mem::take(T::tampon_du_fondu(&mut fondu));
+        tampon.clear();
+        tampon.extend_from_slice(samples);
         if let Some(depart) = fondu.depart.as_mut() {
-            depart.process_interleaved(&mut fondu.tampon);
+            depart.traiter(&mut tampon);
         }
         let stats = self.traiter_sans_fondu(samples);
         let canaux = self.channels.max(1) as usize;
         for (i, (trame, avant)) in samples
             .chunks_mut(canaux)
-            .zip(fondu.tampon.chunks(canaux))
+            .zip(tampon.chunks(canaux))
             .enumerate()
         {
-            let t = ((fondu.fait + i + 1) as f32 / fondu.total as f32).min(1.0);
+            let t = T::rapport_borne(fondu.fait + i + 1, fondu.total);
             for (s, a) in trame.iter_mut().zip(avant) {
                 *s = *a + (*s - *a) * t;
             }
         }
+        *T::tampon_du_fondu(&mut fondu) = tampon;
         fondu.fait += samples.len() / canaux;
         if fondu.fait < fondu.total {
             self.fondu = Some(fondu);
@@ -675,21 +758,21 @@ impl EqProcessor {
         }
         stats
     }
-    fn traiter_sans_fondu(&mut self, samples: &mut [f32]) -> EqProcessStats {
+    fn traiter_sans_fondu<T: EchantillonHote>(&mut self, samples: &mut [T]) -> EqProcessStats {
         // #6211 — un neutre (compensation 1,0) dont le préampli s'éteint.
         if self.extinction.is_some() {
             self.appliquer_l_extinction(samples);
             return EqProcessStats::default();
         }
         let stats = match &mut self.engine {
-            Engine::Bundled(p) => p.process_interleaved(samples),
-            Engine::Native(p) => record_native(&mut self.clipping, p.process_f32(samples)),
+            Engine::Bundled(p) => T::moteur_integre(p, samples),
+            Engine::Native(p) => record_native(&mut self.clipping, T::moteur_natif(p, samples)),
             Engine::Unavailable => EqProcessStats::default(),
             Engine::Neutre => {
                 if let Some(gains) = self.gain_garde.as_deref() {
                     for trame in samples.chunks_mut(gains.len().max(1)) {
                         for (s, g) in trame.iter_mut().zip(gains) {
-                            *s *= g;
+                            *s = *s * T::depuis_f32(*g);
                         }
                     }
                 }
@@ -699,8 +782,9 @@ impl EqProcessor {
         // #5227 — après le filtre, donc après ses compteurs d'écrêtage : le
         // rendu flottant dépasse l'unité ici, le volume le ramène au rappel.
         if self.compensation != 1.0 {
+            let compensation = T::depuis_f32(self.compensation);
             for s in samples.iter_mut() {
-                *s *= self.compensation;
+                *s = *s * compensation;
             }
         }
         stats
@@ -709,7 +793,7 @@ impl EqProcessor {
     /// #6211 — applique le préampli gardé en le ramenant vers 0 dB, trame par
     /// trame, puis retient le gain atteint (un report vers une piste suivante
     /// part de là). Rampe finie : plus rien de gardé.
-    fn appliquer_l_extinction(&mut self, samples: &mut [f32]) {
+    fn appliquer_l_extinction<T: EchantillonHote>(&mut self, samples: &mut [T]) {
         let Some(mut ext) = self.extinction.take() else {
             return;
         };
@@ -717,7 +801,7 @@ impl EqProcessor {
         let coefs = ext.depart.len().max(1);
         let gain_a = Self::gain_de_la_rampe;
         for (j, s) in samples.iter_mut().enumerate() {
-            *s *= gain_a(&ext, j / canaux + 1, j % coefs);
+            *s = *s * T::depuis_f32(gain_a(&ext, j / canaux + 1, j % coefs));
         }
         ext.fait += samples.len() / canaux;
         if ext.fait >= ext.total {
@@ -837,6 +921,10 @@ fn record_native(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "eq_f64_t06_tests.rs"]
+mod f64_t06;
 
 #[cfg(test)]
 mod rampe_de_bascule_5215 {

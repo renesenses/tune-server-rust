@@ -172,3 +172,58 @@ fn signed_native_activation_keeps_old_instance_alive_during_update_and_rollback(
     // Drop the processor before TempDir: Windows intentionally keeps its DLL mapped.
     drop(processor);
 }
+/// TESS T05 then T06 — the reference equalizer and crossfeed behind
+/// `Stage::process_f64`.
+///
+/// - Built from this tree (T06), they request `audio-f64`: the host hands them
+///   its `f64` samples as they are, and their engines compute in `f64` end to
+///   end. The result is NOT the F32 path any more (no rounding to `f32` on the
+///   way) but stays within 2^-21 (−126 dBFS) of it: inaudible.
+/// - Pointed at libraries built from a pre-T06 tree (`TUNE_NATIVE_TEST_DIR`),
+///   they do not request it, and still run converted at their boundary, bit
+///   for bit like the historical F32 path: an existing F32 binary runs
+///   unchanged under the new host.
+#[test]
+fn reference_plugins_run_behind_the_f64_boundary() {
+    for (id, settings) in [
+        (
+            "equalizer",
+            serde_json::json!({"enabled":true,"listening":"headphones","room_size":"medium","speaker_placement":"free_standing","bass_gain_db":0.0,"mid_gain_db":0.0,"treble_gain_db":0.0,"bands":[{"freq":1700.0,"gain":-7.0,"q":1.2,"channel":0}]}),
+        ),
+        (
+            "crossfeed",
+            serde_json::json!({"enabled":true,"amount":0.3,"delay_ms":0.3}),
+        ),
+    ] {
+        let library = library(id);
+        let f64_natif = library.manifest.declares_f64();
+        let mut wide = Stage::prepare(library.clone(), 48000, 2, &settings).unwrap();
+        let mut narrow = Stage::prepare(library, 48000, 2, &settings).unwrap();
+        assert_eq!(wide.processes_f64_natively(), f64_natif, "{id}");
+        let input: Vec<f64> = (0..32768)
+            .map(|i| (f64::from(i) * 0.07).sin() * 0.8 + 1e-11)
+            .collect();
+        let mut x = input.clone();
+        for chunk in x.chunks_mut(2 * 333) {
+            wide.process_f64(chunk).unwrap();
+        }
+        let mut y: Vec<f32> = input.iter().map(|v| *v as f32).collect();
+        narrow.process_f32(&mut y).unwrap();
+        let expected: Vec<f64> = y.iter().map(|v| f64::from(*v)).collect();
+        if f64_natif {
+            let ecart = x
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                ecart <= 1.0 / f64::from(1u32 << 21),
+                "{id}: F64 path {ecart:e} away from the F32 path"
+            );
+            assert_ne!(x, expected, "{id}: requests F64 but rounds to f32");
+        } else {
+            assert_eq!(x, expected, "{id}: F64 boundary differs from the F32 path");
+        }
+        assert_ne!(x, input, "{id}: native DSP must actually run");
+    }
+}

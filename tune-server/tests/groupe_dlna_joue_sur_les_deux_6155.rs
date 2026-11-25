@@ -403,3 +403,124 @@ async fn un_deplacement_relaye_depasse_ne_s_applique_plus_7759() {
         "un relais dépassé a déplacé la KEF : {deplacements:?}"
     );
 }
+
+/// Un WAV PCM 16 bits mono de `secondes` secondes de silence : la piste de
+/// banc (`test.flac`) dure une seconde, trop court pour franchir le seuil de
+/// relance de « Précédent » (3 s).
+fn ecrire_un_wav_long(chemin: &std::path::Path, secondes: u32) {
+    let cadence: u32 = 44_100;
+    let donnees = cadence * secondes * 2;
+    let mut wav = Vec::with_capacity(44 + donnees as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + donnees).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&cadence.to_le_bytes());
+    wav.extend_from_slice(&(cadence * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&donnees.to_le_bytes());
+    wav.resize(44 + donnees as usize, 0);
+    std::fs::write(chemin, wav).unwrap();
+}
+
+/// Fil du forum 2757 — « revenir au début » donné sur la meneuse ne valait
+/// que pour elle. Les clients (web, iOS, Flutter) n'envoient pas un `seek` à
+/// 0 : ils appellent `POST /zones/{id}/previous`, et la route, au-delà de
+/// 3 s de lecture, RELANCE la piste par `orchestrator.seek(zone, 0)` puis
+/// répond `restarted`. Ce chemin n'appelle pas `deplacer_les_suiveuses`
+/// (seule la route `seek` le fait), et le relais n'écoute pas l'événement
+/// `seek` : la suiveuse, déjà sur la même piste, restait à sa position.
+#[tokio::test]
+async fn precedent_qui_relance_la_piste_relance_aussi_la_suiveuse_2757() {
+    let banc = phantom_et_kef().await;
+    let long = banc._dir.path().join("longue.wav");
+    ecrire_un_wav_long(&long, 12);
+    banc.state
+        .backend
+        .execute_batch(&format!(
+            "UPDATE tracks SET file_path = '{}', format = 'wav', sample_rate = 44100, \
+             channels = 1, duration_ms = 12000 WHERE id = 1;",
+            long.to_string_lossy()
+        ))
+        .unwrap();
+    grouper(&banc).await;
+    banc.state
+        .orchestrator
+        .play_from_queue(banc.phantom, 0)
+        .await
+        .expect("lecture sur la meneuse");
+    let kef_joue = attendre(|| async {
+        banc.state.playback.get_state(banc.kef).await.state == PlayState::Playing
+    })
+    .await;
+    assert!(kef_joue, "témoin : la KEF a rejoint la lecture du groupe");
+
+    // Les deux zones avancent dans la piste (le seek de la meneuse est
+    // relayé, #7759) : au-delà du seuil de 3 s, « Précédent » relance.
+    let cible = 6_000;
+    let (status, corps) = poster(
+        &banc.app,
+        &format!("/api/v1/zones/{}/seek", banc.phantom),
+        json!({ "position_ms": cible }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "déplacement : {corps}");
+    let kef_deplacee = attendre(|| async {
+        deplacements_de(&banc.state, "dlna-kef").await.last() == Some(&cible)
+    })
+    .await;
+    assert!(
+        kef_deplacee,
+        "témoin : le seek de la meneuse est relayé à la KEF — reçu {:?}, durée {:?}",
+        deplacements_de(&banc.state, "dlna-kef").await,
+        banc.state
+            .playback
+            .get_state(banc.phantom)
+            .await
+            .now_playing
+            .map(|np| np.duration_ms)
+    );
+    assert!(
+        banc.state
+            .playback
+            .get_state(banc.phantom)
+            .await
+            .position_ms
+            > 3_000,
+        "témoin : la meneuse est au-delà du seuil de relance"
+    );
+
+    // « Revenir au début » tel que l'envoient les clients.
+    let (status, corps) = poster(
+        &banc.app,
+        &format!("/api/v1/zones/{}/previous", banc.phantom),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "précédent : {corps}");
+    assert_eq!(
+        corps["status"], "restarted",
+        "témoin : la piste est relancée"
+    );
+    assert_eq!(
+        deplacements_de(&banc.state, "dlna-phantom").await.last(),
+        Some(&0),
+        "témoin : la meneuse est revenue au début"
+    );
+
+    let kef_relancee =
+        attendre(|| async { deplacements_de(&banc.state, "dlna-kef").await.last() == Some(&0) })
+            .await;
+    assert!(
+        kef_relancee,
+        "fil 2757 : « revenir au début » sur la meneuse doit ramener la KEF, \
+         suiveuse du groupe, au début de la piste — déplacements reçus par la \
+         KEF : {:?}, position {} ms",
+        deplacements_de(&banc.state, "dlna-kef").await,
+        banc.state.playback.get_state(banc.kef).await.position_ms,
+    );
+}

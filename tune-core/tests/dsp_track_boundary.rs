@@ -49,6 +49,17 @@ fn chaine_par_la_boucle() -> String {
     )
 }
 
+/// TESS T03 : la chaîne locale en `f64` (`local/executeur_tess.rs`), coupée à
+/// ses témoins. C'est elle que la frontière PCM commune appelle.
+fn executeur_tess() -> String {
+    let lu = std::fs::read_to_string(Path::new("src/outputs/local/executeur_tess.rs"))
+        .expect("src/outputs/local/executeur_tess.rs doit être lisible depuis la racine du crate");
+    lu.split("#[cfg(test)]\n#[path")
+        .next()
+        .unwrap_or(&lu)
+        .to_string()
+}
+
 /// L'étage natif des bras Windows (REF-8, #2219) : `local/etage_natif.rs`,
 /// coupé à son `mod tests`. C'est lui qui prépare (`prepare_windows_native_pcm`)
 /// et qui draine (`flush_local_dsp`) pour WASAPI ; le bras ne fait plus que
@@ -151,9 +162,23 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         .nth(1)
         .and_then(|s| s.split("fn report_incomplete_local_pcm_probe(").next())
         .expect("la frontière PCM locale commune doit rester identifiable");
+    // TESS T03 : la frontière commune décode ET traite par l'exécuteur TESS
+    // (`decoder_par_la_chaine_tess`, qui appelle la chaîne locale en `f64`).
     assert!(
-        preparation_locale.contains("apply_local_dsp("),
+        preparation_locale.contains("decoder_par_la_chaine_tess("),
         "la frontière PCM commune ne passe plus par le DSP"
+    );
+    // … et ce geste fait réellement passer le bloc par la chaîne : un nom
+    // conservé autour d'un simple décodage ne doit pas suffire.
+    let geste = executeur_tess()
+        .split("pub(super) fn decoder_par_la_chaine_tess(")
+        .nth(1)
+        .and_then(|s| s.split("\n}\n").next())
+        .map(str::to_string)
+        .expect("le geste du producteur TESS doit rester identifiable");
+    assert!(
+        geste.contains("moteurs.executer(ordre, 0, large, channels)"),
+        "decoder_par_la_chaine_tess ne fait plus passer le bloc par la chaîne DSP"
     );
 
     let coreaudio = prod
@@ -198,7 +223,7 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         .expect("la route flottante d'ASIO doit monter l'étage de R1");
     assert!(
         route_flottante_asio.contains("pcm: LocalPcmProcessor {")
-            && preparation_locale.contains("apply_local_dsp("),
+            && preparation_locale.contains("decoder_par_la_chaine_tess("),
         "la préparation Windows flottante ne passe plus par le DSP : la route traitée \
          d'ASIO doit monter l'étage de R1 sur la frontière PCM commune (REF-10, #2219)"
     );
@@ -209,7 +234,7 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         .and_then(|s| s.split("impl OutputTarget for LocalOutput").next())
         .expect("la préparation Windows entière doit rester identifiable");
     assert!(
-        preparation_windows_native.contains("apply_local_dsp("),
+        preparation_windows_native.contains("decoder_par_la_chaine_tess("),
         "la préparation Windows entière ne traite plus le PCM non bit-perfect"
     );
     let asio = prod
