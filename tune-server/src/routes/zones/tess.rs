@@ -775,6 +775,13 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     if cles.contains(&cle_mode_pure(id)) {
         let _ = state.orchestrator.apply_audiophile_change_portee(id).await;
     }
+    // rc14 — piste modulée vers le DSD : les greffons et l'étage fixe vivent
+    // dans le flux du producteur, pas dans la sortie. Tout changement de la
+    // chaîne relance la piste à sa position (anti-rebond partagé avec
+    // l'égaliseur).
+    if !cles.is_empty() {
+        state.orchestrator.relancer_si_flux_dsd_module(id).await;
+    }
 }
 
 /// La convolution d'une sortie locale : posée ou retirée à chaud, comme par

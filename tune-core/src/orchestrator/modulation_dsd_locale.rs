@@ -2,29 +2,42 @@
 //! LOCALE (voir `tess::modulation_dsd` pour l'architecture et les règles).
 //!
 //! - [`PlaybackOrchestrator::capacites_dsd_de_zone`] : ce que la sortie fait
-//!   de chaque cible, SANS sonder le pilote (capacités déjà connues), pour
-//!   `GET/PUT /zones/{id}/tess` ;
+//!   de chaque cible, SANS sonder le pilote ni attendre une sortie occupée ni
+//!   mesurer la machine (mesure en tâche de fond), pour `GET/PUT
+//!   /zones/{id}/tess` ;
 //! - [`PlaybackOrchestrator::decider_la_modulation_dsd`] : à la lecture d'une
 //!   piste PCM de la bibliothèque, après le DoP anticipé des sources DSD ;
 //!   sert le flux modulé, ou laisse le chemin PCM d'avant (repli dit au
 //!   chemin du signal) ;
-//! - [`PlaybackOrchestrator::attenuation_logicielle_en_dsd`] : la protection
-//!   du niveau DSD (#8813) appliquée au flux modulé.
+//! - [`PlaybackOrchestrator::relancer_apres_rupture_dsd`] : la sortie n'a pas
+//!   pu porter le DoP (rééchantillonnage) : la piste est relancée à la même
+//!   position, et repart en PCM ;
+//! - [`PlaybackOrchestrator::relancer_si_flux_dsd_module`] : un réglage de
+//!   la chaîne (égaliseur, convolution…) change pendant la modulation : la
+//!   piste est relancée à la même position avec le nouveau réglage.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use tracing::{info, warn};
 
 use super::*;
 use crate::tess::chaine::{ID_UPSAMPLING, Upsampling};
 use crate::tess::modulation_dsd::{
-    self as modulation, CapacitesDsd, EtatModulation, FaitsSortieDsd, ModulationEnService,
-    MotifDsdRefuse, PlanModulation, ProducteurDsd, TransportModulation,
+    self as modulation, BilanDuFlux, CapacitesDsd, CleFlux, EtatModulation, FaitsSortieDsd,
+    ModulationEnService, MotifDsdRefuse, PlanModulation, ProducteurDsd, TransportModulation,
 };
 use crate::tess::resolution::{
     CodeEtape, ContexteExecution, ControleVolume, SourceFlux, VolumeZone,
 };
 use crate::tess::zones::TransportZone;
+
+/// Tampon de la session d'un flux modulé, en blocs : il borne l'avance du
+/// producteur, donc le retard du volume (Q9 : « réponse plus lente »).
+const BLOCS_DE_SESSION: usize = 8;
+/// Taille d'un bloc PCM décodé (≈ 46 ms en stéréo 44,1 kHz, 32 bits).
+const OCTETS_PAR_BLOC_PCM: usize = 16_384;
 
 /// Ce que l'orchestrateur sait de la sortie d'une zone, pour la décision.
 struct FaitsDeZone {
@@ -32,7 +45,7 @@ struct FaitsDeZone {
     dsd_mode: String,
     plafond_zone_hz: Option<u32>,
     natif: SortieDsdLocale,
-    /// Nom du périphérique local (réponses DoP retenues), s'il y en a un.
+    /// Nom du périphérique local (réponses DoP et ruptures retenues).
     peripherique: Option<String>,
 }
 
@@ -48,14 +61,42 @@ impl FaitsDeZone {
         .map_err(MotifDsdServiEnDop::as_str)
     }
 
-    fn dop_refuse_connu(&self, cadence_dop: u32, voies: u16) -> bool {
-        self.peripherique.as_deref().is_some_and(|nom| {
-            matches!(
-                crate::audio::dop_ecarte_7265::accueil_exclusif_connu(nom, cadence_dop, voies),
-                Some(crate::audio::dop_ecarte_7265::AccueilDuDop::ExclusifRefuse { .. })
-            )
-        })
+    /// Un porteur DoP déjà refusé à cette cadence : par la sonde exclusive
+    /// (#7265), ou par une rupture constatée à l'ouverture.
+    fn dop_refuse_connu(&self, cadence_dop: u32, voies: u16) -> Option<MotifDsdRefuse> {
+        let nom = self.peripherique.as_deref()?;
+        if modulation::rupture_connue(nom, cadence_dop, voies) {
+            return Some(MotifDsdRefuse::CarrierRateNotSupported);
+        }
+        matches!(
+            crate::audio::dop_ecarte_7265::accueil_exclusif_connu(nom, cadence_dop, voies),
+            Some(crate::audio::dop_ecarte_7265::AccueilDuDop::ExclusifRefuse { .. })
+        )
+        .then_some(MotifDsdRefuse::DopRefusedByOutput)
     }
+
+    fn pures<'a>(
+        &'a self,
+        natif: &'a dyn Fn(u32, u16) -> Result<(), &'static str>,
+        dop_refuse: &'a dyn Fn(u32, u16) -> Option<MotifDsdRefuse>,
+        temps_reel: Option<[f64; 3]>,
+    ) -> FaitsSortieDsd<'a> {
+        FaitsSortieDsd {
+            sortie_locale: self.sortie_locale,
+            dsd_mode: &self.dsd_mode,
+            plafond_zone_hz: self.plafond_zone_hz,
+            natif,
+            dop_refuse,
+            temps_reel,
+        }
+    }
+}
+
+/// Le nom du périphérique d'une sortie locale, retenu à la première lecture
+/// réussie : les routes ne l'attendent jamais derrière une sortie occupée.
+fn noms_retenus() -> &'static Mutex<HashMap<String, String>> {
+    static N: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    N.get_or_init(Default::default)
 }
 
 /// La cadence (s) et la durée (s) à décoder pour une piste, tranche CUE et
@@ -92,23 +133,59 @@ fn replier_en_mono(x: &mut [f64]) {
     }
 }
 
+/// Le volume de la zone tel que la sortie locale l'appliquerait (consigne
+/// linéaire, verrou Pure, sourdine, trim), pour le modulateur.
+fn gain_de_volume(volume: f64, muet: bool, trim_db: f64) -> f64 {
+    if muet {
+        return 0.0;
+    }
+    let trim = if trim_db < 0.0 {
+        10f64.powf(trim_db / 20.0)
+    } else {
+        1.0
+    };
+    (volume.clamp(0.0, 1.0) * trim).clamp(0.0, 1.0)
+}
+
+/// Ce dont le fil du producteur a besoin pour suivre le volume de la zone.
+struct SuiviDuVolume {
+    zone_id: i64,
+    db: Arc<dyn crate::db::backend::DbBackend>,
+    playback: Arc<crate::playback::PlaybackManager>,
+}
+
+impl SuiviDuVolume {
+    fn trim_db(&self) -> f64 {
+        super::regles::gain_trim_db_enregistre(&self.db, self.zone_id)
+    }
+
+    fn gain(&self, rt: &tokio::runtime::Handle, trim_db: f64) -> f64 {
+        let etat = rt.block_on(self.playback.get_state(self.zone_id));
+        let volume =
+            crate::audio::audiophile::effective_volume(&self.db, self.zone_id, etat.volume);
+        gain_de_volume(volume, etat.muted, trim_db)
+    }
+}
+
 /// Le fil du producteur : décodage en entiers 32 bits (exacts pour 16 et
-/// 24 bits), greffons de la zone, `f64`, modulateur, porteur. Rend le nombre
-/// de remises à zéro de la boucle et l'entrée maximale du quantificateur.
+/// 24 bits, mono dupliqué en stéréo), greffons de la zone, `f64`, volume de
+/// la zone, modulateur, porteur. Rend le producteur à la FIN NORMALE de la
+/// piste (pour l'enchaînement), ou l'erreur.
 #[allow(clippy::too_many_arguments)]
 fn produire_le_flux_dsd(
     fichier: String,
     seek_s: f64,
     duree_s: Option<f64>,
     duree_servie_ms: u64,
-    plan: PlanModulation,
     mut producteur: ProducteurDsd,
     mut dsp: StreamingDsp,
     mono: bool,
+    volume: SuiviDuVolume,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_ready: Arc<tokio::sync::Notify>,
     rt: tokio::runtime::Handle,
-) -> Result<(u64, f64), String> {
+) -> Result<ProducteurDsd, String> {
+    let plan = producteur.plan();
     let delai = crate::http::streamer::SESSION_IDLE_TIMEOUT;
     let envoyer = |bloc: Vec<u8>| -> Result<(), String> {
         match rt.block_on(tokio::time::timeout(delai, tx.send(bloc))) {
@@ -117,11 +194,13 @@ fn produire_le_flux_dsd(
             Err(_) => Err("délai d'envoi dépassé".into()),
         }
     };
+    let mut trim_db = volume.trim_db();
+    producteur.definir_volume(volume.gain(&rt, trim_db));
     envoyer(producteur.entete(Some(duree_servie_ms)))?;
     data_ready.notify_one();
 
     let voies = usize::from(plan.voies);
-    let (tx_pcm, mut rx_pcm) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let (tx_pcm, mut rx_pcm) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
     let (niveaux_tx, _niveaux_rx) = tokio::sync::mpsc::unbounded_channel();
     let canaux = u32::from(plan.voies);
     let cadence = plan.cadence_pcm;
@@ -129,10 +208,11 @@ fn produire_le_flux_dsd(
         crate::audio::decode::decode_to_pcm_streaming_tranche(
             &fichier,
             Some(cadence),
+            // Le porteur est stéréo : une source mono est dupliquée.
             Some(canaux),
             Some(32),
             tx_pcm,
-            65_536,
+            OCTETS_PAR_BLOC_PCM,
             Arc::new(tokio::sync::Notify::new()),
             niveaux_tx,
             seek_s,
@@ -145,6 +225,7 @@ fn produire_le_flux_dsd(
     let mut entete_lue = false;
     let mut f64s: Vec<f64> = Vec::new();
     let mut sortie: Vec<u8> = Vec::new();
+    let mut blocs = 0u32;
     let mut traiter = |octets: &mut Vec<u8>,
                        producteur: &mut ProducteurDsd,
                        sortie: &mut Vec<u8>|
@@ -179,6 +260,13 @@ fn produire_le_flux_dsd(
         if utiles == 0 {
             continue;
         }
+        // Q9 : le volume juste avant le modulateur, relu à chaque bloc (la
+        // rampe de 10 ms de T11b évite toute marche) ; le trim, moins souvent.
+        blocs = blocs.wrapping_add(1);
+        if blocs.is_multiple_of(64) {
+            trim_db = volume.trim_db();
+        }
+        producteur.definir_volume(volume.gain(&rt, trim_db));
         let mut pcm: Vec<u8> = reste.drain(..utiles).collect();
         dsp.process_flux(&mut pcm, 32);
         sortie.clear();
@@ -187,24 +275,21 @@ fn produire_le_flux_dsd(
             envoyer(std::mem::take(&mut sortie))?;
         }
     }
-    // Fin de piste : la queue du convolveur, puis le retard du modulateur.
+    // Fin de piste : la queue du convolveur. Le retard du suréchantillonneur
+    // et une éventuelle trame DoP impaire attendent la piste suivante.
     let mut queue = dsp.terminer_flux(32);
     sortie.clear();
     if !queue.is_empty() {
         traiter(&mut queue, &mut producteur, &mut sortie)?;
     }
-    producteur
-        .terminer(&mut sortie)
-        .map_err(|e| format!("modulateur : {e}"))?;
     if !sortie.is_empty() {
         envoyer(sortie)?;
     }
     match rt.block_on(decodeur) {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Err(format!("décodage : {e}")),
-        Err(e) => return Err(format!("décodage interrompu : {e}")),
+        Ok(Ok(_)) => Ok(producteur),
+        Ok(Err(e)) => Err(format!("décodage : {e}")),
+        Err(e) => Err(format!("décodage interrompu : {e}")),
     }
-    Ok((producteur.reinitialisations(), producteur.entree_max()))
 }
 
 impl PlaybackOrchestrator {
@@ -237,7 +322,7 @@ impl PlaybackOrchestrator {
         if !sortie_locale {
             return faits;
         }
-        faits.peripherique = self.nom_du_peripherique_local(device_id.as_deref()).await;
+        faits.peripherique = self.nom_du_peripherique_local(device_id.as_deref());
         if faits.dsd_mode == "native" {
             faits.natif = if sonder {
                 self.sortie_dsd_locale(device_id.as_deref()).await
@@ -248,21 +333,33 @@ impl PlaybackOrchestrator {
         faits
     }
 
-    async fn nom_du_peripherique_local(&self, device_id: Option<&str>) -> Option<String> {
+    /// Le nom du périphérique, sans jamais attendre : registre ou sortie
+    /// tenus par une lecture → le nom retenu la dernière fois.
+    fn nom_du_peripherique_local(&self, device_id: Option<&str>) -> Option<String> {
+        let device_id = device_id?;
         #[cfg(feature = "local-audio")]
         {
-            let sortie = { self.outputs.lock().await.get(device_id?) }?;
-            let sortie = sortie.lock().await;
-            sortie
-                .as_any()
-                .downcast_ref::<crate::outputs::local::LocalOutput>()
-                .map(|l| l.nom_du_peripherique().to_string())
+            let lu = self.outputs.try_lock().ok().and_then(|registre| {
+                let sortie = registre.get(device_id)?;
+                let sortie = sortie.try_lock().ok()?;
+                sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                    .map(|l| l.nom_du_peripherique().to_string())
+            });
+            if let Some(nom) = lu {
+                noms_retenus()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(device_id.to_owned(), nom.clone());
+                return Some(nom);
+            }
         }
-        #[cfg(not(feature = "local-audio"))]
-        {
-            let _ = device_id;
-            None
-        }
+        noms_retenus()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device_id)
+            .cloned()
     }
 
     /// La capacité native DÉJÀ connue (aucune sonde).
@@ -285,65 +382,95 @@ impl PlaybackOrchestrator {
             .is_none_or(|license| license.premium_snapshot())
     }
 
-    /// rc14 — les capacités DSD de la zone (`dsd_capabilities`), sans sonder
-    /// le pilote. La machine est mesurée une fois (≈ 0,1 à 1 s), hors du fil
-    /// asynchrone.
+    /// rc14 — les capacités DSD de la zone (`dsd_capabilities`). Peu
+    /// coûteuses : quelques lectures de la base, aucune sonde, aucun verrou
+    /// de sortie attendu (nom du périphérique retenu), mesure de la machine
+    /// en cache (lancée en tâche de fond la première fois, jamais attendue).
     pub async fn capacites_dsd_de_zone(&self, zone_id: i64) -> CapacitesDsd {
         let faits = self.faits_dsd_de_zone(zone_id, false).await;
-        let temps_reel = match modulation::mesure_de_la_machine() {
-            Some(m) => Some(m),
-            None if faits.sortie_locale => {
-                tokio::task::spawn_blocking(modulation::mesurer_la_machine)
-                    .await
-                    .ok()
-            }
-            None => None,
-        };
+        if faits.sortie_locale {
+            modulation::lancer_la_mesure_en_fond();
+        }
         let natif = |c: u32, v: u16| faits.natif(c, v);
         let dop_refuse = |c: u32, v: u16| faits.dop_refuse_connu(c, v);
-        let pures = FaitsSortieDsd {
-            sortie_locale: faits.sortie_locale,
-            dsd_mode: &faits.dsd_mode,
-            plafond_zone_hz: faits.plafond_zone_hz,
-            natif: &natif,
-            dop_refuse: &dop_refuse,
-            temps_reel,
-        };
-        modulation::capacites(
-            &pures,
-            crate::audio::dop_ecarte_7265::protection_du_niveau_active(&self.db, zone_id),
-        )
-    }
-
-    /// #8813 appliqué au flux modulé : la zone demande-t-elle une atténuation
-    /// logicielle que le DSD perdrait (volume sous 100 %, sourdine, trim
-    /// négatif) ? Le ReplayGain et le préampli de l'égaliseur sont, eux,
-    /// appliqués dans le flux avant le modulateur. Protection désactivée par
-    /// la zone : jamais.
-    pub(super) async fn attenuation_logicielle_en_dsd(&self, zone_id: i64) -> bool {
-        if !crate::audio::dop_ecarte_7265::protection_du_niveau_active(&self.db, zone_id) {
-            return false;
-        }
-        let etat = self.playback.get_state(zone_id).await;
-        let volume_fixe = ZoneRepo::with_backend(self.db.clone())
-            .get(zone_id)
-            .ok()
-            .flatten()
-            .is_some_and(|z| z.fixed_volume);
-        etat.muted
-            || (!volume_fixe
-                && (etat.volume < 1.0 - 1e-6
-                    || super::regles::gain_trim_db_enregistre(&self.db, zone_id) < -1e-6))
+        modulation::capacites(&faits.pures(&natif, &dop_refuse, modulation::mesure_de_la_machine()))
     }
 
     /// La piste qui joue sur la zone est-elle un flux modulé vers le DSD ?
     pub(super) async fn modulation_dsd_en_service(&self, zone_id: i64) -> bool {
         let etat = self.playback.get_state(zone_id).await;
-        let piste = etat.now_playing.as_ref().and_then(|np| np.track_id);
+        let Some(np) = etat.now_playing.as_ref() else {
+            return false;
+        };
         matches!(
-            modulation::etat_pour(zone_id, piste),
+            modulation::etat_pour(zone_id, np.stream_id.as_deref(), np.track_id),
             Some(EtatModulation::EnService(_))
         )
+    }
+
+    /// rc14 — la sortie a refusé le porteur DoP d'un flux modulé (le
+    /// périphérique s'est ouvert à une autre cadence : les marqueurs seraient
+    /// détruits). La rupture est retenue, et la piste relancée à sa position :
+    /// elle repart en PCM (`carrier_rate_not_supported`) au lieu du silence.
+    /// Rend `true` si la relance a été faite (le sondeur n'arrête alors pas la
+    /// zone).
+    pub async fn relancer_apres_rupture_dsd(&self, zone_id: i64) -> bool {
+        if !self.modulation_dsd_en_service(zone_id).await {
+            return false;
+        }
+        let device_id = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id);
+        let Some(nom) = self.nom_du_peripherique_local(device_id.as_deref()) else {
+            return false;
+        };
+        if !modulation::rupture_recente(&nom, Duration::from_secs(15)) {
+            return false;
+        }
+        let etat = self.playback.get_state(zone_id).await;
+        let position = super::dsp::position_a_reprendre(&etat);
+        warn!(zone_id, position, "tess_dsd_porteur_refuse_relance_en_pcm");
+        Box::pin(self.replay_zone_at_position(zone_id, position, "tess_dsd_porteur_refuse"))
+            .await
+            .is_ok()
+    }
+
+    /// rc14 — un réglage de la chaîne a changé pendant une piste modulée :
+    /// la sortie ne traite pas un porteur DSD, c'est le producteur qui porte
+    /// les greffons. La piste est relancée à la même position (anti-rebond et
+    /// plancher de [`Self::schedule_eq_replay`]). `true` : relance programmée.
+    pub async fn relancer_si_flux_dsd_module(self: &Arc<Self>, zone_id: i64) -> bool {
+        if !self.modulation_dsd_en_service(zone_id).await {
+            return false;
+        }
+        info!(zone_id, "tess_dsd_reglage_change_relance");
+        self.schedule_eq_replay(zone_id)
+    }
+
+    /// Le préampli que l'égaliseur désactivé garde dans la sortie locale (dB
+    /// < 0), pour le reporter dans le flux modulé ; sans attendre.
+    fn preampli_garde_db(&self, device_id: Option<&str>) -> f64 {
+        #[cfg(feature = "local-audio")]
+        {
+            let lu = device_id.and_then(|id| {
+                let registre = self.outputs.try_lock().ok()?;
+                let sortie = registre.get(id)?;
+                let sortie = sortie.try_lock().ok()?;
+                sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                    .and_then(|l| l.preampli_garde())
+                    .map(|g| g.db)
+            });
+            lu.filter(|db| *db < 0.0).unwrap_or(0.0)
+        }
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = device_id;
+            0.0
+        }
     }
 
     /// rc14 — une piste PCM de la bibliothèque, sortie locale, chaîne de la
@@ -390,9 +517,10 @@ impl PlaybackOrchestrator {
             return Ok(None);
         };
         // La résolution de TESS décide si l'étage est effectif (Premium,
-        // moteur installé, PURE, « Bypass all ») ; sinon rien ne change. Les
-        // fermetures (non `Send`) vivent dans ce bloc, hors des `await`.
-        let effective = {
+        // moteur installé, PURE, « Bypass all ») et donne le headroom à
+        // appliquer avant le modulateur. Les fermetures (non `Send`) vivent
+        // dans ce bloc, hors des `await`.
+        let (effective, headroom_db) = {
             let disponible = |id: &str| {
                 id != ID_UPSAMPLING
                     || crate::audio::premium_plugins::enabled(
@@ -416,12 +544,14 @@ impl PlaybackOrchestrator {
                 },
                 replaygain_actif: false,
             };
-            lecture
+            let r = lecture
                 .chaine
-                .resoudre(&crate::tess::catalogue_de_reference(), &ctx)
+                .resoudre(&crate::tess::catalogue_de_reference(), &ctx);
+            let effective = r
                 .etapes
                 .iter()
-                .any(|e| e.code == CodeEtape::Upsampling && e.effective)
+                .any(|e| e.code == CodeEtape::Upsampling && e.effective);
+            (effective, r.headroom_db.min(0.0))
         };
         if !effective {
             modulation::oublier(zone_id, piste);
@@ -437,28 +567,32 @@ impl PlaybackOrchestrator {
                 motif = motif.as_str(),
                 "tess_dsd_repli_en_pcm"
             );
-            modulation::noter(zone_id, piste, EtatModulation::Repli(motif));
+            modulation::noter(
+                zone_id,
+                CleFlux {
+                    track_id: piste,
+                    stream_id: None,
+                },
+                EtatModulation::Repli(motif),
+            );
             Ok(None)
         };
-        if self.attenuation_logicielle_en_dsd(zone_id).await {
-            return repli(MotifDsdRefuse::SoftwareVolumeActive);
-        }
         let faits = self.faits_dsd_de_zone(zone_id, true).await;
-        let temps_reel = tokio::task::spawn_blocking(modulation::mesurer_la_machine)
-            .await
-            .ok();
+        let temps_reel = match modulation::mesure_de_la_machine() {
+            Some(m) => Some(m),
+            None => tokio::task::spawn_blocking(modulation::mesurer_la_machine)
+                .await
+                .ok(),
+        };
         let plan = {
             let natif = |c: u32, v: u16| faits.natif(c, v);
             let dop_refuse = |c: u32, v: u16| faits.dop_refuse_connu(c, v);
-            let pures = FaitsSortieDsd {
-                sortie_locale: faits.sortie_locale,
-                dsd_mode: &faits.dsd_mode,
-                plafond_zone_hz: faits.plafond_zone_hz,
-                natif: &natif,
-                dop_refuse: &dop_refuse,
-                temps_reel,
-            };
-            modulation::planifier(&pures, rate, cadence_pcm, voies)
+            modulation::planifier(
+                &faits.pures(&natif, &dop_refuse, temps_reel),
+                rate,
+                cadence_pcm,
+                voies,
+            )
         };
         let plan = match plan {
             Ok(p) => p,
@@ -469,14 +603,14 @@ impl PlaybackOrchestrator {
         if plan.transport == TransportModulation::Dop {
             let cadence_dop = plan.cadence_du_porteur();
             let accueil = self
-                .accueil_du_dop_local(req.output_device_id.as_deref(), cadence_dop, voies)
+                .accueil_du_dop_local(req.output_device_id.as_deref(), cadence_dop, plan.voies)
                 .await;
-            if crate::audio::dop_ecarte_7265::decider(&accueil, cadence_dop, voies).is_some() {
+            if crate::audio::dop_ecarte_7265::decider(&accueil, cadence_dop, plan.voies).is_some() {
                 return repli(MotifDsdRefuse::DopRefusedByOutput);
             }
         }
         match self
-            .servir_la_modulation_dsd(req, track, file_path, plan, tranche)
+            .servir_la_modulation_dsd(req, track, file_path, plan, headroom_db, tranche)
             .await
         {
             Ok(resolu) => Ok(Some(resolu)),
@@ -491,17 +625,31 @@ impl PlaybackOrchestrator {
         track: &crate::db::models::Track,
         file_path: &str,
         plan: PlanModulation,
+        headroom_db: f64,
         tranche: Option<&super::resolve_local::TrancheCue>,
     ) -> Result<ResolvedStream, MotifDsdRefuse> {
         let zone_id = req.zone_id;
-        // Conception du NTF et des filtres : hors du fil asynchrone.
-        let producteur = tokio::task::spawn_blocking(move || ProducteurDsd::new(plan))
-            .await
-            .map_err(|_| MotifDsdRefuse::ModulatorFailed)?
-            .map_err(|e| {
-                warn!(zone_id, error = %e, "tess_dsd_modulateur_non_construit");
-                MotifDsdRefuse::ModulatorFailed
-            })?;
+        // Enchaînement : la piste qui suit IMMÉDIATEMENT une piste modulée
+        // compatible, depuis son début, en reprend l'état.
+        let generation = modulation::ouvrir_une_generation(zone_id);
+        let depuis_le_debut = req.seek_ms.unwrap_or(0) == 0;
+        let suite = depuis_le_debut
+            .then(|| modulation::reprendre_la_suite(zone_id, generation, plan))
+            .flatten();
+        let continuee = suite.is_some();
+        let mut producteur = match suite {
+            Some(p) => p,
+            // Conception du NTF et des filtres : hors du fil asynchrone.
+            None => tokio::task::spawn_blocking(move || ProducteurDsd::new(plan))
+                .await
+                .map_err(|_| MotifDsdRefuse::ModulatorFailed)?
+                .map_err(|e| {
+                    warn!(zone_id, error = %e, "tess_dsd_modulateur_non_construit");
+                    MotifDsdRefuse::ModulatorFailed
+                })?,
+        };
+        let preampli_db = self.preampli_garde_db(req.output_device_id.as_deref());
+        producteur.definir_gain_fixe(10f64.powf((headroom_db + preampli_db) / 20.0));
         let (seek_s, duree_s, duree_servie_ms) =
             fenetre_de_decodage(tranche, req.seek_ms, track.duration_ms.max(0) as u64);
         let (format, mime, ext, profondeur) = match plan.transport {
@@ -518,7 +666,10 @@ impl PlaybackOrchestrator {
             duration_ms: Some(duree_servie_ms),
             ..Default::default()
         };
-        let (session_id, tx, data_ready) = self.streamer.create_session(info, true, 128).await;
+        let (session_id, tx, data_ready) = self
+            .streamer
+            .create_session(info, true, BLOCS_DE_SESSION)
+            .await;
         if plan.transport == TransportModulation::Dop {
             // L'en-tête WAV part DANS le canal (même règle que le DoP d'un
             // fichier, #1894) : sinon la session en préfixe un second et le
@@ -543,13 +694,22 @@ impl PlaybackOrchestrator {
             cadence_pcm = plan.cadence_pcm,
             cadence_dsd = plan.cadence_dsd,
             porteur = plan.cadence_du_porteur(),
-            voies = plan.voies,
+            voies_source = plan.voies_source,
             transport = ?plan.transport,
+            headroom_db,
+            preampli_db,
+            continuee,
             greffons_dans_le_flux,
             mono,
             "tess_dsd_modulation_lancee"
         );
         let fichier = file_path.to_string();
+        let volume = SuiviDuVolume {
+            zone_id,
+            db: self.db.clone(),
+            playback: self.playback.clone(),
+        };
+        let session = session_id.clone();
         tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             match produire_le_flux_dsd(
@@ -557,23 +717,27 @@ impl PlaybackOrchestrator {
                 seek_s,
                 duree_s,
                 duree_servie_ms,
-                plan,
                 producteur,
                 dsp,
                 mono,
+                volume,
                 tx,
                 data_ready,
                 rt,
             ) {
-                Ok((reinitialisations, entree_max)) => {
-                    if reinitialisations > 0 {
-                        warn!(
-                            zone_id,
-                            reinitialisations, entree_max, "tess_dsd_modulateur_instable"
-                        );
+                Ok(producteur) => {
+                    let bilan = BilanDuFlux {
+                        reinitialisations: producteur.reinitialisations(),
+                        ecretages: producteur.ecretages(),
+                        entree_max: producteur.entree_max(),
+                    };
+                    modulation::noter_bilan(&session, bilan);
+                    if bilan.reinitialisations > 0 {
+                        warn!(zone_id, ?bilan, "tess_dsd_modulateur_instable");
                     } else {
-                        tracing::debug!(zone_id, entree_max, "tess_dsd_modulation_terminee");
+                        tracing::debug!(zone_id, ?bilan, "tess_dsd_modulation_terminee");
                     }
+                    modulation::deposer_pour_la_suite(zone_id, generation, producteur);
                 }
                 Err(e) => warn!(zone_id, error = %e, "tess_dsd_modulation_interrompue"),
             }
@@ -596,7 +760,10 @@ impl PlaybackOrchestrator {
         }
         modulation::noter(
             zone_id,
-            req.track_id,
+            CleFlux {
+                track_id: req.track_id,
+                stream_id: Some(session_id.clone()),
+            },
             EtatModulation::EnService(ModulationEnService {
                 rate: plan.taux,
                 rate_hz: plan.cadence_dsd,
@@ -604,8 +771,11 @@ impl PlaybackOrchestrator {
                 order: modulation::ORDRE_DU_MODULATEUR,
                 carrier_rate_hz: plan.cadence_du_porteur(),
                 source_rate_hz: plan.cadence_pcm,
+                source_channels: plan.voies_source,
                 channels: plan.voies,
                 plugins_in_stream: greffons_dans_le_flux || mono,
+                headroom_db,
+                continued: continuee,
             }),
         );
         let server_ip = self.server_ip();

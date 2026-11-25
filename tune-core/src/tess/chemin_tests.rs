@@ -775,8 +775,11 @@ fn rc14_modulateur_en_service_ou_repli_dit() {
         order: 7,
         carrier_rate_hz: 5_644_800,
         source_rate_hz: 96_000,
+        source_channels: 2,
         channels: 2,
         plugins_in_stream: false,
+        headroom_db: 0.0,
+        continued: false,
     }));
     let c = chemin(&chaine, &ctx(TransportZone::Local, false, 0.0), &s, None);
     let m = etape(&c, CodeEtape::DsdModulator);
@@ -786,6 +789,8 @@ fn rc14_modulateur_en_service_ou_repli_dit() {
     assert_eq!(p["rate_hz"], 5_644_800);
     assert_eq!(p["transport"], "native");
     assert_eq!(p["rate"], "dsd128");
+    assert_eq!(p["zero_dbfs_modulation"], 0.5);
+    assert_eq!(p["reference_level"], "0 dB SACD");
     assert!(etape(&c, CodeEtape::Upsampling).etape.effective);
     assert!(
         c.steps
@@ -800,12 +805,17 @@ fn rc14_modulateur_en_service_ou_repli_dit() {
         c.discrepancies
     );
 
-    s.modulation_dsd = Some(EtatModulation::Repli(MotifDsdRefuse::SoftwareVolumeActive));
+    s.modulation_dsd = Some(EtatModulation::Repli(
+        MotifDsdRefuse::SourceRateNotModulable,
+    ));
     let c = chemin(&chaine, &ctx(TransportZone::Local, false, 0.0), &s, None);
     let up = etape(&c, CodeEtape::Upsampling);
     assert!(!up.etape.effective);
     assert_eq!(up.etape.reason, Some(MotifEtape::DsdNotSupportedByOutput));
-    assert_eq!(up.etape.detail.as_deref(), Some("software_volume_active"));
+    assert_eq!(
+        up.etape.detail.as_deref(),
+        Some("source_rate_not_modulable")
+    );
     let m = etape(&c, CodeEtape::DsdModulator);
     assert!(!m.etape.effective && m.etape.requested);
     assert_eq!(m.etape.reason, Some(MotifEtape::DsdNotSupportedByOutput));

@@ -138,6 +138,10 @@ impl ReponseTessZone {
                         p.insert("rate_hz".into(), json!(f.rate_hz));
                         p.insert("transport".into(), json!(f.transport));
                         p.insert("dop_rate_hz".into(), json!(f.dop_rate_hz));
+                        p.insert(
+                            "zero_dbfs_modulation".into(),
+                            json!(super::modulation_dsd::MODULATION_A_0_DBFS),
+                        );
                         e.params = Some(Value::Object(p));
                     }
                 } else {
@@ -576,12 +580,15 @@ fn schema_capacites_dsd() -> Value {
     cible["properties"]["family_48k"] = famille;
     json!({
         "type": "object",
-        "required": ["dsd_mode", "output_local", "modulator_order", "volume_protection", "targets"],
+        "required": ["dsd_mode", "output_local", "modulator_order", "reference_level",
+                     "volume_placement", "machine_measured", "targets"],
         "properties": {
             "dsd_mode": { "type": "string" },
             "output_local": { "type": "boolean" },
             "modulator_order": { "type": "integer" },
-            "volume_protection": { "type": "boolean" },
+            "reference_level": { "type": "string" },
+            "volume_placement": { "const": "before_dsd_modulator" },
+            "machine_measured": { "type": "boolean" },
             "targets": { "type": "array", "items": cible }
         },
         "additionalProperties": false

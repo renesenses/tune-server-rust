@@ -902,6 +902,14 @@ impl PositionPoller {
                     };
                     (output.take_output_failure(), output.take_paused_by_device())
                 };
+                // rc14 — un flux modulé vers le DSD dont la sortie n'a pas pu
+                // porter le DoP (périphérique ouvert à une autre cadence) :
+                // relancé à sa position, il repart en PCM, jamais en silence.
+                if failure.is_some() && self.orchestrator.relancer_apres_rupture_dsd(zone_id).await
+                {
+                    poll_states.remove(&zone_id);
+                    continue;
+                }
                 if failure.is_some() {
                     self.noter_tune_tested(zone_state, &device_id, false).await;
                 }

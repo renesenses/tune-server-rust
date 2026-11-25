@@ -276,6 +276,9 @@ pub struct ModulateurDsd {
     gains: Vec<f64>,
     /// `rapport` échantillons à la cadence DSD.
     tampon: Vec<f64>,
+    /// Échantillons DSD ramenés par le limiteur de sécurité depuis la
+    /// construction (crête intersample ou étage amont trop chaud).
+    ecretages: u64,
 }
 
 impl ModulateurDsd {
@@ -330,6 +333,7 @@ impl ModulateurDsd {
             pas_rampe: 1.0 / (RAMPE_VOLUME_S * f64::from(cadence_dsd)),
             gains: vec![1.0; rapport],
             tampon: vec![0.0; rapport],
+            ecretages: 0,
         })
     }
 
@@ -378,6 +382,12 @@ impl ModulateurDsd {
         self.boucles.iter().map(|b| b.reinitialisations).sum()
     }
 
+    /// Échantillons ramenés par le limiteur de sécurité (±[`LIMITE_MODULATION`])
+    /// depuis la construction, tous canaux.
+    pub fn ecretages(&self) -> u64 {
+        self.ecretages
+    }
+
     /// Plus grande entrée du quantificateur vue, tous canaux.
     pub fn entree_max(&self) -> f64 {
         self.boucles
@@ -421,6 +431,7 @@ impl ModulateurDsd {
             });
         }
         let octets_par_canal = self.rapport / 8;
+        let mut ecretages = 0u64;
         for (t, trame) in entree.chunks_exact(c).enumerate() {
             // Gains de la trame : la rampe avance d'un pas par échantillon DSD.
             for g in &mut self.gains {
@@ -447,13 +458,16 @@ impl ModulateurDsd {
                 {
                     let mut octet = 0u8;
                     for (x, g) in morceau.iter().zip(gains) {
-                        let s = (x * g).clamp(-LIMITE_MODULATION, LIMITE_MODULATION);
+                        let v = x * g;
+                        let s = v.clamp(-LIMITE_MODULATION, LIMITE_MODULATION);
+                        ecretages += u64::from(s != v);
                         octet = (octet << 1) | u8::from(boucle.pas(s));
                     }
                     sortie[base + o * c + canal] = octet;
                 }
             }
         }
+        self.ecretages += ecretages;
         Ok(besoin)
     }
 }

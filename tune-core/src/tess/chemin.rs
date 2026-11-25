@@ -266,7 +266,15 @@ pub fn params_du_modulateur(m: &ModulationEnService) -> Map<String, Value> {
     p.insert("transport".into(), json!(m.transport));
     p.insert("carrier_rate_hz".into(), json!(m.carrier_rate_hz));
     p.insert("source_rate_hz".into(), json!(m.source_rate_hz));
+    p.insert("source_channels".into(), json!(m.source_channels));
     p.insert("channels".into(), json!(m.channels));
+    p.insert("continued".into(), json!(m.continued));
+    // Niveau de référence de T11b : 0 dBFS PCM = 50 % de modulation.
+    p.insert(
+        "zero_dbfs_modulation".into(),
+        json!(super::modulation_dsd::MODULATION_A_0_DBFS),
+    );
+    p.insert("reference_level".into(), json!("0 dB SACD"));
     p
 }
 

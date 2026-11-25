@@ -1082,6 +1082,16 @@ impl PlaybackOrchestrator {
         self: &std::sync::Arc<Self>,
         zone_id: i64,
     ) -> PorteeDuReglage {
+        // rc14 — piste modulée vers le DSD : l'égaliseur est DANS le flux du
+        // producteur ; la sortie, qui reçoit un porteur DSD, n'en applique
+        // aucun. Relance à la même position avec le nouveau réglage.
+        if self.modulation_dsd_en_service(zone_id).await {
+            return if self.relancer_si_flux_dsd_module(zone_id).await {
+                PorteeDuReglage::Relance
+            } else {
+                PorteeDuReglage::PisteSuivante
+            };
+        }
         let debut = std::time::Instant::now();
         let rapport = self.refresh_zone_eq_detaille(zone_id).await;
         let applique_a_chaud = rapport.applique();

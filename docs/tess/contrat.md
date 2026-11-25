@@ -330,7 +330,7 @@ chaîne. C'est le comportement de #7632.
 | `volume_not_software` | volume réglé par l'appareil, ou volume fixe |
 | `nothing_to_quantize` | rien ne modifie les échantillons ; le détail dit « Bit-perfect » |
 | `not_in_service` | T16 : résolu effectif, mais l'étage ne tourne pas (exécuteur ou sonde de la sortie) |
-| `dsd_not_supported_by_output` | rc14 : vers le DSD, la sortie locale ne prend pas la cible, ou la piste est repartie en PCM ; `detail` = motif précis (`dsd_mode_not_enabled`, `software_volume_active`…). Sur `upsampling` et sur l'étape `dsd_modulator`, publiée éteinte. |
+| `dsd_not_supported_by_output` | rc14 : vers le DSD, la sortie locale ne prend pas la cible, ou la piste est repartie en PCM ; `detail` = motif précis (`dsd_mode_not_enabled`, `carrier_rate_not_supported`…). Sur `upsampling` et sur l'étape `dsd_modulator`, publiée éteinte. |
 
 ### Badge (A4)
 
@@ -536,12 +536,14 @@ l'API : `error` (= `code`), `message` (= `detail`) et, sur un 402,
 
 Facultatif dans `zone_response` (absent d'un serveur antérieur : « inconnu »).
 Ce que la sortie de la zone fait de chaque cible DSD, **sans sonder le
-pilote** (capacité native déjà connue, réponses DoP retenues) :
+pilote, sans attendre une sortie occupée, sans mesurer la machine** (mesure
+en tâche de fond, en cache) :
 
 ```json
 {
   "dsd_mode": "dop", "output_local": true, "modulator_order": 7,
-  "volume_protection": true,
+  "reference_level": "0 dBFS = 50 % modulation (0 dB SACD)",
+  "volume_placement": "before_dsd_modulator", "machine_measured": true,
   "targets": [
     { "rate": "dsd64", "rate_hz": 2822400, "accepted": true, "transport": "dop",
       "dop_rate_hz": 176400, "reason": null, "native_reason": null,
@@ -556,23 +558,44 @@ pilote** (capacité native déjà connue, réponses DoP retenues) :
   l'écran grise) ; `family_48k` : une piste 48/96/192 kHz y est modulée.
 - `transport` : `native` (ASIO `DsdU8`, ALSA `DSD_U32`, zone « natif » dont le
   pilote déclare la cadence) ou `dop` ; `native_reason` dit pourquoi une zone
-  « natif » part en DoP.
+  « natif » part en DoP. Le porteur est **toujours stéréo** : une source mono
+  est dupliquée, une source de plus de deux voies part en PCM.
 - `reason` : `output_not_local`, `dsd_mode_not_enabled` (zone `auto`/`pcm` :
-  jamais de DoP vers un DAC non déclaré), `rate_above_zone_max`,
-  `dop_refused_by_output`, `machine_too_slow` (marge ×2 de temps réel par
-  paire de voies, mesurée une fois). À la lecture seulement :
-  `source_rate_not_modulable`, `channels_not_supported`,
-  `software_volume_active` (protection du niveau DSD, #8813),
+  jamais de DoP vers un DAC non déclaré), `rate_above_zone_max` (plafond de
+  zone, catalogue compris), `dop_refused_by_output` (sonde exclusive),
+  `carrier_rate_not_supported` (le périphérique a déjà rééchantillonné ce
+  porteur : constat retenu), `machine_too_slow` (marge ×2 de temps réel,
+  meilleure de trois passes, refaite après 10 min si elle refuse). À la
+  lecture seulement : `source_rate_not_modulable`, `channels_not_supported`,
   `modulator_failed`.
-- `volume_protection` : le volume logiciel ne s'applique pas en DSD ; une
-  zone qui demande une atténuation (volume < 100 %, sourdine, trim) joue en
-  PCM tant que la protection est active. ReplayGain et préampli de
-  l'égaliseur sont appliqués dans le flux, avant le modulateur.
+- **Niveau** : 0 dBFS PCM = 50 % de modulation = 0 dB SACD (T11b), limiteur
+  de sécurité à 60 %. Le headroom de TESS (−3 dB en automatique) s'applique
+  avant le modulateur : une crête intersample à +3 dB n'atteint pas le
+  limiteur.
+- **Volume (Q9)** : appliqué juste avant le modulateur (rampe de 10 ms),
+  relu à chaque bloc du producteur ; il répond avec le retard du tampon
+  (≈ 1 s). Une baisse de volume ou la sourdine ne relancent rien. La
+  protection `dsd_volume_protection` (#8813) reste celle des fichiers DSD.
+- **Repli en PCM** (file mixte, refus) : la piste joue au niveau PCM, soit
+  environ +6 dB au-dessus du même passage modulé (+9 dB avec le headroom
+  automatique). Compensation simple possible, non appliquée : atténuer de 6
+  (ou 9) dB au rendu une piste repliée d'une zone vers le DSD.
+- **Rupture à l'ouverture** : si la sortie ouvre le périphérique à une autre
+  cadence que le porteur DoP (les marqueurs seraient détruits), la piste est
+  relancée à sa position et repart en PCM (`carrier_rate_not_supported`),
+  jamais en silence ; la cadence est ensuite refusée au `PUT`.
+- **Réglage à chaud** : un changement de la chaîne (égaliseur, convolution,
+  crossfeed…) pendant une piste modulée la relance à la même position. Le
+  préampli que garde la sortie est reporté dans le flux.
+- **Enchaînement** : deux pistes modulées de même famille et de même cadence
+  partagent l'état du modulateur (ni silence ni clôture) ; chaque piste
+  émet un nombre pair de trames DoP.
 
 Sur le chemin résolu, une cible acceptée ajoute à l'étape `dsd_modulator`
-`order`, `rate_hz`, `transport` et `dop_rate_hz` ; le chemin du signal (T16)
-de la piste qui joue y ajoute `carrier_rate_hz`, `source_rate_hz` et
-`channels`.
+`order`, `rate_hz`, `transport`, `dop_rate_hz` et `zero_dbfs_modulation`
+(0,5) ; le chemin du signal (T16) de la piste qui joue y ajoute
+`carrier_rate_hz`, `source_rate_hz`, `source_channels`, `channels`,
+`continued` et `reference_level` (« 0 dB SACD »).
 
 ### Routes (T08, `tune-server/src/routes/zones/tess.rs`)
 

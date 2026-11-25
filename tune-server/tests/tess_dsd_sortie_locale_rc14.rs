@@ -121,7 +121,11 @@ async fn les_capacites_sont_publiees_et_conformes_au_schema() {
     assert_eq!(caps["dsd_mode"], "dop");
     assert_eq!(caps["output_local"], true);
     assert_eq!(caps["modulator_order"], 7);
-    assert_eq!(caps["volume_protection"], true);
+    assert_eq!(caps["volume_placement"], "before_dsd_modulator");
+    assert_eq!(
+        caps["reference_level"],
+        "0 dBFS = 50 % modulation (0 dB SACD)"
+    );
     let d64 = cible(&v, "dsd64");
     assert_eq!(
         (&d64["accepted"], &d64["transport"], &d64["dop_rate_hz"]),

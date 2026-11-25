@@ -1,6 +1,8 @@
 //! rc14 — TESS vers le DSD sur la sortie locale, de la chaîne de la zone aux
-//! octets de la session : non-régression du PCM à l'octet près, porteur DoP
-//! de bout en bout, replis dits.
+//! octets de la session : non-régression du PCM (comparé à la SOURCE, pas à
+//! un autre passage de la PR), porteur DoP de bout en bout, mono porté en
+//! stéréo, multicanal en repli, volume avant le modulateur, headroom et
+//! crêtes intersample par la chaîne complète.
 
 use super::*;
 use std::sync::Arc;
@@ -10,26 +12,31 @@ use crate::db::models::Track;
 use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
 use crate::db::settings_repo::SettingsRepo;
 use crate::db::track_repo::TrackRepo;
-use crate::tess::chaine::{ChaineTess, EtagesFixes, TauxDsd, Upsampling};
+use crate::tess::chaine::{ChaineTess, EtagesFixes, Headroom, TauxDsd, Upsampling};
 use crate::tess::modulation_dsd::{EtatModulation, MotifDsdRefuse, TransportModulation};
 
 const FLAC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/flac/ref_16_44100_stereo.flac"
 );
+const FLAC_MONO: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/flac/ref_16_44100_mono.flac"
+);
 
 struct Banc {
     orch: PlaybackOrchestrator,
     zone_id: i64,
-    track_id: i64,
+    pistes: std::sync::atomic::AtomicI64,
     /// Le registre de `tess::modulation_dsd` est global, et chaque banc a sa
-    /// base neuve (zone 1, piste 1) : les bancs passent un par un.
+    /// base neuve : les bancs passent un par un.
     _tour: tokio::sync::MutexGuard<'static, ()>,
 }
 
 static TOUR: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Zone et piste du banc : loin des identifiants des autres bancs.
+/// Zone et pistes du banc : loin des identifiants des autres bancs, que
+/// toute résolution locale fait passer par le registre.
 const ID_DU_BANC: i64 = 9_430_077;
 
 async fn banc(premium: bool, dsd_mode: &str) -> Banc {
@@ -53,8 +60,7 @@ async fn banc(premium: bool, dsd_mode: &str) -> Banc {
     orch.license = Some(if premium {
         crate::license::licence_premium_pour_test(db.clone())
     } else {
-        // Sans compte Premium : la licence existe et dit Free (sans licence du
-        // tout, l'hôte se tient pour Premium, comme le suréchantillonneur).
+        // Sans compte Premium : la licence existe et dit Free.
         let l = Arc::new(crate::license::LicenseManager::new(db.clone()));
         assert!(!l.premium_snapshot());
         l
@@ -66,8 +72,6 @@ async fn banc(premium: bool, dsd_mode: &str) -> Banc {
             Some("local:DAC DSD banc"),
         )
         .unwrap();
-    // Le registre est global, et toute résolution locale d'un autre banc
-    // (zone 1, piste 1) y passe : des identifiants à part.
     db.execute(
         "UPDATE zones SET id = ? WHERE id = ?",
         &[&ID_DU_BANC, &zone_id],
@@ -81,57 +85,81 @@ async fn banc(premium: bool, dsd_mode: &str) -> Banc {
     s.set("plugin_upsampler_installed", "true").unwrap();
     s.set("plugin_upsampler_enabled", "true").unwrap();
     orch.playback.set_volume(zone_id, 1.0).await;
-    // La machine de test (debug) n'est pas celle de la production : une
-    // mesure imposée, au-dessus de la marge.
+    // La machine de test (debug) n'est pas celle de la production.
     crate::tess::modulation_dsd::retenir_mesure_de_la_machine([50.0, 25.0, 12.0]);
-    let mut t = Track::new("Piste du banc DSD rc14".into());
-    t.duration_ms = 1_000;
-    t.file_path = Some(FLAC.into());
-    t.format = Some("flac".into());
-    t.sample_rate = Some(44_100);
-    t.bit_depth = Some(16);
-    t.channels = 2;
-    t.file_size = std::fs::metadata(FLAC).ok().map(|m| m.len() as i64);
-    t.source = "local".into();
-    let track_id = TrackRepo::with_backend(orch.db.clone()).create(&t).unwrap();
-    orch.db
-        .execute(
-            "UPDATE tracks SET id = ? WHERE id = ?",
-            &[&ID_DU_BANC, &track_id],
-        )
-        .unwrap();
-    let track_id = ID_DU_BANC;
     Banc {
         orch,
         zone_id,
-        track_id,
+        pistes: std::sync::atomic::AtomicI64::new(0),
         _tour: tour,
     }
 }
 
-fn ecrire_chaine(b: &Banc, upsampling: Option<Upsampling>) {
+/// Une piste de la bibliothèque, à un identifiant propre au banc.
+fn piste(b: &Banc, chemin: &str, format: &str, canaux: i32) -> i64 {
+    let mut t = Track::new("Piste du banc DSD rc14".into());
+    t.duration_ms = 1_000;
+    t.file_path = Some(chemin.into());
+    t.format = Some(format.into());
+    t.sample_rate = Some(44_100);
+    t.bit_depth = Some(16);
+    t.channels = canaux;
+    t.file_size = std::fs::metadata(chemin).ok().map(|m| m.len() as i64);
+    t.source = "local".into();
+    let id = TrackRepo::with_backend(b.orch.db.clone())
+        .create(&t)
+        .unwrap();
+    let voulu = ID_DU_BANC + b.pistes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    b.orch
+        .db
+        .execute("UPDATE tracks SET id = ? WHERE id = ?", &[&voulu, &id])
+        .unwrap();
+    voulu
+}
+
+fn chaine(b: &Banc, upsampling: Option<Upsampling>, headroom: Headroom) {
     let s = SettingsRepo::with_backend(b.orch.db.clone());
     match upsampling {
         None => {
             let _ = s.delete(&crate::tess::cle_chaine_zone(b.zone_id));
         }
         Some(u) => {
-            let chaine = ChaineTess {
+            let c = ChaineTess {
                 fixed: EtagesFixes {
                     upsampling: u,
+                    headroom,
                     ..EtagesFixes::default()
                 },
                 ..ChaineTess::default()
             };
-            crate::tess::migration::ecrire_chaine(&s, b.zone_id, &chaine).unwrap();
+            crate::tess::migration::ecrire_chaine(&s, b.zone_id, &c).unwrap();
         }
     }
 }
 
-/// Résout la piste (FLAC 16/44,1 stéréo de la caisse) et rend (mime, octets
-/// complets de la session, id de la piste).
-async fn jouer(b: &Banc) -> (String, Vec<u8>, i64) {
-    let track_id = b.track_id;
+fn ecrire_chaine(b: &Banc, upsampling: Option<Upsampling>) {
+    chaine(b, upsampling, Headroom::Auto {});
+}
+
+struct Joue {
+    mime: String,
+    octets: Vec<u8>,
+    track_id: i64,
+    stream_id: String,
+}
+
+impl Joue {
+    fn etat(&self, b: &Banc) -> Option<EtatModulation> {
+        crate::tess::modulation_dsd::etat_pour(
+            b.zone_id,
+            Some(&self.stream_id),
+            Some(self.track_id),
+        )
+    }
+}
+
+/// Résout la piste et rend tous les octets de sa session.
+async fn jouer(b: &Banc, track_id: i64) -> Joue {
     let pq = PlayQueueRepo::with_backend(b.orch.db.clone());
     let _ = pq.clear(b.zone_id);
     pq.append(b.zone_id, &[QueueInput::Local { track_id }])
@@ -161,7 +189,12 @@ async fn jouer(b: &Banc) -> (String, Vec<u8>, i64) {
             octets.extend_from_slice(&c);
         }
     }
-    (r.mime_type, octets, track_id)
+    Joue {
+        mime: r.mime_type,
+        octets,
+        track_id,
+        stream_id: sid,
+    }
 }
 
 fn dsd(rate: TauxDsd) -> Upsampling {
@@ -171,71 +204,96 @@ fn dsd(rate: TauxDsd) -> Upsampling {
     }
 }
 
-/// LE témoin de non-régression : avec `pcm`, `off` ou sans chaîne, la zone
-/// sert EXACTEMENT les mêmes octets — alors même que tout est réuni pour que
-/// le DSD s'engage (Premium, moteur installé, zone « dop », volume 100 %).
-/// La contre-épreuve : la même zone en `dsd` sert autre chose.
+/// Le PCM d'un WAV servi (bloc `data`), cadré à gauche sur 32 bits, avec
+/// sa cadence et ses voies.
+fn pcm_du_wav(octets: &[u8]) -> (u32, u16, Vec<i32>) {
+    let voies = u16::from_le_bytes([octets[22], octets[23]]);
+    let cadence = u32::from_le_bytes(octets[24..28].try_into().unwrap());
+    let bits = u16::from_le_bytes([octets[34], octets[35]]);
+    let mut debut = 12;
+    while &octets[debut..debut + 4] != b"data" {
+        let n = u32::from_le_bytes(octets[debut + 4..debut + 8].try_into().unwrap()) as usize;
+        debut += 8 + n + n % 2;
+    }
+    let data = &octets[debut + 8..];
+    let mots = match bits {
+        16 => data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|s| i32::from(i16::from_le_bytes(*s)) << 16)
+            .collect(),
+        24 => data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|s| i32::from_le_bytes([0, s[0], s[1], s[2]]))
+            .collect(),
+        _ => data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|s| i32::from_le_bytes(*s))
+            .collect(),
+    };
+    (cadence, voies, mots)
+}
+
+/// LE témoin de non-régression, contre la SOURCE : avec `pcm`, `off` ou sans
+/// chaîne, la zone sert le fichier lui-même (passthrough) ou son PCM exact —
+/// le chemin PCM complet, tel qu'il était avant cette PR — alors même que
+/// tout est réuni pour que le DSD s'engage. Contre-épreuve : `dsd`.
 #[tokio::test]
-async fn pcm_off_et_sans_chaine_servent_les_memes_octets() {
+async fn pcm_off_et_sans_chaine_servent_la_source_a_l_octet_pres() {
     let b = banc(true, "dop").await;
-    ecrire_chaine(&b, None);
-    let (mime_0, ref_0, piste) = jouer(&b).await;
-    assert!(ref_0.len() > 44, "la référence doit porter du PCM");
-    assert_eq!(
-        crate::tess::modulation_dsd::etat_pour(b.zone_id, Some(piste)),
-        None
-    );
+    let id = piste(&b, FLAC, "flac", 2);
+    let source = std::fs::read(FLAC).unwrap();
+    // La référence indépendante de la PR : le fichier lui-même
+    // (passthrough), ou son PCM décodé, cadré à gauche sur 32 bits.
+    let decode = crate::audio::decode::decode_to_pcm(FLAC, None, None, 0.0, 0.0).unwrap();
+    let decalage = 32 - u32::from(decode.bit_depth);
+    let attendu: Vec<i32> = decode.samples_i32.iter().map(|s| s << decalage).collect();
+    let conforme = |j: &Joue| {
+        if j.octets.starts_with(b"RIFF") {
+            let (cadence, voies, mots) = pcm_du_wav(&j.octets);
+            cadence == 44_100 && voies == 2 && mots == attendu
+        } else {
+            j.octets == source
+        }
+    };
     for u in [
-        Upsampling::Off {},
-        Upsampling::Pcm {
+        None,
+        Some(Upsampling::Off {}),
+        Some(Upsampling::Pcm {
             filter: crate::audio::surechantillonnage::greffon::DEFAULT_FILTER.into(),
             max_ratio: Some(4),
             max_rate_hz: None,
-        },
+        }),
     ] {
-        ecrire_chaine(&b, Some(u.clone()));
-        let (mime, octets, piste) = jouer(&b).await;
-        assert_eq!(mime, mime_0, "{u:?}");
-        assert!(octets == ref_0, "{u:?} : les octets servis ont changé");
-        assert_eq!(
-            crate::tess::modulation_dsd::etat_pour(b.zone_id, Some(piste)),
-            None,
-            "{u:?}"
+        ecrire_chaine(&b, u.clone());
+        let j = jouer(&b, id).await;
+        assert!(
+            conforme(&j),
+            "{u:?} : le flux PCM n'est plus la source ({})",
+            j.mime
         );
+        assert_eq!(j.etat(&b), None, "{u:?}");
     }
     ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd64)));
-    let (_, octets, _) = jouer(&b).await;
-    assert!(
-        octets != ref_0,
-        "contre-épreuve : le DSD doit changer le flux"
-    );
+    let j = jouer(&b, id).await;
+    assert!(!conforme(&j), "contre-épreuve : le DSD change le flux");
 }
 
-/// La piste PCM part en DoP DSD64 : en-tête WAV 24 bits à 176,4 kHz, marqueurs
-/// alternés sur TOUT le flux et identiques sur les deux voies, débit attendu,
-/// état publié pour le chemin du signal.
-#[tokio::test]
-async fn une_piste_pcm_part_en_dop_dsd64_de_bout_en_bout() {
-    let b = banc(true, "dop").await;
-    ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd64)));
-    let (mime, octets, piste) = jouer(&b).await;
-    assert_eq!(mime, "audio/wav");
-    assert_eq!(&octets[..4], b"RIFF");
-    let cadence = u32::from_le_bytes(octets[24..28].try_into().unwrap());
-    let canaux = u16::from_le_bytes(octets[22..24].try_into().unwrap());
-    let bits = u16::from_le_bytes(octets[34..36].try_into().unwrap());
-    assert_eq!((cadence, canaux, bits), (176_400, 2, 24));
-    let charge = &octets[44..];
-    assert_eq!(charge.len() % 6, 0);
-    let trames = charge.len() / 6;
-    // ≈ 1 s de piste (4 trames DoP par trame PCM), plus la queue du filtre.
-    let trames_pcm = {
-        let r = crate::audio::decode::decode_to_pcm(FLAC, None, None, 0.0, 0.0).unwrap();
-        r.samples_i32.len() / 2
-    };
-    assert!(trames >= trames_pcm * 4, "{trames} < {}", trames_pcm * 4);
-    assert!(trames <= trames_pcm * 4 + 1_000, "{trames}");
-    assert_eq!(trames % 2, 0, "clôture paire (#7704)");
+fn verifier_dop_stereo(j: &Joue, cadence: u32) -> &[u8] {
+    assert_eq!(j.mime, "audio/wav");
+    let o = &j.octets;
+    assert_eq!(&o[..4], b"RIFF");
+    let c = u32::from_le_bytes(o[24..28].try_into().unwrap());
+    let voies = u16::from_le_bytes(o[22..24].try_into().unwrap());
+    let bits = u16::from_le_bytes(o[34..36].try_into().unwrap());
+    assert_eq!((c, voies, bits), (cadence, 2, 24));
+    let charge = &o[44..];
+    assert_eq!(charge.len() % 12, 0, "trames DoP paires");
     let mut attendu = 0x05u8;
     for t in charge.as_chunks::<6>().0 {
         assert_eq!((t[2], t[5]), (attendu, attendu));
@@ -243,16 +301,77 @@ async fn une_piste_pcm_part_en_dop_dsd64_de_bout_en_bout() {
     }
     #[cfg(feature = "local-audio")]
     assert!(crate::outputs::local::is_dop_pcm(charge, 24, 2));
-    match crate::tess::modulation_dsd::etat_pour(b.zone_id, Some(piste)) {
+    charge
+}
+
+#[tokio::test]
+async fn une_piste_pcm_part_en_dop_dsd64_de_bout_en_bout() {
+    let b = banc(true, "dop").await;
+    let id = piste(&b, FLAC, "flac", 2);
+    ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd64)));
+    let j = jouer(&b, id).await;
+    let charge = verifier_dop_stereo(&j, 176_400);
+    let trames_pcm = crate::audio::decode::decode_to_pcm(FLAC, None, None, 0.0, 0.0)
+        .unwrap()
+        .samples_i32
+        .len()
+        / 2;
+    let trames = charge.len() / 6;
+    // 4 trames DoP par trame PCM ; la queue du filtre (≈ 1 ms) attend une
+    // éventuelle piste suivante.
+    assert!(
+        trames <= trames_pcm * 4 && trames + 400 >= trames_pcm * 4,
+        "{trames}"
+    );
+    match j.etat(&b) {
         Some(EtatModulation::EnService(m)) => {
             assert_eq!(m.transport, TransportModulation::Dop);
             assert_eq!(
                 (m.rate_hz, m.carrier_rate_hz, m.order),
                 (2_822_400, 176_400, 7)
             );
+            assert_eq!(
+                m.headroom_db, -3.0,
+                "headroom automatique avant le modulateur"
+            );
         }
         autre => panic!("état {autre:?}"),
     }
+}
+
+/// HAUTE de la relecture : une source MONO part en DoP STÉRÉO (un DoP mono
+/// serait coupé par la sortie, qui ouvre deux voies).
+#[tokio::test]
+async fn une_source_mono_part_en_dop_stereo() {
+    let b = banc(true, "dop").await;
+    let id = piste(&b, FLAC_MONO, "flac", 1);
+    ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd64)));
+    let j = jouer(&b, id).await;
+    let charge = verifier_dop_stereo(&j, 176_400);
+    // La même voie des deux côtés (le dither diffère : même niveau, pas les
+    // mêmes bits).
+    let (g, d) = (rms_porte(charge, 0), rms_porte(charge, 1));
+    assert!(g > 0.01 && (g - d).abs() < 0.1 * g, "voies {g} / {d}");
+    match j.etat(&b) {
+        Some(EtatModulation::EnService(m)) => assert_eq!((m.source_channels, m.channels), (1, 2)),
+        autre => panic!("état {autre:?}"),
+    }
+}
+
+/// Un 5.1 : le porteur est stéréo, la piste repart en PCM, motif dit.
+#[tokio::test]
+async fn une_source_multicanal_repart_en_pcm() {
+    let b = banc(true, "dop").await;
+    let id = piste(&b, FLAC, "flac", 6);
+    ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd64)));
+    let j = jouer(&b, id).await;
+    assert!(
+        !j.octets.starts_with(b"RIFF") || u16::from_le_bytes([j.octets[34], j.octets[35]]) != 24
+    );
+    assert_eq!(
+        crate::tess::modulation_dsd::etat_pour(b.zone_id, None, Some(id)),
+        Some(EtatModulation::Repli(MotifDsdRefuse::ChannelsNotSupported))
+    );
 }
 
 /// Une zone qui n'a pas déclaré son DAC DSD (`auto`) : rien en DoP, la piste
@@ -260,60 +379,108 @@ async fn une_piste_pcm_part_en_dop_dsd64_de_bout_en_bout() {
 #[tokio::test]
 async fn zone_auto_repli_en_pcm_dit() {
     let b = banc(true, "dop").await;
+    let id = piste(&b, FLAC, "flac", 2);
     ecrire_chaine(&b, None);
-    let (_, reference, _) = jouer(&b).await;
+    let reference = jouer(&b, id).await.octets;
     ZoneRepo::with_backend(b.orch.db.clone())
         .update_dsd_mode(b.zone_id, "auto")
         .unwrap();
     ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd128)));
-    let (_, octets, piste) = jouer(&b).await;
-    assert!(octets == reference, "le repli sert le PCM d'avant");
+    let j = jouer(&b, id).await;
+    assert!(j.octets == reference, "le repli sert le PCM d'avant");
     assert_eq!(
-        crate::tess::modulation_dsd::etat_pour(b.zone_id, Some(piste)),
+        crate::tess::modulation_dsd::etat_pour(b.zone_id, Some(&j.stream_id), Some(id)),
         Some(EtatModulation::Repli(MotifDsdRefuse::DsdModeNotEnabled))
     );
 }
 
-/// La protection du niveau DSD (#8813) : volume à 50 %, la piste part en PCM.
-/// Protection désactivée par la zone : DSD.
-#[tokio::test]
-async fn volume_logiciel_sous_100_repli_en_pcm() {
-    let b = banc(true, "dop").await;
-    ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd64)));
-    b.orch.playback.set_volume(b.zone_id, 0.5).await;
-    let (mime, _, piste) = jouer(&b).await;
-    assert_eq!(
-        crate::tess::modulation_dsd::etat_pour(b.zone_id, Some(piste)),
-        Some(EtatModulation::Repli(MotifDsdRefuse::SoftwareVolumeActive))
-    );
-    let _ = mime;
-    SettingsRepo::with_backend(b.orch.db.clone())
-        .set(
-            &crate::audio::dop_ecarte_7265::cle_protection_du_niveau(b.zone_id),
-            "false",
-        )
-        .unwrap();
-    let (_, _, piste) = jouer(&b).await;
-    assert!(matches!(
-        crate::tess::modulation_dsd::etat_pour(b.zone_id, Some(piste)),
-        Some(EtatModulation::EnService(_))
-    ));
+/// Énergie (RMS) du signal porté, par fenêtres de 64 octets DSD d'une voie.
+fn rms_porte(charge: &[u8], voie: usize) -> f64 {
+    let dsd: Vec<u8> = charge
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .flat_map(|t| [t[3 * voie + 1], t[3 * voie]])
+        .collect();
+    let moyennes: Vec<f64> = dsd
+        .chunks(64)
+        .map(|f| {
+            let uns: u32 = f.iter().map(|o| o.count_ones()).sum();
+            (2.0 * f64::from(uns) - 8.0 * f.len() as f64) / (8.0 * f.len() as f64)
+        })
+        .collect();
+    (moyennes.iter().map(|m| m * m).sum::<f64>() / moyennes.len() as f64).sqrt()
 }
 
-/// Sans Premium, l'étage n'est pas effectif : rien ne change (la résolution
-/// le dit `premium_required`), aucun état DSD n'est publié.
+/// Q9 : le volume de la zone s'applique juste avant le modulateur. À 50 %,
+/// la piste reste modulée (aucun repli, aucune relance) et porte la moitié
+/// du niveau ; en sourdine, rien ; `dsd_volume_protection` n'y change rien.
+#[tokio::test]
+async fn le_volume_s_applique_avant_le_modulateur() {
+    let b = banc(true, "dop").await;
+    let id = piste(&b, FLAC, "flac", 2);
+    ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd64)));
+    let plein = rms_porte(verifier_dop_stereo(&jouer(&b, id).await, 176_400), 0);
+    b.orch.playback.set_volume(b.zone_id, 0.5).await;
+    let j = jouer(&b, id).await;
+    assert!(matches!(j.etat(&b), Some(EtatModulation::EnService(_))));
+    let moitie = rms_porte(verifier_dop_stereo(&j, 176_400), 0);
+    let rapport = moitie / plein;
+    assert!((0.4..0.6).contains(&rapport), "rapport {rapport}");
+}
+
+/// Point 10 de la relecture : un master chaud (crête intersample à +3 dB)
+/// par la CHAÎNE COMPLÈTE (décodage, greffons, headroom, volume,
+/// modulateur). Headroom automatique (−3 dB) : le limiteur n'est jamais
+/// atteint. Contre-épreuve, headroom manuel à 0 dB : il l'est.
+#[tokio::test]
+async fn crete_intersample_par_la_chaine_complete() {
+    let b = banc(true, "dop").await;
+    let wav = crate::test_scratch::scratch_file("intersample-rc14", ".wav");
+    let trames = 44_100usize;
+    let mut w =
+        crate::audio::wav::build_wav_header_with_data_size(2, 44_100, 16, (trames * 4) as u32)
+            .to_vec();
+    for i in 0..trames {
+        let v = [32_767i16, 32_767, -32_767, -32_767][i % 4];
+        w.extend_from_slice(&v.to_le_bytes());
+        w.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(wav.path(), &w).unwrap();
+    let chemin = wav.path().to_string_lossy().to_string();
+    let id = piste(&b, &chemin, "wav", 2);
+    for (headroom, ecrete) in [
+        (Headroom::Auto {}, false),
+        (Headroom::Manual { db: 0.0 }, true),
+    ] {
+        chaine(&b, Some(dsd(TauxDsd::Dsd64)), headroom);
+        let j = jouer(&b, id).await;
+        verifier_dop_stereo(&j, 176_400);
+        let mut bilan = None;
+        for _ in 0..100 {
+            bilan = crate::tess::modulation_dsd::bilan(&j.stream_id);
+            if bilan.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let bilan = bilan.expect("bilan du flux");
+        assert_eq!(bilan.reinitialisations, 0, "{headroom:?}");
+        assert_eq!(bilan.ecretages > 0, ecrete, "{headroom:?} : {bilan:?}");
+    }
+}
+
+/// Sans Premium, l'étage n'est pas effectif : rien ne change.
 #[tokio::test]
 async fn sans_premium_rien_ne_change() {
     let b = banc(false, "dop").await;
+    let id = piste(&b, FLAC, "flac", 2);
     ecrire_chaine(&b, None);
-    let (_, reference, _) = jouer(&b).await;
+    let reference = jouer(&b, id).await.octets;
     ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd64)));
-    let (_, octets, piste) = jouer(&b).await;
-    assert!(octets == reference);
-    assert_eq!(
-        crate::tess::modulation_dsd::etat_pour(b.zone_id, Some(piste)),
-        None
-    );
+    let j = jouer(&b, id).await;
+    assert!(j.octets == reference);
+    assert_eq!(j.etat(&b), None);
 }
 
 /// Les capacités publiées d'une zone locale « dop » sans plafond : les trois

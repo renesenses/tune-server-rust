@@ -6,8 +6,11 @@
 //! # Le branchement
 //!
 //! ```text
-//! fichier PCM → décodage (entiers 32 bits) → greffons de la zone (f64, une
-//! quantification 32 bits, ~−186 dBFS) → f64 → ModulateurDsd (T11b)
+//! fichier PCM → décodage (entiers 32 bits, mono dupliqué en stéréo)
+//!   → greffons de la zone (f64, une quantification 32 bits, ~−186 dBFS) → f64
+//!   → headroom TESS et préampli gardé (gain fixe) → volume de la zone (rampe
+//!     10 ms, Q9) → ModulateurDsd (T11b : 0 dBFS = 50 % de modulation, soit
+//!     0 dB SACD ; limiteur à 60 %)
 //!   → DoP (WAV 24 bits, marqueurs 0x05/0xFA)  ┐ session du streamer,
 //!   → DSD brut (`audio::dsd_brut`, MSB-first) ┘ sortie locale inchangée
 //! ```
@@ -16,18 +19,17 @@
 //! un porteur DoP qu'elle reconnaît sur les octets (`is_dop_pcm` : DSP
 //! contourné, volume épinglé à l'unité), ou le flux DSD brut de son bras natif
 //! (ASIO `DsdU8`, ALSA `DSD_U32`). Aucun chemin de sortie n'est inventé ici.
+//! Le porteur est TOUJOURS stéréo : un DoP mono serait coupé par la sortie,
+//! qui ouvre deux voies (`rupture_du_porteur_dop`).
 //!
-//! # Le volume
+//! # Le volume (décision Q9 du 17/11)
 //!
-//! Le volume logiciel ne peut pas s'appliquer à un flux DSD à la sortie, et
-//! le producteur tourne plusieurs secondes en avance sur l'écoute : un volume
-//! « juste avant le modulateur » répondrait avec ce retard. La règle retenue
-//! est celle de la protection DSD existante (#8813,
-//! `zone_{id}_dsd_volume_protection`) : si la zone demande une atténuation
-//! logicielle (volume sous 100 %, sourdine, trim négatif), la piste part en
-//! PCM, motif [`MotifDsdRefuse::SoftwareVolumeActive`]. Le ReplayGain et le
-//! préampli de l'égaliseur, eux, sont appliqués dans le flux, avant le
-//! modulateur : ils ne déclenchent pas la protection.
+//! Le volume de la zone s'applique JUSTE AVANT le modulateur
+//! ([`ProducteurDsd::definir_volume`], rampe de 10 ms de T11b), relu à chaque
+//! bloc par le producteur. Il répond avec le retard du tampon (≈ 1 s) : c'est
+//! la « réponse plus lente acceptée » de Q9. Une baisse de volume ou la
+//! sourdine ne relancent donc rien. La protection #8813 reste celle des
+//! FICHIERS DSD, qui n'ont pas d'échantillon où appliquer le volume.
 //!
 //! # Refus ou repli
 //!
@@ -35,15 +37,35 @@
 //! `dsd_not_supported_by_output`) : la chaîne enregistrée ne change pas, donc
 //! le suréchantillonnage PCM en place n'est jamais éteint par un choix DSD
 //! impossible. À la lecture, ce qui ne se sait qu'avec la piste (cadence non
-//! modulable, volume, machine) retombe en PCM, et le chemin du signal le dit
-//! ([`EtatModulation::Repli`]). Jamais de silence, jamais de DoP vers un DAC
-//! que la zone n'a pas déclaré DSD (`dsd_mode` à `dop` ou `native`).
+//! modulable, voies, machine, porteur refusé par le périphérique) retombe en
+//! PCM, et le chemin du signal le dit ([`EtatModulation::Repli`]). Jamais de
+//! silence, jamais de DoP vers un DAC que la zone n'a pas déclaré DSD
+//! (`dsd_mode` à `dop` ou `native`).
+//!
+//! Un repli en PCM joue au niveau du PCM : environ +6 dB par rapport au
+//! même passage modulé (0 dBFS = 0 dB SACD = 50 % de modulation), +9 dB avec
+//! le headroom automatique. Compensation possible, NON appliquée : atténuer
+//! de 6 dB (9 dB) au rendu une piste repliée d'une zone vers le DSD.
+//!
+//! # Enchaînements
+//!
+//! Entre deux pistes modulées de même famille et de même cadence, l'état du
+//! modulateur et du suréchantillonneur passe d'une piste à l'autre
+//! ([`deposer_pour_la_suite`], [`reprendre_la_suite`]) : ni silence de
+//! clôture, ni marche. Chaque piste émet un nombre PAIR de trames DoP (la
+//! trame impaire attend la piste suivante) : toute piste commence par 0x05.
+//! Une piste sans suite perd ce qui restait dans le filtre (≈ 1 ms) et au plus
+//! une trame DoP (≈ 6 µs).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tune_plugin_audio_support::modulateur_dsd::{CadenceDsd, ErreurModulateur, ModulateurDsd};
+use tune_plugin_audio_support::modulateur_dsd::{
+    CadenceDsd, ErreurModulateur, ModulateurDsd, NIVEAU_REFERENCE,
+};
 
 use crate::audio::dsd_to_dop::DsdToDoP;
 
@@ -52,9 +74,15 @@ use super::chaine::TauxDsd;
 /// Ordre de la boucle sigma-delta publiée au chemin du signal.
 pub const ORDRE_DU_MODULATEUR: usize = tune_plugin_audio_support::modulateur_dsd::ORDRE;
 
+/// Modulation portée par 0 dBFS PCM : 50 %, le « 0 dB SACD » (T11b).
+pub const MODULATION_A_0_DBFS: f64 = NIVEAU_REFERENCE;
+
 /// Plafond DoP d'une sortie locale (#8789) : le DSD256 des deux familles.
 pub const PLAFOND_DOP_44K1: u32 = 705_600;
 pub const PLAFOND_DOP_48K: u32 = 768_000;
+
+/// Voies du porteur : toujours la stéréo (voir l'en-tête).
+pub const VOIES_DU_PORTEUR: u16 = 2;
 
 /// Marge de temps réel exigée de la machine, pour deux voies : le modulateur
 /// doit tourner au moins deux fois plus vite que l'écoute (décodage, greffons
@@ -85,19 +113,19 @@ pub enum MotifDsdRefuse {
     /// Ni natif, et le DoP dépasserait le plafond de cadence de la zone (ou
     /// le plafond DoP local du DSD256).
     RateAboveZoneMax,
-    /// La sortie a refusé un porteur DoP à cette cadence (sonde WASAPI).
+    /// La sortie a refusé un porteur DoP à cette cadence (sonde WASAPI
+    /// exclusive).
     DopRefusedByOutput,
+    /// Le périphérique a déjà été ouvert à une autre cadence que celle du
+    /// porteur (rééchantillonnage, qui détruit les marqueurs) : constat retenu.
+    CarrierRateNotSupported,
     /// La machine ne tient pas cette cadence avec la marge exigée.
     MachineTooSlow,
     /// À la lecture : la cadence de la piste n'est pas 44,1 ou 48 kHz × 2ⁿ
     /// avec un rapport d'au moins 8 vers la cible.
     SourceRateNotModulable,
-    /// À la lecture : nombre de voies que le modulateur ou la sortie ne prend
-    /// pas.
+    /// À la lecture : plus de deux voies (le porteur est stéréo).
     ChannelsNotSupported,
-    /// À la lecture : la protection du niveau DSD (#8813) — une atténuation
-    /// logicielle est demandée, le DSD la perdrait.
-    SoftwareVolumeActive,
     /// À la lecture : construction du modulateur impossible.
     ModulatorFailed,
     #[serde(other)]
@@ -111,10 +139,10 @@ impl MotifDsdRefuse {
             Self::DsdModeNotEnabled => "dsd_mode_not_enabled",
             Self::RateAboveZoneMax => "rate_above_zone_max",
             Self::DopRefusedByOutput => "dop_refused_by_output",
+            Self::CarrierRateNotSupported => "carrier_rate_not_supported",
             Self::MachineTooSlow => "machine_too_slow",
             Self::SourceRateNotModulable => "source_rate_not_modulable",
             Self::ChannelsNotSupported => "channels_not_supported",
-            Self::SoftwareVolumeActive => "software_volume_active",
             Self::ModulatorFailed => "modulator_failed",
             Self::Unknown => "unknown",
         }
@@ -126,10 +154,10 @@ impl MotifDsdRefuse {
         Self::DsdModeNotEnabled,
         Self::RateAboveZoneMax,
         Self::DopRefusedByOutput,
+        Self::CarrierRateNotSupported,
         Self::MachineTooSlow,
         Self::SourceRateNotModulable,
         Self::ChannelsNotSupported,
-        Self::SoftwareVolumeActive,
         Self::ModulatorFailed,
     ];
 }
@@ -152,13 +180,14 @@ pub fn cadence_hz(taux: TauxDsd, famille_48k: bool) -> Option<u32> {
 }
 
 /// Ce que l'hôte sait de la sortie de la zone, pour décider (fonctions pures
-/// ci-dessous). Les deux fermetures portent les sondes de l'orchestrateur :
+/// ci-dessous). Les fermetures portent les sondes de l'orchestrateur :
 ///
 /// - `natif(cadence_dsd, voies)` : `Ok` si la sortie part en DSD natif à
 ///   cette cadence (règle de `decider_dsd_natif_local_voies`), sinon le
 ///   libellé du motif natif (publié à titre d'information) ;
-/// - `dop_refuse(cadence_dop, voies)` : la sortie a-t-elle REFUSÉ un porteur
-///   DoP à cette cadence (réponse connue d'une sonde) ?
+/// - `dop_refuse(cadence_dop, voies)` : le motif si la sortie a déjà REFUSÉ
+///   un porteur DoP à cette cadence (sonde exclusive, ou rupture constatée à
+///   l'ouverture : [`rupture_connue`]).
 pub struct FaitsSortieDsd<'a> {
     pub sortie_locale: bool,
     /// `zones.dsd_mode` : `auto`, `native`, `dop`, `pcm`…
@@ -166,10 +195,10 @@ pub struct FaitsSortieDsd<'a> {
     /// Plafond de cadence de la zone, catalogue compris (`zone_max_sample_rate`).
     pub plafond_zone_hz: Option<u32>,
     pub natif: &'a dyn Fn(u32, u16) -> Result<(), &'static str>,
-    pub dop_refuse: &'a dyn Fn(u32, u16) -> bool,
+    pub dop_refuse: &'a dyn Fn(u32, u16) -> Option<MotifDsdRefuse>,
     /// Facteurs de temps réel mesurés (stéréo) pour DSD64, 128, 256 ; `None`
     /// tant que la machine n'est pas mesurée (rien n'est alors refusé pour ce
-    /// motif : la lecture le mesure avant de lancer).
+    /// motif : la lecture la mesure avant de lancer).
     pub temps_reel: Option<[f64; 3]>,
 }
 
@@ -182,33 +211,29 @@ fn rang(taux: TauxDsd) -> Option<usize> {
     }
 }
 
-/// La machine tient-elle `taux` sur `voies` voies avec la marge ?
-pub fn machine_tient(temps_reel: Option<[f64; 3]>, taux: TauxDsd, voies: u16) -> bool {
+/// La machine tient-elle `taux` en stéréo avec la marge ?
+pub fn machine_tient(temps_reel: Option<[f64; 3]>, taux: TauxDsd) -> bool {
     let (Some(mesure), Some(i)) = (temps_reel, rang(taux)) else {
         return true;
     };
-    let exige = MARGE_TEMPS_REEL * f64::from(voies.max(1)) / 2.0;
-    mesure[i] >= exige
+    mesure[i] >= MARGE_TEMPS_REEL
 }
 
-/// Décision d'UNE cadence DSD (Hz) sur `voies` voies : le transport, ou le
-/// motif du refus. Pure.
+/// Décision d'UNE cadence DSD (Hz) pour le porteur stéréo : le transport, ou
+/// le motif du refus. Pure.
 pub fn decider_cadence(
     faits: &FaitsSortieDsd<'_>,
     taux: TauxDsd,
     cadence_dsd: u32,
-    voies: u16,
 ) -> Result<TransportModulation, MotifDsdRefuse> {
+    let voies = VOIES_DU_PORTEUR;
     if !faits.sortie_locale {
         return Err(MotifDsdRefuse::OutputNotLocal);
     }
     if !matches!(faits.dsd_mode, "native" | "dop") {
         return Err(MotifDsdRefuse::DsdModeNotEnabled);
     }
-    if voies == 0 || voies > 8 {
-        return Err(MotifDsdRefuse::ChannelsNotSupported);
-    }
-    if !machine_tient(faits.temps_reel, taux, voies) {
+    if !machine_tient(faits.temps_reel, taux) {
         return Err(MotifDsdRefuse::MachineTooSlow);
     }
     if faits.dsd_mode == "native" && (faits.natif)(cadence_dsd, voies).is_ok() {
@@ -226,8 +251,8 @@ pub fn decider_cadence(
     if cadence_dop > plafond {
         return Err(MotifDsdRefuse::RateAboveZoneMax);
     }
-    if (faits.dop_refuse)(cadence_dop, voies) {
-        return Err(MotifDsdRefuse::DopRefusedByOutput);
+    if let Some(motif) = (faits.dop_refuse)(cadence_dop, voies) {
+        return Err(motif);
     }
     Ok(TransportModulation::Dop)
 }
@@ -268,10 +293,13 @@ pub struct CapacitesDsd {
     pub output_local: bool,
     /// Ordre de la boucle sigma-delta (T11b).
     pub modulator_order: usize,
-    /// Le volume logiciel n'est pas appliqué en DSD : la protection du niveau
-    /// (`software_volume_active`) fait partir en PCM une piste dont la zone
-    /// demande une atténuation logicielle.
-    pub volume_protection: bool,
+    /// Niveau de référence : 0 dBFS PCM = 50 % de modulation (0 dB SACD).
+    pub reference_level: String,
+    /// Le volume de la zone s'applique juste avant le modulateur (Q9).
+    pub volume_placement: String,
+    /// La machine a-t-elle été mesurée ? Tant que non, `machine_too_slow`
+    /// n'est jamais rendu (la lecture mesure avant de lancer).
+    pub machine_measured: bool,
     pub targets: Vec<CapaciteCible>,
 }
 
@@ -283,10 +311,12 @@ impl CapacitesDsd {
 
 fn famille(faits: &FaitsSortieDsd<'_>, taux: TauxDsd, famille_48k: bool) -> CapaciteFamille {
     let rate_hz = cadence_hz(taux, famille_48k).unwrap_or(0);
-    let decision = decider_cadence(faits, taux, rate_hz, 2);
+    let decision = decider_cadence(faits, taux, rate_hz);
     let native_reason = match decision {
         Ok(TransportModulation::Dop) if faits.dsd_mode == "native" => {
-            (faits.natif)(rate_hz, 2).err().map(str::to_owned)
+            (faits.natif)(rate_hz, VOIES_DU_PORTEUR)
+                .err()
+                .map(str::to_owned)
         }
         _ => None,
     };
@@ -301,13 +331,15 @@ fn famille(faits: &FaitsSortieDsd<'_>, taux: TauxDsd, famille_48k: bool) -> Capa
     }
 }
 
-/// Les capacités des trois cibles, en stéréo. Pure.
-pub fn capacites(faits: &FaitsSortieDsd<'_>, volume_protection: bool) -> CapacitesDsd {
+/// Les capacités des trois cibles. Pure.
+pub fn capacites(faits: &FaitsSortieDsd<'_>) -> CapacitesDsd {
     CapacitesDsd {
         dsd_mode: faits.dsd_mode.to_owned(),
         output_local: faits.sortie_locale,
         modulator_order: ORDRE_DU_MODULATEUR,
-        volume_protection,
+        reference_level: "0 dBFS = 50 % modulation (0 dB SACD)".into(),
+        volume_placement: "before_dsd_modulator".into(),
+        machine_measured: faits.temps_reel.is_some(),
         targets: [TauxDsd::Dsd64, TauxDsd::Dsd128, TauxDsd::Dsd256]
             .into_iter()
             .map(|rate| CapaciteCible {
@@ -325,6 +357,9 @@ pub struct PlanModulation {
     pub taux: TauxDsd,
     pub cadence_pcm: u32,
     pub cadence_dsd: u32,
+    /// Voies de la source (1 ou 2).
+    pub voies_source: u16,
+    /// Voies du porteur : toujours [`VOIES_DU_PORTEUR`].
     pub voies: u16,
     pub transport: TransportModulation,
 }
@@ -338,40 +373,59 @@ impl PlanModulation {
             TransportModulation::Native => self.cadence_dsd,
         }
     }
+
+    /// Deux plans dont le flux peut continuer sans rupture.
+    pub fn enchaine_sur(&self, autre: &Self) -> bool {
+        self.cadence_pcm == autre.cadence_pcm
+            && self.cadence_dsd == autre.cadence_dsd
+            && self.voies == autre.voies
+            && self.transport == autre.transport
+    }
 }
 
-/// Décision d'une PISTE PCM à `cadence_pcm` Hz et `voies` voies vers `taux`.
-/// Pure.
+/// Décision d'une PISTE PCM à `cadence_pcm` Hz et `voies_source` voies vers
+/// `taux`. Une source mono est portée en stéréo (voie dupliquée) ; plus de
+/// deux voies repartent en PCM. Pure.
 pub fn planifier(
     faits: &FaitsSortieDsd<'_>,
     taux: TauxDsd,
     cadence_pcm: u32,
-    voies: u16,
+    voies_source: u16,
 ) -> Result<PlanModulation, MotifDsdRefuse> {
+    if !(1..=2).contains(&voies_source) {
+        return Err(MotifDsdRefuse::ChannelsNotSupported);
+    }
     let cadence = cadence_du_taux(taux).ok_or(MotifDsdRefuse::Unknown)?;
     let cadence_dsd = cadence
         .cadence_pour(cadence_pcm)
         .ok_or(MotifDsdRefuse::SourceRateNotModulable)?;
-    let transport = decider_cadence(faits, taux, cadence_dsd, voies)?;
+    let transport = decider_cadence(faits, taux, cadence_dsd)?;
     Ok(PlanModulation {
         taux,
         cadence_pcm,
         cadence_dsd,
-        voies,
+        voies_source,
+        voies: VOIES_DU_PORTEUR,
         transport,
     })
 }
 
 // ── Producteur ──────────────────────────────────────────────────────
 
-/// PCM `f64` entrelacé → octets du porteur (DoP 24 bits LE ou DSD brut
-/// MSB-first). Hors du fil audio : il tourne sur le fil du producteur de la
-/// session, et seul [`ModulateurDsd::traiter`] est garanti sans allocation.
+/// PCM `f64` stéréo entrelacé → octets du porteur (DoP 24 bits LE ou DSD
+/// brut MSB-first). Hors du fil audio : il tourne sur le fil du producteur de
+/// la session ; seul [`ModulateurDsd::traiter`] est garanti sans allocation.
 pub struct ProducteurDsd {
     plan: PlanModulation,
     modulateur: ModulateurDsd,
     dop: Option<DsdToDoP>,
     dsd: Vec<u8>,
+    /// DoP : octets DSD d'une trame DoP impaire, qui attendent la suivante
+    /// (chaque piste émet un nombre pair de trames).
+    en_attente: Vec<u8>,
+    /// Gain fixe avant le volume : headroom TESS, préampli gardé (≤ 1).
+    gain_fixe: f64,
+    tampon: Vec<f64>,
 }
 
 impl ProducteurDsd {
@@ -386,11 +440,25 @@ impl ProducteurDsd {
             modulateur,
             dop,
             dsd: Vec::new(),
+            en_attente: Vec::new(),
+            gain_fixe: 1.0,
+            tampon: Vec::new(),
         })
     }
 
     pub fn plan(&self) -> PlanModulation {
         self.plan
+    }
+
+    /// Enchaînement : le même modulateur continue sur `plan` s'il est
+    /// compatible (même cadence PCM, même cadence DSD, même transport).
+    /// Sinon `None` (l'état est abandonné : la piste part d'un modulateur neuf).
+    pub fn continuer(mut self, plan: PlanModulation) -> Option<Self> {
+        if !self.plan.enchaine_sur(&plan) {
+            return None;
+        }
+        self.plan = plan;
+        Some(self)
     }
 
     /// Le premier bloc de la session : l'en-tête WAV 24 bits du porteur DoP
@@ -411,33 +479,50 @@ impl ProducteurDsd {
         }
     }
 
-    /// Module `pcm` (trames entières, pleine échelle ±1,0) et AJOUTE le
-    /// porteur à `sortie`.
+    /// Volume linéaire de la zone (1,0 = 0 dB), juste avant le modulateur,
+    /// atteint par une rampe de 10 ms (T11b) ; plafonné à 0 dB.
+    pub fn definir_volume(&mut self, gain: f64) {
+        self.modulateur.definir_volume(gain);
+    }
+
+    /// Gain fixe (headroom, préampli gardé), appliqué avant le volume.
+    pub fn definir_gain_fixe(&mut self, gain: f64) {
+        if gain.is_finite() && gain >= 0.0 {
+            self.gain_fixe = gain.min(1.0);
+        }
+    }
+
+    pub fn gain_fixe(&self) -> f64 {
+        self.gain_fixe
+    }
+
+    /// Module `pcm` (trames stéréo entières, pleine échelle ±1,0) et AJOUTE
+    /// le porteur à `sortie`.
     pub fn moduler(&mut self, pcm: &[f64], sortie: &mut Vec<u8>) -> Result<(), ErreurModulateur> {
         let canaux = usize::from(self.plan.voies);
         let trames = pcm.len() / canaux.max(1);
+        let pcm = &pcm[..trames * canaux];
+        let entree: &[f64] = if self.gain_fixe == 1.0 {
+            pcm
+        } else {
+            self.tampon.clear();
+            let g = self.gain_fixe;
+            self.tampon.extend(pcm.iter().map(|x| x * g));
+            &self.tampon
+        };
         let besoin = self.modulateur.octets_pour(trames);
         self.dsd.resize(besoin, 0);
-        let n = self
-            .modulateur
-            .traiter(&pcm[..trames * canaux], &mut self.dsd)?;
+        let n = self.modulateur.traiter(entree, &mut self.dsd)?;
         match self.dop.as_mut() {
-            Some(dop) => sortie.extend_from_slice(&dop.feed(&self.dsd[..n])),
+            Some(dop) => {
+                // Deux trames DoP à la fois : le compte reste pair.
+                let paire = 4 * canaux;
+                self.en_attente.extend_from_slice(&self.dsd[..n]);
+                let pret = self.en_attente.len() / paire * paire;
+                sortie.extend_from_slice(&dop.feed(&self.en_attente[..pret]));
+                self.en_attente.drain(..pret);
+            }
             None => sortie.extend_from_slice(&self.dsd[..n]),
-        }
-        Ok(())
-    }
-
-    /// Fin de piste : vide le retard du suréchantillonneur (quelques
-    /// dizaines de trames de silence, environ 1 ms) puis clôt le DoP sur un
-    /// nombre pair de trames (#7704).
-    pub fn terminer(&mut self, sortie: &mut Vec<u8>) -> Result<(), ErreurModulateur> {
-        let rapport = self.modulateur.rapport().max(1) as f64;
-        let trames = (self.modulateur.retard_dsd() / rapport).ceil() as usize + 1;
-        let silence = vec![0.0; trames * usize::from(self.plan.voies)];
-        self.moduler(&silence, sortie)?;
-        if let Some(dop) = self.dop.as_mut() {
-            sortie.extend_from_slice(&dop.terminer());
         }
         Ok(())
     }
@@ -451,33 +536,156 @@ impl ProducteurDsd {
     pub fn entree_max(&self) -> f64 {
         self.modulateur.entree_max()
     }
+
+    /// Échantillons DSD ramenés par le limiteur de sécurité (±60 %).
+    pub fn ecretages(&self) -> u64 {
+        self.modulateur.ecretages()
+    }
+}
+
+// ── Enchaînements ───────────────────────────────────────────────────
+
+struct Suite {
+    generation: u64,
+    producteur: ProducteurDsd,
+    depose: Instant,
+}
+
+#[derive(Default)]
+struct Continuites {
+    generations: HashMap<i64, u64>,
+    suites: HashMap<i64, Suite>,
+}
+
+fn continuites() -> &'static Mutex<Continuites> {
+    static C: OnceLock<Mutex<Continuites>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// Durée au-delà de laquelle un état déposé ne continue plus rien.
+const SUITE_PERIMEE: Duration = Duration::from_secs(120);
+
+/// Une nouvelle piste modulée sur la zone : sa génération.
+pub fn ouvrir_une_generation(zone_id: i64) -> u64 {
+    let mut c = continuites().lock().unwrap_or_else(|e| e.into_inner());
+    let g = c.generations.entry(zone_id).or_insert(0);
+    *g += 1;
+    *g
+}
+
+/// Fin NORMALE d'une piste : son état attend la piste suivante.
+pub fn deposer_pour_la_suite(zone_id: i64, generation: u64, producteur: ProducteurDsd) {
+    let mut c = continuites().lock().unwrap_or_else(|e| e.into_inner());
+    c.suites.insert(
+        zone_id,
+        Suite {
+            generation,
+            producteur,
+            depose: Instant::now(),
+        },
+    );
+}
+
+/// L'état de la piste IMMÉDIATEMENT précédente (génération − 1), s'il est
+/// déjà déposé, récent et compatible avec `plan`. Sinon `None` : la piste
+/// part d'un modulateur neuf.
+pub fn reprendre_la_suite(
+    zone_id: i64,
+    generation: u64,
+    plan: PlanModulation,
+) -> Option<ProducteurDsd> {
+    let mut c = continuites().lock().unwrap_or_else(|e| e.into_inner());
+    let suite = c.suites.remove(&zone_id)?;
+    if suite.generation + 1 != generation || suite.depose.elapsed() > SUITE_PERIMEE {
+        return None;
+    }
+    suite.producteur.continuer(plan)
+}
+
+// ── Ruptures constatées par la sortie ───────────────────────────────
+
+type Ruptures = HashMap<String, Vec<(u32, u16, Instant)>>;
+
+fn ruptures() -> &'static Mutex<Ruptures> {
+    static R: OnceLock<Mutex<Ruptures>> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// La sortie locale `peripherique` a dû rééchantillonner (ou adapter les
+/// voies d') un porteur DoP à `cadence` Hz : retenu pour les décisions
+/// suivantes (`carrier_rate_not_supported`).
+pub fn noter_rupture(peripherique: &str, cadence: u32, voies: u16) {
+    let mut r = ruptures().lock().unwrap_or_else(|e| e.into_inner());
+    let v = r.entry(peripherique.to_owned()).or_default();
+    v.retain(|(c, n, _)| (*c, *n) != (cadence, voies));
+    v.push((cadence, voies, Instant::now()));
+}
+
+/// Cette cadence de porteur a-t-elle déjà été refusée par le périphérique ?
+pub fn rupture_connue(peripherique: &str, cadence: u32, voies: u16) -> bool {
+    let r = ruptures().lock().unwrap_or_else(|e| e.into_inner());
+    r.get(peripherique)
+        .is_some_and(|v| v.iter().any(|(c, n, _)| (*c, *n) == (cadence, voies)))
+}
+
+/// Une rupture a-t-elle été constatée sur ce périphérique depuis `depuis` ?
+pub fn rupture_recente(peripherique: &str, depuis: Duration) -> bool {
+    let r = ruptures().lock().unwrap_or_else(|e| e.into_inner());
+    r.get(peripherique)
+        .is_some_and(|v| v.iter().any(|(_, _, t)| t.elapsed() <= depuis))
 }
 
 // ── Mesure de la machine ────────────────────────────────────────────
 
-fn mesure_retenue() -> &'static Mutex<Option<[f64; 3]>> {
-    static M: OnceLock<Mutex<Option<[f64; 3]>>> = OnceLock::new();
+struct Mesure {
+    facteurs: [f64; 3],
+    quand: Instant,
+}
+
+fn mesure_retenue() -> &'static Mutex<Option<Mesure>> {
+    static M: OnceLock<Mutex<Option<Mesure>>> = OnceLock::new();
     M.get_or_init(|| Mutex::new(None))
 }
 
+static MESURE_EN_COURS: AtomicBool = AtomicBool::new(false);
+
+/// Une mesure qui refuse une cadence est refaite au plus tôt après ce délai
+/// (elle a pu être prise sous charge).
+const NOUVELLE_MESURE_APRES: Duration = Duration::from_secs(600);
+
+/// Passes de mesure : la meilleure est retenue.
+const PASSES: usize = 3;
+
 /// La mesure retenue (facteurs de temps réel stéréo, DSD64/128/256).
 pub fn mesure_de_la_machine() -> Option<[f64; 3]> {
-    *mesure_retenue().lock().unwrap_or_else(|e| e.into_inner())
+    mesure_retenue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|m| m.facteurs)
 }
 
 /// Retient une mesure (production : [`mesurer_la_machine`] ; bancs et tests
 /// d'intégration : une valeur imposée).
 pub fn retenir_mesure_de_la_machine(facteurs: [f64; 3]) {
-    *mesure_retenue().lock().unwrap_or_else(|e| e.into_inner()) = Some(facteurs);
+    *mesure_retenue().lock().unwrap_or_else(|e| e.into_inner()) = Some(Mesure {
+        facteurs,
+        quand: Instant::now(),
+    });
 }
 
-/// BLOQUANT (≈ 0,1 s sur un serveur, ≈ 1 s sur un Pi 4) : module 0,25 s de
-/// stéréo 44,1 kHz à chaque cadence et retient le facteur de temps réel. Une
-/// mesure déjà retenue est rendue sans recalcul.
-pub fn mesurer_la_machine() -> [f64; 3] {
-    if let Some(m) = mesure_de_la_machine() {
-        return m;
+fn mesure_a_refaire() -> bool {
+    match &*mesure_retenue().lock().unwrap_or_else(|e| e.into_inner()) {
+        None => true,
+        Some(m) => {
+            m.facteurs.iter().any(|f| *f < MARGE_TEMPS_REEL)
+                && m.quand.elapsed() >= NOUVELLE_MESURE_APRES
+        }
     }
+}
+
+/// Une passe : 0,25 s de stéréo 44,1 kHz modulée à chaque cadence.
+fn une_passe() -> [f64; 3] {
     const TRAMES: usize = 11_025;
     let pcm: Vec<f64> = (0..TRAMES)
         .flat_map(|i| {
@@ -494,24 +702,60 @@ pub fn mesurer_la_machine() -> [f64; 3] {
             continue;
         };
         let mut sortie = vec![0u8; m.octets_pour(TRAMES)];
-        let debut = std::time::Instant::now();
+        let debut = Instant::now();
         let _ = m.traiter(&pcm, &mut sortie);
         let duree = debut.elapsed().as_secs_f64().max(1e-6);
         facteurs[i] = (TRAMES as f64 / 44_100.0) / duree;
     }
+    facteurs
+}
+
+/// BLOQUANT (≈ 0,3 s sur un serveur, ≈ 3 s sur un Pi 4) : [`PASSES`] passes,
+/// la meilleure par cadence (une passe prise sous charge ne condamne pas la
+/// machine), fusionnée avec la mesure précédente. Une mesure récente et
+/// suffisante est rendue sans recalcul.
+pub fn mesurer_la_machine() -> [f64; 3] {
+    if !mesure_a_refaire()
+        && let Some(m) = mesure_de_la_machine()
+    {
+        return m;
+    }
+    let mut meilleurs = mesure_de_la_machine().unwrap_or([0.0; 3]);
+    for _ in 0..PASSES {
+        for (m, f) in meilleurs.iter_mut().zip(une_passe()) {
+            *m = m.max(f);
+        }
+    }
     tracing::info!(
-        dsd64 = facteurs[0],
-        dsd128 = facteurs[1],
-        dsd256 = facteurs[2],
+        dsd64 = meilleurs[0],
+        dsd128 = meilleurs[1],
+        dsd256 = meilleurs[2],
         "tess_dsd_machine_mesuree"
     );
-    retenir_mesure_de_la_machine(facteurs);
-    facteurs
+    retenir_mesure_de_la_machine(meilleurs);
+    meilleurs
+}
+
+/// Lance la mesure en tâche de fond si elle manque (ou est à refaire) et
+/// rend tout de suite : les routes ne l'attendent jamais.
+pub fn lancer_la_mesure_en_fond() {
+    if !mesure_a_refaire() || MESURE_EN_COURS.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let lance = std::thread::Builder::new()
+        .name("tess-dsd-mesure".into())
+        .spawn(|| {
+            mesurer_la_machine();
+            MESURE_EN_COURS.store(false, Ordering::SeqCst);
+        });
+    if lance.is_err() {
+        MESURE_EN_COURS.store(false, Ordering::SeqCst);
+    }
 }
 
 // ── Ce qui tourne (chemin du signal) ────────────────────────────────
 
-/// Le modulateur en service sur une piste, publié au chemin du signal.
+/// Le modulateur en service sur un flux, publié au chemin du signal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModulationEnService {
     pub rate: TauxDsd,
@@ -521,10 +765,15 @@ pub struct ModulationEnService {
     /// Cadence du flux qui part (DoP : cadence / 16 ; natif : cadence DSD).
     pub carrier_rate_hz: u32,
     pub source_rate_hz: u32,
+    pub source_channels: u16,
     pub channels: u16,
     /// Les greffons de la zone sont-ils appliqués dans le flux (égaliseur,
-    /// convolution, crossfeed) ?
+    /// convolution, crossfeed, repli mono) ?
     pub plugins_in_stream: bool,
+    /// Headroom TESS appliqué avant le modulateur (dB ≤ 0).
+    pub headroom_db: f64,
+    /// Le flux continue l'état de la piste précédente (enchaînement).
+    pub continued: bool,
 }
 
 /// L'état de la modulation DSD d'une piste.
@@ -535,42 +784,95 @@ pub enum EtatModulation {
     Repli(MotifDsdRefuse),
 }
 
-type Registre = HashMap<i64, Vec<(Option<i64>, EtatModulation)>>;
+/// Ce qui identifie le flux d'une décision : la session (modulée), ou la
+/// piste seule (repli : la session PCM n'existe pas encore).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleFlux {
+    pub track_id: Option<i64>,
+    pub stream_id: Option<String>,
+}
+
+type Registre = HashMap<i64, Vec<(CleFlux, EtatModulation)>>;
 
 fn registre() -> &'static Mutex<Registre> {
     static R: OnceLock<Mutex<Registre>> = OnceLock::new();
     R.get_or_init(Default::default)
 }
 
-/// Retient l'état de la piste `track_id` sur la zone (les deux dernières
-/// pistes : la piste en cours et la suivante préparée).
-pub fn noter(zone_id: i64, track_id: Option<i64>, etat: EtatModulation) {
+/// Entrées gardées par zone : le flux en cours, le suivant préparé, et les
+/// replis récents.
+const ENTREES_PAR_ZONE: usize = 4;
+
+/// Retient l'état d'un flux de la zone.
+pub fn noter(zone_id: i64, cle: CleFlux, etat: EtatModulation) {
     let mut r = registre().lock().unwrap_or_else(|e| e.into_inner());
     let v = r.entry(zone_id).or_default();
-    v.retain(|(t, _)| *t != track_id);
-    v.push((track_id, etat));
-    if v.len() > 2 {
+    v.retain(|(c, _)| *c != cle);
+    v.push((cle, etat));
+    if v.len() > ENTREES_PAR_ZONE {
         v.remove(0);
     }
 }
 
-/// L'état retenu pour la piste qui joue ; `None` : la chaîne ne demande pas
-/// le DSD, ou rien n'a été décidé pour cette piste.
-pub fn etat_pour(zone_id: i64, track_id: Option<i64>) -> Option<EtatModulation> {
+/// L'état du flux qui joue : d'abord par sa session (un flux modulé), puis,
+/// pour un repli, par la piste. `None` : rien n'a été décidé pour ce flux.
+pub fn etat_pour(
+    zone_id: i64,
+    stream_id: Option<&str>,
+    track_id: Option<i64>,
+) -> Option<EtatModulation> {
     let r = registre().lock().unwrap_or_else(|e| e.into_inner());
-    r.get(&zone_id)?
-        .iter()
+    let v = r.get(&zone_id)?;
+    if let Some(s) = stream_id
+        && let Some((_, e)) = v
+            .iter()
+            .rev()
+            .find(|(c, _)| c.stream_id.as_deref() == Some(s))
+    {
+        return Some(e.clone());
+    }
+    v.iter()
         .rev()
-        .find(|(t, _)| *t == track_id)
+        .find(|(c, e)| {
+            c.stream_id.is_none() && c.track_id == track_id && matches!(e, EtatModulation::Repli(_))
+        })
         .map(|(_, e)| e.clone())
 }
 
-/// Oublie l'état d'une piste (décision sans DSD).
+/// Oublie le repli retenu pour une piste (décision sans DSD).
 pub fn oublier(zone_id: i64, track_id: Option<i64>) {
     let mut r = registre().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(v) = r.get_mut(&zone_id) {
-        v.retain(|(t, _)| *t != track_id);
+        v.retain(|(c, _)| !(c.stream_id.is_none() && c.track_id == track_id));
     }
+}
+
+/// Le bilan d'un flux modulé terminé.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BilanDuFlux {
+    pub reinitialisations: u64,
+    pub ecretages: u64,
+    pub entree_max: f64,
+}
+
+fn bilans() -> &'static Mutex<Vec<(String, BilanDuFlux)>> {
+    static B: OnceLock<Mutex<Vec<(String, BilanDuFlux)>>> = OnceLock::new();
+    B.get_or_init(Default::default)
+}
+
+/// Retient le bilan d'un flux (les 16 derniers).
+pub fn noter_bilan(stream_id: &str, bilan: BilanDuFlux) {
+    let mut b = bilans().lock().unwrap_or_else(|e| e.into_inner());
+    b.retain(|(s, _)| s != stream_id);
+    b.push((stream_id.to_owned(), bilan));
+    if b.len() > 16 {
+        b.remove(0);
+    }
+}
+
+pub fn bilan(stream_id: &str) -> Option<BilanDuFlux> {
+    let b = bilans().lock().unwrap_or_else(|e| e.into_inner());
+    b.iter().find(|(s, _)| s == stream_id).map(|(_, x)| *x)
 }
 
 #[cfg(test)]

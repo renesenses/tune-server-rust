@@ -8737,6 +8737,9 @@ impl OutputTarget for LocalOutput {
                     return false;
                 };
                 rupture.journaliser(&device_name);
+                // rc14 — retenu pour la modulation DSD de TESS : ce porteur
+                // ne repartira plus vers ce périphérique (repli PCM dit).
+                crate::tess::modulation_dsd::noter_rupture(&device_name, src_sr, src_ch);
                 if let Ok(mut slot) = open_failure.lock() {
                     *slot = Some(rupture.message_utilisateur(&device_name));
                 }
