@@ -347,6 +347,9 @@ fn membres_remplacants(
         .iter()
         .enumerate()
         .filter(|(_, m)| !m.enabled)
+        // rc14 — une façade de l'égaliseur écartée ne reprend jamais la place :
+        // le moteur n'applique que la première façade COCHÉE.
+        .filter(|(_, m)| !super::migration::FACADES_EQ.contains(&m.id.as_str()))
         .filter_map(|(i, m)| {
             let gagnant = m
                 .settings
@@ -799,6 +802,40 @@ mod tests {
     }
 
     #[test]
+    fn une_chaine_ancienne_a_deux_egaliseurs_coches_n_applique_que_le_premier_rc14() {
+        let c = ChaineTess {
+            plugins: vec![
+                maillon("equalizer-graphic", true),
+                maillon("crossfeed", true),
+                maillon("equalizer-parametric", true),
+            ],
+            ..ChaineTess::default()
+        };
+        let r = resoudre(&c, &ctx(TransportZone::Local));
+        assert!(greffon(&r, "equalizer-graphic").effective);
+        assert!(greffon(&r, "crossfeed").effective);
+        let p = greffon(&r, "equalizer-parametric");
+        assert!(p.requested && !p.effective);
+        assert_eq!(p.reason, Some(MotifEtape::ReplacedInGroup));
+        assert_eq!(p.detail.as_deref(), Some("Replaced by equalizer-graphic"));
+        assert_eq!(
+            p.params,
+            Some(json!({ "replaced_by": "equalizer-graphic" }))
+        );
+        // Contre-épreuve : une seule façade cochée traite.
+        let c = ChaineTess {
+            plugins: vec![
+                maillon("equalizer-graphic", false),
+                maillon("equalizer-parametric", true),
+            ],
+            ..ChaineTess::default()
+        };
+        let r = resoudre(&c, &ctx(TransportZone::Local));
+        assert!(greffon(&r, "equalizer-parametric").effective);
+        assert_eq!(greffon(&r, "equalizer-parametric").reason, None);
+    }
+
+    #[test]
     fn une_convolution_sans_fichier_ne_traite_rien_rc14() {
         let x = ctx(TransportZone::Local);
         for reglages in [Value::Null, json!({}), json!({ "ir_path": " " })] {
@@ -970,11 +1007,16 @@ mod tests {
     /// headroom, le suréchantillonnage et le volume logiciel.
     #[test]
     fn hors_tess_l_egaliseur_et_la_correction_restent_appliques_t12c() {
-        for transport in [TransportZone::HqPlayer, TransportZone::Diretta] {
+        // rc14 : les façades de l'égaliseur sont exclusives — une à la fois.
+        for (transport, eq) in [
+            (TransportZone::HqPlayer, "room-correction"),
+            (TransportZone::HqPlayer, "equalizer-parametric"),
+            (TransportZone::Diretta, "room-correction"),
+            (TransportZone::Diretta, "equalizer-parametric"),
+        ] {
             let c = ChaineTess {
                 plugins: vec![
-                    maillon("room-correction", true),
-                    maillon("equalizer-parametric", true),
+                    maillon(eq, true),
                     maillon("crossfeed", true),
                     maillon("mono-downmix", true),
                 ],
@@ -982,7 +1024,7 @@ mod tests {
             };
             let r = resoudre(&c, &ctx(transport));
             assert_eq!(r.badge, Badge::OutsideTess, "{transport:?}");
-            for id in ["room-correction", "equalizer-parametric", "crossfeed"] {
+            for id in [eq, "crossfeed"] {
                 assert!(
                     greffon(&r, id).effective,
                     "{transport:?} : {id} doit être annoncé appliqué"

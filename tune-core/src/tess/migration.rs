@@ -578,7 +578,13 @@ fn marques_par_le_serveur(reference: Option<&ChaineTess>, chaine: &ChaineTess) -
                 || valeur
                     .as_str()
                     .is_some_and(|g| coches.iter().any(|id| id == g));
-            if (m.enabled || !deja_posee || !gagnant_coche)
+            // rc14 — la marque d'une façade de l'égaliseur écartée au profit
+            // d'une autre façade cochée est posée par le serveur lui-même
+            // ([`normaliser_les_egaliseurs`]) : elle est gardée.
+            let marque_egaliseur = marque == MARQUE_REMPLACE
+                && FACADES_EQ.contains(&m.id.as_str())
+                && valeur.as_str().is_some_and(|g| FACADES_EQ.contains(&g));
+            if (m.enabled || !(deja_posee || marque_egaliseur) || !gagnant_coche)
                 && let Value::Object(s) = &mut m.settings
             {
                 s.remove(marque);
@@ -1141,6 +1147,58 @@ fn membre_en_service(settings: &SettingsRepo, id: &str) -> bool {
     }
 }
 
+/// rc14 (GO du 24/11) — les façades de l'égaliseur sont exclusives. Une
+/// chaîne ENREGISTRÉE avant cette règle (testeurs, préréglages) peut en
+/// cocher plusieurs : on garde la PREMIÈRE cochée (celle que le moteur
+/// applique, [`egaliseur_principal`]) et on décoche les autres, réglages
+/// gardés. Une façade décochée qui a des réglages porte la marque
+/// [`MARQUE_REMPLACE`] (« Replaced by … » dans le chemin du signal) ; sans
+/// réglages (`null`), elle est seulement décochée (la marque seule ne serait
+/// pas un profil valide). Rend `true` si la chaîne a changé.
+pub fn normaliser_les_egaliseurs(chaine: &mut ChaineTess) -> bool {
+    let coches: Vec<usize> = chaine
+        .plugins
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.enabled && FACADES_EQ.contains(&m.id.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+    let Some((&premier, autres)) = coches.split_first() else {
+        return false;
+    };
+    if autres.is_empty() {
+        return false;
+    }
+    let gagnant = chaine.plugins[premier].id.clone();
+    for &i in autres {
+        let m = &mut chaine.plugins[i];
+        m.enabled = false;
+        if let Value::Object(s) = &mut m.settings {
+            s.insert(MARQUE_REMPLACE.into(), Value::String(gagnant.clone()));
+        }
+    }
+    true
+}
+
+/// Le corps d'un `PUT` coche-t-il lui-même deux façades de l'égaliseur ou
+/// plus, dont au moins une change d'état par rapport à `enregistree` ? C'est
+/// le seul cas refusé (409 `mutually_exclusive`) ; sinon la chaîne est
+/// normalisée ([`normaliser_les_egaliseurs`]).
+pub fn corps_coche_deux_egaliseurs(corps: &ChaineTess, enregistree: &ChaineTess) -> bool {
+    let coches: Vec<&MaillonGreffon> = corps
+        .plugins
+        .iter()
+        .filter(|m| m.enabled && FACADES_EQ.contains(&m.id.as_str()))
+        .collect();
+    coches.len() >= 2
+        && coches.iter().any(|m| {
+            !enregistree
+                .plugins
+                .iter()
+                .any(|e| e.id == m.id && e.enabled)
+        })
+}
+
 /// Décision B : une chaîne ne coche qu'un membre du groupe crossfeed. Quand
 /// les anciennes clés en cochent plusieurs, on garde celui qui traite
 /// aujourd'hui (#7616 : Crosstalk > `crossfeed-*` > crossfeed intégré, parmi
@@ -1156,6 +1214,11 @@ fn exclusivite_du_groupe(chaine: &mut ChaineTess, en_service: &dyn Fn(&str) -> b
         .map(|m| m.id.clone())
         .collect();
     for m in &mut chaine.plugins {
+        // rc14 — les façades de l'égaliseur ont leur propre règle
+        // ([`normaliser_les_egaliseurs`]) : jamais recochées ici.
+        if FACADES_EQ.contains(&m.id.as_str()) {
+            continue;
+        }
         let gagnant = m.settings.get(MARQUE_REMPLACE).and_then(Value::as_str);
         if !m.enabled
             && let Some(g) = gagnant

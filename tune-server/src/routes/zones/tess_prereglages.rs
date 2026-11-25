@@ -49,8 +49,8 @@ use tune_core::tess::prereglages::{self, ModeApplication, PreReglage};
 use tune_core::tess::resolution::MotifEtape;
 
 use super::tess::{
-    appliquer_le_put, catalogue_du_serveur, cle_prereglage_actif, erreur_migration, rafraichir,
-    refus, reponse_de_zone, verrou_des_put, zone_de,
+    appliquer_le_put, catalogue_du_serveur, cle_mode_pure, cle_prereglage_actif, erreur_migration,
+    rafraichir, refus, reponse_de_zone, verrou_des_put, zone_de,
 };
 use super::*;
 
@@ -210,6 +210,10 @@ pub async fn enregistrer_prereglage(State(state): State<AppState>, corps: Bytes)
             attendue: tune_core::tess::VERSION_CHAINE,
         });
     }
+    // rc14 — jamais un préréglage qu'on ne pourrait pas charger : une zone
+    // enregistrée avec deux égaliseurs cochés est normalisée.
+    let mut chaine = chaine;
+    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine);
     let mut liste = match prereglages::lire(&settings) {
         Ok(l) => l,
         Err(e) => return stockage(e),
@@ -279,6 +283,92 @@ fn effacer_le_marqueur(settings: &SettingsRepo, zone_id: i64) -> bool {
 
 /// L'avertissement rendu quand le marqueur « ACTIVE » n'a pas pu être écrit.
 pub const AVERTISSEMENT_MARQUEUR: &str = "active_preset_not_stored";
+
+/// rc14 — le mode PURE n'a pas été basculé par le préréglage parce que le
+/// verrou de volume de la zone est armé : la bascule ferait sauter l'appareil
+/// à 100 % (ou l'en ferait redescendre sans recomposer le trim), ce que
+/// l'interrupteur PURE ne fait qu'après une confirmation explicite.
+pub const AVERTISSEMENT_PURE_A_CONFIRMER: &str = "pure_mode_needs_confirmation";
+/// rc14 — le réglage PURE de la zone n'a pas pu être écrit.
+pub const AVERTISSEMENT_PURE_NON_ECRIT: &str = "pure_mode_not_stored";
+
+enum BasculePure {
+    Rien,
+    Ecrite { cle: String, pure: bool },
+    Avertissement(String),
+}
+
+/// La chaîne traite-t-elle quelque chose (greffon coché ou suréchantillonnage
+/// demandé, hors « Bypass all ») ?
+fn chaine_traite(c: &ChaineTess) -> bool {
+    !c.bypass_all && (c.plugins.iter().any(|m| m.enabled) || c.fixed.upsampling.demande())
+}
+
+/// rc14 (recette .18) — charger « Pure » vidait la chaîne mais laissait le
+/// mode PURE de la zone éteint ([`cle_mode_pure`], hors chaîne). Le
+/// préréglage intégré l'allume désormais ; un préréglage qui traite l'éteint
+/// (sinon PURE contournerait ce qu'on vient de charger). Un préréglage
+/// utilisateur sans traitement n'y touche pas. `lock_volume` est gardé, et
+/// rien ne bascule quand le verrou de volume est armé : c'est
+/// l'interrupteur PURE, avec sa confirmation, qui le fait.
+async fn accorder_le_mode_pure(state: &AppState, zone_id: i64, p: &PreReglage) -> BasculePure {
+    use tune_core::audio::audiophile;
+    let voulu = if p.builtin && p.id == prereglages::ID_PREREGLAGE_PURE {
+        true
+    } else if chaine_traite(&p.chain) {
+        false
+    } else {
+        return BasculePure::Rien;
+    };
+    if audiophile::zone_enabled(&state.backend, zone_id) == voulu {
+        return BasculePure::Rien;
+    }
+    // Comme l'interrupteur PURE de la zone : seule l'ENTRÉE en PURE
+    // avec le verrou de volume armé (saut à 100 %) demande une confirmation.
+    // La sortie est libre ; elle recompose la consigne (`set_volume_sortie_de_pure`).
+    let verrou = audiophile::volume_lock_enabled(&state.backend, zone_id);
+    if voulu && verrou {
+        warn!(zone_id, "tess_prereglage_pure_a_confirmer");
+        return BasculePure::Avertissement(AVERTISSEMENT_PURE_A_CONFIRMER.to_owned());
+    }
+    let sortie_du_plein_volume = !voulu && verrou;
+    let settings = settings_de(state);
+    // La clé est tenue par `tess.rs`, dont `rafraichir` l'applique
+    // à la sortie vivante selon le mode, comme le reste du préréglage.
+    let cle = cle_mode_pure(zone_id);
+    let mut objet = settings
+        .get(&cle)
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    objet.insert("enabled".into(), Value::Bool(voulu));
+    match settings.set(&cle, &Value::Object(objet).to_string()) {
+        Ok(()) => {
+            if sortie_du_plein_volume {
+                // #6213 — après l'écriture, pour que le verrou ne morde plus :
+                // l'appareil revient à la consigne de la zone, trim compris.
+                let appareil = zone_de(state, zone_id)
+                    .ok()
+                    .and_then(|z| z.output_device_id);
+                let consigne = state.playback.get_state(zone_id).await.volume;
+                if let Err(e) = state
+                    .orchestrator
+                    .set_volume_sortie_de_pure(zone_id, consigne, appareil.as_deref())
+                    .await
+                {
+                    warn!(zone_id, erreur = %e, "tess_prereglage_sortie_pure_non_recomposee");
+                }
+            }
+            BasculePure::Ecrite { cle, pure: voulu }
+        }
+        Err(e) => {
+            warn!(zone_id, erreur = %e, "tess_prereglage_pure_non_ecrit");
+            BasculePure::Avertissement(AVERTISSEMENT_PURE_NON_ECRIT.to_owned())
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -468,7 +558,12 @@ pub async fn appliquer_prereglage(
     let Some(p) = liste.get(&preset_id).cloned() else {
         return introuvable(&preset_id);
     };
-    let corps = match serde_json::to_vec(&p.chain) {
+    // rc14 — un préréglage enregistré avant l'exclusivité des égaliseurs
+    // peut en cocher plusieurs : chargé normalisé (la première façade
+    // cochée), jamais refusé.
+    let mut chaine_du_prereglage = p.chain.clone();
+    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine_du_prereglage);
+    let corps = match serde_json::to_vec(&chaine_du_prereglage) {
         Ok(c) => c,
         Err(e) => return refus(&ErreurChaine::CorpsIllisible(e.to_string())),
     };
@@ -507,7 +602,7 @@ pub async fn appliquer_prereglage(
         Ok(r) => r,
         Err(e) => Err(erreur_migration(&ErreurMigration::Stockage(e.to_string()))),
     };
-    let (lecture, cles) = match resultat {
+    let (mut lecture, mut cles) = match resultat {
         Ok(x) => x,
         Err(r) => {
             // Refusé : si la chaîne enregistrée n'a pas bougé, l'ancien
@@ -528,9 +623,20 @@ pub async fn appliquer_prereglage(
     };
     // La chaîne est écrite : quoi qu'il arrive au marqueur, elle atteint la
     // sortie selon le mode, et la réponse est un succès.
-    let avertissements: Vec<String> = poser_le_marqueur(&settings, id, &p.id)
+    let mut avertissements: Vec<String> = poser_le_marqueur(&settings, id, &p.id)
         .into_iter()
         .collect();
+    // rc14 (recette .18) — « Pure » allume le mode PURE de la zone ; un
+    // préréglage qui traite l'éteint. Même voie que le reste du préréglage :
+    // la clé rejoint `cles` (tout de suite, ou à la prochaine lecture).
+    match accorder_le_mode_pure(&state, id, &p).await {
+        BasculePure::Rien => {}
+        BasculePure::Ecrite { cle, pure } => {
+            cles.push(cle);
+            lecture.pure = pure;
+        }
+        BasculePure::Avertissement(a) => avertissements.push(a),
+    }
     drop(_liste);
     let mode = appliquer_selon_le_mode(&state, &zone, cles.clone()).await;
     info!(zone_id = id, preset_id = %p.id, cles = ?cles, mode = ?mode, "tess_prereglage_charge");
@@ -568,7 +674,12 @@ pub(super) fn oublier_le_prereglage_s_il_differe(
     let decrit = prereglages::lire(&settings)
         .ok()
         .and_then(|l| l.get(&actif).cloned())
-        .is_some_and(|p| sans_champs_du_serveur(&p.chain) == sans_champs_du_serveur(&enregistree));
+        .is_some_and(|p| {
+            // rc14 — comparé tel qu'il a été chargé (égaliseurs normalisés).
+            let mut c = p.chain.clone();
+            tune_core::tess::migration::normaliser_les_egaliseurs(&mut c);
+            sans_champs_du_serveur(&c) == sans_champs_du_serveur(&enregistree)
+        });
     if !decrit && !effacer_le_marqueur(&settings, zone_id) {
         return Some(AVERTISSEMENT_MARQUEUR.to_owned());
     }

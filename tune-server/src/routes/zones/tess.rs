@@ -55,7 +55,8 @@ use tune_core::tess::greffon::{
 use tune_core::tess::migration::{
     ErreurMigration, ID_CONVOLUTION, ID_CORRECTION_PIECE, ID_CROSSFEED, ID_EQ_CASQUE,
     ID_EQ_GRAPHIQUE, ID_EQ_PARAMETRIQUE, ID_MONO, ID_REAFFECTATION, LectureZone, Partie,
-    correction_estimee, ecrire_chaine, lecture_dsd, lire_zone, origines_par_le_serveur,
+    corps_coche_deux_egaliseurs, correction_estimee, ecrire_chaine, lecture_dsd, lire_zone,
+    origines_par_le_serveur,
 };
 use tune_core::tess::resolution::{
     CodeEtape, ContexteExecution, ControleVolume, LectureDsd, MotifEtape, SourceFlux, VolumeZone,
@@ -646,7 +647,7 @@ pub(super) fn appliquer_le_put(
     })?;
     // Lecture stricte du corps tel qu'envoyé : 400 sur tout champ ou valeur
     // inconnus, avant toute fusion.
-    ChaineTess::depuis_corps(texte).map_err(|e| refus(&e))?;
+    let corps_lu = ChaineTess::depuis_corps(texte).map_err(|e| refus(&e))?;
     let brut: Value = serde_json::from_str(texte)
         .map_err(|e| refus(&ErreurChaine::CorpsIllisible(e.to_string())))?;
 
@@ -671,6 +672,12 @@ pub(super) fn appliquer_le_put(
     }
     // D1 : l'origine d'une correction de pièce vient de `room_profile_{id}`,
     // jamais du corps ; `ecrire_chaine` la réécrit de même.
+    // rc14 — égaliseurs exclusifs : une chaîne enregistrée avant la règle
+    // (deux façades cochées) est NORMALISÉE, pas refusée ; seul un corps qui
+    // coche lui-même une seconde façade reçoit le 409.
+    if !corps_coche_deux_egaliseurs(&corps_lu, &enregistree) {
+        tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine);
+    }
     let chaine = origines_par_le_serveur(settings, zone_id, &chaine);
     valider_le_put(&chaine, &enregistree, catalogue, premium).map_err(|e| refus(&e))?;
     let chaine = chaine.mettre_a_niveau();
@@ -678,6 +685,12 @@ pub(super) fn appliquer_le_put(
     let bilan = ecrire_chaine(settings, zone_id, &chaine).map_err(|e| erreur_migration(&e))?;
     let lecture = lire_zone(settings, zone_id, premium).map_err(|e| erreur_migration(&e))?;
     Ok((lecture, bilan.cles_modifiees))
+}
+
+/// rc14 — la clé du mode PURE de la zone (hors chaîne), que le chargement
+/// d'un préréglage bascule ; [`rafraichir`] l'applique à la sortie vivante.
+pub(super) fn cle_mode_pure(zone_id: i64) -> String {
+    format!("zone_{zone_id}_audiophile")
 }
 
 /// Chaque ancienne clé réécrite atteint la sortie vivante, comme par son
@@ -705,6 +718,10 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     }
     if est(Partie::Convolution) {
         rafraichir_le_convolueur(state, zone).await;
+    }
+    // rc14 — le mode PURE basculé par un préréglage (« Pure » l'allume).
+    if cles.contains(&cle_mode_pure(id)) {
+        let _ = state.orchestrator.apply_audiophile_change_portee(id).await;
     }
 }
 

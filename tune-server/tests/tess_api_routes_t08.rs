@@ -1136,6 +1136,52 @@ async fn le_get_d_etat_n_attend_pas_la_sonde_d_une_lecture_t12b() {
     sonde.abort();
 }
 
+/// rc14 (GO du 24/11) — les quatre façades de l'égaliseur partagent une clé
+/// et un moteur : deux cochées = 409 `mutually_exclusive` (`plugin_id` =
+/// la seconde), sans rien écrire. Contre-épreuve : une seule passe. Le
+/// groupe crossfeed reste ce qu'il était.
+#[tokio::test]
+async fn deux_egaliseurs_coches_409_et_un_seul_passe_rc14() {
+    let b = Banc::nouveau(true).await;
+    let avant = b.enregistree();
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "equalizer-graphic", "enabled": true, "settings": profil(json!([]))},
+            {"id": "equalizer-parametric", "enabled": true, "settings": profil(bandes_parametriques())}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    refus_conforme(&v, 409, "mutually_exclusive");
+    assert_eq!(v["plugin_id"], json!("equalizer-parametric"));
+    assert_eq!(b.enregistree(), avant);
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "equalizer-graphic", "enabled": true, "settings": profil(json!([]))},
+            {"id": "equalizer-parametric", "enabled": false, "settings": profil(bandes_parametriques())}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // Le catalogue publie le groupe et sa politique.
+    let (_, cat) = b
+        .brut(Method::GET, "/api/v1/tess/catalog", None, None)
+        .await;
+    let groupes = cat["catalog"]["groups"].as_array().unwrap();
+    for g in ["equalizer", "crossfeed_crosstalk"] {
+        assert!(
+            groupes
+                .iter()
+                .any(|x| x["id"] == json!(g) && x["policy"] == json!("refuse")),
+            "{g} : {cat}"
+        );
+    }
+    // Groupe crossfeed inchangé : toujours 409.
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [{"id": "crossfeed", "enabled": true}, {"id": "crosstalk", "enabled": true}]}))
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    refus_conforme(&v, 409, "mutually_exclusive");
+}
+
 /// rc14 — un paquet installé mais désactivé n'est pas « à installer » : il
 /// reste `plugin_unavailable`, sans `install_package`. Désinstallé, il
 /// redevient `plugin_not_installed` avec le paquet à installer.

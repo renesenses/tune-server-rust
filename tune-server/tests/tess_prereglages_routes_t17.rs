@@ -1070,3 +1070,227 @@ async fn un_marqueur_ni_ecrit_ni_efface_refuse_le_chargement_sans_rien_changer_s
     assert_eq!(b.chaine().plugins[0].id, "equalizer-parametric");
     assert_eq!(b.get_zone().await["active_preset"], json!("studio"));
 }
+
+// ── rc14 (recette .18) : « Pure » et le mode PURE de la zone ─────────
+
+fn pure_de_la_zone(b: &Banc) -> bool {
+    tune_core::audio::audiophile::zone_enabled(&b.state.backend, b.zone)
+}
+
+/// « Pure » chargé ⇒ mode PURE de la zone allumé, `bypass_all` relu vrai ;
+/// un préréglage avec un égaliseur chargé ensuite ⇒ PURE éteint, et la
+/// chaîne relue n'est plus contournée.
+#[tokio::test]
+async fn pure_allume_le_mode_pure_et_un_prereglage_qui_traite_l_eteint_rc14() {
+    let b = Banc::nouveau(true).await;
+    // Un préréglage avec égaliseur, enregistré depuis la chaîne courante.
+    let (s, v) = b
+        .put_chaine(json!({"version": 1, "plugins": [parametrique()]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = b.enregistrer("Égaliseur").await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let eq_id = v["id"].as_str().unwrap().to_owned();
+    assert!(!pure_de_la_zone(&b));
+
+    let (s, v) = b.appliquer("pure").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(pure_de_la_zone(&b), "« Pure » n'a pas allumé le mode PURE");
+    assert!(lire_zone(&b.settings(), b.zone, true).unwrap().pure);
+    assert!(b.chaine().bypass_all, "bypass_all perdu à la relecture");
+    assert_eq!(b.get_zone().await["chain"]["bypass_all"], json!(true));
+    assert_eq!(v["zone"]["chain"]["bypass_all"], json!(true));
+
+    let (s, v) = b.appliquer(&eq_id).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(
+        !pure_de_la_zone(&b),
+        "le préréglage qui traite a laissé PURE"
+    );
+    assert!(!b.chaine().bypass_all);
+    let eq = b.chaine();
+    assert!(
+        eq.plugins
+            .iter()
+            .any(|m| m.id == "equalizer-parametric" && m.enabled)
+    );
+}
+
+/// `bypass_all` posé par un `PUT` de chaîne est enregistré et relu.
+#[tokio::test]
+async fn bypass_all_d_un_put_est_relu_rc14() {
+    let b = Banc::nouveau(true).await;
+    let (s, v) = b
+        .put_chaine(json!({"version": 1, "bypass_all": true, "plugins": [crossfeed()]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(b.chaine().bypass_all);
+    assert_eq!(b.get_zone().await["chain"]["bypass_all"], json!(true));
+    let (s, _) = b
+        .put_chaine(json!({"version": 1, "bypass_all": false, "plugins": [crossfeed()]}))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!b.chaine().bypass_all);
+    // Un PUT de chaîne ne touche pas au mode PURE de la zone.
+    assert!(!pure_de_la_zone(&b));
+}
+
+/// Contre-épreuves : l'interrupteur PURE manuel de la zone fonctionne seul ;
+/// verrou de volume armé, « Pure » ne bascule rien et le dit
+/// (`pure_mode_needs_confirmation`).
+#[tokio::test]
+async fn l_interrupteur_pure_reste_seul_maitre_et_le_verrou_de_volume_est_respecte_rc14() {
+    let b = Banc::nouveau(true).await;
+    let uri = format!("/api/v1/zones/{}/audiophile", b.zone);
+    let (s, v) = b
+        .brut(Method::POST, &uri, Some(json!({"enabled": true})))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(pure_de_la_zone(&b));
+    let (s, v) = b
+        .brut(Method::POST, &uri, Some(json!({"enabled": false})))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(!pure_de_la_zone(&b));
+    // La chaîne n'a pas bougé.
+    assert!(!b.chaine().bypass_all);
+
+    b.settings()
+        .set(tune_core::audio::audiophile::SETTING_LOCK_VOLUME, "true")
+        .unwrap();
+    let (s, v) = b.appliquer("pure").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(
+        !pure_de_la_zone(&b),
+        "PURE allumé sans confirmation, verrou armé"
+    );
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("pure_mode_needs_confirmation")),
+        "{v}"
+    );
+}
+
+// ── rc14 (relecture #9512) : chaînes anciennes à deux égaliseurs ─────
+
+fn graphique() -> Value {
+    json!({"id": "equalizer-graphic", "enabled": true, "settings": profil(json!([]))})
+}
+
+/// Une chaîne à deux égaliseurs cochés, écrite comme avant la règle (sans
+/// passer par la validation du PUT).
+fn chaine_a_deux_egaliseurs() -> ChaineTess {
+    serde_json::from_value(json!({"version": 1, "plugins": [graphique(), parametrique()]})).unwrap()
+}
+
+fn egaliseur<'a>(c: &'a ChaineTess, id: &str) -> &'a tune_core::tess::chaine::MaillonGreffon {
+    c.plugins.iter().find(|m| m.id == id).unwrap()
+}
+
+/// Zone enregistrée avec deux égaliseurs, puis PUT qui ne touche que
+/// `fixed` : 200, le second est décoché et marqué. Un PUT qui coche
+/// lui-même un second égaliseur : 409.
+#[tokio::test]
+async fn deux_egaliseurs_enregistres_sont_normalises_au_put_rc14() {
+    let b = Banc::nouveau(true).await;
+    tune_core::tess::migration::ecrire_chaine(&b.settings(), b.zone, &chaine_a_deux_egaliseurs())
+        .unwrap();
+    assert!(egaliseur(&b.chaine(), "equalizer-parametric").enabled);
+    let (s, v) = b
+        .put_chaine(json!({"version": 1, "fixed": {"headroom": {"mode": "manual", "db": -3.0}}}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let c = b.chaine();
+    assert!(egaliseur(&c, "equalizer-graphic").enabled);
+    let p = egaliseur(&c, "equalizer-parametric");
+    assert!(!p.enabled);
+    assert_eq!(p.settings["replaced_in_group"], json!("equalizer-graphic"));
+    let e = v["signal_path"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["plugin_id"] == json!("equalizer-parametric"))
+        .unwrap()
+        .clone();
+    assert_eq!(e["reason"], json!("replaced_in_group"), "{e}");
+
+    // Contre-épreuve : le corps coche lui-même un second égaliseur ⇒ 409.
+    let (s, v) = b
+        .put_chaine(json!({"version": 1, "plugins": [graphique(), parametrique()]}))
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("mutually_exclusive"));
+    assert_eq!(v["plugin_id"], json!("equalizer-parametric"));
+}
+
+/// Préréglage ancien à deux égaliseurs : chargé, normalisé ; et un
+/// préréglage enregistré depuis une zone à deux égaliseurs l'est aussi.
+#[tokio::test]
+async fn prereglage_ancien_a_deux_egaliseurs_charge_normalise_rc14() {
+    let b = Banc::nouveau(true).await;
+    let mut liste = tune_core::tess::prereglages::lire(&b.settings()).unwrap();
+    liste
+        .presets
+        .push(tune_core::tess::prereglages::PreReglage {
+            id: "ancien".into(),
+            name: "Ancien".into(),
+            builtin: false,
+            chain: chaine_a_deux_egaliseurs(),
+        });
+    b.settings()
+        .set(
+            tune_core::tess::prereglages::CLE_PREREGLAGES,
+            &serde_json::to_string(&liste).unwrap(),
+        )
+        .unwrap();
+    let (s, v) = b.appliquer("ancien").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let c = b.chaine();
+    assert!(egaliseur(&c, "equalizer-graphic").enabled);
+    assert!(!egaliseur(&c, "equalizer-parametric").enabled);
+    assert_eq!(v["zone"]["active_preset"], json!("ancien"), "{v}");
+
+    // Enregistrer depuis une zone à deux égaliseurs : normalisé.
+    tune_core::tess::migration::ecrire_chaine(&b.settings(), b.zone, &chaine_a_deux_egaliseurs())
+        .unwrap();
+    let (s, v) = b.enregistrer("Depuis la zone").await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let enregistre: ChaineTess = serde_json::from_value(v["chain"].clone()).unwrap();
+    assert!(egaliseur(&enregistre, "equalizer-graphic").enabled);
+    assert!(!egaliseur(&enregistre, "equalizer-parametric").enabled);
+    let (s, v) = b.appliquer(v["id"].as_str().unwrap()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+/// D3 — verrou de volume armé : SORTIR de PURE en chargeant un préréglage
+/// qui traite est libre (comme l'interrupteur PURE), sans avertissement.
+#[tokio::test]
+async fn sortie_de_pure_libre_avec_le_verrou_de_volume_rc14() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": [parametrique()]}))
+        .await;
+    let (_, v) = b.enregistrer("Égaliseur").await;
+    let eq_id = v["id"].as_str().unwrap().to_owned();
+    b.settings()
+        .set(
+            &format!("zone_{}_audiophile", b.zone),
+            r#"{"enabled":true}"#,
+        )
+        .unwrap();
+    b.settings()
+        .set(tune_core::audio::audiophile::SETTING_LOCK_VOLUME, "true")
+        .unwrap();
+    assert!(pure_de_la_zone(&b));
+    let (s, v) = b.appliquer(&eq_id).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(!pure_de_la_zone(&b), "sortie de PURE bloquée par le verrou");
+    assert!(
+        !v["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("pure_mode_needs_confirmation")),
+        "{v}"
+    );
+}
