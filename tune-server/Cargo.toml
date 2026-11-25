@@ -2292,6 +2292,15 @@ path = "tests/activation_authentification.rs"
 name = "premiere_configuration_admin"
 path = "tests/premiere_configuration_admin.rs"
 
+[[test]]
+name = "revue_premiere_configuration"
+path = "tests/revue_premiere_configuration.rs"
+
+# Variables d'environnement : une seule épreuve dans ce binaire.
+[[test]]
+name = "premiere_configuration_environnement"
+path = "tests/premiere_configuration_environnement.rs"
+
 # rc13.2 : connexion de `default` sur cette machine et depuis le réseau local,
 # après l'activation et sur une base rc12 (ancien hachage). SQLite, et
 # PostgreSQL quand `TUNE_TEST_PG_URL` est posée (feature `postgres`).

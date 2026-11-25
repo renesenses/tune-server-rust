@@ -439,6 +439,8 @@ pub async fn run_with(opts: RunOptions) {
         .expect("failed to init app state");
     if base_neuve {
         crate::auth::ouvrir_la_premiere_configuration(&state);
+    } else {
+        crate::auth::fermer_une_premiere_configuration_heritee(&state);
     }
 
     // #5320 — la sonde du processeur est relevée en tâche de fond, une fois

@@ -38,6 +38,14 @@ fn installation_neuve() -> AppState {
     state
 }
 
+fn fermee(state: &AppState) -> bool {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get(tune_server::auth::CLE_FIN_PREMIERE_CONFIGURATION)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 fn active(state: &AppState) -> bool {
     tune_server::auth::authentification_active(state)
 }
@@ -167,15 +175,140 @@ async fn creation_avec_l_origine_du_serveur() {
 }
 
 #[tokio::test]
-async fn la_fenetre_survit_a_un_redemarrage_rapide() {
-    // Après un redémarrage, l'horloge monotone est perdue : l'heure
-    // enregistrée prend le relais.
+async fn la_fenetre_ne_survit_pas_a_un_redemarrage() {
+    // L'heure d'ouverture ne vit qu'en mémoire : après un redémarrage, la
+    // voie du code reprend, même dans les 45 minutes.
     let state = installation_neuve();
     oublier_l_horloge_de_la_premiere_configuration(&state);
-    vieillir_la_premiere_configuration(&state, Duration::from_secs(10 * 60));
-    assert!(premiere_configuration_restante(&state).is_some());
-    let (st, v) = creer(&state, HOTE_DU_LAN, &[], "proprio-1234").await;
+    assert_eq!(premiere_configuration_restante(&state), None);
+    let (st, v) = creer(&state, HOTE_DU_LAN, &[], "intrus-1234").await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    rien_n_a_change(&state);
+}
+
+#[tokio::test]
+async fn la_fenetre_se_ferme_sur_l_une_ou_l_autre_horloge() {
+    use tune_server::auth::vieillir_les_horloges;
+    let au_dela = DUREE_PREMIERE_CONFIGURATION + Duration::from_secs(1);
+    // Heure murale dépassée (mise en veille, horloge réglée), monotone non.
+    let state = installation_neuve();
+    vieillir_les_horloges(&state, Duration::ZERO, au_dela);
+    assert_eq!(premiere_configuration_restante(&state), None);
+    let (st, _) = creer(&state, HOTE_DU_LAN, &[], "intrus-1234").await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    rien_n_a_change(&state);
+    // Horloge monotone dépassée, heure murale non.
+    let state = installation_neuve();
+    vieillir_les_horloges(&state, au_dela, Duration::ZERO);
+    assert_eq!(premiere_configuration_restante(&state), None);
+    let (st, _) = creer(&state, HOTE_DU_LAN, &[], "intrus-1234").await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    rien_n_a_change(&state);
+}
+
+#[tokio::test]
+async fn une_base_remplacee_ferme_la_fenetre() {
+    // L'heure enregistrée ne correspond plus à celle de l'ouverture.
+    let state = installation_neuve();
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set(tune_server::auth::CLE_DEBUT_PREMIERE_CONFIGURATION, "1")
+        .unwrap();
+    assert_eq!(premiere_configuration_restante(&state), None);
+    let (st, _) = creer(&state, HOTE_DU_LAN, &[], "intrus-1234").await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    rien_n_a_change(&state);
+}
+
+#[tokio::test]
+async fn une_fenetre_heritee_est_fermee_au_demarrage() {
+    let state = installation_neuve();
+    tune_server::auth::fermer_une_premiere_configuration_heritee(&state);
+    assert!(fermee(&state));
+    assert_eq!(premiere_configuration_restante(&state), None);
+}
+
+#[tokio::test]
+async fn toute_activation_ferme_la_fenetre() {
+    // Par cette machine.
+    let state = installation_neuve();
+    let (st, v) = creer(&state, CETTE_MACHINE, &[], "proprio-1234").await;
     assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(fermee(&state));
+    // Par le code du journal.
+    let state = installation_neuve();
+    let _ = tune_server::auth::emettre_code_activation(&state);
+    let code = tune_server::auth::code_activation_en_cours(&state).unwrap();
+    let corps = format!(r#"{{"password":"proprio-1234","code":"{code}"}}"#);
+    let (st, v) = appel(&state, INTERNET, Method::POST, "/api/v1/auth/activation", &[], Some(&corps)).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(fermee(&state));
+    // Par `POST /auth/config` depuis cette machine.
+    let state = installation_neuve();
+    let (st, v) = appel(
+        &state,
+        CETTE_MACHINE,
+        Method::POST,
+        "/api/v1/auth/config",
+        &[],
+        Some(r#"{"auth_enabled":true}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(fermee(&state));
+    assert_eq!(premiere_configuration_restante(&state), None);
+}
+
+#[tokio::test]
+async fn la_premiere_configuration_ne_supprime_aucun_compte() {
+    let state = installation_neuve();
+    let h = tune_server::auth::hash_password("autre-1234").unwrap();
+    {
+        use tune_core::db::backend::ToSqlValue;
+        state
+            .backend
+            .execute(
+                "INSERT INTO profiles (username, is_admin, password_hash_v2) VALUES ('autre', 0, ?)",
+                &[&h as &dyn ToSqlValue],
+            )
+            .unwrap();
+    }
+    let id = state
+        .backend
+        .query_one("SELECT id FROM profiles WHERE username = 'autre'", &[])
+        .unwrap()
+        .unwrap()
+        .first()
+        .and_then(|v| v.as_i64())
+        .unwrap();
+    let corps = format!(r#"{{"password":"proprio-1234","delete_accounts":[{id}]}}"#);
+    let (st, v) = appel(&state, HOTE_DU_LAN, Method::POST, "/api/v1/auth/activation", &[], Some(&corps)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "account_not_deletable");
+    rien_n_a_change(&state);
+    assert!(
+        state
+            .backend
+            .query_one("SELECT id FROM profiles WHERE username = 'autre'", &[])
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn passerelles_lues_dans_la_table_de_routage() {
+    let v4 = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n\
+              eth0\t00000000\t010011AC\t0003\t0\t0\t0\t00000000\n\
+              eth0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\n";
+    let v6 = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003 eth0\n";
+    let p = tune_server::auth::passerelles_par_defaut(v4, v6);
+    assert_eq!(
+        p,
+        vec![
+            "172.17.0.1".parse::<std::net::IpAddr>().unwrap(),
+            "fe80::1".parse::<std::net::IpAddr>().unwrap(),
+        ]
+    );
+    assert!(tune_server::auth::passerelles_par_defaut("", "").is_empty());
 }
 
 // --- refus -----------------------------------------------------------------

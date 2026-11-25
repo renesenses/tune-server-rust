@@ -1861,6 +1861,7 @@ async fn set_auth_config(
             // Les jetons et la clé émis pendant que tout était ouvert ne
             // survivent pas à l'activation.
             renouveler_les_secrets(&settings);
+            fermer_la_premiere_configuration(&state);
             renouveler_le_jeton_du_pont(&state);
             state.fermeture_websockets.send_modify(|n| *n += 1);
         } else if enabled {
@@ -1919,7 +1920,8 @@ pub struct EtatCodeActivation {
     en_cours: Option<CodeActivation>,
     derniere_emission: Option<std::time::Instant>,
     echecs_par_ip: std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>,
-    premiere_configuration: Option<std::time::Instant>,
+    /// Heure monotone et heure Unix de l'ouverture de la fenêtre.
+    premiere_configuration: Option<(std::time::Instant, u64)>,
 }
 
 /// Durée de vie d'un code d'activation.
@@ -2244,21 +2246,24 @@ fn maintenant_unix() -> u64 {
 /// Ouvre la fenêtre de première configuration. Appelé au démarrage, et
 /// seulement quand [`base_neuve_avant_ouverture`] a répondu oui. Ne rouvre
 /// jamais une fenêtre déjà ouverte ou fermée. Rend vrai si elle s'ouvre.
+///
+/// La fenêtre ne vit que dans CE processus : l'heure d'ouverture (monotone et
+/// murale) est gardée en mémoire, et l'heure enregistrée doit être la même.
+/// Après un redémarrage, ou si la base est remplacée, elle est fermée.
 pub fn ouvrir_la_premiere_configuration(state: &AppState) -> bool {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let deja = |cle: &str| settings.get(cle).ok().flatten().is_some();
-    if authentification_active(state)
+    if !crate::routes::appliance::bouclage_fiable()
+        || authentification_active(state)
         || un_administrateur_a_un_mot_de_passe(state)
         || deja(CLE_DEBUT_PREMIERE_CONFIGURATION)
         || deja(CLE_FIN_PREMIERE_CONFIGURATION)
     {
         return false;
     }
+    let debut = maintenant_unix();
     if settings
-        .set(
-            CLE_DEBUT_PREMIERE_CONFIGURATION,
-            &maintenant_unix().to_string(),
-        )
+        .set(CLE_DEBUT_PREMIERE_CONFIGURATION, &debut.to_string())
         .is_err()
     {
         return false;
@@ -2267,7 +2272,7 @@ pub fn ouvrir_la_premiere_configuration(state: &AppState) -> bool {
         .code_activation_auth
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .premiere_configuration = Some(std::time::Instant::now());
+        .premiere_configuration = Some((std::time::Instant::now(), debut));
     let minutes = DUREE_PREMIERE_CONFIGURATION.as_secs() / 60;
     eprintln!(
         "Tune : première configuration — le mot de passe administrateur peut être créé \
@@ -2279,15 +2284,43 @@ pub fn ouvrir_la_premiere_configuration(state: &AppState) -> bool {
     true
 }
 
+/// Ferme la fenêtre de première configuration pour de bon. Appelé à toute
+/// activation de l'authentification, quelle que soit la voie.
+fn fermer_la_premiere_configuration(state: &AppState) {
+    SettingsRepo::with_backend(state.backend.clone())
+        .set(CLE_FIN_PREMIERE_CONFIGURATION, &maintenant_unix().to_string())
+        .ok();
+    state
+        .code_activation_auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .premiere_configuration = None;
+}
+
+/// Au démarrage d'une base qui n'est PAS neuve : une fenêtre ouverte par un
+/// démarrage précédent (ou apportée par une base importée) est fermée.
+pub fn fermer_une_premiere_configuration_heritee(state: &AppState) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let present = |cle: &str| settings.get(cle).ok().flatten().is_some();
+    if present(CLE_DEBUT_PREMIERE_CONFIGURATION) && !present(CLE_FIN_PREMIERE_CONFIGURATION) {
+        fermer_la_premiere_configuration(state);
+        tracing::info!("premiere_configuration_heritee_fermee");
+    }
+}
+
 /// Le temps qui reste à la fenêtre de première configuration, ou `None` si
-/// elle est fermée. Mesuré sur l'horloge MONOTONE quand ce processus l'a
-/// ouverte (un réglage de l'horloge au premier démarrage ne la prolonge
-/// pas) ; après un redémarrage, sur l'heure enregistrée — une heure dans le
-/// futur la ferme.
+/// elle est fermée. Elle se ferme dès que l'horloge monotone OU l'heure murale
+/// dépasse [`DUREE_PREMIERE_CONFIGURATION`] (mise en veille, horloge réglée),
+/// et si l'heure murale recule.
 pub fn premiere_configuration_restante(state: &AppState) -> Option<std::time::Duration> {
-    if authentification_active(state) {
+    if !crate::routes::appliance::bouclage_fiable() || authentification_active(state) {
         return None;
     }
+    let (ouverture, debut_memoire) = state
+        .code_activation_auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .premiere_configuration?;
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if settings
         .get(CLE_FIN_PREMIERE_CONFIGURATION)
@@ -2304,21 +2337,17 @@ pub fn premiere_configuration_restante(state: &AppState) -> Option<std::time::Du
         .trim()
         .parse()
         .ok()?;
-    let ecoule = match state
-        .code_activation_auth
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .premiere_configuration
-    {
-        Some(ouverture) => ouverture.elapsed(),
-        None => {
-            let maintenant = maintenant_unix();
-            if maintenant < debut {
-                return None;
-            }
-            std::time::Duration::from_secs(maintenant - debut)
-        }
-    };
+    // Base remplacée depuis l'ouverture : ce n'est plus la même installation.
+    if debut != debut_memoire {
+        return None;
+    }
+    let maintenant = maintenant_unix();
+    if maintenant < debut {
+        return None;
+    }
+    let ecoule = ouverture
+        .elapsed()
+        .max(std::time::Duration::from_secs(maintenant - debut));
     let reste = DUREE_PREMIERE_CONFIGURATION.checked_sub(ecoule)?;
     if reste.is_zero() || un_administrateur_a_un_mot_de_passe(state) {
         return None;
@@ -2327,34 +2356,36 @@ pub fn premiere_configuration_restante(state: &AppState) -> Option<std::time::Du
 }
 
 /// Pour les épreuves : fait comme si la fenêtre avait été ouverte `il_y_a`
-/// plus tôt (horloge monotone et heure enregistrée).
+/// plus tôt, sur les deux horloges.
 #[doc(hidden)]
 pub fn vieillir_la_premiere_configuration(state: &AppState, il_y_a: std::time::Duration) {
+    vieillir_les_horloges(state, il_y_a, il_y_a);
+}
+
+/// Pour les épreuves : recule séparément l'horloge monotone et l'heure murale
+/// de l'ouverture.
+#[doc(hidden)]
+pub fn vieillir_les_horloges(
+    state: &AppState,
+    monotone: std::time::Duration,
+    murale: std::time::Duration,
+) {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    if let Some(debut) = settings
-        .get(CLE_DEBUT_PREMIERE_CONFIGURATION)
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        settings
-            .set(
-                CLE_DEBUT_PREMIERE_CONFIGURATION,
-                &debut.saturating_sub(il_y_a.as_secs()).to_string(),
-            )
-            .ok();
-    }
     let mut etat = state
         .code_activation_auth
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(ouverture) = etat.premiere_configuration {
-        etat.premiere_configuration = ouverture.checked_sub(il_y_a);
+    if let Some((ouverture, debut)) = etat.premiere_configuration {
+        let debut = debut.saturating_sub(murale.as_secs());
+        settings
+            .set(CLE_DEBUT_PREMIERE_CONFIGURATION, &debut.to_string())
+            .ok();
+        etat.premiere_configuration = ouverture.checked_sub(monotone).map(|o| (o, debut));
     }
 }
 
-/// Pour les épreuves : oublie l'horloge monotone, comme après un
-/// redémarrage du serveur.
+/// Pour les épreuves : oublie l'heure d'ouverture gardée en mémoire, comme
+/// après un redémarrage du serveur.
 #[doc(hidden)]
 pub fn oublier_l_horloge_de_la_premiere_configuration(state: &AppState) {
     state
@@ -2364,8 +2395,75 @@ pub fn oublier_l_horloge_de_la_premiere_configuration(state: &AppState) {
         .premiere_configuration = None;
 }
 
-/// L'appel vient-il du RÉSEAU LOCAL ([`appel_depuis_le_reseau_local`]) ?
-/// Extracteur infaillible, sans trace : le gestionnaire décide.
+/// Passerelles par défaut lues dans `/proc/net/route` (IPv4, petit-boutiste
+/// en hexadécimal) et `/proc/net/ipv6_route`.
+pub fn passerelles_par_defaut(route_v4: &str, route_v6: &str) -> Vec<std::net::IpAddr> {
+    let mut passerelles = Vec::new();
+    for ligne in route_v4.lines().skip(1) {
+        let champs: Vec<&str> = ligne.split_whitespace().collect();
+        if champs.len() > 2
+            && champs[1] == "00000000"
+            && let Ok(v) = u32::from_str_radix(champs[2], 16)
+            && v != 0
+        {
+            passerelles.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                v.to_le_bytes(),
+            )));
+        }
+    }
+    for ligne in route_v6.lines() {
+        let champs: Vec<&str> = ligne.split_whitespace().collect();
+        if champs.len() > 4
+            && champs[0] == "00000000000000000000000000000000"
+            && champs[1] == "00"
+            && let Ok(v) = u128::from_str_radix(champs[4], 16)
+            && v != 0
+        {
+            passerelles.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(v)));
+        }
+    }
+    passerelles
+}
+
+/// Le conteneur et ses passerelles : `None` hors conteneur. En développement
+/// et sous test, `TUNE_TEST_PASSERELLE_CONTENEUR` (adresses séparées par des
+/// virgules) simule un conteneur.
+fn passerelles_du_conteneur() -> Option<Vec<std::net::IpAddr>> {
+    if cfg!(debug_assertions)
+        && let Ok(v) = std::env::var("TUNE_TEST_PASSERELLE_CONTENEUR")
+    {
+        return Some(v.split(',').filter_map(|a| a.trim().parse().ok()).collect());
+    }
+    crate::conteneur::detecter()?;
+    let v4 = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let v6 = std::fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default();
+    Some(passerelles_par_defaut(&v4, &v6))
+}
+
+/// Dans un conteneur (Docker en pont, Docker Desktop, sans privilèges,
+/// Podman), une connexion relayée par le moteur arrive de la passerelle : on
+/// ne sait plus d'où elle vient. Dans un conteneur dont la passerelle est
+/// illisible, la réponse est oui (refus).
+fn source_passerelle_du_conteneur(ip: std::net::IpAddr) -> bool {
+    let Some(passerelles) = passerelles_du_conteneur() else {
+        return false;
+    };
+    if passerelles.is_empty() {
+        return true;
+    }
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
+    };
+    passerelles.contains(&ip)
+}
+
+/// L'appel vient-il du RÉSEAU LOCAL, au sens de la première configuration ?
+/// [`appel_depuis_le_reseau_local`], et en plus : jamais derrière le relais du
+/// port 80 d'une appliance (le bouclage n'y prouve rien), jamais depuis la
+/// passerelle d'un conteneur. Extracteur infaillible, sans trace.
 pub struct DepuisLeReseauLocal(pub bool);
 
 impl FromRequestParts<AppState> for DepuisLeReseauLocal {
@@ -2375,7 +2473,16 @@ impl FromRequestParts<AppState> for DepuisLeReseauLocal {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        Ok(Self(appel_depuis_le_reseau_local(parts, state).await))
+        if !crate::routes::appliance::bouclage_fiable() {
+            return Ok(Self(false));
+        }
+        if !appel_depuis_le_reseau_local(parts, state).await {
+            return Ok(Self(false));
+        }
+        let Some(ip) = adresse_de_l_appelant(parts, state).await else {
+            return Ok(Self(false));
+        };
+        Ok(Self(!source_passerelle_du_conteneur(ip)))
     }
 }
 
@@ -2520,6 +2627,9 @@ struct ActivationRequest {
     delete_accounts: Vec<i64>,
 }
 
+/// Un seul hachage d'activation à la fois (argon2 est coûteux).
+static HACHAGE_ACTIVATION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// Une seule activation à la fois : l'état est relu sous ce verrou.
 static VERROU_ACTIVATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -2561,10 +2671,24 @@ async fn activer_l_authentification(
             .into_response();
     }
     // Première configuration : seulement quand ni cette machine ni le code
-    // n'est en jeu, depuis le réseau local, fenêtre ouverte. Revérifié sous
-    // le verrou plus bas.
-    let par_la_premiere_configuration =
-        !cette_machine && reseau_local && premiere_configuration_restante(&state).is_some();
+    // n'est en jeu, depuis le réseau local, fenêtre ouverte. Revérifié avant
+    // de hacher, puis sous le verrou plus bas.
+    let code_fourni = body.code.as_deref().is_some_and(|c| !c.trim().is_empty());
+    let par_la_premiere_configuration = !cette_machine
+        && reseau_local
+        && !(code_fourni && !body.delete_accounts.is_empty())
+        && premiere_configuration_restante(&state).is_some();
+    // Cette voie ne supprime aucun compte.
+    if par_la_premiere_configuration && !body.delete_accounts.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "account_not_deletable",
+                "id": body.delete_accounts[0],
+            })),
+        )
+            .into_response();
+    }
     let Some((id, nom)) = compte_administrateur(&state) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2625,7 +2749,29 @@ async fn activer_l_authentification(
             }
         }
     }
-    let hachage = match hash_password(&body.password) {
+    // Un seul hachage à la fois, hors de l'exécuteur asynchrone. L'état est
+    // relu une fois la place obtenue, AVANT de hacher.
+    let _place = match HACHAGE_ACTIVATION.acquire().await {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "activation_unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    if authentification_active(&state) {
+        return refus_deja_active();
+    }
+    if par_la_premiere_configuration && premiere_configuration_restante(&state).is_none() {
+        return refus_premiere_configuration_fermee();
+    }
+    let mot_de_passe = body.password.clone();
+    let hachage = match tokio::task::spawn_blocking(move || hash_password(&mot_de_passe))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()))
+    {
         Ok(h) => h,
         Err(e) => {
             return (
@@ -2668,12 +2814,6 @@ async fn activer_l_authentification(
                         .into_response();
                 }
             }
-            SettingsRepo::with_backend(state.backend.clone())
-                .set(
-                    CLE_FIN_PREMIERE_CONFIGURATION,
-                    &maintenant_unix().to_string(),
-                )
-                .ok();
             tracing::warn!(
                 appelant = %pair.ip(),
                 "administrateur_cree_par_la_premiere_configuration"
@@ -2707,6 +2847,8 @@ async fn activer_l_authentification(
         settings.set("auth_enabled", "true").ok();
         // Un code encore en attente ne sert plus à rien.
         state.code_activation_auth.lock().unwrap().en_cours = None;
+        // Quelle que soit la voie, la première configuration est finie.
+        fermer_la_premiere_configuration(&state);
         let secret = get_or_create_jwt_secret(&settings);
         (sign_jwt(id, "admin", &secret).ok(), supprimes)
     };

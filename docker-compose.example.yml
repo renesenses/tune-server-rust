@@ -4,6 +4,12 @@ services:
   tune:
     image: renesenses/tune:latest
     container_name: tune
+    # Reseau de l'hote : Tune voit l'adresse reelle des appareils du reseau
+    # local. Indispensable a la decouverte (UPnP, AirPlay) et a la premiere
+    # configuration : sans lui (pont Docker, Docker Desktop, Podman sans
+    # privileges), les connexions arrivent de la passerelle du conteneur et
+    # le mot de passe administrateur se cree avec le code d'activation du
+    # journal (`docker logs tune | grep TUNE-ACTIVATION-CODE`).
     network_mode: host
     restart: unless-stopped
     volumes:
