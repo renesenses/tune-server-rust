@@ -239,7 +239,15 @@ async fn toute_activation_ferme_la_fenetre() {
     let _ = tune_server::auth::emettre_code_activation(&state);
     let code = tune_server::auth::code_activation_en_cours(&state).unwrap();
     let corps = format!(r#"{{"password":"proprio-1234","code":"{code}"}}"#);
-    let (st, v) = appel(&state, INTERNET, Method::POST, "/api/v1/auth/activation", &[], Some(&corps)).await;
+    let (st, v) = appel(
+        &state,
+        INTERNET,
+        Method::POST,
+        "/api/v1/auth/activation",
+        &[],
+        Some(&corps),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(fermee(&state));
     // Par `POST /auth/config` depuis cette machine.
@@ -281,7 +289,15 @@ async fn la_premiere_configuration_ne_supprime_aucun_compte() {
         .and_then(|v| v.as_i64())
         .unwrap();
     let corps = format!(r#"{{"password":"proprio-1234","delete_accounts":[{id}]}}"#);
-    let (st, v) = appel(&state, HOTE_DU_LAN, Method::POST, "/api/v1/auth/activation", &[], Some(&corps)).await;
+    let (st, v) = appel(
+        &state,
+        HOTE_DU_LAN,
+        Method::POST,
+        "/api/v1/auth/activation",
+        &[],
+        Some(&corps),
+    )
+    .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
     assert_eq!(v["error"], "account_not_deletable");
     rien_n_a_change(&state);

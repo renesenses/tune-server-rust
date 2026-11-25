@@ -84,7 +84,10 @@ async fn rebinding_dns_hote_public_refuse() {
         ],
     )
     .await;
-    assert!(st == StatusCode::MISDIRECTED_REQUEST || st == StatusCode::FORBIDDEN, "{st} {v}");
+    assert!(
+        st == StatusCode::MISDIRECTED_REQUEST || st == StatusCode::FORBIDDEN,
+        "{st} {v}"
+    );
     assert!(!active(&state));
 }
 
@@ -95,7 +98,10 @@ async fn csrf_text_plain_autre_site_refuse() {
         &state,
         "192.168.1.50:50000",
         Version::HTTP_11,
-        &[("host", "192.168.1.20:8888"), ("origin", "http://evil.example")],
+        &[
+            ("host", "192.168.1.20:8888"),
+            ("origin", "http://evil.example"),
+        ],
         "text/plain",
         r#"{"password":"intrus-1234"}"#,
     )

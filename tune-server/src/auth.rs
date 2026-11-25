@@ -2288,7 +2288,10 @@ pub fn ouvrir_la_premiere_configuration(state: &AppState) -> bool {
 /// activation de l'authentification, quelle que soit la voie.
 fn fermer_la_premiere_configuration(state: &AppState) {
     SettingsRepo::with_backend(state.backend.clone())
-        .set(CLE_FIN_PREMIERE_CONFIGURATION, &maintenant_unix().to_string())
+        .set(
+            CLE_FIN_PREMIERE_CONFIGURATION,
+            &maintenant_unix().to_string(),
+        )
         .ok();
     state
         .code_activation_auth

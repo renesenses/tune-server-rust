@@ -79,7 +79,11 @@ async fn appliance_et_conteneur() {
         Some(CORPS),
     )
     .await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "tune_os_port_80_internet_vu_comme_lan {v}");
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "tune_os_port_80_internet_vu_comme_lan {v}"
+    );
     assert_eq!(v["error"], "activation_code_required", "{v}");
     assert!(!active(&state));
     let (_, v) = appel(&state, "127.0.0.1:41234", Method::GET, &[], None).await;
@@ -101,7 +105,11 @@ async fn appliance_et_conteneur() {
     unsafe {
         std::env::set_var("TUNE_TEST_PASSERELLE_CONTENEUR", "172.17.0.1,fd00::1");
     }
-    for passerelle in ["172.17.0.1:50000", "[::ffff:172.17.0.1]:50000", "[fd00::1]:50000"] {
+    for passerelle in [
+        "172.17.0.1:50000",
+        "[::ffff:172.17.0.1]:50000",
+        "[fd00::1]:50000",
+    ] {
         let state = nouvel_etat();
         assert!(ouvrir_la_premiere_configuration(&state));
         let (_, v) = appel(&state, passerelle, Method::GET, &[], None).await;
