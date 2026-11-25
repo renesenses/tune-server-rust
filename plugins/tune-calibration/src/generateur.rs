@@ -67,7 +67,8 @@ pub enum Consigne {
     Salve { niveau_dbfs: f64 },
     /// Le balayage complet à `niveau_dbfs` crête.
     Balayage { niveau_dbfs: f64 },
-    /// Plus rien à jouer : le flux se termine.
+    /// Plus rien à jouer : le reste du flux n'est que du silence, jusqu'à
+    /// la longueur promise (le `Content-Length` annoncé à la zone).
     Fin,
 }
 
@@ -470,12 +471,17 @@ impl Generateur {
         }
     }
 
+    /// Plus rien à jouer : `Fin` prise (segment épuisé) ou mesure annulée.
+    /// Le reste du flux n'est que du silence.
+    fn termine(&self) -> bool {
+        self.deroule.annulee() || (self.deroule.fini() && self.segment.is_none())
+    }
+
     /// #9066 — `n` trames de silence au plus (dans la longueur promise), sans
-    /// prendre de consigne ni avancer le segment en cours.
+    /// prendre de consigne ni avancer le segment en cours. Sert aussi, une
+    /// fois le déroulé [`terminé`](Self::termine), à combler le flux jusqu'à
+    /// sa longueur promise.
     fn silence(&mut self, n: usize) -> Vec<u8> {
-        if self.deroule.annulee() || (self.deroule.fini() && self.segment.is_none()) {
-            return Vec::new();
-        }
         let n = (n as u64).min(self.trames_max.saturating_sub(self.trames_rendues));
         self.trames_rendues += n;
         self.deroule.verrou().trames_rendues = self.trames_rendues;
@@ -530,21 +536,31 @@ impl Read for Generateur {
         if buf.is_empty() {
             return Ok(0);
         }
-        if self.reste.is_empty() {
-            // Des blocs de 10 ms : une consigne est prise au bloc suivant.
-            let bloc = (self.deroule.plan.format.frequence / 100).max(1) as usize;
-            self.reste = if self.attendre_l_ecoute(bloc as u64) {
-                self.produire(bloc)
-            } else {
-                self.silence(bloc)
-            };
-            if self.reste.is_empty() {
+        while self.reste.is_empty() {
+            // La longueur promise est le `Content-Length` que l'orchestrateur
+            // a annoncé à la zone (`FluxPcm::octets`) : le flux ne finit
+            // qu'elle atteinte. S'arrêter plus tôt — à `Fin`, ou sur une
+            // annulation — c'était « fin de flux avant la longueur annoncée »,
+            // une erreur de lecture fatale, et sur OAAT un corps HTTP court
+            // pris pour une coupure (Xavier, 25/11). Après `Fin`, le reste
+            // n'est que du silence, et l'arrêt de la zone, qui suit la mesure,
+            // ferme le flux bien avant.
+            if self.trames_rendues >= self.trames_max {
                 let mut e = self.deroule.verrou();
                 e.fini = true;
                 drop(e);
                 self.deroule.signal.notify_all();
                 return Ok(0);
             }
+            // Des blocs de 10 ms : une consigne est prise au bloc suivant.
+            let bloc = (self.deroule.plan.format.frequence / 100).max(1) as usize;
+            self.reste = if self.termine() {
+                self.silence(bloc)
+            } else if self.attendre_l_ecoute(bloc as u64) {
+                self.produire(bloc)
+            } else {
+                self.silence(bloc)
+            };
         }
         let n = buf.len().min(self.reste.len());
         buf[..n].copy_from_slice(&self.reste[..n]);
@@ -619,11 +635,13 @@ mod tests {
         assert_eq!(em[0].niveau_dbfs, -6.0);
     }
 
-    /// Sans consigne : du silence, et le flux ne s'arrête qu'à `Fin` ou à la
-    /// longueur maximale promise.
+    /// Sans consigne : du silence. Après `Fin`, plus aucun signal, mais le
+    /// flux va jusqu'à la longueur promise, en silence : c'est le
+    /// `Content-Length` annoncé à la zone.
     #[test]
     fn sans_consigne_le_generateur_rend_du_silence_puis_finit_sur_fin() {
-        let d = Deroule::new(plan());
+        let p = plan();
+        let d = Deroule::new(p.clone());
         let mut g = Generateur::new(d.clone());
         assert!(d.ouvert());
         let mut buf = vec![0u8; 48_000 * 6];
@@ -631,8 +649,60 @@ mod tests {
         assert!(buf.iter().all(|b| *b == 0));
         d.consigner(Consigne::Fin);
         let reste = tout_lire(&mut g);
-        assert!(reste.len() < 48_000 * 6 * 2, "le flux ne finit pas");
+        assert_eq!(buf.len() as u64 + reste.len() as u64, p.octets_max());
+        assert!(reste.iter().all(|b| *b == 0));
         assert!(d.fini());
+    }
+
+    /// Calibration sur OAAT (Xavier, 25/11) — la mesure finit (`Fin`) bien
+    /// avant la longueur maximale budgétée : le flux s'arrêtait là, et la
+    /// pompe de l'orchestrateur, qui a annoncé `octets_max` en
+    /// `Content-Length`, le disait « interrompu : fin de flux avant la
+    /// longueur annoncée » — erreur fatale de lecture, et sur OAAT un corps
+    /// HTTP court lu comme une coupure. Le flux doit aller au bout de sa
+    /// longueur, en silence.
+    #[test]
+    fn apres_fin_la_pompe_remet_toute_la_longueur_annoncee() {
+        let p = plan();
+        let d = Deroule::new(p.clone());
+        let ecoute = Arc::new(AtomicU64::new(0));
+        let e = ecoute.clone();
+        d.cadencer_sur_l_ecoute(Arc::new(move || e.load(Ordering::SeqCst)), 4_800);
+        d.consigner(Consigne::Balayage { niveau_dbfs: -12.0 });
+        let mut g = Generateur::new(d.clone());
+        let mut remis = 0u64;
+        let mut fin_donnee = false;
+        let fin = tune_core::source_pcm::pomper(&mut g, p.octets_max(), |t| {
+            remis += t.len() as u64;
+            // L'écoute suit ce qui est joué ; le balayage et sa garde
+            // captés, l'analyseur donne `Fin`, comme `jouer_et_mesurer`.
+            ecoute.store(remis / p.format.octets_par_trame(), Ordering::SeqCst);
+            if !fin_donnee && remis / p.format.octets_par_trame() > 3 * 48_000 {
+                d.consigner(Consigne::Fin);
+                fin_donnee = true;
+            }
+            true
+        });
+        assert!(fin_donnee);
+        assert_eq!(fin, tune_core::source_pcm::FinDePompe::Complete);
+        assert_eq!(remis, p.octets_max());
+    }
+
+    /// Une mesure annulée ne fait plus sortir de signal, mais ne coupe pas
+    /// non plus le flux avant sa longueur : c'est l'arrêt de la zone, qui
+    /// suit, qui le ferme.
+    #[test]
+    fn une_annulation_tait_le_signal_sans_raccourcir_le_flux() {
+        let p = plan();
+        let d = Deroule::new(p.clone());
+        d.consigner(Consigne::Balayage { niveau_dbfs: -12.0 });
+        let mut g = Generateur::new(d.clone());
+        let mut debut = vec![0u8; 6 * 4_800];
+        g.read_exact(&mut debut).unwrap();
+        d.annuler();
+        let reste = tout_lire(&mut g);
+        assert_eq!(debut.len() as u64 + reste.len() as u64, p.octets_max());
+        assert_eq!(crete_24(&reste), 0.0, "du signal après l'annulation");
     }
 
     /// Une voie seule : l'autre reste exactement nulle.
