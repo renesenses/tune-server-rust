@@ -490,6 +490,12 @@ impl Controleur {
                 demande.zone_id
             )
         })?;
+        // Fil 3094 — une zone dont l'appareil n'est pas enregistré (deux
+        // zones sur le même DAC, celle-ci orpheline) : refus clair AVANT de
+        // forcer le volume, au lieu de « output local:… is not registered ».
+        if let Some(inactive) = self.hote.sortie_inactive(demande.zone_id) {
+            return Err(inactive.message());
+        }
         let traitements = self.hote.traitements(demande.zone_id);
         if traitements.volume_fixe {
             return Err(
@@ -624,9 +630,9 @@ impl Controleur {
         )
         .inspect_err(|_| capture.arreter())?;
         let r = self.jouer_et_mesurer(mesure, &capture, &zone, etalonnage.as_ref(), &traitements);
-        // Restauration dans tous les cas : arrêt de la zone, volume initial,
-        // capture close.
-        zone.rendre();
+        // Restauration dans tous les cas : arrêt de la zone, balayage retiré
+        // de la file (fil 3094), volume initial, capture close.
+        zone.rendre(&mesure.id);
         capture.arreter();
         if capture.debordements() > 0 {
             mesure.avertir(format!(
@@ -976,8 +982,11 @@ impl ZoneTenue {
             .map_err(|e| Sortie::Erreur(format!("la zone n'a pas démarré le balayage : {e}")))
     }
 
-    fn rendre(self) {
+    fn rendre(self, mesure_id: &str) {
         self.hote.arreter(self.zone_id);
+        // Fil 3094 — réussie, échouée ou annulée : le balayage quitte la
+        // file et la file d'avant revient.
+        self.hote.liberer(self.zone_id, mesure_id);
         // Zone arrêtée : la prochaine lecture repartira avec ses traitements.
         drop(self.contournement);
         if let Err(e) = self.hote.regler_volume(self.zone_id, self.volume_initial) {
