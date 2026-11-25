@@ -304,12 +304,13 @@ fn sous_le_lsb_le_dither_garde_le_niveau_moyen() {
 #[test]
 fn headroom_auto_arme_avec_un_traitement_et_desarme_sans() {
     let source = source_24_bits(4_410);
-    // Crossfeed coché (Free, stéréo) : traitement effectif ⇒ −3 dB.
+    // Crossfeed coché (Free, stéréo) : traitement effectif ⇒ l'Auto
+    // (rc14 : 0 dB, la marge est celle des égaliseurs).
     let arme = avec(&[("crossfeed", true)]);
     let r = resoudre(&arme, &ctx(0.0, false));
-    assert_eq!(r.headroom_db, -3.0);
+    assert_eq!(r.headroom_db, crate::tess::chaine::HEADROOM_AUTO_DB);
     let b = bilan(&arme, &r, 0.0);
-    assert_eq!(b.gain_d_entree_db, -3.0);
+    assert_eq!(b.gain_d_entree_db, crate::tess::chaine::HEADROOM_AUTO_DB);
     let mut h = EtageHeadroom::new(b.gain_d_entree_db).unwrap();
     h.preparer(CD, BLOC).unwrap();
     let mut f: Vec<f64> = source[..BLOC * 2]
@@ -319,7 +320,7 @@ fn headroom_auto_arme_avec_un_traitement_et_desarme_sans() {
     let avant = f.clone();
     h.traiter_sur_place(&mut f, BLOC).unwrap();
     for (a, b) in f.iter().zip(&avant) {
-        assert_eq!(*a, b * lineaire(-3.0));
+        assert_eq!(*a, b * lineaire(crate::tess::chaine::HEADROOM_AUTO_DB));
     }
     // Décoché : rien à protéger ⇒ 0 dB, l'étage ne touche rien.
     let desarme = avec(&[("crossfeed", false)]);
@@ -443,7 +444,7 @@ fn pas_de_double_compte_avec_la_compensation_4594() {
 fn le_niveau_percu_est_celui_du_volume_sur_le_signal() {
     let chaine = avec(&[("equalizer-graphic", true)]);
     let r = resoudre(&chaine, &ctx(-20.0, false));
-    assert_eq!(r.headroom_db, -3.0);
+    assert_eq!(r.headroom_db, crate::tess::chaine::HEADROOM_AUTO_DB);
     let b = bilan(&chaine, &r, -12.0);
     let consigne = ConsigneVolume::new(b.gain_de_rendu(lineaire(-20.0)).lineaire);
     let mut banc = Banc::new(

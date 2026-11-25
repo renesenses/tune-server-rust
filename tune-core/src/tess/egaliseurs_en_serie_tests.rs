@@ -250,3 +250,36 @@ fn le_schema_publie_les_bornes_rc14() {
     borner_le_schema("crossfeed", &mut cf);
     assert_eq!(cf, json!({"type": "object"}));
 }
+
+/// L'ordre des familles ne change qu'au déplacement : cocher le repli mono
+/// ou un second égaliseur à sa place par défaut ne le change pas.
+#[test]
+fn l_ordre_des_familles_ne_change_qu_au_deplacement_rc14() {
+    let c = |ids: &[(&str, bool)]| ChaineTess {
+        plugins: ids
+            .iter()
+            .map(|(id, on)| MaillonGreffon {
+                id: (*id).into(),
+                enabled: *on,
+                settings: Value::Null,
+            })
+            .collect(),
+        ..ChaineTess::default()
+    };
+    let defaut = ordre_des_coches(&c(&[("equalizer-graphic", true), ("crossfeed", true)]));
+    assert_eq!(defaut, [0, 1, 2]);
+    assert_eq!(
+        ordre_des_coches(&c(&[
+            ("equalizer-graphic", true),
+            ("equalizer-parametric", true),
+            ("crossfeed", true),
+            ("mono-downmix", true),
+        ])),
+        defaut
+    );
+    assert_eq!(ordre_des_coches(&c(&[("crossfeed", false)])), defaut);
+    assert_eq!(
+        ordre_des_coches(&c(&[("crossfeed", true), ("equalizer-graphic", true)])),
+        [2, 0, 1]
+    );
+}

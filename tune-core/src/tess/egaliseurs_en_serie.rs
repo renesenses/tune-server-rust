@@ -216,14 +216,39 @@ pub fn cle_ordre_tess(zone_id: i64) -> String {
     format!("{}#order", super::cle_chaine_zone(zone_id))
 }
 
-/// Les greffons cochés, dans l'ordre de la chaîne.
-pub fn ordre_des_coches(chaine: &ChaineTess) -> Vec<&str> {
-    chaine
-        .plugins
-        .iter()
-        .filter(|m| m.enabled)
-        .map(|m| m.id.as_str())
-        .collect()
+/// L'ordre des FAMILLES d'étages de la sortie locale que donnent les
+/// greffons cochés (0 égaliseurs, 1 convolution, 2 crossfeed et natifs), les
+/// familles non nommées à leur rang historique — la même règle que
+/// `outputs::local::executeur_tess::OrdreLocal::depuis_ids`. Cocher ou
+/// décocher sans rien déplacer ne le change pas.
+pub fn ordre_des_coches(chaine: &ChaineTess) -> Vec<u8> {
+    let catalogue = super::catalogue_de_reference();
+    let mut ordre: Vec<u8> = Vec::with_capacity(3);
+    for m in chaine.plugins.iter().filter(|m| m.enabled) {
+        let id = m.id.as_str();
+        let famille = if FACADES_EQ.contains(&id) {
+            0
+        } else if id == "convolution" {
+            1
+        } else if id == "crossfeed"
+            || id == crate::audio::crossfeed::ID_CROSSTALK
+            || id.starts_with(super::greffon::PREFIXE_FAMILLE_CROSSFEED)
+            || catalogue.get(id).is_none()
+        {
+            2
+        } else {
+            continue;
+        };
+        if !ordre.contains(&famille) {
+            ordre.push(famille);
+        }
+    }
+    for f in 0..3 {
+        if !ordre.contains(&f) {
+            ordre.push(f);
+        }
+    }
+    ordre
 }
 
 /// La chaîne ENREGISTRÉE de la zone, sans la relire (rapide) ; la chaîne par

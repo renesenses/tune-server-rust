@@ -2598,11 +2598,6 @@ impl PlaybackOrchestrator {
                     .downcast_ref::<crate::outputs::local::LocalOutput>()
                 {
                     local_output.set_pure_bypass(zone_audiophile);
-                    // rc14 — l'ordre des étages suit la chaîne TESS de la zone.
-                    local_output.set_ordre_tess(&crate::tess::egaliseurs_en_serie::chaine_de_zone(
-                        &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
-                        zone_id,
-                    ));
                     local_output.set_fixed_sample_rate(crate::audio::frequence_fixe::active(
                         &self.db, zone_id,
                     ));
@@ -2616,6 +2611,11 @@ impl PlaybackOrchestrator {
                     // lecture comme le strict : `play_url` la lit une fois.
                     local_output.set_secondes_sorties(secondes_sorties);
                     local_output.set_retard_de_depart_ms(retard_de_depart_ms);
+                    // rc14 — l'ordre des étages suit la chaîne TESS de la zone.
+                    local_output.set_ordre_tess(&crate::tess::egaliseurs_en_serie::chaine_de_zone(
+                        &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+                        zone_id,
+                    ));
                     // #8869 — le silence de verrouillage de la zone, lu à
                     // chaque lecture : `play_url` le lit une fois.
                     local_output.set_silence_de_verrouillage_ms(
