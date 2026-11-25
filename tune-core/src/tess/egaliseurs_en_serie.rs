@@ -46,11 +46,18 @@ use crate::db::settings_repo::SettingsRepo;
 pub const GAIN_PARAMETRIQUE_MIN_DB: f64 = -30.0;
 pub const GAIN_PARAMETRIQUE_MAX_DB: f64 = 15.0;
 
+/// Plafond du casque : des corrections OPRA montent jusqu'à +20 dB (197
+/// profils au-dessus de +15 dB, #9519). Sous le plafond du moteur (+24 dB).
+pub const GAIN_CASQUE_MAX_DB: f64 = 20.0;
+
 /// Les bornes de gain d'une bande pour cette façade : ±12 dB pour le
-/// graphique (curseurs, conversion P2), −30 / +15 dB pour les autres.
+/// graphique (curseurs, conversion P2), −30 / +20 dB pour le casque,
+/// −30 / +15 dB pour le paramétrique et la correction de pièce.
 pub fn bornes_de_gain(id: &str) -> Option<(f64, f64)> {
     if id == ID_EQ_GRAPHIQUE {
         Some((-GAIN_GRAPHIQUE_MAX_DB, GAIN_GRAPHIQUE_MAX_DB))
+    } else if id == super::migration::ID_EQ_CASQUE {
+        Some((GAIN_PARAMETRIQUE_MIN_DB, GAIN_CASQUE_MAX_DB))
     } else if FACADES_EQ.contains(&id) {
         Some((GAIN_PARAMETRIQUE_MIN_DB, GAIN_PARAMETRIQUE_MAX_DB))
     } else {

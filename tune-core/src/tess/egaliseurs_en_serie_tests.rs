@@ -200,7 +200,8 @@ fn les_gains_sont_bornes_au_put_rc14() {
     let vide = ChaineTess::default();
     for (id, ok, refuse) in [
         ("equalizer-parametric", [-30.0, 15.0], [-30.1, 15.1]),
-        ("equalizer-headphone", [-30.0, 15.0], [-31.0, 16.0]),
+        ("equalizer-headphone", [-30.0, 20.0], [-31.0, 20.5]),
+        ("room-correction", [-30.0, 15.0], [-30.5, 15.5]),
         ("equalizer-graphic", [-12.0, 12.0], [-12.5, 12.5]),
     ] {
         for g in ok {
@@ -284,4 +285,32 @@ fn l_ordre_des_familles_ne_change_qu_au_deplacement_rc14() {
         ordre_des_coches(&c(&[("crossfeed", true), ("equalizer-graphic", true)])),
         [2, 0, 1]
     );
+}
+
+/// #9519 — un profil casque OPRA à +20 dB : accepté au `PUT`, publié dans le
+/// catalogue, et joué tel quel par le moteur (plafond +24 dB).
+#[test]
+fn un_profil_casque_a_plus_20_db_est_accepte_rc14() {
+    let casque = ChaineTess {
+        plugins: vec![MaillonGreffon {
+            id: "equalizer-headphone".into(),
+            enabled: true,
+            settings: json!({"bands": [
+                {"freq": 9000.0, "gain": 20.0, "q": 2.0, "type": "peak"},
+                {"freq": 40.0, "gain": -30.0, "q": 0.7, "type": "low_shelf"}
+            ]}),
+        }],
+        ..ChaineTess::default()
+    };
+    verifier_les_gains(&casque, &ChaineTess::default()).unwrap();
+    let mut s: Value = serde_json::from_str(include_str!(
+        "../../../sdk/tune-plugin-equalizer/schemas/config.json"
+    ))
+    .unwrap();
+    borner_le_schema("equalizer-headphone", &mut s);
+    let g = &s["properties"]["bands"]["items"]["properties"]["gain"];
+    assert_eq!((g["minimum"].clone(), g["maximum"].clone()), (json!(-30.0), json!(20.0)));
+    let p = profil_du_maillon(&casque.plugins[0]).unwrap();
+    let r = courbe_db(&p, &[9000.0]);
+    assert!((r[0][0] - 20.0).abs() < 0.3, "{}", r[0][0]);
 }

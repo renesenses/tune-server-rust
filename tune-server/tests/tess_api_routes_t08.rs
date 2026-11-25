@@ -1241,8 +1241,8 @@ async fn une_zone_normalisee_par_l_exclusivite_retrouve_ses_egaliseurs_rc14() {
 }
 
 /// rc14 — bornes de gain publiées au chemin que lit le web, et tenues au
-/// `PUT` : −30 / +15 dB pour le paramétrique et le casque, ±12 dB pour le
-/// graphique.
+/// `PUT` : −30 / +15 dB pour le paramétrique et la pièce, −30 / +20 dB pour
+/// le casque (OPRA, #9519), ±12 dB pour le graphique.
 #[tokio::test]
 async fn les_bornes_de_gain_sont_publiees_et_tenues_rc14() {
     let b = Banc::nouveau(true).await;
@@ -1260,7 +1260,7 @@ async fn les_bornes_de_gain_sont_publiees_et_tenues_rc14() {
     };
     for (id, min, max) in [
         ("equalizer-parametric", -30.0, 15.0),
-        ("equalizer-headphone", -30.0, 15.0),
+        ("equalizer-headphone", -30.0, 20.0),
         ("room-correction", -30.0, 15.0),
         ("equalizer-graphic", -12.0, 12.0),
     ] {
@@ -1295,7 +1295,14 @@ async fn les_bornes_de_gain_sont_publiees_et_tenues_rc14() {
         ]}))
         .await;
     assert_eq!(s, StatusCode::CONFLICT, "{v}");
-    refus_conforme(&v, 409, "invalid_settings");
+    refus_conforme(&v, 409, "invalid_settings");    // #9519 — une correction casque OPRA à +20 dB passe.
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "equalizer-headphone", "enabled": true,
+             "settings": profil(json!([{"freq": 9000.0, "gain": 20.0, "q": 2.0, "type": "peak"}]))}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
 }
 
 /// rc14 — un paquet installé mais désactivé n'est pas « à installer » : il
