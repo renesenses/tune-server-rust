@@ -103,7 +103,7 @@ fn une_sortie_sans_reglage_n_est_pas_touchee() {
     assert!(!agit(&s.cle, false));
     // Le premier `poser` (neutre, au démarrage d'une lecture) crée le
     // créneau : la ligne à retard est désormais alimentée, sans rien toucher.
-    poser(&s.cle, None);
+    poser(&s.cle, true, None);
     assert_eq!(reglages(&s.cle), Some(ReglagesEnceintes::default()));
     assert!(!traiter(&s.cle, &mut t, 2, 44_100, false));
     assert!(t.iter().all(|x| *x == 0.5));
@@ -119,10 +119,10 @@ fn une_sortie_sans_reglage_n_est_pas_touchee() {
 fn du_neutre_a_un_delai_sans_saut_100_300_et_1000_cm() {
     for ecart in [100.0, 300.0, 1000.0] {
         let mut s = Sortie::new();
-        poser(&s.cle, None);
+        poser(&s.cle, true, None);
         s.jouer(1.0);
         let pose = s.trames();
-        poser(&s.cle, Some(deux_voies(ecart, 0.0, 0.0)));
+        poser(&s.cle, true, Some(deux_voies(ecart, 0.0, 0.0)));
         s.jouer(1.0);
         let saut = s.saut_max(0, 1).max(s.saut_max(1, 1));
         eprintln!(
@@ -156,7 +156,7 @@ fn du_neutre_a_un_delai_sans_saut_100_300_et_1000_cm() {
 fn premier_reglage_pendant_la_lecture_sans_saut() {
     let mut s = Sortie::new();
     s.jouer(0.5);
-    poser(&s.cle, Some(deux_voies(1000.0, 0.0, -3.0)));
+    poser(&s.cle, true, Some(deux_voies(1000.0, 0.0, -3.0)));
     s.jouer(1.0);
     let saut = s.saut_max(0, 1).max(s.saut_max(1, 1));
     eprintln!("saut_mesure premier reglage 10 m : {saut:.5}");
@@ -175,7 +175,7 @@ fn premier_reglage_pendant_la_lecture_sans_saut() {
 #[test]
 fn sortie_de_pure_sans_saut() {
     let mut s = Sortie::new();
-    poser(&s.cle, Some(deux_voies(300.0, 0.0, -6.0)));
+    poser(&s.cle, true, Some(deux_voies(300.0, 0.0, -6.0)));
     s.jouer(0.5);
     s.cle.store(true, Ordering::Relaxed);
     let debut_pure = s.trames();
@@ -207,11 +207,11 @@ fn sortie_de_pure_sans_saut() {
 #[test]
 fn retrait_et_changement_a_chaud_sans_saut() {
     let mut s = Sortie::new();
-    poser(&s.cle, Some(deux_voies(300.0, 0.0, 0.0)));
+    poser(&s.cle, true, Some(deux_voies(300.0, 0.0, 0.0)));
     s.jouer(0.5);
-    poser(&s.cle, Some(deux_voies(1000.0, 0.0, 2.0)));
+    poser(&s.cle, true, Some(deux_voies(1000.0, 0.0, 2.0)));
     s.jouer(0.5);
-    poser(&s.cle, None);
+    poser(&s.cle, true, None);
     s.jouer(0.5);
     let saut = s.saut_max(0, 1).max(s.saut_max(1, 1));
     eprintln!("saut_mesure retrait et 3 m -> 10 m : {saut:.5}");
@@ -227,7 +227,7 @@ fn retrait_et_changement_a_chaud_sans_saut() {
 fn le_reglage_est_propre_a_chaque_sortie() {
     let a = Sortie::new();
     let b = Sortie::new();
-    poser(&a.cle, Some(deux_voies(300.0, 300.0, -6.0)));
+    poser(&a.cle, true, Some(deux_voies(300.0, 300.0, -6.0)));
     assert!(agit(&a.cle, false));
     assert!(!agit(&b.cle, false), "l'autre sortie n'a rien");
     assert!(!agit(&a.cle, true), "jamais sur un porteur DoP");
@@ -252,11 +252,11 @@ fn le_bras_natif_reste_bit_perfect_sans_reglage_et_fond_sans_saut() {
     let mut sortie: Vec<i32> = Vec::new();
     let mut entree: Vec<i32> = Vec::new();
     let mut tous_bruts_avant = true;
-    poser(&pure, None);
+    poser(&pure, true, None);
     for debut in (0..total).step_by(bloc) {
         if debut == 13_230 {
             // 0,3 s : la voie droite 100 cm plus près (129 trames).
-            poser(&pure, Some(deux_voies(300.0, 200.0, 0.0)));
+            poser(&pure, true, Some(deux_voies(300.0, 200.0, 0.0)));
         }
         let mut octets = Vec::new();
         for n in debut..debut + bloc {
@@ -312,4 +312,42 @@ fn le_bras_natif_reste_bit_perfect_sans_reglage_et_fond_sans_saut() {
         assert_eq!(sortie[n * 2 + 1], entree[(n - 129) * 2 + 1], "droite {n}");
     }
     oublier(&pure);
+}
+
+/// Relecture de #9523 — aucun créneau (coût nul) quand le greffon n'est pas
+/// dans la chaîne de la zone ; une nouvelle lecture le retire.
+#[test]
+fn hors_de_la_chaine_aucun_creneau() {
+    let s = Sortie::new();
+    poser(&s.cle, false, None);
+    assert!(reglages(&s.cle).is_none());
+    nouvelle_lecture(&s.cle, true, Some(deux_voies(300.0, 0.0, -6.0)));
+    assert!(reglages(&s.cle).is_some());
+    nouvelle_lecture(&s.cle, false, None);
+    assert!(reglages(&s.cle).is_none(), "retiré à la lecture suivante");
+}
+
+/// Relecture de #9523 — une nouvelle lecture (arrêt, seek, autre piste) ou un
+/// arrêt vident l'historique : rien de l'écoute précédente n'est rejoué,
+/// même au même format, même longtemps après.
+#[test]
+fn une_nouvelle_lecture_ne_rejoue_rien_de_la_precedente() {
+    for vider_par_arret in [false, true] {
+        let mut s = Sortie::new();
+        nouvelle_lecture(&s.cle, true, Some(deux_voies(1000.0, 0.0, 0.0)));
+        s.jouer(0.5);
+        if vider_par_arret {
+            vider(&s.cle);
+        } else {
+            nouvelle_lecture(&s.cle, true, Some(deux_voies(1000.0, 0.0, 0.0)));
+        }
+        // La lecture suivante commence par du silence : la voie retardée ne
+        // doit rien rendre de l'ancien sinus.
+        let mut silence = vec![0.0_f64; 2 * 2_000];
+        traiter(&s.cle, &mut silence, 2, CADENCE, false);
+        assert!(
+            silence.iter().all(|x| *x == 0.0),
+            "son de l'écoute précédente rejoué (arrêt : {vider_par_arret})"
+        );
+    }
 }

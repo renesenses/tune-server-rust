@@ -489,6 +489,15 @@ impl ProcesseurEnceintes {
         self.rampe_restante = self.rampe_totale;
     }
 
+    /// Un nouveau flux commence (nouvelle lecture) : historique vidé, fondu
+    /// abandonné, `reglages` appliqué dès le premier bloc.
+    pub fn nouveau_flux(&mut self, reglages: ReglagesEnceintes) {
+        self.en_attente = None;
+        self.reglages = reglages;
+        self.contourne = false;
+        self.reinitialiser();
+    }
+
     /// Vide l'historique (nouveau flux indépendant du précédent).
     pub fn reinitialiser(&mut self) {
         self.anneau.fill(0.0);
@@ -650,6 +659,23 @@ pub fn bypass_all_de_zone(settings: &crate::db::settings_repo::SettingsRepo, zon
         .flatten()
         .and_then(|brut| serde_json::from_str::<Value>(&brut).ok())
         .and_then(|v| v.get("bypass_all").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// Le greffon est-il dans la chaîne TESS de la zone (coché ou non) ?
+/// Chaîne absente ou illisible : non.
+pub fn dans_la_chaine(settings: &crate::db::settings_repo::SettingsRepo, zone_id: i64) -> bool {
+    settings
+        .get(&crate::tess::cle_chaine_zone(zone_id))
+        .ok()
+        .flatten()
+        .and_then(|brut| serde_json::from_str::<Value>(&brut).ok())
+        .and_then(|v| {
+            v.get("plugins").and_then(Value::as_array).map(|l| {
+                l.iter()
+                    .any(|m| m.get("id").and_then(Value::as_str) == Some(ID_GREFFON))
+            })
+        })
         .unwrap_or(false)
 }
 

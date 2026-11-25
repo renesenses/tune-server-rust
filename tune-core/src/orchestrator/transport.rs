@@ -2665,8 +2665,14 @@ impl PlaybackOrchestrator {
                     // `false` en mode PURE, donc la promesse bit-perfect tient
                     // sans garde supplémentaire, exactement comme pour l'EQ.
                     local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
-                    // rc14 — le réglage des enceintes de la zone.
-                    local_output.set_reglage_enceintes(self.zone_reglage_enceintes(zone_id));
+                    // rc14 — le réglage des enceintes de la zone : nouvelle
+                    // lecture, historique vidé (rien d'une écoute précédente
+                    // n'est rejoué) ; aucun créneau si le greffon n'est pas
+                    // dans la chaîne.
+                    local_output.demarrer_reglage_enceintes(
+                        self.zone_enceintes_dans_la_chaine(zone_id),
+                        self.zone_reglage_enceintes(zone_id),
+                    );
                     // #7632 — le droit de convoluer, posé à chaque lecture
                     // comme PURE : sans Premium, l'IR mémorisée ne bâtit
                     // aucun moteur pour la piste qui démarre.

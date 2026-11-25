@@ -13,9 +13,21 @@
 //! rééchantillonnage (`EtageDeConversion::convertir`) ; sur les bras natifs,
 //! après l'adaptation et avant le volume (`prepare_windows_native_pcm`).
 //!
-//! **Coût nul quand rien n'est posé** : un compteur atomique dit si une
-//! sortie au moins a un réglage ; sinon le chemin temps réel ne prend aucun
-//! verrou. Un réglage neutre au repos ne touche aucun échantillon.
+//! **Créneau seulement si le greffon est dans la chaîne de la zone** (même
+//! neutre) : une sortie dont la zone n'a pas le greffon n'a pas de créneau ;
+//! son chemin temps réel ne prend alors que la lecture d'un compteur atomique
+//! (aucun créneau nulle part) ou d'une table sous `RwLock` (créneaux
+//! ailleurs), sans `Mutex` ni copie. Avec le greffon, la ligne à retard est
+//! alimentée en permanence ; un réglage neutre au repos ne touche aucun
+//! échantillon.
+//!
+//! **Historique remis à zéro à chaque nouvelle lecture** (démarrage, reprise
+//! après arrêt, seek, piste lancée hors enchaînement :
+//! [`nouvelle_lecture`]) : un son d'une autre écoute n'est jamais rejoué. Seul
+//! l'enchaînement sans blanc (même flux de sortie) garde l'historique.
+//!
+//! **Entrée en PURE sans fondu**, comme les autres étages : PURE rend le flux
+//! intact dès le bloc suivant. La sortie de PURE, elle, passe par un fondu.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -43,15 +55,15 @@ fn creneau(cle: &AtomicBool) -> Option<Creneau> {
     table().read().ok()?.get(&adresse(cle)).cloned()
 }
 
-/// Pose (ou retire, `None`) le réglage de la sortie dont `cle` est le drapeau
-/// PURE. Hors temps réel.
+/// Change à chaud le réglage de la sortie dont `cle` est le drapeau PURE
+/// (réglage modifié, PURE ou « Bypass all » basculés). Hors temps réel.
 ///
-/// Le créneau est créé dès le PREMIER appel, réglage neutre compris (la
-/// lecture en pose un à chaque démarrage) : sa ligne à retard est alors
-/// alimentée en permanence, et un réglage posé plus tard trouve un historique
-/// plein. Un créneau neuf part du neutre ; tout changement passe par le
-/// fondu du processeur, retrait compris.
-pub(crate) fn poser(cle: &AtomicBool, reglages: Option<ReglagesEnceintes>) {
+/// - Greffon dans la chaîne (`dans_la_chaine`) : le créneau est créé s'il
+///   manque (il part du neutre et rejoint le réglage par un fondu) ; sinon le
+///   processeur passe au nouveau réglage par son fondu (`None` = neutre).
+/// - Greffon hors de la chaîne : un créneau existant fond vers le neutre ; il
+///   disparaîtra à la prochaine lecture. Aucun créneau n'est créé.
+pub(crate) fn poser(cle: &AtomicBool, dans_la_chaine: bool, reglages: Option<ReglagesEnceintes>) {
     let r = reglages.unwrap_or_default();
     if let Some(c) = creneau(cle) {
         if let Ok(mut p) = c.lock() {
@@ -59,10 +71,52 @@ pub(crate) fn poser(cle: &AtomicBool, reglages: Option<ReglagesEnceintes>) {
         }
         return;
     }
+    if !dans_la_chaine {
+        return;
+    }
     if let Ok(mut t) = table().write() {
         t.entry(adresse(cle))
             .or_insert_with(|| Arc::new(Mutex::new(ProcesseurEnceintes::au_neutre(r))));
         POSES.store(t.len(), Ordering::Release);
+    }
+}
+
+/// Une NOUVELLE lecture démarre sur la sortie (lancement, reprise après
+/// arrêt, seek, piste hors enchaînement). Hors temps réel, avant le premier
+/// bloc. Greffon hors de la chaîne : le créneau est retiré (coût nul).
+/// Sinon l'historique est vidé (rien d'une écoute précédente n'est rejoué)
+/// et le réglage s'applique dès le premier bloc, comme à tout début de flux :
+/// les voies retardées commencent par leur délai de silence.
+pub(crate) fn nouvelle_lecture(
+    cle: &AtomicBool,
+    dans_la_chaine: bool,
+    reglages: Option<ReglagesEnceintes>,
+) {
+    if !dans_la_chaine {
+        oublier(cle);
+        return;
+    }
+    let r = reglages.unwrap_or_default();
+    if let Some(c) = creneau(cle) {
+        if let Ok(mut p) = c.lock() {
+            p.nouveau_flux(r);
+        }
+        return;
+    }
+    if let Ok(mut t) = table().write() {
+        t.entry(adresse(cle))
+            .or_insert_with(|| Arc::new(Mutex::new(ProcesseurEnceintes::new(r))));
+        POSES.store(t.len(), Ordering::Release);
+    }
+}
+
+/// Arrêt de la sortie : l'historique est vidé, le réglage gardé.
+pub(crate) fn vider(cle: &AtomicBool) {
+    if let Some(c) = creneau(cle)
+        && let Ok(mut p) = c.lock()
+    {
+        let r = p.reglages().clone();
+        p.nouveau_flux(r);
     }
 }
 

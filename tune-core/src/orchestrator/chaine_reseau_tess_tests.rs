@@ -672,17 +672,16 @@ fn le_reglage_des_enceintes_decale_une_voie_au_mot_pres_rc14() {
     assert_eq!(pcm, src);
 }
 
-/// rc14 (relecture de #9523, m2) — deux pistes enchaînées SANS BLANC sur un
-/// relais réseau : la ligne à retard de la première passe à la seconde. La
-/// suite des deux flux est exactement le traitement continu des deux pistes
-/// mises bout à bout : la queue de la voie retardée n'est pas perdue (elle
-/// sort en tête de la piste 2), la piste 2 ne commence pas par des zéros, et
-/// chaque piste garde sa longueur. Sinus de 50 Hz, amplitude 0,8.
+/// rc14 (relecture de #9523, M1) — convolveur PUIS réglage des enceintes avec
+/// inversion, sur un relais : la queue que le convolveur rend en fin de flux
+/// (`Passage::Fin`) passe ELLE AUSSI par le réglage des enceintes (délai,
+/// gain, phase). Avant, les dernières trames (la latence du convolveur)
+/// sortaient non inversées : saut de −8000 à +8000. Sinus de 50 Hz,
+/// amplitude 0,8 ; écart à la référence ≤ 2 LSB sur TOUT le flux, queue
+/// comprise.
 #[test]
-fn deux_pistes_s_enchainent_sans_blanc_ni_perte_rc14() {
-    use super::{garder_les_enceintes, reprendre_les_enceintes};
+fn la_queue_du_convolveur_passe_par_le_reglage_des_enceintes_rc14() {
     use crate::audio::reglage_enceintes::{ProcesseurEnceintes, ReglagesEnceintes, VoieEnceinte};
-    const ZONE: i64 = 9_523_002;
     let reglages = ReglagesEnceintes {
         channels: vec![
             VoieEnceinte {
@@ -690,66 +689,68 @@ fn deux_pistes_s_enchainent_sans_blanc_ni_perte_rc14() {
                 ..VoieEnceinte::default()
             },
             VoieEnceinte {
-                distance_cm: Some(0.0), // 10 ms : 480 trames à 48 kHz
-                ..VoieEnceinte::default()
+                distance_cm: Some(343.0 / 2.0), // 240 trames à 48 kHz
+                gain_db: -3.0,
+                invert: false,
             },
         ],
-        invert_all: false,
+        invert_all: true,
     };
-    let piste = |debut: usize, n: usize| -> Vec<u8> {
-        let mut o = Vec::new();
-        for i in debut..debut + n {
-            let x = 0.8 * (2.0 * std::f64::consts::PI * 50.0 * i as f64 / 48_000.0).sin();
-            let v = (x * 8_388_607.0).round() as i32;
-            for _ in 0..2 {
-                o.extend_from_slice(&v.to_le_bytes()[..3]);
-            }
-        }
-        o
+    let n = 7_000;
+    let x: Vec<i16> = (0..n)
+        .flat_map(|i| {
+            let v =
+                (0.8 * (2.0 * std::f64::consts::PI * 50.0 * i as f64 / 48_000.0).sin() * 32_767.0)
+                    .round() as i16;
+            [v, v]
+        })
+        .collect();
+    let octets: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut dsp = StreamingDsp {
+        convolver: Some(Convolver::new(&[vec![1.0f32], vec![1.0f32]], 64)),
+        enceintes: Some(ProcesseurEnceintes::new(reglages.clone())),
+        ..porteur(None)
     };
-    let (p1, p2) = (piste(0, 9_000), piste(9_000, 7_000));
-    let jouer = |pcm: &[u8], fin: bool| -> Vec<u8> {
-        let mut dsp = StreamingDsp {
-            enceintes: reprendre_les_enceintes(ZONE, Some(reglages.clone()), 2, 48_000),
-            zone_enceintes: Some(ZONE),
-            ..porteur(None)
-        };
-        let mut servi = Vec::new();
-        for bloc in pcm.chunks(1_000 * 6) {
-            let mut b = bloc.to_vec();
-            dsp.process_flux(&mut b, 24);
-            assert_eq!(b.len(), bloc.len(), "longueur conservée");
-            servi.extend(b);
-        }
-        if fin {
-            assert!(dsp.terminer_flux(24).is_empty(), "rien après la piste");
-        }
-        servi
-    };
-    let s1 = jouer(&p1, true);
-    let s2 = jouer(&p2, true);
-    // Référence : un seul processeur sur les deux pistes bout à bout.
-    let mut tout: Vec<f64> = lire(&p1, 24);
-    tout.extend(lire(&p2, 24));
-    let mut p = ProcesseurEnceintes::new(reglages.clone());
-    p.traiter(&mut tout, 2, 48_000);
-    let mut servi = lire(&s1, 24);
-    servi.extend(lire(&s2, 24));
-    assert_eq!(servi.len(), tout.len());
-    for (i, (a, b)) in servi.iter().zip(&tout).enumerate() {
-        assert_eq!(a.to_bits(), b.to_bits(), "échantillon {i}");
+    let mut servi = Vec::new();
+    for bloc in octets.chunks(500 * 4) {
+        let mut b = bloc.to_vec();
+        dsp.process_flux(&mut b, 16);
+        servi.extend(b);
     }
-    // La tête de la voie retardée de la piste 2 porte la queue de la piste 1.
-    assert_ne!(servi[9_000 * 2 + 1], 0.0, "pas de zéros en tête");
-    // Contre-épreuve : une piste interrompue (pas de fin complète) ne laisse
-    // rien ; la suivante repart d'un historique vide.
-    let _ = jouer(&p1, false);
-    assert!(
-        reprendre_les_enceintes(ZONE, Some(reglages.clone()), 2, 48_000)
-            .is_some_and(|p| p.format_vu().is_none()),
-        "processeur neuf"
-    );
-    garder_les_enceintes(ZONE, ProcesseurEnceintes::new(reglages));
-    // Greffon coupé entre deux pistes : rien n'est repris.
-    assert!(reprendre_les_enceintes(ZONE, None, 2, 48_000).is_none());
+    let queue = dsp.terminer_flux(16);
+    assert!(!queue.is_empty(), "le convolveur rend sa queue");
+    servi.extend(queue);
+    assert_eq!(servi.len(), octets.len(), "amorce retirée, queue rendue");
+    let y: Vec<i16> = servi
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    // Référence : le réglage seul sur le flux entier.
+    let mut attendu: Vec<f64> = x.iter().map(|v| f64::from(*v) / 32_768.0).collect();
+    ProcesseurEnceintes::new(reglages).traiter(&mut attendu, 2, 48_000);
+    let pire = y
+        .iter()
+        .zip(&attendu)
+        .map(|(a, b)| (f64::from(*a) - b * 32_768.0).abs())
+        .fold(0.0, f64::max);
+    assert!(pire <= 2.0, "écart {pire} LSB (queue non traitée ?)");
+    // Et aucun saut d'un échantillon au suivant au-delà de 3 fois le pas
+    // naturel (0,8 × 2π × 50 / 48 000 pleine échelle).
+    let pas = 0.8 * 2.0 * std::f64::consts::PI * 50.0 / 48_000.0 * 32_768.0;
+    for voie in 0..2 {
+        let v: Vec<f64> = y
+            .iter()
+            .skip(voie)
+            .step_by(2)
+            .map(|s| f64::from(*s))
+            .collect();
+        let saut = v
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "saut_mesure reseau convolveur+enceintes voie {voie} : {saut} LSB (pas {pas:.1})"
+        );
+        assert!(saut <= 3.0 * pas, "voie {voie} : saut {saut} LSB");
+    }
 }

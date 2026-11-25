@@ -2409,16 +2409,28 @@ impl LocalOutput {
         self.mono_downmix.store(mono, Ordering::Relaxed);
     }
 
-    /// rc14 — poser (ou retirer, `None`) le réglage des enceintes de la zone
-    /// (greffon TESS `speaker-setup`). En pleine lecture, le passage se fait
-    /// par un fondu de `reglage_enceintes::RAMPE_MS` : ni saut de délai, ni
-    /// marche de gain. `None` sous PURE ou « Bypass all » (l'orchestrateur ne
-    /// le charge pas) ; le drapeau PURE le coupe de toute façon au bloc.
+    /// rc14 — changer À CHAUD le réglage des enceintes de la zone (greffon
+    /// TESS `speaker-setup`) : fondu de `reglage_enceintes::RAMPE_MS`, ni saut
+    /// de délai ni marche de gain. `None` sous PURE ou « Bypass all »
+    /// (l'orchestrateur ne le charge pas). `dans_la_chaine` : le greffon est
+    /// dans la chaîne de la zone (sinon aucun créneau n'est créé).
     pub fn set_reglage_enceintes(
         &self,
+        dans_la_chaine: bool,
         reglages: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
     ) {
-        enceintes_de_sortie::poser(&self.pure_bypass, reglages);
+        enceintes_de_sortie::poser(&self.pure_bypass, dans_la_chaine, reglages);
+    }
+
+    /// rc14 — une NOUVELLE lecture démarre (lancement, reprise, seek, piste
+    /// hors enchaînement) : l'historique du réglage des enceintes est vidé, et
+    /// le créneau retiré si le greffon n'est pas dans la chaîne de la zone.
+    pub fn demarrer_reglage_enceintes(
+        &self,
+        dans_la_chaine: bool,
+        reglages: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
+    ) {
+        enceintes_de_sortie::nouvelle_lecture(&self.pure_bypass, dans_la_chaine, reglages);
     }
 
     /// rc14 — les voies qu'a vues le réglage des enceintes de cette sortie au
@@ -9597,6 +9609,8 @@ impl OutputTarget for LocalOutput {
         // `current_format()` decrirait encore la piste precedente et on
         // rebatirait un EqProcessor pour un flux mort (#1725).
         self.current_format.store(0, Ordering::Relaxed);
+        // rc14 — l'historique du réglage des enceintes ne survit pas à l'arrêt.
+        enceintes_de_sortie::vider(&self.pure_bypass);
         // Immediately silence the cpal callback so no audio leaks while
         // we wait for the playback thread to exit.  This flag is also
         // checked by the I/O read loop and feed_ring, causing the thread

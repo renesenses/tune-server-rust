@@ -2086,7 +2086,10 @@ impl PlaybackOrchestrator {
             // suivante alors que le panneau annonce déjà « Mono ».
             local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
             // rc14 — le réglage des enceintes aussi (coupé sous PURE).
-            local_output.set_reglage_enceintes(self.zone_reglage_enceintes(zone_id));
+            local_output.set_reglage_enceintes(
+                self.zone_enceintes_dans_la_chaine(zone_id),
+                self.zone_reglage_enceintes(zone_id),
+            );
             // #6044 — la réaffectation est elle aussi gouvernée par PURE.
             local_output.set_reaffectation(self.reaffectation_de_la_piste(
                 zone_id,
@@ -2191,16 +2194,14 @@ impl PlaybackOrchestrator {
             crossfeed: self.load_crossfeed_processor(zone_id, sample_rate),
             channels,
             compensation: None,
-            // rc14 — le réglage des enceintes, s'il touche ce flux ; la ligne
-            // à retard de la piste précédente de la zone, si elle vient de
-            // finir (enchaînement sans blanc).
-            enceintes: super::chaine_reseau_tess::reprendre_les_enceintes(
-                zone_id,
-                self.zone_reglage_enceintes(zone_id),
-                channels,
-                sample_rate,
-            ),
-            zone_enceintes: Some(zone_id),
+            // rc14 — le réglage des enceintes, s'il touche ce flux. Chaque
+            // flux part d'un historique VIDE : rien d'une autre piste n'est
+            // jamais rejoué (les voies retardées commencent par leur délai de
+            // silence, et leur queue s'arrête avec le flux : ≤ 58 ms).
+            enceintes: self
+                .zone_reglage_enceintes(zone_id)
+                .filter(|r| !r.est_neutre(usize::from(channels)))
+                .map(crate::audio::reglage_enceintes::ProcesseurEnceintes::new),
             sample_rate,
             en_vol: None,
             convolveur_reste_a_jeter: None,
@@ -3283,6 +3284,16 @@ impl PlaybackOrchestrator {
         crate::audio::reglage_enceintes::reglages_appliques(&self.db, zone_id)
     }
 
+    /// rc14 — le greffon `speaker-setup` est-il dans la chaîne TESS de la
+    /// zone (coché ou non, neutre compris) ? Sinon, la sortie locale n'a pas
+    /// de créneau (coût nul).
+    pub fn zone_enceintes_dans_la_chaine(&self, zone_id: i64) -> bool {
+        crate::audio::reglage_enceintes::dans_la_chaine(
+            &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+            zone_id,
+        )
+    }
+
     /// rc14 — le réglage des enceintes CONFIGURÉ et non neutre, sans regarder
     /// PURE (le bouclier PURE le compte parmi ce qu'il contourne).
     pub(super) fn zone_enceintes_configure_with(
@@ -3341,7 +3352,8 @@ impl PlaybackOrchestrator {
             };
             let reglages = self.zone_reglage_enceintes(zone_id);
             let arme = reglages.is_some();
-            local_output.set_reglage_enceintes(reglages);
+            local_output
+                .set_reglage_enceintes(self.zone_enceintes_dans_la_chaine(zone_id), reglages);
             self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
             info!(
                 zone_id,
