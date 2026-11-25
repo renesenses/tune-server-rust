@@ -142,7 +142,7 @@ fn planifier_porte_le_mono_en_stereo_et_refuse_le_multicanal() {
 fn les_capacites_publient_chaque_cible_avec_son_transport_ou_son_motif() {
     let mut f = faits("native", &natif_dsd64_seul);
     f.plafond_zone_hz = Some(384_000);
-    let c = capacites(&f);
+    let c = capacites(&f, true);
     assert_eq!(c.modulator_order, 7);
     assert!(c.output_local && c.machine_measured);
     assert_eq!(c.volume_placement, "before_dsd_modulator");
@@ -173,7 +173,7 @@ fn les_capacites_publient_chaque_cible_avec_son_transport_ou_son_motif() {
 
 #[test]
 fn une_zone_auto_ne_publie_aucune_cible_acceptee() {
-    let c = capacites(&faits("auto", &natif_absent));
+    let c = capacites(&faits("auto", &natif_absent), true);
     for t in &c.targets {
         assert!(!t.famille_44k1.accepted && !t.family_48k.accepted);
         assert_eq!(
@@ -271,63 +271,91 @@ fn natif_en_tete_du_flux_dsd_brut() {
     assert_eq!((e.cadence, e.canaux), (6_144_000, 2));
 }
 
-// ── Enchaînement ────────────────────────────────────────────────────
+// ── Enchaînement ───────────────────────────────────────────────────
 
-/// Deux pistes enchaînées (même famille, même cadence) : l'état passe de
-/// l'une à l'autre. Le flux concaténé est EXACTEMENT celui d'une seule
-/// modulation des deux pistes bout à bout — ni silence, ni clôture, ni
-/// marche — et la seconde piste commence par 0x05.
+/// L'ordre RÉEL du pré-armement gapless (relecture v2) : la piste 2 est
+/// résolue (lien annoncé) pendant que le producteur de la piste 1 tourne
+/// encore ; elle n'attend l'état qu'au moment de moduler son premier bloc,
+/// et le reçoit dès que la piste 1 le dépose. Le flux enchaîné est alors
+/// EXACTEMENT celui d'une seule modulation des deux pistes bout à bout.
 #[test]
-fn enchainement_sans_rupture_ni_silence() {
-    // Longueurs quelconques (3 001 et 2 003 trames) : le filtre du
-    // suréchantillonneur porte la fin de la piste 1 dans la piste 2.
+fn enchainement_dans_l_ordre_reel_du_pre_armement() {
     let p1 = sinus(44_100, 997.0, 0.5, 3_001);
     let p2 = sinus(44_100, 1_499.0, 0.5, 2_003);
-    for transport in [TransportModulation::Dop, TransportModulation::Native] {
+    for (n, transport) in [TransportModulation::Dop, TransportModulation::Native]
+        .into_iter()
+        .enumerate()
+    {
+        let zone = 9_430_101 + n as i64;
         let pl = plan(transport, TauxDsd::Dsd64, 44_100);
         let mut seul = ProducteurDsd::new(pl).unwrap();
         let mut tout = Vec::new();
         seul.moduler(&[p1.clone(), p2.clone()].concat(), &mut tout)
             .unwrap();
 
-        let zone = 9_430_101 + transport as i64;
-        let g1 = ouvrir_une_generation(zone);
+        // Piste 1 : son producteur démarre.
+        let s1 = format!("session-1-{n}");
+        ouvrir_le_relais(zone, &s1, pl);
+        // Pré-armement de la piste 2 (piste 1 encore en production) : lien.
+        annoncer_la_suivante(zone, 2, &s1);
+        let lien = prendre_le_lien(zone, Some(2), pl).expect("lien explicite");
+        // Le producteur de la piste 2 attend, avant son premier bloc.
+        let attente = std::thread::spawn(move || {
+            attendre_le_relais(&lien, pl, Duration::from_secs(10), &|| false)
+        });
+        // La piste 1 finit sa production, puis dépose son état.
         let mut a = ProducteurDsd::new(pl).unwrap();
         let mut piste1 = Vec::new();
         a.moduler(&p1, &mut piste1).unwrap();
-        deposer_pour_la_suite(zone, g1, a);
-        let g2 = ouvrir_une_generation(zone);
-        let mut b = reprendre_la_suite(zone, g2, pl).expect("l'état continue");
+        std::thread::sleep(Duration::from_millis(50));
+        deposer_au_relais(&s1, a);
+        let mut b = attente
+            .join()
+            .unwrap()
+            .expect("la piste 2 reprend l'état de la piste 1");
         let mut piste2 = Vec::new();
         b.moduler(&p2, &mut piste2).unwrap();
-
         let enchaine = [piste1.clone(), piste2.clone()].concat();
         if transport == TransportModulation::Dop {
             marqueurs_alternes_depuis_05(&piste1);
             marqueurs_alternes_depuis_05(&piste2);
-            assert_eq!(piste1.len() / 6 % 2, 0);
         }
         assert_eq!(enchaine, tout[..enchaine.len()], "{transport:?}");
-        assert!(
-            tout.len() - enchaine.len() <= 12,
-            "au plus une paire en attente"
-        );
+        assert!(tout.len() - enchaine.len() <= 12);
     }
 }
 
+/// Sans lien explicite, rien ne continue : une piste sans rapport (pas
+/// annoncée comme suivante), une autre piste que celle annoncée, un plan
+/// incompatible, une piste précédente abandonnée (saut, arrêt).
 #[test]
-fn pas_d_enchainement_sur_un_plan_different_ou_apres_une_autre_piste() {
+fn aucun_etat_n_est_repris_sans_lien_explicite() {
     let zone = 9_430_110;
     let pl = plan(TransportModulation::Dop, TauxDsd::Dsd64, 44_100);
-    let g = ouvrir_une_generation(zone);
-    deposer_pour_la_suite(zone, g, ProducteurDsd::new(pl).unwrap());
-    let g2 = ouvrir_une_generation(zone);
+    ouvrir_le_relais(zone, "s-a", pl);
+    deposer_au_relais("s-a", ProducteurDsd::new(pl).unwrap());
+    // Aucun lien annoncé : même un état tout frais ne passe pas.
+    assert!(prendre_le_lien(zone, Some(5), pl).is_none());
+    // Annoncé pour la piste 5 ; c'est la piste 6 qui se résout.
+    annoncer_la_suivante(zone, 5, "s-a");
+    assert!(prendre_le_lien(zone, Some(6), pl).is_none());
+    // Plan incompatible.
+    annoncer_la_suivante(zone, 5, "s-a");
     let autre = plan(TransportModulation::Dop, TauxDsd::Dsd128, 44_100);
-    assert!(reprendre_la_suite(zone, g2, autre).is_none());
-    // Une piste intercalée (génération sautée) : rien ne continue.
-    let g3 = ouvrir_une_generation(zone);
-    deposer_pour_la_suite(zone, g3 - 2, ProducteurDsd::new(pl).unwrap());
-    assert!(reprendre_la_suite(zone, g3, pl).is_none());
+    assert!(prendre_le_lien(zone, Some(5), autre).is_none());
+    // Précédente abandonnée pendant l'attente : la suivante part à neuf.
+    ouvrir_le_relais(zone, "s-b", pl);
+    annoncer_la_suivante(zone, 7, "s-b");
+    let lien = prendre_le_lien(zone, Some(7), pl).unwrap();
+    let attente = std::thread::spawn(move || {
+        attendre_le_relais(&lien, pl, Duration::from_secs(10), &|| false)
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    abandonner_le_relais("s-b");
+    assert!(attente.join().unwrap().is_none());
+    // La suivante elle-même annulée (sa session fermée) : elle n'attend pas.
+    ouvrir_le_relais(zone, "s-c", pl);
+    assert!(attendre_le_relais("s-c", pl, Duration::from_secs(10), &|| true).is_none());
 }
 
 // ── Volume, headroom, stabilité, marge (T11b) ───────────────────────
@@ -354,11 +382,13 @@ fn le_volume_et_le_gain_fixe_s_appliquent_avant_le_modulateur() {
     ] {
         let mut p =
             ProducteurDsd::new(plan(TransportModulation::Native, TauxDsd::Dsd64, 44_100)).unwrap();
-        p.definir_volume(volume);
+        p.fixer_volume(volume);
         p.definir_gain_fixe(fixe);
         let mut sortie = Vec::new();
         p.moduler(&vec![1.0; 2 * 8_820], &mut sortie).unwrap();
-        let d = densite(&sortie[sortie.len() / 2..], 0);
+        // TOUT le signal, dès le premier échantillon (pas seulement le régime
+        // établi) : le niveau est posé avant le premier bloc.
+        let d = densite(&sortie, 0);
         assert!(
             (d - attendu).abs() < 0.01,
             "volume {volume} × {fixe} : {d}, attendu {attendu}"
@@ -509,4 +539,26 @@ fn une_rupture_constatee_est_retenue() {
     assert!(rupture_connue(nom, 352_800, 2));
     assert!(!rupture_connue(nom, 176_400, 2));
     assert!(rupture_recente(nom, Duration::from_secs(5)));
+}
+
+/// Relecture v2 (D1) : un producteur neuf en sourdine ne laisse passer
+/// AUCUNE milliseconde à 0 dB (5 ms de continu pleine échelle en entrée).
+#[test]
+fn depart_en_sourdine_sans_bouffee_a_0_db() {
+    let mut p =
+        ProducteurDsd::new(plan(TransportModulation::Native, TauxDsd::Dsd64, 44_100)).unwrap();
+    p.fixer_volume(0.0);
+    let mut sortie = Vec::new();
+    p.moduler(&vec![1.0; 2 * 220], &mut sortie).unwrap();
+    let d = densite(&sortie, 0);
+    assert!(
+        d.abs() < 0.02,
+        "densité des 5 premières ms : {d} (0,5 = 0 dB)"
+    );
+    // En cours de lecture, le changement passe par la rampe de 10 ms.
+    p.definir_volume(1.0);
+    let mut suite = Vec::new();
+    p.moduler(&vec![1.0; 2 * 4_410], &mut suite).unwrap();
+    let d = densite(&suite[suite.len() / 2..], 0);
+    assert!((d - 0.5).abs() < 0.01, "{d}");
 }

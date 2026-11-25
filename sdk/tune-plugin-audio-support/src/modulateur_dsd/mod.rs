@@ -373,6 +373,19 @@ impl ModulateurDsd {
         }
     }
 
+    /// Volume linéaire posé SANS rampe : à appeler avant le premier bloc
+    /// d'un flux (construction, saut, relance), pour que le premier
+    /// échantillon soit déjà au bon niveau. Partir de 1,0 et descendre en
+    /// rampe vers une sourdine ferait sortir quelques millisecondes à pleine
+    /// échelle. La rampe ([`Self::definir_volume`]) ne sert qu'aux
+    /// changements en cours de lecture.
+    pub fn fixer_volume(&mut self, gain: f64) {
+        if gain.is_finite() && gain >= 0.0 {
+            self.cible = gain.min(1.0);
+            self.gain = self.cible;
+        }
+    }
+
     pub fn volume(&self) -> f64 {
         self.gain
     }

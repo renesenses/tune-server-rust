@@ -544,6 +544,7 @@ en tâche de fond, en cache) :
   "dsd_mode": "dop", "output_local": true, "modulator_order": 7,
   "reference_level": "0 dBFS = 50 % modulation (0 dB SACD)",
   "volume_placement": "before_dsd_modulator", "machine_measured": true,
+  "status": "known",
   "targets": [
     { "rate": "dsd64", "rate_hz": 2822400, "accepted": true, "transport": "dop",
       "dop_rate_hz": 176400, "reason": null, "native_reason": null,
@@ -572,10 +573,19 @@ en tâche de fond, en cache) :
   de sécurité à 60 %. Le headroom de TESS (−3 dB en automatique) s'applique
   avant le modulateur : une crête intersample à +3 dB n'atteint pas le
   limiteur.
-- **Volume (Q9)** : appliqué juste avant le modulateur (rampe de 10 ms),
-  relu à chaque bloc du producteur ; il répond avec le retard du tampon
-  (≈ 1 s). Une baisse de volume ou la sourdine ne relancent rien. La
-  protection `dsd_volume_protection` (#8813) reste celle des fichiers DSD.
+- **`status`** : `unknown` tant que la sortie de la zone n'a jamais pu être
+  lue (sortie occupée, nom du périphérique jamais vu) : `targets` est alors
+  vide et le `PUT` ne refuse rien (la lecture décide et le dit).
+- **Volume (Q9)** : appliqué juste avant le modulateur. Un modulateur neuf
+  (piste, saut, relance) pose le niveau AVANT son premier échantillon :
+  jamais une milliseconde à 0 dB, même en sourdine. En cours de lecture, le
+  volume publié au changement (valeur atomique) est relu à chaque bloc et
+  suit une rampe de 10 ms. Il répond avec le retard de ce qui est déjà
+  modulé en aval : la session (≈ 0,4 s) plus l'anneau de la sortie locale
+  (≈ 2 s), soit **2 à 2,5 s**. Une baisse de volume ou la sourdine ne
+  relancent rien. La protection `dsd_volume_protection` (#8813) reste celle
+  des fichiers DSD. Proposé, non appliqué : un anneau réduit en mode modulé
+  (≈ 0,5 s) ramènerait la réponse vers 1 s, à mesurer sur Pi (famine).
 - **Repli en PCM** (file mixte, refus) : la piste joue au niveau PCM, soit
   environ +6 dB au-dessus du même passage modulé (+9 dB avec le headroom
   automatique). Compensation simple possible, non appliquée : atténuer de 6
@@ -586,10 +596,14 @@ en tâche de fond, en cache) :
   jamais en silence ; la cadence est ensuite refusée au `PUT`.
 - **Réglage à chaud** : un changement de la chaîne (égaliseur, convolution,
   crossfeed…) pendant une piste modulée la relance à la même position. Le
-  préampli que garde la sortie est reporté dans le flux.
-- **Enchaînement** : deux pistes modulées de même famille et de même cadence
-  partagent l'état du modulateur (ni silence ni clôture) ; chaque piste
-  émet un nombre pair de trames DoP.
+  préampli que garde la sortie est reporté dans le flux (lu en attendant la
+  sortie : jamais un 0 dB faute de verrou).
+- **Enchaînement** : la suivante de la file, annoncée par son pré-armement
+  gapless (lien explicite avec la session qui joue), de même famille et de
+  même cadence, reprend l'état du modulateur AU MOMENT où elle module son
+  premier bloc (elle attend que la piste en cours le dépose) : ni silence ni
+  clôture. Aucune autre piste ne reprend jamais un état. Chaque piste émet
+  un nombre pair de trames DoP.
 
 Sur le chemin résolu, une cible acceptée ajoute à l'étape `dsd_modulator`
 `order`, `rate_hz`, `transport`, `dop_rate_hz` et `zero_dbfs_modulation`

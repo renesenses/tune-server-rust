@@ -2054,6 +2054,8 @@ impl PlaybackManager {
             ..Default::default()
         });
         state.volume = volume.clamp(0.0, 1.0);
+        // rc14 — publié pour la modulation DSD de TESS (lu sans verrou).
+        crate::tess::modulation_dsd::publier_volume(zone_id, state.volume, state.muted);
         self.emit(PlaybackEvent {
             event: "volume".into(),
             zone_id,
@@ -2126,6 +2128,7 @@ impl PlaybackManager {
         let mute_change = state.muted != muted;
         state.volume = volume;
         state.muted = muted;
+        crate::tess::modulation_dsd::publier_volume(zone_id, volume, muted);
         if volume_change {
             self.emit(PlaybackEvent {
                 event: "volume".into(),
@@ -2177,6 +2180,7 @@ impl PlaybackManager {
             zones.get_mut(&zone_id).map(|state| {
                 state.muted = muted;
                 state.last_mute_set_at = Some(Instant::now());
+                crate::tess::modulation_dsd::publier_volume(zone_id, state.volume, muted);
                 state.volume
             })
         };

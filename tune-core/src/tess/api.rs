@@ -581,7 +581,7 @@ fn schema_capacites_dsd() -> Value {
     json!({
         "type": "object",
         "required": ["dsd_mode", "output_local", "modulator_order", "reference_level",
-                     "volume_placement", "machine_measured", "targets"],
+                     "volume_placement", "machine_measured", "status", "targets"],
         "properties": {
             "dsd_mode": { "type": "string" },
             "output_local": { "type": "boolean" },
@@ -589,6 +589,7 @@ fn schema_capacites_dsd() -> Value {
             "reference_level": { "type": "string" },
             "volume_placement": { "const": "before_dsd_modulator" },
             "machine_measured": { "type": "boolean" },
+            "status": { "enum": ["known", "unknown"] },
             "targets": { "type": "array", "items": cible }
         },
         "additionalProperties": false

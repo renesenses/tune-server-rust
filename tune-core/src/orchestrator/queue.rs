@@ -1616,6 +1616,20 @@ impl PlaybackOrchestrator {
                 disc_number: None,
                 album_ref: None,
             };
+            // rc14 — lien EXPLICITE pour la modulation DSD de TESS : cette
+            // piste est la suivante de la file de celle qui joue ; son
+            // producteur pourra reprendre l'état du modulateur en cours.
+            {
+                let etat = self.playback.get_state(zone_id).await;
+                if etat.queue_position + 1 == position
+                    && let Some(session) = etat
+                        .now_playing
+                        .as_ref()
+                        .and_then(|np| np.stream_id.clone())
+                {
+                    crate::tess::modulation_dsd::annoncer_la_suivante(zone_id, track_id, &session);
+                }
+            }
             let resolved = Box::pin(self.resolve_stream(&req)).await?;
             if let Some(ref sid) = resolved.stream_id {
                 self.gapless_sessions

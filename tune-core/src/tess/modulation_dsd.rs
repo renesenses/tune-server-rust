@@ -24,12 +24,19 @@
 //!
 //! # Le volume (décision Q9 du 17/11)
 //!
-//! Le volume de la zone s'applique JUSTE AVANT le modulateur
-//! ([`ProducteurDsd::definir_volume`], rampe de 10 ms de T11b), relu à chaque
-//! bloc par le producteur. Il répond avec le retard du tampon (≈ 1 s) : c'est
-//! la « réponse plus lente acceptée » de Q9. Une baisse de volume ou la
-//! sourdine ne relancent donc rien. La protection #8813 reste celle des
-//! FICHIERS DSD, qui n'ont pas d'échantillon où appliquer le volume.
+//! Le volume de la zone s'applique JUSTE AVANT le modulateur. Il est publié
+//! au changement ([`publier_volume`], valeur atomique) et relu sans verrou à
+//! chaque bloc ; un modulateur neuf le pose SANS rampe avant son premier bloc
+//! ([`ProducteurDsd::fixer_volume`] : jamais une milliseconde à 0 dB avant
+//! une sourdine), les changements en cours passent par la rampe de 10 ms de
+//! T11b ([`ProducteurDsd::definir_volume`]). Il répond avec le retard de tout
+//! ce qui est déjà modulé en aval : la session (≈ 0,4 s) PLUS l'anneau de la
+//! sortie locale (≈ 2 s), soit **2 à 2,5 s** — la « réponse plus lente
+//! acceptée » de Q9. Une baisse de volume ou la sourdine ne relancent rien.
+//! La protection #8813 reste celle des FICHIERS DSD, qui n'ont pas
+//! d'échantillon où appliquer le volume. (Piste non retenue ici : réduire
+//! l'anneau de la sortie en mode modulé ramènerait la réponse vers 1 s, au
+//! prix d'un risque de famine à mesurer sur Pi.)
 //!
 //! # Refus ou repli
 //!
@@ -49,10 +56,11 @@
 //!
 //! # Enchaînements
 //!
-//! Entre deux pistes modulées de même famille et de même cadence, l'état du
-//! modulateur et du suréchantillonneur passe d'une piste à l'autre
-//! ([`deposer_pour_la_suite`], [`reprendre_la_suite`]) : ni silence de
-//! clôture, ni marche. Chaque piste émet un nombre PAIR de trames DoP (la
+//! Entre une piste modulée et sa SUIVANTE de la file (lien explicite, voir
+//! [`annoncer_la_suivante`]), de même famille et de même cadence, l'état du
+//! modulateur et du suréchantillonneur passe d'une piste à l'autre au moment
+//! où la suivante commence vraiment à moduler ([`attendre_le_relais`]) : ni
+//! silence de clôture, ni marche. Chaque piste émet un nombre PAIR de trames DoP (la
 //! trame impaire attend la piste suivante) : toute piste commence par 0x05.
 //! Une piste sans suite perd ce qui restait dans le filtre (≈ 1 ms) et au plus
 //! une trame DoP (≈ 6 µs).
@@ -300,6 +308,10 @@ pub struct CapacitesDsd {
     /// La machine a-t-elle été mesurée ? Tant que non, `machine_too_slow`
     /// n'est jamais rendu (la lecture mesure avant de lancer).
     pub machine_measured: bool,
+    /// `known` ; `unknown` quand la sortie n'a pas encore pu être lue (nom du
+    /// périphérique jamais vu, sortie occupée) : `targets` est alors VIDE,
+    /// plutôt qu'une réponse fausse, et le `PUT` ne refuse rien.
+    pub status: String,
     pub targets: Vec<CapaciteCible>,
 }
 
@@ -331,8 +343,9 @@ fn famille(faits: &FaitsSortieDsd<'_>, taux: TauxDsd, famille_48k: bool) -> Capa
     }
 }
 
-/// Les capacités des trois cibles. Pure.
-pub fn capacites(faits: &FaitsSortieDsd<'_>) -> CapacitesDsd {
+/// Les capacités des trois cibles. Pure. `connues` faux : la sortie n'a pas
+/// pu être lue, aucune cible n'est publiée (`status: "unknown"`).
+pub fn capacites(faits: &FaitsSortieDsd<'_>, connues: bool) -> CapacitesDsd {
     CapacitesDsd {
         dsd_mode: faits.dsd_mode.to_owned(),
         output_local: faits.sortie_locale,
@@ -340,8 +353,10 @@ pub fn capacites(faits: &FaitsSortieDsd<'_>) -> CapacitesDsd {
         reference_level: "0 dBFS = 50 % modulation (0 dB SACD)".into(),
         volume_placement: "before_dsd_modulator".into(),
         machine_measured: faits.temps_reel.is_some(),
+        status: if connues { "known" } else { "unknown" }.into(),
         targets: [TauxDsd::Dsd64, TauxDsd::Dsd128, TauxDsd::Dsd256]
             .into_iter()
+            .filter(|_| connues)
             .map(|rate| CapaciteCible {
                 rate,
                 famille_44k1: famille(faits, rate, false),
@@ -485,6 +500,13 @@ impl ProducteurDsd {
         self.modulateur.definir_volume(gain);
     }
 
+    /// Volume posé SANS rampe, avant le premier bloc d'un modulateur neuf :
+    /// le premier échantillon est déjà au niveau (une sourdine n'est jamais
+    /// précédée de millisecondes à 0 dB).
+    pub fn fixer_volume(&mut self, gain: f64) {
+        self.modulateur.fixer_volume(gain);
+    }
+
     /// Gain fixe (headroom, préampli gardé), appliqué avant le volume.
     pub fn definir_gain_fixe(&mut self, gain: f64) {
         if gain.is_finite() && gain >= 0.0 {
@@ -544,62 +566,234 @@ impl ProducteurDsd {
 }
 
 // ── Enchaînements ───────────────────────────────────────────────────
+//
+// Ordre réel en lecture : la piste N+1 est résolue (pré-armement gapless)
+// ~30 s avant la fin de N, pendant que le producteur de N tourne encore. Le
+// lien est EXPLICITE : la résolution de la suivante de la file l'annonce
+// ([`annoncer_la_suivante`]) avec la session qui joue ; le producteur de
+// N+1 envoie son en-tête, puis ATTEND, avant son premier bloc, que celui de
+// N dépose son état ([`attendre_le_relais`]). N abandonné (saut, arrêt) ou
+// plan incompatible : N+1 part d'un modulateur neuf. Aucune autre piste ne
+// reprend jamais un état.
 
-struct Suite {
-    generation: u64,
-    producteur: ProducteurDsd,
-    depose: Instant,
+enum EtatDuRelais {
+    EnCours,
+    Depose(Box<ProducteurDsd>),
+    Abandonne,
+}
+
+struct Relais {
+    zone_id: i64,
+    plan: PlanModulation,
+    etat: EtatDuRelais,
+    ouvert: Instant,
 }
 
 #[derive(Default)]
-struct Continuites {
-    generations: HashMap<i64, u64>,
-    suites: HashMap<i64, Suite>,
+struct TableDesRelais {
+    par_session: HashMap<String, Relais>,
+    /// zone → (piste annoncée comme suivante, session qui jouait).
+    annonces: HashMap<i64, (i64, String, Instant)>,
 }
 
-fn continuites() -> &'static Mutex<Continuites> {
-    static C: OnceLock<Mutex<Continuites>> = OnceLock::new();
-    C.get_or_init(Default::default)
+fn relais() -> &'static (Mutex<TableDesRelais>, std::sync::Condvar) {
+    static R: OnceLock<(Mutex<TableDesRelais>, std::sync::Condvar)> = OnceLock::new();
+    R.get_or_init(|| {
+        (
+            Mutex::new(TableDesRelais::default()),
+            std::sync::Condvar::new(),
+        )
+    })
 }
 
-/// Durée au-delà de laquelle un état déposé ne continue plus rien.
-const SUITE_PERIMEE: Duration = Duration::from_secs(120);
+/// Durée de validité d'une annonce de suivante (le pré-armement a lieu dans
+/// les 30 dernières secondes de la piste).
+const ANNONCE_VALABLE: Duration = Duration::from_secs(90);
 
-/// Une nouvelle piste modulée sur la zone : sa génération.
-pub fn ouvrir_une_generation(zone_id: i64) -> u64 {
-    let mut c = continuites().lock().unwrap_or_else(|e| e.into_inner());
-    let g = c.generations.entry(zone_id).or_insert(0);
-    *g += 1;
-    *g
-}
+/// Relais gardés au plus (les plus anciens terminés sont retirés).
+const RELAIS_MAX: usize = 8;
 
-/// Fin NORMALE d'une piste : son état attend la piste suivante.
-pub fn deposer_pour_la_suite(zone_id: i64, generation: u64, producteur: ProducteurDsd) {
-    let mut c = continuites().lock().unwrap_or_else(|e| e.into_inner());
-    c.suites.insert(
-        zone_id,
-        Suite {
-            generation,
-            producteur,
-            depose: Instant::now(),
+/// Le producteur de `session` (zone, plan) démarre : son état pourra passer
+/// à la piste qui lui sera EXPLICITEMENT liée.
+pub fn ouvrir_le_relais(zone_id: i64, session: &str, plan: PlanModulation) {
+    let (m, _) = relais();
+    let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
+    if r.par_session.len() >= RELAIS_MAX
+        && let Some(vieux) = r
+            .par_session
+            .iter()
+            .filter(|(_, x)| !matches!(x.etat, EtatDuRelais::EnCours))
+            .min_by_key(|(_, x)| x.ouvert)
+            .map(|(k, _)| k.clone())
+    {
+        r.par_session.remove(&vieux);
+    }
+    r.par_session.insert(
+        session.to_owned(),
+        Relais {
+            zone_id,
+            plan,
+            etat: EtatDuRelais::EnCours,
+            ouvert: Instant::now(),
         },
     );
 }
 
-/// L'état de la piste IMMÉDIATEMENT précédente (génération − 1), s'il est
-/// déjà déposé, récent et compatible avec `plan`. Sinon `None` : la piste
-/// part d'un modulateur neuf.
-pub fn reprendre_la_suite(
+/// Fin NORMALE de la piste de `session` : son état attend la suivante liée.
+pub fn deposer_au_relais(session: &str, producteur: ProducteurDsd) {
+    let (m, c) = relais();
+    let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(x) = r.par_session.get_mut(session) {
+        x.etat = EtatDuRelais::Depose(Box::new(producteur));
+    }
+    c.notify_all();
+}
+
+/// Piste interrompue (session fermée, erreur) : rien ne continue.
+pub fn abandonner_le_relais(session: &str) {
+    let (m, c) = relais();
+    let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(x) = r.par_session.get_mut(session) {
+        x.etat = EtatDuRelais::Abandonne;
+    }
+    c.notify_all();
+}
+
+/// La résolution de la SUIVANTE de la file (pré-armement gapless) annonce le
+/// lien : la piste `track_id` suit la session `precedente` qui joue.
+pub fn annoncer_la_suivante(zone_id: i64, track_id: i64, precedente: &str) {
+    let (m, _) = relais();
+    let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
+    r.annonces
+        .insert(zone_id, (track_id, precedente.to_owned(), Instant::now()));
+}
+
+/// Le lien annoncé pour cette piste sur la zone (consommé) : la session
+/// précédente, si elle est un flux modulé de la même zone au plan
+/// compatible. Sans annonce, aucun lien : la piste part d'un modulateur neuf.
+pub fn prendre_le_lien(
     zone_id: i64,
-    generation: u64,
+    track_id: Option<i64>,
     plan: PlanModulation,
-) -> Option<ProducteurDsd> {
-    let mut c = continuites().lock().unwrap_or_else(|e| e.into_inner());
-    let suite = c.suites.remove(&zone_id)?;
-    if suite.generation + 1 != generation || suite.depose.elapsed() > SUITE_PERIMEE {
+) -> Option<String> {
+    let (m, _) = relais();
+    let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
+    let (piste, session, quand) = r.annonces.remove(&zone_id)?;
+    if Some(piste) != track_id || quand.elapsed() > ANNONCE_VALABLE {
         return None;
     }
-    suite.producteur.continuer(plan)
+    let x = r.par_session.get(&session)?;
+    (x.zone_id == zone_id
+        && x.plan.enchaine_sur(&plan)
+        && !matches!(x.etat, EtatDuRelais::Abandonne))
+    .then_some(session)
+}
+
+/// BLOQUANT, sur le fil du producteur, avant son premier bloc : l'état
+/// déposé par la session liée, dès qu'il l'est. `None` si elle est
+/// abandonnée, si `annule()` (la session de la suivante a été fermée), ou
+/// après `delai`.
+pub fn attendre_le_relais(
+    session: &str,
+    plan: PlanModulation,
+    delai: Duration,
+    annule: &dyn Fn() -> bool,
+) -> Option<ProducteurDsd> {
+    let (m, c) = relais();
+    let debut = Instant::now();
+    let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        match r.par_session.get(session).map(|x| &x.etat) {
+            None | Some(EtatDuRelais::Abandonne) => return None,
+            Some(EtatDuRelais::Depose(_)) => {
+                let x = r.par_session.get_mut(session)?;
+                let EtatDuRelais::Depose(p) =
+                    std::mem::replace(&mut x.etat, EtatDuRelais::Abandonne)
+                else {
+                    return None;
+                };
+                return (*p).continuer(plan);
+            }
+            Some(EtatDuRelais::EnCours) => {}
+        }
+        if annule() || debut.elapsed() >= delai {
+            return None;
+        }
+        r = c
+            .wait_timeout(r, Duration::from_millis(200))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+}
+
+// ── Volume publié ───────────────────────────────────────────────────
+
+/// Le volume de la zone, publié au changement (`PlaybackManager`) et lu sans
+/// verrou par le producteur à chaque bloc.
+pub struct VolumePublie {
+    volume: std::sync::atomic::AtomicU64,
+    muet: AtomicBool,
+}
+
+impl VolumePublie {
+    pub fn volume(&self) -> f64 {
+        f64::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+    pub fn muet(&self) -> bool {
+        self.muet.load(Ordering::Relaxed)
+    }
+}
+
+fn volumes() -> &'static Mutex<HashMap<i64, std::sync::Arc<VolumePublie>>> {
+    static V: OnceLock<Mutex<HashMap<i64, std::sync::Arc<VolumePublie>>>> = OnceLock::new();
+    V.get_or_init(Default::default)
+}
+
+/// Le volume publié d'une zone (créé à 0 dB, non muet).
+pub fn volume_de_la_zone(zone_id: i64) -> std::sync::Arc<VolumePublie> {
+    volumes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(zone_id)
+        .or_insert_with(|| {
+            std::sync::Arc::new(VolumePublie {
+                volume: std::sync::atomic::AtomicU64::new(1.0f64.to_bits()),
+                muet: AtomicBool::new(false),
+            })
+        })
+        .clone()
+}
+
+/// Publie le volume et la sourdine de la zone (appelé à chaque changement).
+pub fn publier_volume(zone_id: i64, volume: f64, muet: bool) {
+    let v = volume_de_la_zone(zone_id);
+    v.volume.store(volume.to_bits(), Ordering::Relaxed);
+    v.muet.store(muet, Ordering::Relaxed);
+}
+
+// ── Producteurs actifs ──────────────────────────────────────────────
+
+static PRODUCTEURS_ACTIFS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Tenu par le fil d'un producteur le temps de sa piste : la mesure de la
+/// machine ne se refait pas pendant une modulation.
+pub struct ProducteurActif(());
+
+impl ProducteurActif {
+    pub fn tenir() -> Self {
+        PRODUCTEURS_ACTIFS.fetch_add(1, Ordering::SeqCst);
+        Self(())
+    }
+}
+
+impl Drop for ProducteurActif {
+    fn drop(&mut self) {
+        PRODUCTEURS_ACTIFS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub fn producteurs_actifs() -> usize {
+    PRODUCTEURS_ACTIFS.load(Ordering::SeqCst)
 }
 
 // ── Ruptures constatées par la sortie ───────────────────────────────
@@ -739,7 +933,12 @@ pub fn mesurer_la_machine() -> [f64; 3] {
 /// Lance la mesure en tâche de fond si elle manque (ou est à refaire) et
 /// rend tout de suite : les routes ne l'attendent jamais.
 pub fn lancer_la_mesure_en_fond() {
-    if !mesure_a_refaire() || MESURE_EN_COURS.swap(true, Ordering::SeqCst) {
+    // Jamais pendant une modulation : la mesure serait prise sous la charge
+    // du producteur, et la prendrait à la lecture.
+    if producteurs_actifs() > 0
+        || !mesure_a_refaire()
+        || MESURE_EN_COURS.swap(true, Ordering::SeqCst)
+    {
         return;
     }
     let lance = std::thread::Builder::new()

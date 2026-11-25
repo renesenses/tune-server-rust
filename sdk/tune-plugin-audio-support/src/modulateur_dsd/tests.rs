@@ -413,3 +413,25 @@ fn les_refus_de_traiter_sont_explicites() {
         })
     );
 }
+
+/// `fixer_volume` : le PREMIER échantillon est déjà au niveau demandé. Avec
+/// `definir_volume` seul, le modulateur partirait de 0 dB et descendrait en
+/// 10 ms (contre-épreuve : la même entrée, rampe depuis 1,0).
+#[test]
+fn fixer_volume_pose_le_niveau_des_le_premier_echantillon() {
+    let densite = |octets: &[u8]| {
+        let uns: u32 = octets.iter().step_by(2).map(|o| o.count_ones()).sum();
+        let n = (octets.len() / 2) as f64 * 8.0;
+        (2.0 * f64::from(uns) - n) / n
+    };
+    // 5 ms de continu pleine échelle.
+    let pcm = vec![1.0; 2 * 220];
+    let mut m = ModulateurDsd::new(FS, 2, CadenceDsd::Dsd64).unwrap();
+    m.fixer_volume(0.0);
+    let d = densite(&moduler(&mut m, &pcm));
+    assert!(d.abs() < 0.02, "sourdine dès le départ : {d}");
+    let mut rampe = ModulateurDsd::new(FS, 2, CadenceDsd::Dsd64).unwrap();
+    rampe.definir_volume(0.0);
+    let d = densite(&moduler(&mut rampe, &pcm));
+    assert!(d > 0.1, "contre-épreuve : la rampe part de 0 dB ({d})");
+}
