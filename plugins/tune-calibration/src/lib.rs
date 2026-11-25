@@ -116,6 +116,7 @@ impl TunePlugin for CalibrationPlugin {
             orchestrator: self.services.orchestrator.clone(),
             playback: self.services.playback.clone(),
             runtime: tokio::runtime::Handle::current(),
+            files_avant: Default::default(),
         });
         let fournisseur = FournisseurBalayage::new();
         self.services

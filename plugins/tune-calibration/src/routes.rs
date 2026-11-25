@@ -177,6 +177,28 @@ fn refus(code: StatusCode, motif: &str, message: String) -> Response {
     (code, Json(json!({ "error": motif, "message": message }))).into_response()
 }
 
+/// Fil 3094 — la zone n'a pas de sortie active (deux zones sur le même
+/// appareil, celle-ci orpheline) : 409, motif stable, et la zone à utiliser.
+pub fn refus_sortie_inactive(inactive: &crate::hote::SortieInactive) -> Response {
+    let (porteuse_id, porteuse_nom) = match &inactive.porteuse {
+        Some((id, nom)) => (Some(*id), Some(nom.clone())),
+        None => (None, None),
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": crate::hote::SortieInactive::MOTIF,
+            "message": inactive.message(),
+            "params": {
+                "device": inactive.appareil(),
+                "holder_zone_id": porteuse_id,
+                "holder_zone_name": porteuse_nom,
+            },
+        })),
+    )
+        .into_response()
+}
+
 async fn microphones(State(etat): State<EtatRoutes>) -> Response {
     let c = etat.controleur.clone();
     let (entrees, pile) =
@@ -318,9 +340,19 @@ async fn lancer(
         Err(r) => return r,
     };
     let c = etat.controleur.clone();
-    let r = tokio::task::spawn_blocking(move || c.lancer(demande))
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()));
+    let r = tokio::task::spawn_blocking(move || match c.hote.sortie_inactive(zone) {
+        // Fil 3094 — refus structuré : motif stable, appareil et zone
+        // porteuse en paramètres, pour que le client le dise dans sa langue.
+        Some(inactive) => Err(Err(inactive)),
+        None => c.lancer(demande).map_err(Ok),
+    })
+    .await
+    .unwrap_or_else(|e| Err(Ok(e.to_string())));
+    let r = match r {
+        Err(Err(inactive)) => return refus_sortie_inactive(&inactive),
+        Err(Ok(e)) => Err(e),
+        Ok(id) => Ok(id),
+    };
     match r {
         Ok(id) => (
             StatusCode::ACCEPTED,
