@@ -136,6 +136,11 @@ pub struct Demande {
     pub voies: Voies,
     /// Politique de niveau ; les plafonds ne peuvent être que resserrés.
     pub politique: LevelPolicy,
+    /// Mesure de VÉRIFICATION (« Mesurer avec la correction ») : la zone
+    /// joue AVEC ses traitements (égaliseur, FIR…), pour entendre l'effet de
+    /// la correction appliquée. Faux par défaut : une mesure ordinaire
+    /// entend la pièce nue (#8513).
+    pub avec_correction: bool,
 }
 
 impl Demande {
@@ -149,6 +154,7 @@ impl Demande {
             volume_mesure_pct: 40.0,
             voies: Voies::LesDeux,
             politique: LevelPolicy::default(),
+            avec_correction: false,
         }
     }
 
@@ -519,6 +525,14 @@ impl Controleur {
                     .into(),
             );
         }
+        // En PURE, aucune correction ne s'entend : une vérification y
+        // mesurerait la pièce nue et dirait à tort « sans effet ».
+        if demande.avec_correction && traitements.pure {
+            return Err(
+                "la zone est en PURE : la correction ne s'y entend pas, la mesure de vérification n'aurait pas de sens (quitter PURE pour vérifier)"
+                    .into(),
+            );
+        }
         let (nom_entree, format) = self.peripheriques.format_natif(&demande.entree)?;
         if format.frequence != FREQUENCE_MESURE {
             return Err(format!(
@@ -562,18 +576,30 @@ impl Controleur {
                 ri: None,
             }),
         });
-        // #8513 — les traitements ne colorent plus la mesure : ils sont
-        // contournés le temps du balayage (`ZoneTenue`), et le résultat le dit.
-        if traitements.egaliseur {
-            mesure.avertir("égaliseur de la zone contourné pendant la mesure, rétabli ensuite");
-        }
-        if traitements.correction_ir {
-            mesure.avertir(
-                "correction de pièce (IR) de la zone contournée pendant la mesure, rétablie ensuite",
-            );
-        }
-        if traitements.pure {
-            mesure.avertir("mode PURE actif : le volume forcé peut être refusé par le verrou PURE");
+        if demande.avec_correction {
+            // Vérification : la zone joue avec ses traitements, la mesure
+            // les entend — c'est ce qu'on veut voir.
+            if !traitements.egaliseur && !traitements.correction_ir {
+                mesure.avertir(
+                    "mesure de vérification : aucune correction n'est active sur la zone (égaliseur et FIR inactifs)",
+                );
+            }
+        } else {
+            // #8513 — les traitements ne colorent plus la mesure : ils sont
+            // contournés le temps du balayage (`ZoneTenue`), et le résultat le dit.
+            if traitements.egaliseur {
+                mesure.avertir("égaliseur de la zone contourné pendant la mesure, rétabli ensuite");
+            }
+            if traitements.correction_ir {
+                mesure.avertir(
+                    "correction de pièce (IR) de la zone contournée pendant la mesure, rétablie ensuite",
+                );
+            }
+            if traitements.pure {
+                mesure.avertir(
+                    "mode PURE de la zone contourné pendant la mesure (volume de mesure compris), rétabli ensuite",
+                );
+            }
         }
         if let Some(t) = self.hote.type_de_sortie(demande.zone_id)
             && sortie_a_latence_propre(Some(&t))
@@ -643,6 +669,7 @@ impl Controleur {
             d.zone_id,
             volume_initial,
             d.volume_mesure_pct,
+            !d.avec_correction,
         )
         .inspect_err(|_| capture.arreter())?;
         let r = self.jouer_et_mesurer(mesure, &capture, &zone, etalonnage.as_ref(), &traitements);
@@ -969,7 +996,8 @@ struct ZoneTenue {
     hote: Arc<dyn HoteZone>,
     zone_id: i64,
     volume_initial: f64,
-    contournement: tune_core::audio::mesure_nue::Contournement,
+    /// `None` : mesure de vérification, la zone garde ses traitements.
+    contournement: Option<tune_core::audio::mesure_nue::Contournement>,
 }
 
 impl ZoneTenue {
@@ -978,10 +1006,15 @@ impl ZoneTenue {
         zone_id: i64,
         volume_initial: f64,
         volume_mesure: f64,
+        contourner: bool,
     ) -> Result<Self, Sortie> {
         // Posée AVANT le volume et le balayage : la lecture lit le
         // contournement à son démarrage. Un refus du volume la rend aussitôt.
-        let contournement = tune_core::audio::mesure_nue::Contournement::poser(zone_id);
+        // Une mesure de vérification ne la pose pas : elle doit entendre la
+        // correction appliquée (retour de Didier, rc13.90 : sans cela,
+        // « avant » et « après » étaient deux mesures de la pièce nue).
+        let contournement =
+            contourner.then(|| tune_core::audio::mesure_nue::Contournement::poser(zone_id));
         hote.regler_volume(zone_id, volume_mesure)
             .map_err(|e| Sortie::Erreur(format!("volume de mesure refusé : {e}")))?;
         Ok(Self {

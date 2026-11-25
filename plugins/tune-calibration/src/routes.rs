@@ -286,6 +286,9 @@ struct DemandeMesure {
     /// Plafonds plus stricts seulement ; les valeurs par défaut sont des maxima.
     max_spl_db: Option<f64>,
     max_play_dbfs: Option<f64>,
+    /// Mesure de vérification : la zone joue avec sa correction.
+    #[serde(default)]
+    avec_correction: bool,
 }
 
 // Le refus est la réponse HTTP prête, comme `proposition_pour`.
@@ -327,6 +330,7 @@ fn demande_de(zone: i64, d: DemandeMesure) -> Result<Demande, Response> {
         demande.politique.max_play_dbfs = p;
     }
     demande.voies = voies;
+    demande.avec_correction = d.avec_correction;
     Ok(demande)
 }
 
