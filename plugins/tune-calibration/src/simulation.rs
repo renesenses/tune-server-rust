@@ -376,7 +376,14 @@ pub struct HoteSimule {
     pub volume: Mutex<Option<f64>>,
     pub traitements: TraitementsDeZone,
     pub journal: Mutex<Journal>,
-    pompe_vivante: Arc<AtomicBool>,
+    /// Le drapeau de la pompe EN COURS : chaque `jouer` en pose un neuf, comme
+    /// une nouvelle lecture de l'orchestrateur arrête les pompes de la zone.
+    /// Un drapeau partagé se rallumait pour l'ancienne pompe, qui comble
+    /// désormais son flux en silence jusqu'à l'arrêt de la zone.
+    pompe_vivante: Mutex<Arc<AtomicBool>>,
+    /// Comment chaque pompe du chemin de lecture s'est arrêtée : une
+    /// `Interrompue` est l'erreur de lecture fatale que la zone afficherait.
+    pub fins_de_pompe: Arc<Mutex<Vec<tune_core::source_pcm::FinDePompe>>>,
 }
 
 impl HoteSimule {
@@ -402,7 +409,8 @@ impl HoteSimule {
             traitements,
             chemin: None,
             journal: Mutex::new(Journal::default()),
-            pompe_vivante: Arc::new(AtomicBool::new(false)),
+            pompe_vivante: Mutex::new(Arc::new(AtomicBool::new(false))),
+            fins_de_pompe: Default::default(),
         })
     }
 
@@ -421,7 +429,8 @@ impl HoteSimule {
             traitements: TraitementsDeZone::default(),
             chemin: Some(chemin),
             journal: Mutex::new(Journal::default()),
-            pompe_vivante: Arc::new(AtomicBool::new(false)),
+            pompe_vivante: Mutex::new(Arc::new(AtomicBool::new(false))),
+            fins_de_pompe: Default::default(),
         })
     }
 
@@ -456,8 +465,12 @@ impl HoteZone for HoteSimule {
         let mut lecteur = flux.lecteur;
         let par_trame = flux.format.octets_par_trame() as usize;
         let bits = flux.format.bits;
-        let vivant = self.pompe_vivante.clone();
-        vivant.store(true, Ordering::SeqCst);
+        let vivant = Arc::new(AtomicBool::new(true));
+        {
+            let mut courante = self.pompe_vivante.lock().unwrap_or_else(|e| e.into_inner());
+            courante.store(false, Ordering::SeqCst);
+            *courante = vivant.clone();
+        }
         let boucle = self.boucle.clone();
         // Compté AVANT le départ du fil : le micro attend la zone dès qu'elle
         // est censée jouer, même si le fil n'est pas encore ordonnancé.
@@ -468,10 +481,12 @@ impl HoteZone for HoteSimule {
             let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(chemin.troncons);
             let octets = flux.octets;
             let v = vivant.clone();
+            let fins = self.fins_de_pompe.clone();
             std::thread::spawn(move || {
-                tune_core::source_pcm::pomper(&mut *lecteur, octets, |t| {
+                let fin = tune_core::source_pcm::pomper(&mut *lecteur, octets, |t| {
                     tx.send(t).is_ok() && v.load(Ordering::SeqCst)
-                })
+                });
+                fins.lock().unwrap_or_else(|e| e.into_inner()).push(fin);
             });
             std::thread::spawn(move || {
                 // C'est la « sortie » qui dépose : elle tient la pompe comptée.
@@ -517,7 +532,10 @@ impl HoteZone for HoteSimule {
             .contournes_a_l_arret
             .push(tune_core::audio::mesure_nue::active(zone_id));
         self.journal().arrets += 1;
-        self.pompe_vivante.store(false, Ordering::SeqCst);
+        self.pompe_vivante
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .store(false, Ordering::SeqCst);
     }
 
     fn traitements(&self, _zone_id: i64) -> TraitementsDeZone {
