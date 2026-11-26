@@ -149,7 +149,31 @@ pub trait FournisseurPcm: Send + Sync {
         let _ = consommation;
         Err(format!("« {source_id} » n'est pas une source en direct"))
     }
+
+    /// Fil 3094 — l'élément `source_id` peut-il encore s'ouvrir ? Faux pour
+    /// un élément ÉPHÉMÈRE dont la vie est finie (le balayage d'une mesure de
+    /// calibration terminée) : sa ligne de file est alors écartée au lieu
+    /// d'échouer à chaque appui sur Lecture. Vrai par défaut.
+    fn encore_jouable(&self, source_id: &str) -> bool {
+        let _ = source_id;
+        true
+    }
 }
+
+/// Fil 3094 — la source du balayage de mesure du greffon « calibration ».
+pub const SOURCE_CALIBRATION: &str = "calibration";
+
+/// Fil 3094 — une source TECHNIQUE : un signal de mesure, pas de la musique.
+/// Une ligne de ce genre n'entre ni dans l'historique, ni dans « Reprendre
+/// l'écoute », ni dans les statistiques, et n'est jamais annoncée (scrobble) ;
+/// périmée, elle est écartée de la file plutôt que jouée.
+pub fn source_technique(source: &str) -> bool {
+    source == SOURCE_CALIBRATION || source == SOURCE_CALIBRATION_NIVEAU
+}
+
+/// Le signal du test de niveau du micro (greffon « calibration », rc14) :
+/// une source technique lui aussi, jamais dans l'historique ni annoncée.
+pub const SOURCE_CALIBRATION_NIVEAU: &str = "calibration-niveau";
 
 /// Un flux en direct : pas de longueur, pas de durée, pas d'avance possible.
 pub struct FluxDirect {
@@ -250,6 +274,17 @@ impl SourcesPcm {
 
     pub fn fournisseur(&self, source: &str) -> Option<Arc<dyn FournisseurPcm>> {
         self.0.read().ok().and_then(|m| m.get(source).cloned())
+    }
+
+    /// Fil 3094 — une ligne `source`/`source_id` d'une source TECHNIQUE qui
+    /// ne peut plus jouer : fournisseur absent (greffon retiré, serveur
+    /// redémarré sans lui) ou élément éteint ([`FournisseurPcm::encore_jouable`]).
+    /// Toujours faux pour une source musicale.
+    pub fn ligne_technique_perimee(&self, source: &str, source_id: &str) -> bool {
+        source_technique(source)
+            && self
+                .fournisseur(source)
+                .is_none_or(|f| !f.encore_jouable(source_id))
     }
 }
 
