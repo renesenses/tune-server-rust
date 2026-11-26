@@ -74,6 +74,21 @@ L'assistant d'accueil vous guide à travers les premières étapes :
 
 ---
 
+## 2 bis. Administration sans mot de passe
+
+Tant que l'authentification n'est pas activée, les actions d'administration (redémarrer, mettre à jour, greffons…) sont acceptées depuis cette machine et depuis les appareils du réseau local. Ne sont jamais considérés comme locaux : l'accès à distance (relais, mandataire inverse), les adresses publiques, le partage d'adresses `100.64.0.0/10`, les plages `fc00::/8` et `fd7a:115c:a1e0::/48`, et la passerelle par défaut de la machine (une machine virtuelle en NAT ou un routeur qui réécrit l'adresse source y font apparaître toutes les connexions).
+
+Le compte, la licence et le jeton de l'accès à distance restent réservés à cette machine (ou à l'administrateur).
+
+Allumez **Réglages → Administration depuis cette machine seulement** (ou activez l'authentification) si :
+
+- un relais TCP (redirection de port) est placé sur une autre machine du réseau devant Tune : il n'est pas détectable ;
+- un réseau superposé utilise des adresses privées que Tune ne peut pas distinguer du réseau domestique. Vous pouvez aussi retirer ses plages avec `TUNE_ADMIN_LAN_EXCLUDED_RANGES=fd12:3456:789a::/48,10.8.0.0/24`.
+
+En conteneur, l'administration depuis le réseau local n'est ouverte qu'avec `TUNE_ADMIN_LAN_IN_CONTAINER=1`, à ne poser qu'avec le réseau de l'hôte (`--network host`). Sous Podman sans root, toutes les connexions semblent venir de `10.0.2.100` : ne pas poser cette variable.
+
+---
+
 ## 3. Ajouter votre bibliothèque
 
 **Réglages → Dossiers musicaux → Ajouter**

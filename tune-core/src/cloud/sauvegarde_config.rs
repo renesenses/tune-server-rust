@@ -651,6 +651,7 @@ pub fn restaurer(
     backend: &Arc<dyn DbBackend>,
     contenu: &Value,
     mode: Mode,
+    premium: bool,
 ) -> Result<Rapport, String> {
     let o = contenu
         .as_object()
@@ -789,7 +790,9 @@ pub fn restaurer(
         o.get("zones").cloned().unwrap_or_else(|| json!([])),
     );
     let fichier = crate::config_export::lire(corps)?;
-    let mut plan = crate::config_export::planifier(backend, &fichier)?;
+    // rc14 — profils d'égaliseur, préréglages et chaînes TESS : la règle de
+    // leurs routes (`config_export::egaliseurs`).
+    let mut plan = crate::config_export::planifier(backend, &fichier, premium)?;
     if mode == Mode::Merge {
         use crate::config_export::Statut;
         plan.reglages.retain(|r| r.statut == Statut::Ajoute);

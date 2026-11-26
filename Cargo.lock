@@ -7090,6 +7090,7 @@ dependencies = [
  "tune-plugin-runtime-wasm",
  "tune-plugin-sdk",
  "tune-pont-roon",
+ "tune-server",
  "tune-smart-http",
  "tune-stream-http",
  "tune-streaming-http",

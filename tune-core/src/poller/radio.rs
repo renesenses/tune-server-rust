@@ -74,6 +74,18 @@ impl PositionPoller {
             )
             .await;
             crate::radio_metadata_relais::noter_zone(zone_id, par_le_relais);
+            // Fil 3095 — la lecture ci-dessus a pu durer plusieurs secondes :
+            // si la zone est passée à une autre station entre-temps, ces
+            // métadonnées sont celles de l'ANCIENNE. Ni historique, ni DIDL,
+            // ni now-playing en son nom ; le tour suivant lira la nouvelle.
+            if meta.is_some() && self.playback.joue_un_autre_flux(zone_id, np).await {
+                debug!(
+                    zone_id,
+                    station = %station_name,
+                    "radio_metadata_perimees_station_changee"
+                );
+                return;
+            }
             if let Some(meta) = meta {
                 // La pochette du titre quand la station la donne, le
                 // logo sinon. Bertrand : « mettre la pochette de
@@ -246,8 +258,22 @@ impl PositionPoller {
                             .await;
                         });
                     }
-                    self.playback.update_now_playing(zone_id, new_np).await;
-                    debug!(zone_id, station = %station_name, "radio_metadata_updated");
+                    // Fil 3095 — écrit seulement si la zone joue TOUJOURS ce
+                    // flux, vérifié sous le verrou de l'écriture : la garde
+                    // plus haut ne ferme pas la fenêtre entre elle et ici.
+                    if self
+                        .playback
+                        .update_now_playing_du_meme_flux(zone_id, np, new_np)
+                        .await
+                    {
+                        debug!(zone_id, station = %station_name, "radio_metadata_updated");
+                    } else {
+                        debug!(
+                            zone_id,
+                            station = %station_name,
+                            "radio_metadata_perimees_station_changee"
+                        );
+                    }
                 }
             }
         }

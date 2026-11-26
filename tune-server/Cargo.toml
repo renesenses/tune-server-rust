@@ -6,6 +6,8 @@ license.workspace = true
 autotests = false
 
 [features]
+# Fonctions réservées aux épreuves (fenêtre de première configuration).
+test-utils = []
 default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "collection-physique", "mon-theme", "aes67", "calibration"]
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
@@ -203,6 +205,8 @@ dotenvy = { workspace = true }
 tune-aes67 = { path = "../plugins/tune-aes67", optional = true }
 
 [dev-dependencies]
+# Les épreuves d'intégration voient les fonctions de `test-utils`.
+tune-server = { path = ".", default-features = false, features = ["test-utils"] }
 tower = "0.5"
 # Test-only (#6286) : donner aux FLAC témoins de l'audit d'intégrité le MD5
 # STREAMINFO de leur PCM. Déjà dans Cargo.lock par tune-core.
@@ -1566,6 +1570,18 @@ path = "tests/tess_migration_routes_t02.rs"
 name = "tess_api_routes_t08"
 path = "tests/tess_api_routes_t08.rs"
 
+# rc14 — l'égaliseur paramétrique est Premium sur les routes historiques
+# (`/zones/{id}/dsp`, `/zones/{id}/eq`, `/eq/presets/{id}/activate`) comme
+# par TESS ; graphique et casque libres.
+[[test]]
+name = "eq_parametrique_premium_rc14"
+path = "tests/eq_parametrique_premium_rc14.rs"
+
+# rc14 — TESS vers le DSD sur la sortie locale : capacités, 402, 409, chemin.
+[[test]]
+name = "tess_dsd_sortie_locale_rc14"
+path = "tests/tess_dsd_sortie_locale_rc14.rs"
+
 # TESS T09a — import d'un jeu de convolution (.zip de RI, .cfg Convolver),
 # archive piégée refusée sans toucher au jeu en place.
 [[test]]
@@ -2285,6 +2301,31 @@ path = "tests/durcissement_routes_admin.rs"
 [[test]]
 name = "activation_authentification"
 path = "tests/activation_authentification.rs"
+
+# rc14 : mot de passe administrateur créé dans l'assistant de première
+# configuration (installation neuve, réseau local, fenêtre courte, une fois).
+[[test]]
+name = "premiere_configuration_admin"
+path = "tests/premiere_configuration_admin.rs"
+
+[[test]]
+name = "revue_premiere_configuration"
+path = "tests/revue_premiere_configuration.rs"
+
+[[test]]
+name = "revue2_premiere_configuration"
+path = "tests/revue2_premiere_configuration.rs"
+
+# Variables d'environnement : une seule épreuve dans ce binaire.
+[[test]]
+name = "premiere_configuration_environnement"
+path = "tests/premiere_configuration_environnement.rs"
+
+# rc14 : sans authentification, l'administration depuis le réseau local
+# (variables d'environnement : épreuves sérialisées dans ce binaire).
+[[test]]
+name = "administration_reseau_local_rc14"
+path = "tests/administration_reseau_local_rc14.rs"
 
 # rc13.2 : connexion de `default` sur cette machine et depuis le réseau local,
 # après l'activation et sur une base rc12 (ancien hachage). SQLite, et

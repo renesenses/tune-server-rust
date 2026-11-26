@@ -122,13 +122,14 @@ async fn chaque_licence_parametrique_402_sans_premium_graphique_et_casque_toujou
         );
         let ctx = ContexteValidation { premium };
 
-        // Graphique et casque : gratuits pour tous (chacun seul : les
-        // façades de l'égaliseur sont exclusives depuis la rc14).
-        for id in ["equalizer-graphic", "equalizer-headphone"] {
-            chaine(vec![maillon(id, true)])
-                .valider(&catalogue, ctx)
-                .unwrap_or_else(|e| panic!("{licence:?} {id} : {e}"));
-        }
+        // Graphique et casque : gratuits pour tous, ensemble (rc14 : les
+        // égaliseurs sont combinables).
+        chaine(vec![
+            maillon("equalizer-graphic", true),
+            maillon("equalizer-headphone", true),
+        ])
+        .valider(&catalogue, ctx)
+        .unwrap_or_else(|e| panic!("{licence:?} : {e}"));
 
         // Paramétrique coché : 402 sans Premium, accepté avec.
         let peq = chaine(vec![maillon(ID_EQ_PARAMETRIQUE, true)]);

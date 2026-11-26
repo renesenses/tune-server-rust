@@ -37,6 +37,18 @@ const CETTE_MACHINE: &str = "127.0.0.1:50000";
 /// Un autre hôte du réseau local.
 const AUTRE_HOTE_DU_LAN: &str = "192.168.1.50:50000";
 
+/// rc14 : sans authentification, le réseau local administre par défaut
+/// (`tests/administration_reseau_local_rc14.rs`). Les épreuves qui tiennent
+/// la règle « cette machine seulement » allument le réglage qui la rétablit.
+fn cette_machine_seulement(state: &AppState) {
+    SettingsRepo::with_backend(state.backend.clone())
+        .set(
+            tune_server::auth::CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT,
+            "true",
+        )
+        .unwrap();
+}
+
 async fn appel(
     state: &AppState,
     methode: Method,
@@ -411,12 +423,14 @@ async fn sans_authentification_les_autres_routes_passent_la_garde() {
     }
 }
 
-/// Sécurité : authentification coupée, une action machine n'est acceptée que
+/// Sécurité : authentification coupée et réglage « Administration depuis
+/// cette machine seulement » allumé, une action machine n'est acceptée que
 /// depuis cette machine — jamais depuis un autre hôte du réseau, jamais par le
 /// relais (vu de 127.0.0.1 mais émis ailleurs).
 #[tokio::test]
 async fn sans_authentification_les_actions_machine_viennent_de_cette_machine() {
     let state = new_state();
+    cette_machine_seulement(&state);
     for (m, chemin, corps) in actions_machine() {
         let (st, _, rep) = appel_depuis(
             &state,
@@ -468,6 +482,7 @@ async fn sans_authentification_les_actions_machine_viennent_de_cette_machine() {
 #[tokio::test]
 async fn sans_authentification_le_bouclage_ipv6_est_cette_machine() {
     let state = new_state();
+    cette_machine_seulement(&state);
     for adresse in ["[::1]:50000", "[::ffff:127.0.0.1]:50000"] {
         for (m, chemin, corps) in actions_machine_hors_ligne() {
             let (st, _, rep) =
@@ -998,6 +1013,7 @@ async fn le_refus_de_la_base_entiere_dit_quoi_faire_dans_la_langue_de_l_interfac
 #[tokio::test]
 async fn l_adresse_de_home_assistant_ne_vise_jamais_la_machine() {
     let state = new_state();
+    cette_machine_seulement(&state);
     let chemin = "/api/v1/homeassistant/config";
     let (st, _, rep) = appel_depuis(
         &state,
@@ -1079,6 +1095,7 @@ async fn un_appel_home_assistant_vers_la_machine_ne_part_pas() {
 #[tokio::test]
 async fn la_configuration_hue_est_reservee_et_nue() {
     let state = new_state();
+    cette_machine_seulement(&state);
     let chemin = "/api/v1/hue/config";
     let corps = r#"{"hue_bridge_ip":"192.168.1.30","hue_username":"abc-DEF_1"}"#;
     let (st, _, rep) = appel_depuis(
@@ -1228,6 +1245,7 @@ fn sans_l_arret(
 #[tokio::test]
 async fn sans_authentification_arret_et_greffons_refuses_depuis_le_reseau_local() {
     let state = new_state();
+    cette_machine_seulement(&state);
     for (m, chemin, corps) in actions_machine_gardees_a_leur_tour() {
         let (st, _, rep) = appel_depuis(
             &state,

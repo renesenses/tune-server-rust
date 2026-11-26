@@ -786,13 +786,128 @@ impl FromRequestParts<AppState> for RequireAdmin {
 
 /// Garde des actions qui engagent la machine (effacer un disque, éteindre,
 /// installer un greffon) : l'administrateur quand l'authentification est
-/// active ; sinon, SEULEMENT un appel émis depuis cette machine (adresse de
-/// bouclage réelle de la connexion, jamais une requête relayée). Même doctrine
-/// que la garde de la base pour la migration : « cette machine », pas « le réseau local ».
+/// active ; sinon, un appel émis depuis cette machine (adresse de bouclage
+/// réelle de la connexion, jamais une requête relayée), ou — rc14 — depuis le
+/// RÉSEAU LOCAL ([`administration_depuis_le_reseau_local`]), sauf si le
+/// réglage « Administration depuis cette machine seulement »
+/// ([`CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT`]) est allumé.
+///
+/// Jamais : le relais distant ou l'écoute directe, un mandataire inverse, une
+/// adresse hors réseau local, le relais du port 80 de Tune OS, la passerelle
+/// d'un conteneur (réseau en pont).
 ///
 /// `RequireAdmin` laisse tout passer quand l'authentification est coupée ;
 /// cette garde ne le fait pas.
 pub struct AdminOuCetteMachine;
+
+/// La garde STRICTE de la rc13 : l'administrateur, ou cette machine
+/// seulement, jamais le réseau local. Pour le compte et la licence : délier
+/// le compte mozaiklabs.fr (décision du 23/11), poser, activer, désactiver ou
+/// retirer la licence, et lire la clé de licence en clair ; pour le pont
+/// d'accès à distance, tout ce qui en rend le jeton (activer, renouveler,
+/// lire le lien d'accès).
+pub struct AdminOuCetteMachineStricte;
+
+/// Réglage « Administration depuis cette machine seulement » : allumé
+/// (`true`), l'authentification coupée, les actions d'administration ne sont
+/// acceptées que depuis la machine de Tune (comportement de la rc13). Éteint
+/// par défaut. Préfixe protégé `auth_` : l'écriture générique des réglages et
+/// les imports ne le touchent pas ; il s'écrit par `POST /auth/admin-scope`,
+/// sous [`AdminOuCetteMachine`] — une fois allumé, seule cette machine (ou
+/// l'administrateur) peut l'éteindre.
+pub const CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT: &str = "auth_admin_this_machine_only";
+
+/// Variable par laquelle l'exploitant d'un CONTENEUR déclare qu'il voit
+/// l'adresse réelle des appareils (`network_mode: host`, aucun mandataire
+/// devant Tune) : l'administration depuis le réseau local y est alors
+/// permise, jamais depuis la passerelle du conteneur. Sans elle, un conteneur
+/// garde la règle stricte : en réseau en pont, toute connexion publiée arrive
+/// de la passerelle (172.17.0.1…), adresse privée, Internet compris.
+pub const VARIABLE_ADMINISTRATION_RESEAU_LOCAL_EN_CONTENEUR: &str = "TUNE_ADMIN_LAN_IN_CONTAINER";
+
+/// Le réglage « Administration depuis cette machine seulement » est-il
+/// allumé ? Une erreur de lecture répond OUI (dans le doute, strict).
+pub fn administration_cette_machine_seulement(state: &AppState) -> bool {
+    match SettingsRepo::with_backend(state.backend.clone())
+        .get(CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT)
+    {
+        Ok(v) => v.is_some_and(|v| v.trim() == "true"),
+        Err(_) => true,
+    }
+}
+
+/// Sans authentification, l'appel d'administration vient-il du réseau
+/// local, adresse fiable ? Voir [`juger_l_adresse_du_reseau_local`].
+/// `None` : réglage strict allumé.
+async fn administration_depuis_le_reseau_local(
+    parts: &mut Parts,
+    state: &AppState,
+) -> Option<AdresseDuReseauLocal> {
+    if administration_cette_machine_seulement(state) {
+        return None;
+    }
+    Some(
+        juger_l_adresse_du_reseau_local(
+            parts,
+            state,
+            variable_vraie(VARIABLE_ADMINISTRATION_RESEAU_LOCAL_EN_CONTENEUR),
+        )
+        .await,
+    )
+}
+
+/// La règle de [`AdminOuCetteMachine`] (ou de la garde stricte,
+/// `reseau_local` faux), authentification coupée. `Ok` : accepté.
+async fn action_de_machine_sans_authentification(
+    parts: &mut Parts,
+    state: &AppState,
+    reseau_local: bool,
+) -> Result<(), Refus> {
+    if appel_depuis_cette_machine(parts, state).await {
+        return Ok(());
+    }
+    if !reseau_local {
+        return Err(Refus::HorsDeCetteMachine);
+    }
+    let adresse = administration_depuis_le_reseau_local(parts, state).await;
+    if adresse == Some(AdresseDuReseauLocal::Fiable) {
+        tracing::info!(
+            chemin = %parts.uri.path(),
+            "action_machine_acceptee_depuis_le_reseau_local_sans_authentification"
+        );
+    }
+    refus_selon_l_adresse(adresse)
+}
+
+/// Le verdict de [`administration_depuis_le_reseau_local`] en refus.
+fn refus_selon_l_adresse(adresse: Option<AdresseDuReseauLocal>) -> Result<(), Refus> {
+    match adresse {
+        Some(AdresseDuReseauLocal::Fiable) => Ok(()),
+        // Réglage strict, ou Tune OS (relais du port 80) : la règle de la
+        // rc13, et son refus.
+        None | Some(AdresseDuReseauLocal::RelaisDuPort80) => Err(Refus::HorsDeCetteMachine),
+        Some(AdresseDuReseauLocal::Conteneur) => Err(Refus::ConteneurSansAdresseFiable),
+        Some(AdresseDuReseauLocal::HorsDuReseauLocal) => {
+            Err(Refus::AdministrationHorsDuReseauLocal)
+        }
+    }
+}
+
+/// Sans authentification, les actions d'administration sont-elles permises à
+/// CET appelant ? Même règle que [`AdminOuCetteMachine`], sans refus rendu :
+/// pour que l'interface grise ou non ses boutons. `None` : permises ; sinon le
+/// motif (`reason`) que la garde rendrait.
+pub async fn refus_des_actions_de_machine_sans_authentification(
+    parts: &mut Parts,
+    state: &AppState,
+) -> Option<&'static str> {
+    if appel_depuis_cette_machine(parts, state).await {
+        return None;
+    }
+    let refus =
+        refus_selon_l_adresse(administration_depuis_le_reseau_local(parts, state).await).err()?;
+    Some(motif_et_phrase_du_refus(refus, !crate::routes::appliance::bouclage_fiable()).0)
+}
 
 /// L'appel vient-il de cette machine ? Lu dans `ConnectInfo` (posé par
 /// `into_make_service_with_connect_info`, ou `MockConnectInfo` sous test).
@@ -971,10 +1086,29 @@ impl FromRequestParts<AppState> for AdminOuCetteMachine {
                 .await
                 .map(|_| AdminOuCetteMachine);
         }
-        if appel_depuis_cette_machine(parts, state).await {
-            return Ok(AdminOuCetteMachine);
+        match action_de_machine_sans_authentification(parts, state, true).await {
+            Ok(()) => Ok(AdminOuCetteMachine),
+            Err(refus) => Err(refus_action_reservee(parts, state, refus).await),
         }
-        Err(refus_action_reservee(parts, state, Refus::HorsDeCetteMachine).await)
+    }
+}
+
+impl FromRequestParts<AppState> for AdminOuCetteMachineStricte {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if authentification_active(state) {
+            return <RequireAdmin as FromRequestParts<AppState>>::from_request_parts(parts, state)
+                .await
+                .map(|_| AdminOuCetteMachineStricte);
+        }
+        match action_de_machine_sans_authentification(parts, state, false).await {
+            Ok(()) => Ok(AdminOuCetteMachineStricte),
+            Err(refus) => Err(refus_action_reservee(parts, state, refus).await),
+        }
     }
 }
 
@@ -989,6 +1123,12 @@ enum Refus {
     /// Liaison du compte mozaiklabs.fr sans authentification, appel venu
     /// d'ailleurs que du réseau local.
     CompteHorsDuReseauLocal,
+    /// Action d'administration sans authentification, appel venu d'ailleurs
+    /// que du réseau local (relais, mandataire, Internet, CGNAT/VPN).
+    AdministrationHorsDuReseauLocal,
+    /// Action d'administration sans authentification, dans un conteneur dont
+    /// l'adresse des appareils n'est pas fiable (réseau en pont, passerelle).
+    ConteneurSansAdresseFiable,
 }
 
 /// L'action que nomme le refus, d'après le chemin appelé : la clé de son
@@ -1015,6 +1155,26 @@ pub fn action_du_chemin(chemin: &str) -> &'static str {
         "extensions"
     } else {
         "other"
+    }
+}
+
+/// Le motif (`reason`) et la clé de la phrase d'un refus.
+fn motif_et_phrase_du_refus(refus: Refus, relais_port_80: bool) -> (&'static str, &'static str) {
+    match refus {
+        Refus::HorsDuReseauLocal => ("not_local_network", "api.machine.reservedOutsideLan"),
+        Refus::CompteHorsDuReseauLocal => {
+            ("not_local_network", "api.machine.reservedOutsideLanAccount")
+        }
+        Refus::AdministrationHorsDuReseauLocal => {
+            ("not_local_network", "api.machine.reservedOutsideLanAdmin")
+        }
+        Refus::ConteneurSansAdresseFiable => {
+            ("container_network", "api.machine.reservedContainerNetwork")
+        }
+        Refus::HorsDeCetteMachine if relais_port_80 => {
+            ("port80_relay", "api.machine.reservedPort80Relay")
+        }
+        Refus::HorsDeCetteMachine => ("not_local", "api.machine.reservedNotLocal"),
     }
 }
 
@@ -1049,16 +1209,7 @@ async fn refus_action_reservee(
     );
     // Le refus dit ce que le serveur a vu : l'exploitant comprend tout de
     // suite pourquoi « depuis cette machine » n'a pas été reconnu.
-    let (motif, cle) = match refus {
-        Refus::HorsDuReseauLocal => ("not_local_network", "api.machine.reservedOutsideLan"),
-        Refus::CompteHorsDuReseauLocal => {
-            ("not_local_network", "api.machine.reservedOutsideLanAccount")
-        }
-        Refus::HorsDeCetteMachine if relais_port_80 => {
-            ("port80_relay", "api.machine.reservedPort80Relay")
-        }
-        Refus::HorsDeCetteMachine => ("not_local", "api.machine.reservedNotLocal"),
-    };
+    let (motif, cle) = motif_et_phrase_du_refus(refus, relais_port_80);
     let lang = crate::i18n::lang_from_header(&parts.headers);
     let action_cle = action_du_chemin(&chemin);
     let action = crate::i18n::t(&lang, &format!("api.machine.action.{action_cle}"));
@@ -1081,20 +1232,132 @@ async fn refus_action_reservee(
 }
 
 /// Adresse du RÉSEAU LOCAL : privée IPv4 (RFC 1918), lien local IPv4
-/// (169.254/16), unique locale IPv6 (fc00::/7), lien local IPv6 (fe80::/10),
+/// (169.254/16), unique locale IPv6 (fd00::/8), lien local IPv6 (fe80::/10),
 /// et leurs formes IPv4 d'une socket à double pile. PAS le partage
-/// d'adresses 100.64/10 (CGNAT, Tailscale) : c'est un accès à distance.
+/// d'adresses 100.64/10 (CGNAT, réseaux superposés) : c'est un accès à
+/// distance. Hors aussi les plages de [`PLAGES_EXCLUES_DU_RESEAU_LOCAL`] et
+/// celles que l'exploitant ajoute par [`VARIABLE_PLAGES_EXCLUES_DU_RESEAU_LOCAL`].
 pub fn adresse_du_reseau_local(ip: std::net::IpAddr) -> bool {
-    let v4_local = |v4: std::net::Ipv4Addr| v4.is_private() || v4.is_link_local();
+    adresse_du_reseau_local_hors(ip, &plages_exclues_par_l_exploitant())
+}
+
+/// Plages privées exclues d'office du réseau local, parce qu'elles servent à
+/// des réseaux superposés (accès à distance) et non au réseau domestique :
+///
+/// - `fc00::/8` : moitié de `fc00::/7` que la RFC 4193 n'attribue pas ; les
+///   box et routeurs tirent leurs préfixes uniques locaux dans `fd00::/8` ;
+/// - `fd7a:115c:a1e0::/48` : préfixe fixe d'un réseau superposé courant.
+///
+/// On ne peut pas exclure tout `fd00::/8` : de nombreuses box (et OpenWrt par
+/// défaut) y tirent au hasard le préfixe du réseau domestique, et un réseau
+/// superposé qui tire le sien de la même façon ne s'en distingue pas par
+/// l'adresse. Dans ce cas : déclarer sa plage dans
+/// [`VARIABLE_PLAGES_EXCLUES_DU_RESEAU_LOCAL`], ou allumer le réglage
+/// « Administration depuis cette machine seulement ».
+pub const PLAGES_EXCLUES_DU_RESEAU_LOCAL: &[(std::net::IpAddr, u8)] = &[
+    (
+        std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)),
+        8,
+    ),
+    (
+        std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+            0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0,
+        )),
+        48,
+    ),
+];
+
+/// Variable par laquelle l'exploitant retire des plages du réseau local
+/// (liste séparée par des virgules, notation `adresse/longueur`, par exemple
+/// `fd12:3456:789a::/48,10.8.0.0/24`). Elle ne fait que RESTREINDRE : une
+/// plage publique ajoutée ici ne devient jamais locale. Une entrée illisible
+/// est ignorée (et signalée au journal).
+pub const VARIABLE_PLAGES_EXCLUES_DU_RESEAU_LOCAL: &str = "TUNE_ADMIN_LAN_EXCLUDED_RANGES";
+
+/// Lit une plage `adresse/longueur` (ou une adresse seule).
+pub fn plage_d_adresses(texte: &str) -> Option<(std::net::IpAddr, u8)> {
+    let texte = texte.trim();
+    let (adresse, longueur) = match texte.split_once('/') {
+        Some((a, l)) => (a.trim(), Some(l.trim())),
+        None => (texte, None),
+    };
+    let adresse: std::net::IpAddr = adresse.parse().ok()?;
+    let maximum = if adresse.is_ipv4() { 32 } else { 128 };
+    let longueur = match longueur {
+        Some(l) => l.parse::<u8>().ok()?,
+        None => maximum,
+    };
+    (longueur <= maximum).then_some((adresse, longueur))
+}
+
+/// L'adresse est-elle dans la plage ? Une adresse IPv4 dans IPv6 est jugée
+/// sous sa forme IPv4.
+pub fn adresse_dans_la_plage(ip: std::net::IpAddr, plage: (std::net::IpAddr, u8)) -> bool {
+    let (reseau, longueur) = plage;
+    match (adresse_ipv4_si_possible(ip), reseau) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+            let l = u32::from(longueur.min(32));
+            let masque = if l == 0 { 0 } else { u32::MAX << (32 - l) };
+            u32::from(a) & masque == u32::from(b) & masque
+        }
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+            let l = u32::from(longueur.min(128));
+            let masque = if l == 0 { 0 } else { u128::MAX << (128 - l) };
+            u128::from(a) & masque == u128::from(b) & masque
+        }
+        _ => false,
+    }
+}
+
+/// La forme IPv4 d'une adresse IPv4 dans IPv6, l'adresse telle quelle sinon.
+fn adresse_ipv4_si_possible(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip {
-        std::net::IpAddr::V4(v4) => v4_local(v4),
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// Les plages de [`VARIABLE_PLAGES_EXCLUES_DU_RESEAU_LOCAL`].
+fn plages_exclues_par_l_exploitant() -> Vec<(std::net::IpAddr, u8)> {
+    let Ok(liste) = std::env::var(VARIABLE_PLAGES_EXCLUES_DU_RESEAU_LOCAL) else {
+        return Vec::new();
+    };
+    liste
+        .split(',')
+        .filter(|e| !e.trim().is_empty())
+        .filter_map(|e| {
+            let plage = plage_d_adresses(e);
+            if plage.is_none() {
+                tracing::warn!(
+                    entree = %e.trim(),
+                    "plage_exclue_du_reseau_local_illisible"
+                );
+            }
+            plage
+        })
+        .collect()
+}
+
+/// [`adresse_du_reseau_local`], avec les plages de l'exploitant données.
+pub fn adresse_du_reseau_local_hors(
+    ip: std::net::IpAddr,
+    exclues: &[(std::net::IpAddr, u8)],
+) -> bool {
+    let ip = adresse_ipv4_si_possible(ip);
+    let privee = match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
         std::net::IpAddr::V6(v6) => {
             let premier = v6.segments()[0];
-            (premier & 0xfe00) == 0xfc00
-                || (premier & 0xffc0) == 0xfe80
-                || v6.to_ipv4_mapped().is_some_and(v4_local)
+            (premier & 0xfe00) == 0xfc00 || (premier & 0xffc0) == 0xfe80
         }
-    }
+    };
+    privee
+        && !PLAGES_EXCLUES_DU_RESEAU_LOCAL
+            .iter()
+            .chain(exclues)
+            .any(|p| adresse_dans_la_plage(ip, *p))
 }
 
 /// L'appel vient-il du RÉSEAU LOCAL ? Mêmes critères que la garde d'hôte et
@@ -1110,6 +1373,16 @@ pub fn adresse_du_reseau_local(ip: std::net::IpAddr) -> bool {
 /// (`appliance::bouclage_fiable` faux) : c'est exactement ce qu'il relaie.
 /// Ailleurs, le bouclage relève de [`appel_depuis_cette_machine`].
 async fn appel_depuis_le_reseau_local(parts: &mut Parts, state: &AppState) -> bool {
+    appel_du_reseau_local(parts, state, true).await
+}
+
+/// [`appel_depuis_le_reseau_local`] ; `verifier_la_passerelle` faux laisse
+/// à [`juger_l_adresse_du_reseau_local`] le soin de juger la passerelle.
+async fn appel_du_reseau_local(
+    parts: &mut Parts,
+    state: &AppState,
+    verifier_la_passerelle: bool,
+) -> bool {
     if crate::garde_du_relais::requete_relayee(&parts.headers) {
         return false;
     }
@@ -1134,7 +1407,7 @@ async fn appel_depuis_le_reseau_local(parts: &mut Parts, state: &AppState) -> bo
     if adresse_de_cette_machine(ip) {
         return !crate::routes::appliance::bouclage_fiable();
     }
-    adresse_du_reseau_local(ip)
+    adresse_du_reseau_local(ip) && !(verifier_la_passerelle && source_passerelle_par_defaut(ip))
 }
 
 /// Garde de la SEULE installation d'une mise à jour officielle
@@ -1149,8 +1422,8 @@ async fn appel_depuis_le_reseau_local(parts: &mut Parts, state: &AppState) -> bo
 ///   signature de `SHA256SUMS`.
 ///
 /// Les autres actions de machine (redémarrer, éteindre, extensions, accès à
-/// distance, sauvegardes, canal de mise à jour) restent sous
-/// [`AdminOuCetteMachine`].
+/// distance, sauvegardes, canal de mise à jour) sont sous
+/// [`AdminOuCetteMachine`] (rc14 : réseau local aussi, sauf réglage strict).
 pub struct AdminOuReseauLocalPourLaMiseAJour;
 
 impl FromRequestParts<AppState> for AdminOuReseauLocalPourLaMiseAJour {
@@ -1298,6 +1571,41 @@ pub fn router() -> Router<AppState> {
             get(etat_activation).post(activer_l_authentification),
         )
         .route("/activation/code", post(demander_un_code_d_activation))
+        .route("/admin-scope", post(regler_la_portee_de_l_administration))
+}
+
+#[derive(Deserialize)]
+struct PorteeDeLAdministration {
+    this_machine_only: bool,
+}
+
+/// `POST /auth/admin-scope` — allume ou éteint le réglage « Administration
+/// depuis cette machine seulement ». Garde [`AdminOuCetteMachine`] : une fois
+/// allumé, seule cette machine (ou l'administrateur, authentification active)
+/// peut l'éteindre.
+async fn regler_la_portee_de_l_administration(
+    _garde: AdminOuCetteMachine,
+    State(state): State<AppState>,
+    Json(body): Json<PorteeDeLAdministration>,
+) -> Response {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let ecrit = if body.this_machine_only {
+        settings.set(CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT, "true")
+    } else {
+        settings.delete(CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT)
+    };
+    if ecrit.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "setting_not_saved" })),
+        )
+            .into_response();
+    }
+    tracing::info!(
+        cette_machine_seulement = body.this_machine_only,
+        "portee_de_l_administration_reglee"
+    );
+    Json(json!({ "admin_this_machine_only": body.this_machine_only })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,6 +2131,7 @@ async fn auth_config(State(state): State<AppState>) -> Json<Value> {
         "auth_enabled": enabled,
         "has_jwt_secret": has_secret,
         "has_api_key": has_api_key,
+        "admin_this_machine_only": administration_cette_machine_seulement(&state),
     }))
 }
 
@@ -1861,6 +2170,7 @@ async fn set_auth_config(
             // Les jetons et la clé émis pendant que tout était ouvert ne
             // survivent pas à l'activation.
             renouveler_les_secrets(&settings);
+            fermer_la_premiere_configuration(&state);
             renouveler_le_jeton_du_pont(&state);
             state.fermeture_websockets.send_modify(|n| *n += 1);
         } else if enabled {
@@ -1911,12 +2221,16 @@ pub struct CodeActivation {
 }
 
 /// L'état du code d'activation : le code en cours, la dernière émission et les
-/// échecs comptés par adresse.
+/// échecs comptés par adresse. Aussi l'heure MONOTONE d'ouverture de la
+/// fenêtre de première configuration, quand c'est CE processus qui l'a
+/// ouverte (voir [`ouvrir_la_premiere_configuration`]).
 #[derive(Default)]
 pub struct EtatCodeActivation {
     en_cours: Option<CodeActivation>,
     derniere_emission: Option<std::time::Instant>,
     echecs_par_ip: std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>,
+    /// Heure monotone et heure Unix de l'ouverture de la fenêtre.
+    premiere_configuration: Option<(std::time::Instant, u64)>,
 }
 
 /// Durée de vie d'un code d'activation.
@@ -2140,6 +2454,19 @@ fn refus_activation_hors_machine() -> Response {
         .into_response()
 }
 
+/// La fenêtre de première configuration s'est fermée entre la lecture de
+/// l'état et la création (autre navigateur, délai écoulé) : le code reste.
+fn refus_premiere_configuration_fermee() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "first_setup_closed",
+            "message": "The first-time setup window is closed; use the one-time activation code.",
+        })),
+    )
+        .into_response()
+}
+
 fn refus_deja_active() -> Response {
     (
         StatusCode::CONFLICT,
@@ -2149,6 +2476,583 @@ fn refus_deja_active() -> Response {
         })),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Première configuration : le mot de passe administrateur dans l'assistant
+// ---------------------------------------------------------------------------
+//
+// Sur une installation NEUVE, l'assistant de première configuration fait créer
+// le mot de passe administrateur sans le code du journal, si les quatre
+// conditions sont réunies :
+//
+// 1. aucun administrateur n'a encore de mot de passe, et l'authentification
+//    n'est pas active ;
+// 2. moins de [`DUREE_PREMIERE_CONFIGURATION`] depuis le premier démarrage de
+//    cette installation — fenêtre ouverte au démarrage seulement quand la base
+//    vient d'être créée ([`base_neuve_avant_ouverture`]) ;
+// 3. l'appel vient de cette machine ou du RÉSEAU LOCAL
+//    ([`appel_depuis_le_reseau_local`] : ni relais, ni écoute directe, ni
+//    mandataire inverse, ni CGNAT, ni requête inter-sites) ;
+// 4. une seule fois : la création se fait sous [`VERROU_ACTIVATION`], par une
+//    écriture conditionnelle, puis la fenêtre est fermée pour de bon.
+//
+// Hors de ces conditions, rien ne change : cette machine, ou le code à usage
+// unique du journal. Une installation EXISTANTE (base déjà présente au
+// démarrage) n'ouvre jamais la fenêtre.
+
+/// Durée de la fenêtre de première configuration. 45 minutes : le temps de
+/// démarrer la machine (premier démarrage de Tune OS compris), de trouver
+/// l'adresse de Tune et de parcourir l'assistant, sans laisser une
+/// installation oubliée réclamable pendant des heures.
+pub const DUREE_PREMIERE_CONFIGURATION: std::time::Duration =
+    std::time::Duration::from_secs(45 * 60);
+
+/// Heure (secondes Unix) du premier démarrage d'une installation neuve. Clé
+/// protégée (préfixe `auth_`) : l'écriture générique des réglages ne la pose
+/// pas sans session administrateur.
+pub const CLE_DEBUT_PREMIERE_CONFIGURATION: &str = "auth_premiere_configuration_debut";
+/// Posée quand la fenêtre a servi : elle ne se rouvre plus.
+pub const CLE_FIN_PREMIERE_CONFIGURATION: &str = "auth_premiere_configuration_close";
+
+/// Longueur maximale d'un mot de passe administrateur, en caractères.
+pub const LONGUEUR_MAX_MOT_DE_PASSE: usize = 256;
+/// Longueur minimale d'un mot de passe administrateur, en caractères.
+pub const LONGUEUR_MIN_MOT_DE_PASSE: usize = 8;
+
+/// La base est-elle NEUVE, juste avant que le serveur ne l'ouvre ? Seulement
+/// en SQLite, et seulement si le fichier n'existe pas encore. PostgreSQL :
+/// non (rien ne distingue sûrement une base vide d'une base déjà servie), la
+/// voie du code reste.
+pub fn base_neuve_avant_ouverture(db_path: &str, database_url: Option<&str>) -> bool {
+    let sqlite = database_url
+        .map(tune_core::db::engine::Engine::from_connection_string)
+        .is_none_or(|e| e == tune_core::db::engine::Engine::Sqlite);
+    sqlite && db_path != ":memory:" && !std::path::Path::new(db_path).exists()
+}
+
+/// Un administrateur a-t-il déjà un mot de passe ? Une erreur de lecture
+/// répond OUI : dans le doute, la fenêtre reste fermée.
+fn un_administrateur_a_un_mot_de_passe(state: &AppState) -> bool {
+    match state.backend.query_one(
+        "SELECT id FROM profiles WHERE is_admin = 1 \
+         AND ((password_hash IS NOT NULL AND password_hash <> '') \
+           OR (password_hash_v2 IS NOT NULL AND password_hash_v2 <> '')) LIMIT 1",
+        &[],
+    ) {
+        Ok(ligne) => ligne.is_some(),
+        Err(_) => true,
+    }
+}
+
+fn maintenant_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Ouvre la fenêtre de première configuration. Appelé au démarrage, et
+/// seulement quand [`base_neuve_avant_ouverture`] a répondu oui. Ne rouvre
+/// jamais une fenêtre déjà ouverte ou fermée. Rend vrai si elle s'ouvre.
+///
+/// La fenêtre ne vit que dans CE processus : l'heure d'ouverture (monotone et
+/// murale) est gardée en mémoire, et l'heure enregistrée doit être la même.
+/// Après un redémarrage, ou si la base est remplacée, elle est fermée.
+pub fn ouvrir_la_premiere_configuration(state: &AppState) -> bool {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let deja = |cle: &str| settings.get(cle).ok().flatten().is_some();
+    if !crate::routes::appliance::bouclage_fiable()
+        || authentification_active(state)
+        || un_administrateur_a_un_mot_de_passe(state)
+        || deja(CLE_DEBUT_PREMIERE_CONFIGURATION)
+        || deja(CLE_FIN_PREMIERE_CONFIGURATION)
+    {
+        return false;
+    }
+    let debut = maintenant_unix();
+    if settings
+        .set(CLE_DEBUT_PREMIERE_CONFIGURATION, &debut.to_string())
+        .is_err()
+    {
+        return false;
+    }
+    state
+        .code_activation_auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .premiere_configuration = Some((std::time::Instant::now(), debut));
+    let minutes = DUREE_PREMIERE_CONFIGURATION.as_secs() / 60;
+    eprintln!(
+        "Tune : première configuration — le mot de passe administrateur peut être créé \
+         dans l'assistant, depuis le réseau local, pendant {minutes} min. / First-time \
+         setup: the administrator password can be created in the setup assistant, from the \
+         local network, for {minutes} min."
+    );
+    if passerelles_du_conteneur().is_some() && !premiere_configuration_autorisee_en_conteneur() {
+        eprintln!(
+            "Tune : conteneur détecté — sans {VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR}=1 \
+             (réseau de l'hôte), le mot de passe administrateur se crée avec le code \
+             d'activation du journal. / Container detected: without \
+             {VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR}=1 (host network), the administrator \
+             password is created with the activation code from the log."
+        );
+    }
+    tracing::info!(minutes, "premiere_configuration_ouverte");
+    true
+}
+
+/// Ferme la fenêtre de première configuration pour de bon. Appelé à toute
+/// activation de l'authentification, quelle que soit la voie.
+fn fermer_la_premiere_configuration(state: &AppState) {
+    SettingsRepo::with_backend(state.backend.clone())
+        .set(
+            CLE_FIN_PREMIERE_CONFIGURATION,
+            &maintenant_unix().to_string(),
+        )
+        .ok();
+    state
+        .code_activation_auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .premiere_configuration = None;
+}
+
+/// Au démarrage d'une base qui n'est PAS neuve : une fenêtre ouverte par un
+/// démarrage précédent (ou apportée par une base importée) est fermée.
+pub fn fermer_une_premiere_configuration_heritee(state: &AppState) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let present = |cle: &str| settings.get(cle).ok().flatten().is_some();
+    if present(CLE_DEBUT_PREMIERE_CONFIGURATION) && !present(CLE_FIN_PREMIERE_CONFIGURATION) {
+        fermer_la_premiere_configuration(state);
+        tracing::info!("premiere_configuration_heritee_fermee");
+    }
+}
+
+/// Le temps qui reste à la fenêtre de première configuration, ou `None` si
+/// elle est fermée. Elle se ferme dès que l'horloge monotone OU l'heure murale
+/// dépasse [`DUREE_PREMIERE_CONFIGURATION`] (mise en veille, horloge réglée),
+/// et si l'heure murale recule.
+pub fn premiere_configuration_restante(state: &AppState) -> Option<std::time::Duration> {
+    if !crate::routes::appliance::bouclage_fiable() || authentification_active(state) {
+        return None;
+    }
+    let (ouverture, debut_memoire) = state
+        .code_activation_auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .premiere_configuration?;
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if settings
+        .get(CLE_FIN_PREMIERE_CONFIGURATION)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return None;
+    }
+    let debut: u64 = settings
+        .get(CLE_DEBUT_PREMIERE_CONFIGURATION)
+        .ok()
+        .flatten()?
+        .trim()
+        .parse()
+        .ok()?;
+    // Base remplacée depuis l'ouverture : ce n'est plus la même installation.
+    if debut != debut_memoire {
+        return None;
+    }
+    let maintenant = maintenant_unix();
+    if maintenant < debut {
+        return None;
+    }
+    let ecoule = ouverture
+        .elapsed()
+        .max(std::time::Duration::from_secs(maintenant - debut));
+    let reste = DUREE_PREMIERE_CONFIGURATION.checked_sub(ecoule)?;
+    if reste.is_zero() || un_administrateur_a_un_mot_de_passe(state) {
+        return None;
+    }
+    Some(reste)
+}
+
+/// Pour les épreuves : fait comme si la fenêtre avait été ouverte `il_y_a`
+/// plus tôt, sur les deux horloges.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn vieillir_la_premiere_configuration(state: &AppState, il_y_a: std::time::Duration) {
+    vieillir_les_horloges(state, il_y_a, il_y_a);
+}
+
+/// Pour les épreuves : recule séparément l'horloge monotone et l'heure murale
+/// de l'ouverture.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn vieillir_les_horloges(
+    state: &AppState,
+    monotone: std::time::Duration,
+    murale: std::time::Duration,
+) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let mut etat = state
+        .code_activation_auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((ouverture, debut)) = etat.premiere_configuration {
+        let debut = debut.saturating_sub(murale.as_secs());
+        settings
+            .set(CLE_DEBUT_PREMIERE_CONFIGURATION, &debut.to_string())
+            .ok();
+        etat.premiere_configuration = ouverture.checked_sub(monotone).map(|o| (o, debut));
+    }
+}
+
+/// Pour les épreuves : oublie l'heure d'ouverture gardée en mémoire, comme
+/// après un redémarrage du serveur.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn oublier_l_horloge_de_la_premiere_configuration(state: &AppState) {
+    state
+        .code_activation_auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .premiere_configuration = None;
+}
+
+/// Passerelles par défaut lues dans `/proc/net/route` (IPv4, petit-boutiste
+/// en hexadécimal) et `/proc/net/ipv6_route`.
+pub fn passerelles_par_defaut(route_v4: &str, route_v6: &str) -> Vec<std::net::IpAddr> {
+    let mut passerelles = Vec::new();
+    for ligne in route_v4.lines().skip(1) {
+        let champs: Vec<&str> = ligne.split_whitespace().collect();
+        if champs.len() > 2
+            && champs[1] == "00000000"
+            && let Ok(v) = u32::from_str_radix(champs[2], 16)
+            && v != 0
+        {
+            passerelles.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                v.to_le_bytes(),
+            )));
+        }
+    }
+    for ligne in route_v6.lines() {
+        let champs: Vec<&str> = ligne.split_whitespace().collect();
+        if champs.len() > 4
+            && champs[0] == "00000000000000000000000000000000"
+            && champs[1] == "00"
+            && let Ok(v) = u128::from_str_radix(champs[4], 16)
+            && v != 0
+        {
+            passerelles.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(v)));
+        }
+    }
+    passerelles
+}
+
+/// Variable par laquelle l'exploitant autorise la première configuration
+/// sans code dans un conteneur, quand celui-ci voit l'adresse réelle des
+/// appareils du réseau local (`network_mode: host`).
+pub const VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR: &str = "TUNE_FIRST_SETUP_IN_CONTAINER";
+
+fn premiere_configuration_autorisee_en_conteneur() -> bool {
+    variable_vraie(VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR)
+}
+
+/// La variable d'environnement vaut-elle `1` ou `true` ?
+fn variable_vraie(nom: &str) -> bool {
+    std::env::var(nom).is_ok_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+}
+
+/// Le conteneur et ses passerelles : `None` hors conteneur. En développement
+/// et sous test, `TUNE_TEST_PASSERELLE_CONTENEUR` (adresses séparées par des
+/// virgules) simule un conteneur, et `TUNE_TEST_HORS_CONTENEUR=1` une machine
+/// ordinaire.
+fn passerelles_du_conteneur() -> Option<Vec<std::net::IpAddr>> {
+    if cfg!(debug_assertions) {
+        if let Ok(v) = std::env::var("TUNE_TEST_PASSERELLE_CONTENEUR") {
+            return Some(v.split(',').filter_map(|a| a.trim().parse().ok()).collect());
+        }
+        if std::env::var("TUNE_TEST_HORS_CONTENEUR").is_ok_and(|v| v == "1") {
+            return None;
+        }
+    }
+    if !crate::conteneur::dans_un_conteneur() {
+        return None;
+    }
+    let v4 = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let v6 = std::fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default();
+    Some(passerelles_par_defaut(&v4, &v6))
+}
+
+/// Dans un conteneur, une connexion relayée par le moteur arrive de la
+/// passerelle : on ne sait plus d'où elle vient. Passerelle illisible : oui.
+fn source_passerelle(ip: std::net::IpAddr, passerelles: &[std::net::IpAddr]) -> bool {
+    if passerelles.is_empty() {
+        return true;
+    }
+    passerelles.contains(&adresse_ipv4_si_possible(ip))
+}
+
+/// L'appel vient-il d'une passerelle par défaut de CETTE machine ? Partout,
+/// conteneur ou non : derrière une traduction d'adresses (machine virtuelle
+/// en NAT, sous-système Linux de Windows, routeur qui réécrit l'adresse
+/// source), les connexions traduites arrivent de la passerelle, quelle que
+/// soit leur origine. Passerelle illisible : oui (dans le doute, refus).
+/// Aucune route par défaut : non.
+pub(crate) fn source_passerelle_par_defaut(ip: std::net::IpAddr) -> bool {
+    let oui = match passerelles_par_defaut_du_systeme() {
+        None => true,
+        Some(passerelles) => passerelles.contains(&adresse_ipv4_si_possible(ip)),
+    };
+    if oui {
+        tracing::info!(%ip, "appel_vu_de_la_passerelle_par_defaut");
+    }
+    oui
+}
+
+/// Durée pendant laquelle la lecture des passerelles par défaut est gardée.
+const DUREE_DES_PASSERELLES_LUES: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Les passerelles par défaut de cette machine (IPv4 et IPv6), ou `None` si
+/// le système ne permet pas de les lire. Lecture gardée
+/// [`DUREE_DES_PASSERELLES_LUES`].
+///
+/// En développement et sous test : `TUNE_TEST_PASSERELLES` (adresses
+/// séparées par des virgules, `illisible` pour une lecture impossible) ;
+/// sinon, un conteneur simulé (`TUNE_TEST_PASSERELLE_CONTENEUR`) prend ses
+/// passerelles, et une machine simulée (`TUNE_TEST_HORS_CONTENEUR=1`) n'en a
+/// aucune.
+pub fn passerelles_par_defaut_du_systeme() -> Option<Vec<std::net::IpAddr>> {
+    if cfg!(debug_assertions) {
+        let liste = |v: &str| -> Vec<std::net::IpAddr> {
+            v.split(',').filter_map(|a| a.trim().parse().ok()).collect()
+        };
+        if let Ok(v) = std::env::var("TUNE_TEST_PASSERELLES") {
+            return (v.trim() != "illisible").then(|| liste(&v));
+        }
+        if let Ok(v) = std::env::var("TUNE_TEST_PASSERELLE_CONTENEUR") {
+            return Some(liste(&v));
+        }
+        if std::env::var("TUNE_TEST_HORS_CONTENEUR").is_ok_and(|v| v == "1") {
+            return Some(Vec::new());
+        }
+    }
+    type Lecture = Option<(std::time::Instant, Option<Vec<std::net::IpAddr>>)>;
+    static LECTURE: std::sync::Mutex<Lecture> = std::sync::Mutex::new(None);
+    let mut lecture = LECTURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((quand, passerelles)) = lecture.as_ref()
+        && quand.elapsed() < DUREE_DES_PASSERELLES_LUES
+    {
+        return passerelles.clone();
+    }
+    let passerelles = lire_les_passerelles_par_defaut();
+    if passerelles.is_none() {
+        tracing::warn!("passerelle_par_defaut_illisible");
+    }
+    *lecture = Some((std::time::Instant::now(), passerelles.clone()));
+    passerelles
+}
+
+/// Linux et Android : `/proc/net/route` et `/proc/net/ipv6_route`. Sans pile
+/// IPv6 (`/proc/net/if_inet6` absent), la table IPv6 manquante est vide.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn lire_les_passerelles_par_defaut() -> Option<Vec<std::net::IpAddr>> {
+    let v4 = std::fs::read_to_string("/proc/net/route").ok()?;
+    let v6 = match std::fs::read_to_string("/proc/net/ipv6_route") {
+        Ok(v6) => v6,
+        Err(_) if !std::path::Path::new("/proc/net/if_inet6").exists() => String::new(),
+        Err(_) => return None,
+    };
+    Some(passerelles_par_defaut(&v4, &v6))
+}
+
+/// macOS et BSD : `route -n get default`, en IPv4 puis en IPv6. Une commande
+/// qui ne se lance pas rend `None` ; « pas de route » rend une liste vide.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+fn lire_les_passerelles_par_defaut() -> Option<Vec<std::net::IpAddr>> {
+    let mut passerelles = Vec::new();
+    for famille in ["-inet", "-inet6"] {
+        let sortie = std::process::Command::new("/sbin/route")
+            .args(["-n", "get", famille, "default"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        passerelles.extend(passerelles_de_route_get(&String::from_utf8_lossy(
+            &sortie.stdout,
+        )));
+    }
+    Some(passerelles)
+}
+
+/// Windows : `route print` (les lignes de routes ne sont pas traduites).
+#[cfg(windows)]
+fn lire_les_passerelles_par_defaut() -> Option<Vec<std::net::IpAddr>> {
+    use std::os::windows::process::CommandExt;
+    const SANS_FENETRE: u32 = 0x0800_0000;
+    let racine = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let sortie = std::process::Command::new(format!(r"{racine}\System32\route.exe"))
+        .arg("print")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(SANS_FENETRE)
+        .output()
+        .ok()?;
+    if !sortie.status.success() {
+        return None;
+    }
+    Some(passerelles_de_route_print(&String::from_utf8_lossy(
+        &sortie.stdout,
+    )))
+}
+
+/// Ailleurs : illisible.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    windows
+)))]
+fn lire_les_passerelles_par_defaut() -> Option<Vec<std::net::IpAddr>> {
+    None
+}
+
+/// Une adresse de passerelle, sans son suffixe de portée (`fe80::1%en0`).
+fn adresse_de_passerelle(texte: &str) -> Option<std::net::IpAddr> {
+    let texte = texte.split('%').next().unwrap_or_default();
+    texte.parse().ok()
+}
+
+/// Les passerelles de la sortie de `route -n get default` (macOS, BSD) :
+/// la ligne `gateway: …`.
+pub fn passerelles_de_route_get(sortie: &str) -> Vec<std::net::IpAddr> {
+    sortie
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("gateway:"))
+        .filter_map(|a| adresse_de_passerelle(a.trim()))
+        .collect()
+}
+
+/// Les passerelles de la sortie de `route print` (Windows) : en IPv4, les
+/// lignes `0.0.0.0 0.0.0.0 <passerelle> …` ; en IPv6, les lignes
+/// `<interface> <métrique> ::/0 <passerelle>`, la passerelle pouvant passer
+/// à la ligne suivante quand elle est longue.
+pub fn passerelles_de_route_print(sortie: &str) -> Vec<std::net::IpAddr> {
+    let mut passerelles = Vec::new();
+    let mut lignes = sortie.lines().peekable();
+    while let Some(ligne) = lignes.next() {
+        let champs: Vec<&str> = ligne.split_whitespace().collect();
+        if champs.len() >= 3 && champs[0] == "0.0.0.0" && champs[1] == "0.0.0.0" {
+            if let Some(ip) = adresse_de_passerelle(champs[2]) {
+                passerelles.push(ip);
+            }
+        } else if champs.len() >= 3 && champs[2] == "::/0" {
+            let suite = match champs.get(3) {
+                Some(p) => Some((*p).to_string()),
+                None => lignes
+                    .peek()
+                    .and_then(|l| l.split_whitespace().next())
+                    .map(str::to_string),
+            };
+            if let Some(ip) = suite.as_deref().and_then(adresse_de_passerelle)
+                && ip.is_ipv6()
+            {
+                passerelles.push(ip);
+            }
+        }
+    }
+    passerelles
+}
+
+/// Ce que vaut l'adresse d'un appel « du réseau local » quand on veut s'y fier
+/// (première configuration, administration sans authentification).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdresseDuReseauLocal {
+    /// Appel du réseau local, adresse réelle de l'appareil.
+    Fiable,
+    /// Appliance Tune OS dont le relais du port 80 masque l'adresse cliente.
+    RelaisDuPort80,
+    /// Conteneur sans autorisation de l'exploitant, ou appel venu de la
+    /// passerelle du conteneur : l'adresse vue n'est pas celle de l'appareil.
+    Conteneur,
+    /// Relais, mandataire, adresse hors réseau local, hôte ou origine refusés.
+    HorsDuReseauLocal,
+}
+
+/// Juge l'adresse d'un appel au sens du réseau local, avec les mêmes gardes
+/// partout : [`appel_depuis_le_reseau_local`], et en plus
+///
+/// - jamais derrière le relais du port 80 d'une appliance (le bouclage n'y
+///   dit rien de l'appareil d'origine) ;
+/// - jamais dans un conteneur, sauf si l'exploitant l'autorise
+///   (`conteneur_autorise`), et alors jamais depuis la passerelle du
+///   conteneur (réseau en pont : toutes les connexions publiées y arrivent) ;
+/// - jamais avec un `Host` à un seul label étranger à cette machine ;
+/// - jamais depuis une passerelle par défaut de la machine, conteneur ou non
+///   ([`source_passerelle_par_defaut`]).
+pub(crate) async fn juger_l_adresse_du_reseau_local(
+    parts: &mut Parts,
+    state: &AppState,
+    conteneur_autorise: bool,
+) -> AdresseDuReseauLocal {
+    if !crate::routes::appliance::bouclage_fiable() {
+        return AdresseDuReseauLocal::RelaisDuPort80;
+    }
+    if !appel_du_reseau_local(parts, state, false).await
+        || crate::garde_origine::hote_de_la_requete_a_un_seul_label_etranger(&parts.headers)
+    {
+        return AdresseDuReseauLocal::HorsDuReseauLocal;
+    }
+    let Some(ip) = adresse_de_l_appelant(parts, state).await else {
+        return AdresseDuReseauLocal::HorsDuReseauLocal;
+    };
+    match passerelles_du_conteneur() {
+        Some(passerelles) if conteneur_autorise && !source_passerelle(ip, &passerelles) => {}
+        Some(_) => return AdresseDuReseauLocal::Conteneur,
+        None => {}
+    }
+    if source_passerelle_par_defaut(ip) {
+        return AdresseDuReseauLocal::HorsDuReseauLocal;
+    }
+    AdresseDuReseauLocal::Fiable
+}
+
+/// L'appel vient-il du RÉSEAU LOCAL, au sens de la première configuration ?
+/// [`juger_l_adresse_du_reseau_local`], le conteneur n'étant admis qu'avec
+/// [`VARIABLE_PREMIERE_CONFIGURATION_EN_CONTENEUR`].
+///
+/// Extracteur infaillible, sans trace.
+pub struct DepuisLeReseauLocal(pub bool);
+
+impl FromRequestParts<AppState> for DepuisLeReseauLocal {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            juger_l_adresse_du_reseau_local(
+                parts,
+                state,
+                premiere_configuration_autorisee_en_conteneur(),
+            )
+            .await
+                == AdresseDuReseauLocal::Fiable,
+        ))
+    }
 }
 
 /// Le compte administrateur : le premier profil administrateur (le profil
@@ -2221,23 +3125,63 @@ fn comptes_existants(state: &AppState, admin: Option<i64>) -> Vec<Value> {
         .collect()
 }
 
+/// Sans authentification, le refus que la garde des actions
+/// d'administration opposerait à cet appelant
+/// ([`refus_des_actions_de_machine_sans_authentification`]), `None` s'il
+/// passe. Extracteur infaillible, sans trace.
+pub struct RefusDesActionsDeMachine(pub Option<&'static str>);
+
+impl FromRequestParts<AppState> for RefusDesActionsDeMachine {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            refus_des_actions_de_machine_sans_authentification(parts, state).await,
+        ))
+    }
+}
+
 /// `GET /auth/activation` — ce que l'écran d'activation doit afficher.
+///
+/// rc14 : `machine_actions_allowed` (authentification coupée seulement) dit
+/// si CET appelant peut lancer les actions d'administration — cette machine,
+/// ou le réseau local quand le réglage strict est éteint — et
+/// `machine_actions_refusal` le motif du refus sinon ; `admin_this_machine_only`
+/// l'état de ce réglage.
 async fn etat_activation(
     State(state): State<AppState>,
     DepuisCetteMachine(cette_machine): DepuisCetteMachine,
+    DepuisLeReseauLocal(reseau_local): DepuisLeReseauLocal,
+    RefusDesActionsDeMachine(refus_actions): RefusDesActionsDeMachine,
 ) -> Json<Value> {
     let active = authentification_active(&state);
+    // La fenêtre de première configuration, pour CET appelant : cette
+    // machine ou le réseau local.
+    let premiere_configuration = if active || !(cette_machine || reseau_local) {
+        None
+    } else {
+        premiere_configuration_restante(&state)
+    };
     Json(json!({
         "auth_enabled": active,
         "from_this_machine": cette_machine,
-        "code_required": !active && !cette_machine,
+        "machine_actions_allowed": if active { None } else { Some(refus_actions.is_none()) },
+        "machine_actions_refusal": if active { None } else { refus_actions },
+        "admin_this_machine_only": administration_cette_machine_seulement(&state),
+        "code_required": !active && !cette_machine && premiere_configuration.is_none(),
+        "first_setup": premiere_configuration.is_some(),
+        "first_setup_expires_in": premiere_configuration.map(|d| d.as_secs()),
+        "max_password_length": LONGUEUR_MAX_MOT_DE_PASSE,
         "admin_username": if active { None } else { compte_administrateur(&state).map(|(_, u)| u) },
         "accounts": if active {
             Vec::new()
         } else {
             comptes_existants(&state, compte_administrateur(&state).map(|(id, _)| id))
         },
-        "min_password_length": 8,
+        "min_password_length": LONGUEUR_MIN_MOT_DE_PASSE,
     }))
 }
 
@@ -2281,15 +3225,22 @@ struct ActivationRequest {
     delete_accounts: Vec<i64>,
 }
 
+/// Un seul hachage d'activation à la fois (argon2 est coûteux).
+static HACHAGE_ACTIVATION: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+
 /// Une seule activation à la fois : l'état est relu sous ce verrou.
 static VERROU_ACTIVATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// `POST /auth/activation` — pose le mot de passe du compte administrateur
 /// et active l'authentification. Seulement tant qu'elle est coupée, et
-/// seulement depuis cette machine ou avec le code de la console.
+/// seulement depuis cette machine, avec le code de la console, ou — une seule
+/// fois, sur une installation neuve — depuis le réseau local pendant la
+/// fenêtre de première configuration.
 async fn activer_l_authentification(
     State(state): State<AppState>,
     DepuisCetteMachine(cette_machine): DepuisCetteMachine,
+    DepuisLeReseauLocal(reseau_local): DepuisLeReseauLocal,
     ConnectInfo(pair): ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
     Json(body): Json<ActivationRequest>,
@@ -2297,12 +3248,42 @@ async fn activer_l_authentification(
     if authentification_active(&state) {
         return refus_deja_active();
     }
-    if body.password.chars().count() < 8 {
+    let longueur = body.password.chars().count();
+    if longueur < LONGUEUR_MIN_MOT_DE_PASSE {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": "password_too_short",
                 "message": "password must be at least 8 characters",
+            })),
+        )
+            .into_response();
+    }
+    if longueur > LONGUEUR_MAX_MOT_DE_PASSE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "password_too_long",
+                "message": "password must be at most 256 characters",
+            })),
+        )
+            .into_response();
+    }
+    // Première configuration : seulement quand ni cette machine ni le code
+    // n'est en jeu, depuis le réseau local, fenêtre ouverte. Revérifié avant
+    // de hacher, puis sous le verrou plus bas.
+    let code_fourni = body.code.as_deref().is_some_and(|c| !c.trim().is_empty());
+    let par_la_premiere_configuration = !cette_machine
+        && reseau_local
+        && !(code_fourni && !body.delete_accounts.is_empty())
+        && premiere_configuration_restante(&state).is_some();
+    // Cette voie ne supprime aucun compte.
+    if par_la_premiere_configuration && !body.delete_accounts.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "account_not_deletable",
+                "id": body.delete_accounts[0],
             })),
         )
             .into_response();
@@ -2336,7 +3317,7 @@ async fn activer_l_authentification(
         )
             .into_response();
     }
-    if !cette_machine {
+    if !cette_machine && !par_la_premiere_configuration {
         let Some(code) = body.code.as_deref().filter(|c| !c.trim().is_empty()) else {
             return refus_activation_hors_machine();
         };
@@ -2367,7 +3348,33 @@ async fn activer_l_authentification(
             }
         }
     }
-    let hachage = match hash_password(&body.password) {
+    // Un seul hachage à la fois, hors de l'exécuteur asynchrone. L'état est
+    // relu une fois la place obtenue, AVANT de hacher.
+    // La place suit le hachage jusqu'au bout, même si la connexion tombe.
+    let place = match HACHAGE_ACTIVATION.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "activation_unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    if authentification_active(&state) {
+        return refus_deja_active();
+    }
+    if par_la_premiere_configuration && premiere_configuration_restante(&state).is_none() {
+        return refus_premiere_configuration_fermee();
+    }
+    let mot_de_passe = body.password.clone();
+    let hachage = match tokio::task::spawn_blocking(move || {
+        let _place = place;
+        hash_password(&mot_de_passe)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()))
+    {
         Ok(h) => h,
         Err(e) => {
             return (
@@ -2387,7 +3394,34 @@ async fn activer_l_authentification(
             return refus_deja_active();
         }
         use tune_core::db::backend::ToSqlValue;
-        if let Err(e) = state.backend.execute(
+        if par_la_premiere_configuration {
+            // Une seule fois : fenêtre relue sous le verrou, et écriture
+            // CONDITIONNELLE — elle ne touche qu'un administrateur encore
+            // sans mot de passe.
+            if premiere_configuration_restante(&state).is_none() {
+                return refus_premiere_configuration_fermee();
+            }
+            match state.backend.execute(
+                "UPDATE profiles SET password_hash_v2 = ?, password_hash = NULL WHERE id = ? \
+                 AND (password_hash IS NULL OR password_hash = '') \
+                 AND (password_hash_v2 IS NULL OR password_hash_v2 = '')",
+                &[&hachage as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+            ) {
+                Ok(1) => {}
+                Ok(_) => return refus_premiere_configuration_fermee(),
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("failed to set password: {e}")})),
+                    )
+                        .into_response();
+                }
+            }
+            tracing::warn!(
+                appelant = %pair.ip(),
+                "administrateur_cree_par_la_premiere_configuration"
+            );
+        } else if let Err(e) = state.backend.execute(
             "UPDATE profiles SET password_hash_v2 = ?, password_hash = NULL WHERE id = ?",
             &[&hachage as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         ) {
@@ -2416,13 +3450,20 @@ async fn activer_l_authentification(
         settings.set("auth_enabled", "true").ok();
         // Un code encore en attente ne sert plus à rien.
         state.code_activation_auth.lock().unwrap().en_cours = None;
+        // Quelle que soit la voie, la première configuration est finie.
+        fermer_la_premiere_configuration(&state);
         let secret = get_or_create_jwt_secret(&settings);
         (sign_jwt(id, "admin", &secret).ok(), supprimes)
     };
     // Les WebSocket ouvertes pendant que tout était ouvert se ferment : le
     // client se reconnecte avec une session.
     state.fermeture_websockets.send_modify(|n| *n += 1);
-    tracing::info!(cette_machine, admin = %nom, "authentification_activee");
+    tracing::info!(
+        cette_machine,
+        par_la_premiere_configuration,
+        admin = %nom,
+        "authentification_activee"
+    );
 
     let Some(token) = token else {
         return Json(json!({"auth_enabled": true, "username": nom, "deleted_accounts": supprimes}))

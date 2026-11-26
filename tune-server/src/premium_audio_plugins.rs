@@ -796,6 +796,12 @@ pub(crate) mod tests {
     /// est `plugin_unavailable` (409), jamais `premium_required` (402) ; après,
     /// les deux routes de l'écran Expert répondent et la barre latérale le
     /// montre.
+    ///
+    /// rc14 (#9517) : les bandes de l'écran Expert sont la grille ISO à 31
+    /// points et son Q (`grille_graphique(31)`), un égaliseur GRAPHIQUE,
+    /// gratuit. Une bande libre (fréquence, Q et type choisis) est un
+    /// égaliseur PARAMÉTRIQUE, Premium par toutes les routes depuis #9517 :
+    /// 402 `premium_required` en Free, 200 en Premium.
     #[tokio::test]
     async fn temoin_6974_l_egaliseur_expert_s_ouvre_par_l_installation_quel_que_soit_le_palier() {
         for premium in [true, false] {
@@ -817,7 +823,20 @@ pub(crate) mod tests {
             );
             let palier = if premium { "Premium" } else { "Free" };
             let resolution = json!({"expert_bands": 31});
+            let (grille, q) = tune_core::tess::migration::grille_graphique(31);
             let bandes = json!({
+                "enabled": true,
+                "bands": grille
+                    .iter()
+                    .map(|f| json!({
+                        "freq": f,
+                        "gain": if *f == 1000.0 { 3.0 } else { 0.0 },
+                        "q": q,
+                        "type": "peak",
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            let parametrique = json!({
                 "enabled": true,
                 "bands": [{"freq": 1000.0, "gain": 3.0, "q": 1.0, "type": "peak"}],
             });
@@ -862,6 +881,19 @@ pub(crate) mod tests {
                 status,
                 StatusCode::OK,
                 "{palier}, égaliseur installé : les bandes Expert refusées — {reponse}"
+            );
+            // #9517 : une bande libre est du paramétrique, Premium.
+            let (status, reponse) =
+                appel_avec_corps(&app, "POST", "/api/v1/zones/1/eq", parametrique.clone()).await;
+            let attendu = if premium {
+                (StatusCode::OK, None)
+            } else {
+                (StatusCode::PAYMENT_REQUIRED, Some("premium_required"))
+            };
+            assert_eq!(
+                (status, reponse["error"].as_str()),
+                attendu,
+                "{palier}, égaliseur installé : bande paramétrique (#9517) — {reponse}"
             );
             assert!(
                 visible_dans_la_barre(&fiche_du_catalogue(&app, "equalizer").await),
