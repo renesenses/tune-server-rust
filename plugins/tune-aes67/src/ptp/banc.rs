@@ -136,6 +136,79 @@ fn message(e: &Entete, corps: &[u8]) -> Vec<u8> {
     m
 }
 
+fn annonce(cfg: ConfigMaitre, port: [u8; 10], seq_annonce: u16, t1: u64) -> Vec<u8> {
+    let mut corps = Vec::with_capacity(30);
+    corps.extend_from_slice(&horodatage(t1));
+    corps.extend_from_slice(&37i16.to_be_bytes());
+    corps.push(0);
+    corps.push(cfg.priorite1);
+    corps.extend_from_slice(&[248, 0xFE, 0xFF, 0xFF]);
+    corps.push(128);
+    corps.extend_from_slice(&cfg.identite);
+    corps.extend_from_slice(&0u16.to_be_bytes());
+    corps.push(0xA0); // INTERNAL_OSCILLATOR
+    message(
+        &Entete {
+            type_msg: ANNOUNCE,
+            domaine: cfg.domaine,
+            drapeaux: [0, 0x0C],
+            port,
+            sequence: seq_annonce,
+            controle: 5,
+            log_intervalle: cfg.log_annonce,
+        },
+        &corps,
+    )
+}
+
+fn sync(cfg: ConfigMaitre, port: [u8; 10], seq_sync: u16) -> Vec<u8> {
+    message(
+        &Entete {
+            type_msg: SYNC,
+            domaine: cfg.domaine,
+            drapeaux: [0x02, 0x0C], // twoStepFlag
+            port,
+            sequence: seq_sync,
+            controle: 0,
+            log_intervalle: cfg.log_sync,
+        },
+        &[0u8; 10],
+    )
+}
+
+fn suivi(cfg: ConfigMaitre, port: [u8; 10], seq_sync: u16, t1: u64) -> Vec<u8> {
+    message(
+        &Entete {
+            type_msg: FOLLOW_UP,
+            domaine: cfg.domaine,
+            drapeaux: [0, 0x0C],
+            port,
+            sequence: seq_sync,
+            controle: 2,
+            log_intervalle: cfg.log_sync,
+        },
+        &horodatage(t1),
+    )
+}
+
+fn reponse_delai(cfg: ConfigMaitre, port: [u8; 10], r: &[u8], t4: u64) -> Vec<u8> {
+    let mut corps = Vec::with_capacity(20);
+    corps.extend_from_slice(&horodatage(t4));
+    corps.extend_from_slice(&r[20..30]); // requestingPortIdentity
+    message(
+        &Entete {
+            type_msg: DELAY_RESP,
+            domaine: cfg.domaine,
+            drapeaux: [0, 0x0C],
+            port,
+            sequence: u16::from_be_bytes([r[30], r[31]]),
+            controle: 3,
+            log_intervalle: 0,
+        },
+        &corps,
+    )
+}
+
 /// Ce que le maître a fait, pour les assertions.
 #[derive(Debug, Default)]
 pub struct CompteursMaitre {
@@ -259,61 +332,18 @@ impl MaitreSimule {
                                 continue;
                             };
                             if maintenant >= prochaine_annonce {
-                                let mut corps = Vec::with_capacity(30);
-                                corps.extend_from_slice(&horodatage(horloge.maintenant_ns()));
-                                corps.extend_from_slice(&37i16.to_be_bytes());
-                                corps.push(0);
-                                corps.push(cfg.priorite1);
-                                corps.extend_from_slice(&[248, 0xFE, 0xFF, 0xFF]);
-                                corps.push(128);
-                                corps.extend_from_slice(&cfg.identite);
-                                corps.extend_from_slice(&0u16.to_be_bytes());
-                                corps.push(0xA0); // INTERNAL_OSCILLATOR
-                                let m = message(
-                                    &Entete {
-                                        type_msg: ANNOUNCE,
-                                        domaine: cfg.domaine,
-                                        drapeaux: [0, 0x0C],
-                                        port,
-                                        sequence: seq_annonce,
-                                        controle: 5,
-                                        log_intervalle: cfg.log_annonce,
-                                    },
-                                    &corps,
-                                );
+                                let m = annonce(cfg, port, seq_annonce, horloge.maintenant_ns());
                                 let _ = ge.send_to(&m, d_ge);
                                 seq_annonce = seq_annonce.wrapping_add(1);
                                 compteurs.annonces.fetch_add(1, Ordering::Relaxed);
                                 prochaine_annonce += pas_annonce;
                             }
                             if maintenant >= prochaine_sync {
-                                let sync = message(
-                                    &Entete {
-                                        type_msg: SYNC,
-                                        domaine: cfg.domaine,
-                                        drapeaux: [0x02, 0x0C], // twoStepFlag
-                                        port,
-                                        sequence: seq_sync,
-                                        controle: 0,
-                                        log_intervalle: cfg.log_sync,
-                                    },
-                                    &[0u8; 10],
-                                );
+                                let sync = sync(cfg, port, seq_sync);
                                 if ev.send_to(&sync, d_ev).is_ok() {
                                     // Horodatage logiciel, comme le suiveur.
                                     let t1 = horloge.maintenant_ns();
-                                    let suivi = message(
-                                        &Entete {
-                                            type_msg: FOLLOW_UP,
-                                            domaine: cfg.domaine,
-                                            drapeaux: [0, 0x0C],
-                                            port,
-                                            sequence: seq_sync,
-                                            controle: 2,
-                                            log_intervalle: cfg.log_sync,
-                                        },
-                                        &horodatage(t1),
-                                    );
+                                    let suivi = suivi(cfg, port, seq_sync, t1);
                                     let _ = ge.send_to(&suivi, d_ge);
                                     compteurs.sync.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -353,21 +383,7 @@ impl MaitreSimule {
                                 continue;
                             };
                             compteurs.delay_req.fetch_add(1, Ordering::Relaxed);
-                            let mut corps = Vec::with_capacity(20);
-                            corps.extend_from_slice(&horodatage(t4));
-                            corps.extend_from_slice(&r[20..30]); // requestingPortIdentity
-                            let reponse = message(
-                                &Entete {
-                                    type_msg: DELAY_RESP,
-                                    domaine: cfg.domaine,
-                                    drapeaux: [0, 0x0C],
-                                    port,
-                                    sequence: u16::from_be_bytes([r[30], r[31]]),
-                                    controle: 3,
-                                    log_intervalle: 0,
-                                },
-                                &corps,
-                            );
+                            let reponse = reponse_delai(cfg, port, r, t4);
                             let _ = ge.send_to(&reponse, d_ge);
                         }
                     })?,
@@ -436,3 +452,7 @@ mod tests {
         assert!((h.temps_a(avant)..=h.temps_a(apres)).contains(&mesure));
     }
 }
+
+#[cfg(feature = "banc-ptp")]
+#[path = "banc_simule.rs"]
+pub mod simule;

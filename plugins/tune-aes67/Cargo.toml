@@ -41,6 +41,10 @@ statime = { version = "=0.4.0", default-features = false, features = ["std"] }
 # Le générateur que `statime` 0.4 attend (trait `rand` 0.8, déjà au Cargo.lock).
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
+[features]
+banc-ptp = []
+
 [dev-dependencies]
+tune-aes67 = { path = ".", features = ["banc-ptp"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

@@ -317,66 +317,93 @@ fn contre_epreuve_un_maitre_d_un_autre_domaine_n_est_jamais_suivi() {
 
 #[test]
 fn perte_du_maitre_repli_sans_saut_puis_calage_sur_un_autre_maitre() {
-    let _banc = un_banc_a_la_fois();
-    let maitre_a = MaitreSimule::demarrer(ConfigMaitre::par_defaut()).unwrap();
-    let (adr_e, adr_g) = maitre_a.adresses();
-    let s = suiveur_pour(&maitre_a);
-    attendre(LIMITE_CALAGE, || s.calee()).expect("calage sur A");
-    let generation_calee = s.generation();
-
-    // Le maître A disparaît.
-    drop(maitre_a);
-    let debut = Instant::now();
-    let mut precedent = s.maintenant_ns();
-    let mut recul = false;
-    while s.calee() && debut.elapsed() < Duration::from_secs(10) {
-        let t = s.maintenant_ns();
-        recul |= t < precedent;
-        precedent = t;
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let e = s.etat();
-    eprintln!("repli après {:?} : {e:?}", debut.elapsed());
-    assert!(!e.calee && e.repli_horloge_locale, "{e:?}");
-    assert!(e.raison_du_repli.is_some());
-    assert_eq!(s.reference(), ReferenceHorloge::Locale);
-    assert!(s.generation() > generation_calee);
-    assert!(!recul, "le temps a reculé pendant le repli");
-    // Le repli ne saute pas : quelques secondes plus tard, le temps
-    // continue (le temps reste monotone pendant 1 s de repli).
-    let a = s.maintenant_ns();
-    std::thread::sleep(Duration::from_secs(1));
-    let b = s.maintenant_ns();
-    assert!(b > a && b - a < 1_100_000_000, "{}", b - a);
-
-    // Un autre maître (autre identité, 5 s plus loin) prend la place.
-    let mut cfg_b = ConfigMaitre::par_defaut();
-    cfg_b.identite = [0x00, 0x0a, 0xe4, 0xff, 0xfe, 0xab, 0xcd, 0xef];
-    cfg_b.decalage_ns += 5_000_000_000;
-    cfg_b.derive_ppm = -25.0;
-    let maitre_b = MaitreSimule::demarrer_sur(cfg_b, adr_e, adr_g).unwrap();
-    maitre_b.servir(s.adresses_locales().unwrap());
-    attendre(LIMITE_CALAGE, || {
-        s.calee() && s.etat().maitre.as_deref() == Some("00-0A-E4-FF-FE-AB-CD-EF")
-    })
-    .unwrap_or_else(|| panic!("pas de calage sur B : {:?}", s.etat()));
-    assert_eq!(
-        s.reference().attribut_sdp(),
-        "ptp=IEEE1588-2008:00-0A-E4-FF-FE-AB-CD-EF:0"
-    );
-    std::thread::sleep(Duration::from_secs(5));
-    let Mesure {
-        min,
-        max,
-        moyenne,
-        delai_max,
-        ..
-    } = mesurer(&maitre_b, &s, Duration::from_secs(3));
+    use tune_aes67::ptp::banc::simule::{jouer, temps_du_maitre};
+    const SECONDE: u64 = 1_000_000_000;
+    let a = ConfigMaitre::par_defaut();
+    let b = ConfigMaitre {
+        identite: [0x00, 0x0a, 0xe4, 0xff, 0xfe, 0xab, 0xcd, 0xef],
+        decalage_ns: a.decalage_ns + 5_000_000_000,
+        derive_ppm: -25.0,
+        ..a
+    };
+    let limite = LIMITE_CALAGE.as_nanos() as u64;
+    let coupure = std::cell::Cell::new(None);
+    let arrivee_b = std::cell::Cell::new(None);
+    let maitre = |t| {
+        if coupure.get().is_none() {
+            Some(a)
+        } else if arrivee_b.get().is_some_and(|debut| t >= debut) {
+            Some(b)
+        } else {
+            None
+        }
+    };
+    let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+    let mut generation_a = None;
+    let mut precedent = 0;
+    let mut repli = None;
+    let mut calage_b = None;
+    let mut ecarts = Vec::new();
+    let mut delai_max = 0;
+    jouer(config_du_banc(local, local), maitre, |t, s| {
+        let e = s.etat();
+        let lecture = s.maintenant_ns();
+        if coupure.get().is_none() {
+            assert!(t < limite, "pas de calage sur A : {e:?}");
+            if e.calee {
+                assert_eq!(e.maitre.as_deref(), Some("00-1D-C1-FF-FE-12-34-56"));
+                generation_a = Some(s.generation());
+                coupure.set(Some(t));
+            }
+        } else if arrivee_b.get().is_none() {
+            assert!(lecture >= precedent, "le temps a reculé pendant le repli");
+            assert!(
+                repli.is_some() || t - coupure.get().unwrap() <= 10 * SECONDE,
+                "repli en moins de 10 s : {e:?}"
+            );
+            if !e.calee {
+                assert!(e.repli_horloge_locale && e.raison_du_repli.is_some());
+                assert_eq!(s.reference(), ReferenceHorloge::Locale);
+                assert!(s.generation() > generation_a.unwrap());
+                let (debut, avant) = *repli.get_or_insert((t, lecture));
+                if t == debut + SECONDE {
+                    assert!(lecture > avant && lecture - avant < 1_100_000_000);
+                    arrivee_b.set(Some(t));
+                }
+            } else {
+                assert!(repli.is_none(), "recalage sans maître");
+            }
+        } else {
+            let debut_b = arrivee_b.get().unwrap();
+            if e.calee && e.maitre.as_deref() == Some("00-0A-E4-FF-FE-AB-CD-EF") {
+                calage_b.get_or_insert(t);
+            }
+            assert!(
+                t < debut_b + limite || calage_b.is_some(),
+                "pas de calage sur B : {e:?}"
+            );
+            if let Some(debut) = calage_b {
+                assert_eq!(
+                    s.reference().attribut_sdp(),
+                    "ptp=IEEE1588-2008:00-0A-E4-FF-FE-AB-CD-EF:0"
+                );
+                if t >= debut + 5 * SECONDE && (t - debut).is_multiple_of(50_000_000) {
+                    ecarts.push(lecture as i64 - temps_du_maitre(b, t) as i64);
+                    delai_max = delai_max.max(e.delai_moyen_ns.unwrap_or_default());
+                }
+                if t == debut + 8 * SECONDE {
+                    return false;
+                }
+            }
+        }
+        precedent = lecture;
+        true
+    });
+    assert_eq!(ecarts.len(), 61, "une mesure toutes les 50 ms pendant 3 s");
+    let min = *ecarts.iter().min().unwrap();
+    let max = *ecarts.iter().max().unwrap();
     let seuil = seuil_ecart_ns(delai_max);
-    eprintln!(
-        "écart sur B : [{min}, {max}] ns, moyenne {moyenne} ns, seuil {seuil} ns ; {:?}",
-        s.etat()
-    );
+    eprintln!("écart sur B : [{min}, {max}] ns (seuil {seuil} ns)");
     assert!(
         min.abs() < seuil && max.abs() < seuil,
         "écart sur B hors seuil : [{min}, {max}] ns (seuil {seuil} ns)"
