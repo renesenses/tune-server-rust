@@ -761,7 +761,7 @@ mod tests {
 
         let profiles = repo.list().unwrap();
         assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].name, "default");
+        assert_eq!(profiles[0].name, "admin");
 
         let id = repo.create("bertrand", Some("Bertrand"), None).unwrap();
         assert!(id > 1);
@@ -804,9 +804,11 @@ mod tests {
         migrations::run_migrations(&db).unwrap();
 
         let repo = ProfileRepo::new(db);
-        let default = repo.get(1).unwrap().unwrap();
-        assert_eq!(default.name, "default");
-        assert!(default.is_admin);
+        // rc14 : le profil d'origine s'appelle `admin` / `Admin`.
+        let admin = repo.get(1).unwrap().unwrap();
+        assert_eq!(admin.name, "admin");
+        assert_eq!(admin.display_name.as_deref(), Some("Admin"));
+        assert!(admin.is_admin);
     }
 
     #[test]

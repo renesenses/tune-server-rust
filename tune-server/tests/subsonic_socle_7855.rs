@@ -322,7 +322,10 @@ async fn methodes_du_socle_en_json_7855() {
     assert_eq!(r["musicFolders"]["musicFolder"][0]["id"], 1, "{r}");
 
     let r = rest_json(&app, &format!("/rest/getUser?f=json&apiKey={cle}")).await;
-    assert_eq!(r["user"]["username"], "default", "{r}");
+    assert_eq!(r["user"]["username"], "admin", "{r}");
+    // rc14 : `default`, ancien nom du profil 1, en reste l'alias.
+    let r = rest_json(&app, &format!("/rest/getUser?f=json&apiKey={cle}&username=default")).await;
+    assert_eq!(r["user"]["username"], "admin", "{r}");
     assert_eq!(r["user"]["streamRole"], true);
 
     let r = rest_json(

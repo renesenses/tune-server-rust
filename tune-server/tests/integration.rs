@@ -423,7 +423,7 @@ async fn profiles_default() {
     let (status, body) = get(&app, "/api/v1/profiles").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.as_array().unwrap().len(), 1);
-    assert_eq!(body[0]["name"], "default");
+    assert_eq!(body[0]["name"], "admin");
 }
 
 #[tokio::test]

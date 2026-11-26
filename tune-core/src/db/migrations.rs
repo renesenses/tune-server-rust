@@ -3004,7 +3004,41 @@ UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipreggae-hifi.a
 UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac?id=radiofrance' WHERE url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac';
 ",
     },
+    // rc14 (décision du 26/11/2026) — le profil administrateur d'origine
+    // s'appelle `admin` / `Admin`. La migration 6 le sème toujours en
+    // `default` : elle est appliquée partout et ne se modifie pas. Celle-ci le
+    // renomme, sur une base neuve comme sur une base existante, seulement s'il
+    // s'appelle encore `default` et qu'aucun autre profil ne s'appelle `admin`
+    // (voir `profil_administrateur`). Le journal du bloc de version dit le
+    // cas où le nom est déjà pris. Jumelle PG 124, même texte.
+    Migration {
+        version: 158,
+        name: "profil_administrateur_admin",
+        up: crate::db::profil_administrateur::SQL_RENOMMER_LE_PROFIL_D_ORIGINE,
+    },
 ];
+
+/// rc14 — migration 158 : dit au journal que le profil 1 garde `default`
+/// parce qu'un autre profil s'appelle déjà `admin`.
+fn journal_du_profil_administrateur(db: &SqliteDb) {
+    let pris = {
+        let conn = db.connection().lock().unwrap();
+        conn.query_row(
+            crate::db::profil_administrateur::SQL_NOM_ADMIN_DEJA_PRIS,
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+    };
+    if pris > 0 {
+        warn!(
+            "profil_administrateur_garde_default — un autre profil s'appelle deja \
+             `admin` : le profil 1 garde le nom `default`"
+        );
+    } else {
+        info!("profil_administrateur_admin");
+    }
+}
 
 /// #8788 — le format des pistes UPnP, migration 156 et réparation idempotente.
 fn format_des_elements_de_file(db: &SqliteDb) {
@@ -4567,6 +4601,9 @@ fn executer_les_migrations(db: &SqliteDb, semer_meme_sur_base_neuve: bool) -> Re
         }
         if migration.version == 156 {
             format_des_elements_de_file(db);
+        }
+        if migration.version == 158 {
+            journal_du_profil_administrateur(db);
         }
         if migration.version == 123 {
             // L'artiste d'une piste de service chez son service (#6079). Sans
@@ -6503,6 +6540,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "queue_items_format_streaming",
         include_str!("../../migrations/postgres/123_queue_items_format_streaming.sql"),
     ),
+    // Jumelle de la SQLite 158 (rc14) : le profil administrateur d'origine
+    // s'appelle `admin` / `Admin`. Même texte, voir `profil_administrateur`.
+    (
+        124,
+        "profil_administrateur_admin",
+        include_str!("../../migrations/postgres/124_profil_administrateur_admin.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -6696,6 +6740,22 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
                 .execute(pool)
                 .await
                 .map_err(|e| format!("pg migration {version} ({name}): {e}"))?;
+        }
+        if version == 124 {
+            // Même journal que la SQLite 158.
+            let pris: i64 =
+                sqlx::query_scalar(crate::db::profil_administrateur::SQL_NOM_ADMIN_DEJA_PRIS)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or(0);
+            if pris > 0 {
+                warn!(
+                    "pg_profil_administrateur_garde_default — un autre profil s'appelle deja \
+                     `admin` : le profil 1 garde le nom `default`"
+                );
+            } else {
+                info!("pg_profil_administrateur_admin");
+            }
         }
 
         done += 1;
