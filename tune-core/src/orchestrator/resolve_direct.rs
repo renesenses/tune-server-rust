@@ -1234,6 +1234,14 @@ impl PlaybackOrchestrator {
         // #3973 — lu avant la tâche détachée, comme la zone elle-même.
         let radio_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
         let frequence_fixe = crate::audio::frequence_fixe::active(&self.db, req.zone_id);
+        // Fil 3107 — la sortie locale adapte elle-même la cadence à son
+        // périphérique ; les autres (OAAT, navigateur…) reçoivent le WAV tel
+        // quel et sont bornées par le plafond de la zone.
+        let plafond = if is_local_output {
+            None
+        } else {
+            crate::audio::frequence_fixe::plafond_de_zone(&self.db, req.zone_id)
+        };
         let err_station = title.clone();
         // #3756 — de quoi RETENIR l'échec, pas seulement le dire. Le sondeur
         // ne voit que le `Ok` de `play()` ; sans cette mémoire il relance une
@@ -1263,6 +1271,7 @@ impl PlaybackOrchestrator {
                     en_vol,
                     is_local_output,
                     frequence_fixe,
+                    plafond,
                 )
             })
             .await;
@@ -2505,6 +2514,9 @@ impl PlaybackOrchestrator {
             // #3973 — lu avant la tâche détachée, comme la zone elle-même.
             let radio_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
             let frequence_fixe = crate::audio::frequence_fixe::active(&self.db, req.zone_id);
+            // Fil 3107 — un Sonos s'arrête à 48 kHz : une station FLAC
+            // 192 kHz lui est servie à 48 kHz, pas en WAV qu'il rejette.
+            let plafond = crate::audio::frequence_fixe::plafond_de_zone(&self.db, req.zone_id);
             let err_station = title.clone();
             // #3756 — même mémoire que le chemin local/OAAT. Le journal du
             // ticket vient d'une sortie ALSA, mais rien dans la boucle de
@@ -2528,6 +2540,7 @@ impl PlaybackOrchestrator {
                         Some(en_vol),
                         false,
                         frequence_fixe,
+                        plafond,
                     )
                 })
                 .await;

@@ -31,6 +31,8 @@ mod chaine_radio_9346;
 /// verdict que la lecture (#3578). Le reste de ce module reste interne.
 pub use radio::non_audio_content_type;
 pub(crate) use radio::*;
+/// Fil 3107 — cadence d'une radio bornée par le lecteur, et son sinc à état.
+mod radio_cadence_f3107;
 /// #8110 — les flux de repli d'une station, retenus par la route au
 /// lancement : la lecture y passe quand le diffuseur refuse le flux joué.
 mod radio_replis_8110;

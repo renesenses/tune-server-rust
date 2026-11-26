@@ -311,6 +311,10 @@ struct EtatRadio {
     // en vol qui a coupé l'égaliseur, une reconnexion ne doit pas remonter
     // l'ancien.
     eq_de_depart_pose: bool,
+    /// Fil 3107 — le sinc à état qui amène la station à la cadence servie,
+    /// gardé d'un paquet à l'autre pendant UNE connexion, neuf (avec son
+    /// fondu) à chaque connexion.
+    reechantillonneur: Option<super::radio_cadence_f3107::ReechantillonneurRadio>,
 }
 
 /// Les canaux et le contexte du décodeur, relevés une fois par
@@ -330,6 +334,8 @@ struct CanauxRadio<'a> {
     strict_bitperfect: bool,
     sortie_locale: bool,
     frequence_fixe: Option<u32>,
+    /// Fil 3107 — le plafond de cadence de la zone (réglage et catalogue).
+    plafond: Option<u32>,
 }
 
 /// Ce que rend une connexion sondée : le lecteur de conteneur, le décodeur
@@ -455,6 +461,7 @@ pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
         en_vol,
         sortie_locale,
         None,
+        None,
     )
 }
 
@@ -471,6 +478,7 @@ pub(super) fn decode_radio_stream_to_pcm_avec_cadence(
     en_vol: Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
     sortie_locale: bool,
     frequence_fixe: Option<u32>,
+    plafond: Option<u32>,
 ) -> Result<(), String> {
     // #6357 — le HLS ne s'arrête plus ici (#2307 le refusait avant le
     // moindre octet de réseau) : `sonder_la_station` le reconnaît et passe
@@ -488,6 +496,7 @@ pub(super) fn decode_radio_stream_to_pcm_avec_cadence(
         expected_format: None,
         radio_eq: None,
         eq_de_depart_pose: false,
+        reechantillonneur: None,
     };
     let canaux = CanauxRadio {
         tx: &tx,
@@ -500,6 +509,7 @@ pub(super) fn decode_radio_stream_to_pcm_avec_cadence(
         strict_bitperfect,
         sortie_locale,
         frequence_fixe,
+        plafond,
     };
 
     let mut url = url;
@@ -1050,9 +1060,15 @@ fn preparer_la_sortie(
     // Renderer-safe output rate: HE-AAC/aacPlus decodes at its AAC-LC core
     // rate (e.g. 22050 Hz) which many DLNA renderers reject as silence. We
     // upsample sub-44.1 kHz streams to 44100 Hz; 44.1/48 kHz+ pass through.
-    let output_sample_rate = canaux
-        .frequence_fixe
-        .unwrap_or_else(|| renderer_safe_wav_rate(source_sample_rate));
+    //
+    // Fil 3107 — sans fréquence fixe, la cadence est aussi bornée par le
+    // plafond de la zone : un Sonos (48 kHz) rejetait le WAV 192 kHz d'une
+    // station FLAC haute résolution. Voir `radio_cadence_f3107`.
+    let output_sample_rate = super::radio_cadence_f3107::cadence_de_sortie_radio(
+        source_sample_rate,
+        canaux.frequence_fixe,
+        canaux.plafond,
+    );
     // #3973 — le site « décodage radio » de la règle bit-perfect : relever la
     // cadence EST une conversion. Strict ⇒ refuser, en le disant.
     if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
@@ -1071,6 +1087,13 @@ fn preparer_la_sortie(
         return Err(SuiteRadio::Rendre(Err(refus.sentinelle())));
     }
     let needs_resample = output_sample_rate != source_sample_rate;
+    // Neuf à chaque connexion : garder l'ancien collerait deux flux dans le
+    // filtre (dépassement de Gibbs, relecture du fil 3107).
+    etat.reechantillonneur = super::radio_cadence_f3107::reechantillonneur_de_connexion(
+        source_sample_rate,
+        output_sample_rate,
+        source_channels,
+    );
     if let Some(refus) = crate::audio::bitperfect_strict::refus_reduction_profondeur(
         sonde.source_info.bit_depth,
         output_bit_depth,
@@ -1113,6 +1136,11 @@ fn preparer_la_sortie(
         source_bit_depth = ?sonde.source_info.bit_depth,
         output_bit_depth,
         resampled = needs_resample,
+        plafond = ?canaux.plafond,
+        reechantillonneur = etat
+            .reechantillonneur
+            .as_ref()
+            .map_or("aucun", |r| r.noyau()),
         reconnect = etat.reconnects,
         gap_ms = ?gap_ms,
         "radio_local_decode_started"
@@ -1222,16 +1250,14 @@ fn decoder_un_paquet(
         (interleaved, channels)
     };
 
-    // Upsample low-rate (HE-AAC 22050) PCM to the renderer-safe rate
-    // before packing the output PCM, so the bytes match the advertised WAV
-    // header. No-op (single move) when the stream is already 44.1/48.
-    if sortie.needs_resample {
-        interleaved = crate::audio::simple_resample(
-            &interleaved,
-            sonde.source_sample_rate,
-            sortie.output_sample_rate,
-            channels as u16,
-        );
+    // Amener le PCM à la cadence annoncée par l'en-tête WAV : relèvement
+    // des HE-AAC à 22,05 kHz, fréquence fixe, ou descente sous le plafond du
+    // lecteur (fil 3107). Le sinc garde son état d'un paquet à l'autre : ni
+    // clic aux frontières, ni repliement. Rien quand la cadence ne change pas.
+    if sortie.needs_resample
+        && let Some(r) = etat.reechantillonneur.as_mut()
+    {
+        interleaved = r.traiter(&interleaved);
     }
 
     // Le WAV servi à OAAT/DLNA/navigateur doit porter le son promis par
