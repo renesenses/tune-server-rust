@@ -229,11 +229,14 @@ fn le_surechantillonneur_a_son_plancher_court_et_differe() {
             >= PlaybackOrchestrator::EQ_REPLAY_DEBOUNCE_MS + 1_000
     );
     assert!(RaisonDeRelance::Surechantillonnage.differe_sous_le_plancher());
-    // Les autres gestes gardent leur règle : 5 s, et abandon sous le plancher.
+    // Les autres gestes gardent leur plancher de 5 s. rc14 (retour de Rémi) :
+    // un réglage est différé sous le plancher, plus abandonné ; seule la
+    // bascule PURE abandonne encore.
     for r in [RaisonDeRelance::Reglage, RaisonDeRelance::BasculePure] {
         assert_eq!(r.plancher_ms(), PlaybackOrchestrator::EQ_REPLAY_FLOOR_MS);
-        assert!(!r.differe_sous_le_plancher());
     }
+    assert!(RaisonDeRelance::Reglage.differe_sous_le_plancher());
+    assert!(!RaisonDeRelance::BasculePure.differe_sous_le_plancher());
     assert_eq!(
         RaisonDeRelance::Surechantillonnage.code(),
         "upsampler_change"

@@ -55,9 +55,9 @@ use tune_core::tess::greffon::{
 use tune_core::tess::migration::{
     ErreurMigration, ID_CONVOLUTION, ID_CORRECTION_PIECE, ID_CROSSFEED, ID_EQ_CASQUE,
     ID_EQ_GRAPHIQUE, ID_EQ_PARAMETRIQUE, ID_MONO, ID_REAFFECTATION, LectureZone, Partie,
-    corps_coche_deux_egaliseurs, correction_estimee, ecrire_chaine, lecture_dsd, lire_zone,
-    origines_par_le_serveur,
+    correction_estimee, ecrire_chaine, lecture_dsd, lire_zone, origines_par_le_serveur,
 };
+use tune_core::tess::modulation_dsd::CapacitesDsd;
 use tune_core::tess::resolution::{
     CodeEtape, ContexteExecution, ControleVolume, LectureDsd, MotifEtape, SourceFlux, VolumeZone,
 };
@@ -150,6 +150,8 @@ pub fn catalogue_tess(paquets_charges: &[String]) -> Catalogue {
     for d in &mut c.plugins {
         if let Some(brut) = schema_de_reference(&d.id) {
             d.settings_schema = schema_de_maillon(brut);
+            // rc14 — les bornes de gain d'une bande, que l'interface suit.
+            tune_core::tess::egaliseurs_en_serie::borner_le_schema(&d.id, &mut d.settings_schema);
         }
     }
     for id in paquets_charges {
@@ -179,6 +181,8 @@ pub fn greffon_disponible(settings: &SettingsRepo, id: &str) -> bool {
         ID_CROSSFEED => enabled(settings, "crossfeed"),
         ID_REAFFECTATION => enabled(settings, "channel-remap"),
         ID_CONVOLUTION | ID_MONO => true,
+        // rc14 — le réglage des enceintes est compilé dans le serveur.
+        tune_core::tess::migration::ID_ENCEINTES => true,
         // rc14 — l'étage fixe de suréchantillonnage : le moteur `upsampler`.
         ID_UPSAMPLING => enabled(settings, tune_core::audio::premium_plugins::UPSAMPLER),
         // Le moteur existe (T13) ; l'hôte ne le fait pas encore tourner.
@@ -370,6 +374,37 @@ async fn sait_regler_le_volume(state: &AppState, zone: &Zone) -> Option<bool> {
     tune_core::orchestrator::volume_reglable_retenu(device, lu)
 }
 
+/// rc14 — les voies que le réglage des enceintes de la zone traite : celles
+/// que la sortie a ouvertes, après adaptation (une source mono sur une sortie
+/// stéréo : 2) ; sans lecture, celles qu'il a vues au dernier bloc sur la
+/// sortie locale. `None` si rien n'est connu.
+async fn voies_de_sortie(
+    state: &AppState,
+    zone: &Zone,
+    etat: &tune_core::playback::ZoneState,
+) -> Option<u16> {
+    if let Some(t) = etat.transformations_reelles.as_ref() {
+        return Some(t.ouvert().canaux);
+    }
+    #[cfg(feature = "local-audio")]
+    {
+        let device = zone.output_device_id.as_deref()?;
+        if !device.starts_with("local:") {
+            return None;
+        }
+        let sortie = { state.outputs.lock().await.get(device) }?;
+        let s = sortie.try_lock().ok()?;
+        s.as_any()
+            .downcast_ref::<tune_core::outputs::local::LocalOutput>()?
+            .voies_vues_par_le_reglage_des_enceintes()
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        let _ = (state, zone);
+        None
+    }
+}
+
 /// La réponse de la zone, à partir de sa chaîne lue (T02).
 pub(super) async fn reponse_de_zone(
     state: &AppState,
@@ -382,13 +417,23 @@ pub(super) async fn reponse_de_zone(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let etat = state.playback.get_state(zone_id).await;
     let volume = volume_de(state, zone).await;
+    // Rémi (fil 3097) — une convolution que le convolueur saute à la cadence
+    // du flux (filtre 384 kHz, radio 48 kHz) ne se dit plus active. Lue
+    // avant le contexte, qui ne traverse pas un `await`.
+    let convolution = super::refus_surechantillonnage_tess::raison_de_la_convolution_en_cours(
+        state, zone_id, &etat,
+    )
+    .await;
     // T12b — famille UPnP : la voie de la chaîne vers ce lecteur (relais
     // progressif LPCM, transcodage, ou aucune), établie par la même sonde et
     // les mêmes réglages que la lecture. `None` hors famille UPnP. Avant le
     // contexte : il emprunte une fermeture qui ne traverse pas un `await`.
     let piste = piste_en_cours(&etat);
     let lecteur = state.orchestrator.faits_upnp_de_zone(zone_id, &piste).await;
+    // Avant le contexte, pour la même raison.
+    let capacites_dsd = state.orchestrator.capacites_dsd_de_zone(zone_id).await;
     let disponible = |id: &str| greffon_disponible(&settings, id);
+    let voies_de_sortie = voies_de_sortie(state, zone, &etat).await;
     let ctx = ContexteExecution {
         transport: TransportZone::depuis_type_de_sortie(zone.output_type.as_deref()),
         source: source_de(&etat, &lecture.dsd_mode),
@@ -404,6 +449,7 @@ pub(super) async fn reponse_de_zone(
                 .abs()
                 > 1e-6
         }),
+        voies_de_sortie,
     };
     // « ACTIVE » seulement si le préréglage existe encore (un marqueur resté
     // après une suppression ou un import ne s'affiche pas).
@@ -424,8 +470,27 @@ pub(super) async fn reponse_de_zone(
         catalogue,
         &ctx,
         lecteur.as_ref(),
-    );
+    )
+    // rc14 — ce que la sortie fait de chaque cible DSD (sans sonder le
+    // pilote), reporté sur le chemin résolu.
+    .avec_capacites_dsd(capacites_dsd);
     preciser_les_paquets_a_installer(&mut reponse, &settings);
+
+    // rc14 (rc13.91) — la sortie locale a refusé de suréchantillonner la
+    // piste en cours : l'étape ne se dit plus active, et dit pourquoi.
+    super::refus_surechantillonnage_tess::avec_le_refus_du_surechantillonneur(
+        reponse.signal_path.iter_mut(),
+        &reponse.chain,
+        super::refus_surechantillonnage_tess::refus_de_la_sortie_locale(
+            zone.output_type.as_deref(),
+            &etat,
+        ),
+    );
+    super::refus_surechantillonnage_tess::avec_la_raison_de_la_convolution(
+        reponse.signal_path.iter_mut(),
+        &reponse.chain,
+        convolution.as_ref().map(|(c, t)| (*c, t.as_str())),
+    );
     reponse
 }
 
@@ -493,7 +558,17 @@ pub async fn get_zone_tess(State(state): State<AppState>, Path(id): Path<i64>) -
     };
     let premium = state.license.is_premium().await;
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let lecture = match tokio::task::spawn_blocking(move || lire_zone(&settings, id, premium)).await
+    let lecture = match tokio::task::spawn_blocking(move || {
+        // rc14 (revue #9520) — un compte Premium voit ses égaliseurs Premium
+        // écartés par l'exclusivité du 24/11 recochés, comme le moteur.
+        lire_zone(&settings, id, premium).map(|mut l| {
+            if premium {
+                tune_core::tess::migration::normaliser_les_egaliseurs(&mut l.chaine, true);
+            }
+            l
+        })
+    })
+    .await
     {
         Ok(Ok(l)) => l,
         Ok(Err(e)) => return erreur_migration(&e),
@@ -574,6 +649,32 @@ pub fn valider_le_put(
     if premium {
         return Ok(());
     }
+    // rc14 — un greffon Premium DÉCOCHÉ ne demande aucun droit, mais ses
+    // réglages non plus ne changent pas sans le droit : comme le cocher, les
+    // modifier est refusé (402). Ses réglages enregistrés, renvoyés tels
+    // quels, et un ajout sans réglages (`settings: null`) restent libres.
+    for m in chaine.plugins.iter().filter(|m| !m.enabled) {
+        let premium_requis = catalogue.get(&m.id).is_some_and(|d| d.demande_le_premium());
+        if !premium_requis || correction_estimee(m) {
+            continue;
+        }
+        // La marque `replaced_in_group`, posée par le serveur
+        // (`normaliser_les_egaliseurs`), n'est pas un réglage.
+        let sans_marque = |v: &Value| {
+            let mut v = v.clone();
+            if let Value::Object(o) = &mut v {
+                o.remove(tune_core::tess::migration::MARQUE_REMPLACE);
+            }
+            v
+        };
+        let reglages_changes = match enregistree.plugins.iter().find(|e| e.id == m.id) {
+            Some(e) => sans_marque(&e.settings) != sans_marque(&m.settings),
+            None => !m.settings.is_null(),
+        };
+        if reglages_changes {
+            return Err(ErreurChaine::PremiumRequis(m.id.clone()));
+        }
+    }
     // Un maillon (ou l'upsampling) inchangé est exempté, `bypass_all` ou
     // non : `ChaineTess::valider` contrôlant le droit sous `bypass_all`, la
     // chaîne enregistrée l'a passé (ou vient des anciennes routes, qui ont le
@@ -639,6 +740,7 @@ pub(super) fn appliquer_le_put(
     corps: &[u8],
     premium: bool,
     catalogue: &Catalogue,
+    capacites: Option<&CapacitesDsd>,
 ) -> Result<(LectureZone, Vec<String>), Response> {
     let texte = std::str::from_utf8(corps).map_err(|e| {
         refus(&ErreurChaine::CorpsIllisible(format!(
@@ -647,7 +749,7 @@ pub(super) fn appliquer_le_put(
     })?;
     // Lecture stricte du corps tel qu'envoyé : 400 sur tout champ ou valeur
     // inconnus, avant toute fusion.
-    let corps_lu = ChaineTess::depuis_corps(texte).map_err(|e| refus(&e))?;
+    ChaineTess::depuis_corps(texte).map_err(|e| refus(&e))?;
     let brut: Value = serde_json::from_str(texte)
         .map_err(|e| refus(&ErreurChaine::CorpsIllisible(e.to_string())))?;
 
@@ -672,19 +774,72 @@ pub(super) fn appliquer_le_put(
     }
     // D1 : l'origine d'une correction de pièce vient de `room_profile_{id}`,
     // jamais du corps ; `ecrire_chaine` la réécrit de même.
-    // rc14 — égaliseurs exclusifs : une chaîne enregistrée avant la règle
-    // (deux façades cochées) est NORMALISÉE, pas refusée ; seul un corps qui
-    // coche lui-même une seconde façade reçoit le 409.
-    if !corps_coche_deux_egaliseurs(&corps_lu, &enregistree) {
-        tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine);
-    }
+    // rc14 — égaliseurs combinables : une façade écartée par l'exclusivité du
+    // 24/11 est recochée ; le gain d'une bande modifiée reste dans les bornes
+    // publiées (−30 / +15 dB, ±12 dB au graphique).
+    tune_core::tess::migration::normaliser_les_egaliseurs(&mut chaine, premium);
+    // Revue #9520 — un préréglage enregistré (bornes d'avant : celles du
+    // moteur) se charge tel quel : ses façades sont « connues ».
+    let prereglages: Vec<ChaineTess> = tune_core::tess::prereglages::lire(settings)
+        .map(|l| l.presets.into_iter().map(|p| p.chain).collect())
+        .unwrap_or_default();
+    let connues: Vec<&ChaineTess> = std::iter::once(&enregistree)
+        .chain(prereglages.iter())
+        .collect();
+    tune_core::tess::egaliseurs_en_serie::verifier_les_gains(&chaine, &connues)
+        .map_err(|e| refus(&e))?;
     let chaine = origines_par_le_serveur(settings, zone_id, &chaine);
     valider_le_put(&chaine, &enregistree, catalogue, premium).map_err(|e| refus(&e))?;
+    refuser_un_dsd_impossible(&chaine, &enregistree, capacites)?;
     let chaine = chaine.mettre_a_niveau();
 
     let bilan = ecrire_chaine(settings, zone_id, &chaine).map_err(|e| erreur_migration(&e))?;
     let lecture = lire_zone(settings, zone_id, premium).map_err(|e| erreur_migration(&e))?;
     Ok((lecture, bilan.cles_modifiees))
+}
+
+/// rc14 — une cible DSD que la sortie LOCALE de la zone ne prend pas est
+/// refusée (409 `dsd_not_supported_by_output`, `reason` = motif précis, et
+/// les capacités) AVANT toute écriture : la chaîne enregistrée ne bouge pas,
+/// le suréchantillonnage PCM en place n'est donc jamais éteint par un choix
+/// DSD impossible. Après le contrôle du droit : un compte Free reçoit
+/// d'abord le 402. Une cible inchangée n'est pas revérifiée (capacité perdue
+/// depuis : la lecture repart en PCM et le dit) ; les sorties réseau ne sont
+/// pas concernées (`not_applied_on_transport`).
+pub fn refuser_un_dsd_impossible(
+    chaine: &ChaineTess,
+    enregistree: &ChaineTess,
+    capacites: Option<&CapacitesDsd>,
+) -> Result<(), Response> {
+    let Upsampling::Dsd { rate, .. } = &chaine.fixed.upsampling else {
+        return Ok(());
+    };
+    if chaine.fixed.upsampling == enregistree.fixed.upsampling {
+        return Ok(());
+    }
+    let Some(caps) = capacites.filter(|c| c.output_local) else {
+        return Ok(());
+    };
+    let Some(cible) = caps.cible(*rate).filter(|c| !c.famille_44k1.accepted) else {
+        return Ok(());
+    };
+    let motif = cible.famille_44k1.reason.map_or("unknown", |m| m.as_str());
+    let e = ErreurChaine::DsdNonPrisParLaSortie {
+        rate: serde_json::to_value(rate)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default(),
+        motif: motif.to_owned(),
+    };
+    let mut corps = corps_du_refus(&RefusTess::from(&e));
+    if let Some(o) = corps.as_object_mut() {
+        o.insert("reason".into(), json!(motif));
+        o.insert(
+            "dsd_capabilities".into(),
+            serde_json::to_value(caps).unwrap_or(Value::Null),
+        );
+    }
+    Err((StatusCode::CONFLICT, Json(corps)).into_response())
 }
 
 /// rc14 — la clé du mode PURE de la zone (hors chaîne), que le chargement
@@ -713,15 +868,40 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     if est(Partie::Reaffectation) {
         let _ = state.orchestrator.refresh_zone_reaffectation(id).await;
     }
+    // rc14 — le réglage des enceintes (ou « Bypass all » qui le coupe).
+    if est(Partie::Enceintes) {
+        let _ = state.orchestrator.refresh_zone_enceintes(id).await;
+    }
     if est(Partie::Surechantillonnage) {
         state.orchestrator.refresh_zone_upsampler(id).await;
     }
     if est(Partie::Convolution) {
         rafraichir_le_convolueur(state, zone).await;
     }
-    // rc14 — le mode PURE basculé par un préréglage (« Pure » l'allume).
-    if cles.contains(&cle_mode_pure(id)) {
+    // rc14 — l'ordre des greffons cochés a changé : la sortie locale suit.
+    if cles.contains(&tune_core::tess::egaliseurs_en_serie::cle_ordre_tess(id)) {
+        state.orchestrator.appliquer_ordre_tess(id).await;
+    }
+    // rc14 — le mode PURE basculé par un préréglage (« Pure » l'allume), ou
+    // « Bypass all » basculé (`ecrire_chaine` rend alors la clé de la chaîne) :
+    // même garde dans le moteur (`traitements_contournes`), même bascule.
+    let bypass = cles.contains(&tune_core::tess::cle_chaine_zone(id));
+    if cles.contains(&cle_mode_pure(id)) || bypass {
         let _ = state.orchestrator.apply_audiophile_change_portee(id).await;
+    }
+    // Revue #9520 — « Bypass all » coupe aussi le suréchantillonneur et la
+    // cadence fixe ; une cadence fixe réglée relance le flux (v2). Aucune voie
+    // réseau n'applique le suréchantillonneur, le repli mono ni la
+    // réaffectation.
+    if bypass && !est(Partie::Surechantillonnage) {
+        let _ = state.orchestrator.apply_bypass_all_portee(id).await;
+    }
+    // rc14 — piste modulée vers le DSD : les greffons et l'étage fixe vivent
+    // dans le flux du producteur, pas dans la sortie. Tout changement de la
+    // chaîne relance la piste à sa position (anti-rebond partagé avec
+    // l'égaliseur).
+    if !cles.is_empty() {
+        state.orchestrator.relancer_si_flux_dsd_module(id).await;
     }
 }
 
@@ -780,9 +960,11 @@ pub async fn put_zone_tess(
     let _garde = verrou.lock().await;
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let cat = catalogue.clone();
-    let resultat =
-        tokio::task::spawn_blocking(move || appliquer_le_put(&settings, id, &corps, premium, &cat))
-            .await;
+    let capacites = state.orchestrator.capacites_dsd_de_zone(id).await;
+    let resultat = tokio::task::spawn_blocking(move || {
+        appliquer_le_put(&settings, id, &corps, premium, &cat, Some(&capacites))
+    })
+    .await;
     let (lecture, cles) = match resultat {
         Ok(Ok(x)) => x,
         Ok(Err(r)) => {

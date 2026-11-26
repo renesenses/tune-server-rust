@@ -19,10 +19,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::VERSION_CONTRAT;
-use super::chaine::{ChaineTess, ErreurChaine};
+use super::chaine::{ChaineTess, ErreurChaine, Upsampling};
 use super::greffon::Catalogue;
+use super::modulation_dsd::{CapacitesDsd, MotifDsdRefuse};
 use super::reseau_upnp::{AcheminementUpnp, FaitsUpnp, acheminer, appliquer, famille_upnp};
-use super::resolution::{Badge, ContexteExecution, EtapeResolue, EtatVolume, MotifEtape};
+use super::resolution::{
+    Badge, CodeEtape, ContexteExecution, EtapeResolue, EtatVolume, MotifEtape, PlacementVolume,
+    Resolution,
+};
 use super::zones::{Applicabilite, TransportZone};
 
 /// La réponse de `GET /zones/{id}/tess` (et d'un `PUT` accepté).
@@ -52,6 +56,12 @@ pub struct ReponseTessZone {
     /// quand le marqueur « ACTIVE » n'a pas pu être tenu). Absent si vide.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// rc14 — ce que la sortie de la zone fait de chaque cible DSD
+    /// (`tess::modulation_dsd::CapacitesDsd`) : acceptée ou non, en natif ou
+    /// en DoP, avec son motif. Posé par le serveur ; absent d'un serveur
+    /// antérieur, qu'un client lit comme « inconnu ».
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsd_capabilities: Option<CapacitesDsd>,
 }
 
 impl ReponseTessZone {
@@ -98,7 +108,67 @@ impl ReponseTessZone {
             catalog,
             delivery,
             warnings: Vec::new(),
+            dsd_capabilities: None,
         }
+    }
+
+    /// rc14 — publie les capacités DSD de la sortie et les reporte sur le
+    /// chemin résolu : vers le DSD, une cible que la sortie locale ne prend
+    /// pas éteint l'upsampling et le modulateur (`dsd_not_supported_by_output`,
+    /// `detail` = motif précis) ; une cible acceptée dit son transport. Les
+    /// sorties réseau ne sont pas touchées (`not_applied_on_transport`).
+    pub fn avec_capacites_dsd(mut self, capacites: CapacitesDsd) -> Self {
+        let cible = match &self.chain.fixed.upsampling {
+            Upsampling::Dsd { rate, .. } => capacites.cible(*rate).cloned(),
+            _ => None,
+        };
+        if let Some(cible) = cible.filter(|_| self.transport == TransportZone::Local) {
+            let f = &cible.famille_44k1;
+            let mut modifie = false;
+            for e in self.signal_path.iter_mut().filter(|e| {
+                e.effective && matches!(e.code, CodeEtape::Upsampling | CodeEtape::DsdModulator)
+            }) {
+                if f.accepted {
+                    if e.code == CodeEtape::DsdModulator {
+                        let mut p = match e.params.take() {
+                            Some(Value::Object(m)) => m,
+                            _ => Map::new(),
+                        };
+                        p.insert("order".into(), json!(capacites.modulator_order));
+                        p.insert("rate_hz".into(), json!(f.rate_hz));
+                        p.insert("transport".into(), json!(f.transport));
+                        p.insert("dop_rate_hz".into(), json!(f.dop_rate_hz));
+                        p.insert(
+                            "zero_dbfs_modulation".into(),
+                            json!(super::modulation_dsd::MODULATION_A_0_DBFS),
+                        );
+                        e.params = Some(Value::Object(p));
+                    }
+                } else {
+                    e.effective = false;
+                    e.reason = Some(MotifEtape::DsdNotSupportedByOutput);
+                    e.detail = f.reason.map(|m| m.as_str().to_owned());
+                    modifie = true;
+                }
+            }
+            if modifie {
+                if self.volume.placement == Some(PlacementVolume::BeforeDsdModulator) {
+                    self.volume.placement = Some(PlacementVolume::AtRender);
+                }
+                let mut r = Resolution {
+                    etapes: std::mem::take(&mut self.signal_path),
+                    headroom_db: self.headroom_db,
+                    volume: self.volume,
+                    badge: self.badge,
+                };
+                r.recalculer_les_etapes_finales();
+                self.signal_path = r.etapes;
+                self.headroom_db = r.headroom_db;
+                self.badge = r.badge;
+            }
+        }
+        self.dsd_capabilities = Some(capacites);
+        self
     }
 }
 
@@ -242,7 +312,7 @@ pub fn schema_json() -> Value {
         "plugin_unavailable", "premium_required", "stereo_only", "replaced_in_group",
         "nothing_to_protect", "volume_not_software", "nothing_to_quantize", "not_in_service",
         "renderer_without_lpcm", "not_applied_on_transport", "plugin_not_installed",
-        "no_filter_selected", null] });
+        "no_filter_selected", "dsd_not_supported_by_output", "neutral_settings", null] });
     let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://mozaiklabs.fr/schemas/tess/contract-1.json",
@@ -313,7 +383,7 @@ pub fn schema_json() -> Value {
                 "type": "object", "required": ["channels", "position", "exclusive_group"],
                 "properties": {
                     "channels": enumere(&["any", "stereo_only", "remaps"]),
-                    "position": enumere(&["free", "last_plugin"]),
+                    "position": enumere(&["free", "last_plugin", "before_upsampling"]),
                     "exclusive_group": { "$ref": "#/$defs/exclusive_group" }
                 },
                 "additionalProperties": false
@@ -462,7 +532,11 @@ pub fn schema_json() -> Value {
                     // `detail`, `upgrade_url` sur un 402 seulement.
                     "error": { "enum": codes_refus },
                     "message": { "type": "string" },
-                    "upgrade_url": { "type": "string" }
+                    "upgrade_url": { "type": "string" },
+                    // rc14 — `dsd_not_supported_by_output` seulement : le
+                    // motif précis et les capacités de la sortie.
+                    "reason": { "type": "string" },
+                    "dsd_capabilities": { "type": "object" }
                 },
                 "additionalProperties": false
             }
@@ -471,7 +545,55 @@ pub fn schema_json() -> Value {
     schema["$defs"]["delivery"] = delivery;
     schema["$defs"]["zone_response"]["properties"]["delivery"] =
         json!({ "$ref": "#/$defs/delivery" });
+    schema["$defs"]["dsd_capabilities"] = schema_capacites_dsd();
+    schema["$defs"]["zone_response"]["properties"]["dsd_capabilities"] =
+        json!({ "$ref": "#/$defs/dsd_capabilities" });
     schema
+}
+
+/// rc14 — le schéma de `dsd_capabilities` (voir [`CapacitesDsd`]).
+fn schema_capacites_dsd() -> Value {
+    let mut motifs: Vec<Value> = MotifDsdRefuse::TOUS
+        .iter()
+        .map(|m| json!(m.as_str()))
+        .collect();
+    motifs.push(Value::Null);
+    let famille = json!({
+        "type": "object",
+        "required": ["rate_hz", "accepted", "transport", "dop_rate_hz", "reason", "native_reason"],
+        "properties": {
+            "rate_hz": { "type": "integer" },
+            "accepted": { "type": "boolean" },
+            "transport": { "enum": ["native", "dop", null] },
+            "dop_rate_hz": { "type": ["integer", "null"] },
+            "reason": { "enum": motifs },
+            "native_reason": { "type": ["string", "null"] }
+        },
+        "additionalProperties": false
+    });
+    let mut cible = famille.clone();
+    cible["required"]
+        .as_array_mut()
+        .expect("liste")
+        .extend([json!("rate"), json!("family_48k")]);
+    cible["properties"]["rate"] = json!({ "enum": ["dsd64", "dsd128", "dsd256"] });
+    cible["properties"]["family_48k"] = famille;
+    json!({
+        "type": "object",
+        "required": ["dsd_mode", "output_local", "modulator_order", "reference_level",
+                     "volume_placement", "machine_measured", "status", "targets"],
+        "properties": {
+            "dsd_mode": { "type": "string" },
+            "output_local": { "type": "boolean" },
+            "modulator_order": { "type": "integer" },
+            "reference_level": { "type": "string" },
+            "volume_placement": { "const": "before_dsd_modulator" },
+            "machine_measured": { "type": "boolean" },
+            "status": { "enum": ["known", "unknown"] },
+            "targets": { "type": "array", "items": cible }
+        },
+        "additionalProperties": false
+    })
 }
 
 /// Ouvre un schéma pour la LECTURE par un client : champs inconnus permis,
@@ -660,6 +782,7 @@ mod tests {
                 db: -18.0,
             },
             replaygain_actif: false,
+            voies_de_sortie: None,
         }
     }
 
@@ -813,7 +936,7 @@ mod tests {
         assert_eq!(r.badge, Badge::OutsideTess);
         // Contre-épreuve sur OAAT.
         let r = reponse(TransportZone::Oaat, chaine_complete());
-        assert_eq!(r.headroom_db, -3.0);
+        assert_eq!(r.headroom_db, crate::tess::chaine::HEADROOM_AUTO_DB);
         assert!(r.volume.placement.is_some());
     }
 

@@ -505,7 +505,8 @@ pub async fn fetch_for_pass(
 pub enum FillStatus {
     /// Plus aucune candidate : la bibliothèque est à jour.
     Done,
-    /// `lyrics_lrclib_enabled` ne vaut pas `"true"`. **Aucune requête émise.**
+    /// `lyrics_lrclib_enabled` refusé (voir [`lrclib_consent_given`]).
+    /// **Aucune requête émise.**
     Refused,
     /// Plafond [`FillOptions::max_requests`] atteint : il reste du travail,
     /// relancer reprendra là où on s'est arrêté.
@@ -607,10 +608,27 @@ impl FillOptions<'static> {
     }
 }
 
+/// Valeur d'un réglage LRCLIB JAMAIS posé : désactivé.
+///
+/// Décision de Bertrand (rc14) : une installation NEUVE reçoit le réglage
+/// POSÉ à `"true"` à la naissance de sa base (`db::migrations`). Une
+/// installation existante qui n'a jamais touché la case reste désactivée :
+/// aucun envoi nouveau à lrclib.net.
+pub const LRCLIB_DEFAUT: bool = false;
+
+/// Lecture pure du réglage : absent → [`LRCLIB_DEFAUT`], `"true"` → oui,
+/// toute autre valeur posée → non.
+pub fn lrclib_consentement_depuis(brut: Option<&str>) -> bool {
+    match brut {
+        None => LRCLIB_DEFAUT,
+        Some(v) => v == "true",
+    }
+}
+
 /// Le consentement, lu là où il est stocké. Rendu public pour que la route
 /// puisse répondre « refusé » sans dupliquer la règle.
 pub fn lrclib_consent_given(db: &Arc<dyn DbBackend>) -> bool {
-    setting(db, SETTING_LRCLIB_ENABLED).as_deref() == Some("true")
+    lrclib_consentement_depuis(setting(db, SETTING_LRCLIB_ENABLED).as_deref())
 }
 
 /// Un réglage, lu là où il vit. Un seul lecteur pour les deux consentements —
@@ -856,11 +874,9 @@ pub async fn rattraper_un_lot(db: &Arc<dyn DbBackend>, http: &reqwest::Client) -
 
 /// La boucle de fond. Miroir de `audio::replaygain::spawn`.
 ///
-/// Elle ne fait rien tant que `lyrics_lrclib_enabled` ne vaut pas `"true"` :
-/// interroger un service tiers gratuit pour toute une bibliothèque reste un
-/// geste que l'utilisateur pose, pas un défaut. Ce que ce spawn change, c'est
-/// qu'une fois ce geste posé **une** fois, il n'a plus à le reposer à chaque
-/// nouveau lot d'albums importés.
+/// Elle ne fait rien tant que `lyrics_lrclib_enabled` ne vaut pas `"true"`.
+/// Depuis la rc14, une installation neuve naît avec le réglage posé à
+/// `"true"` ; une installation existante garde son choix (absent = refus).
 pub fn spawn(backend: Arc<dyn DbBackend>, http: reqwest::Client) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(DELAI_DE_DEMARRAGE_SECS)).await;

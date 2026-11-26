@@ -412,6 +412,10 @@ pub async fn run_with(opts: RunOptions) {
     // données externe est absent (docs/DATA-RELOCATION.md).
     crate::boot_status::set_phase("attente du disque de données");
     crate::routes::appliance_storage::wait_for_data_volume(&config.db_path).await;
+    // rc14 — le cache de pochettes se crée et se sonde APRÈS le disque de
+    // données : un disque externe monté en retard ne doit pas laisser un
+    // faux « non inscriptible » pour toute la session.
+    crate::chemins_de_donnees::preparer_le_cache_retenu();
 
     // Dossier de données non inscriptible (image Docker sous `tune`, `/data`
     // monté depuis un dossier de l'hôte appartenant à root) : un rapport
