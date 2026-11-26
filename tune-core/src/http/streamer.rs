@@ -144,6 +144,21 @@ pub struct StreamInfo {
     /// Même règle que [`Self::crossfeed`] : un fait du flux, posé là où il
     /// est bâti, lu tel quel par le chemin du signal. `false` partout ailleurs.
     pub relaye_tel_quel: bool,
+    /// rc14 — le suréchantillonnage PCM CUIT dans les octets de ce flux
+    /// (fichier refait d'une zone de la famille UPnP). Même règle que
+    /// [`Self::crossfeed`] : un fait du flux, posé là où il est bâti, lu tel
+    /// quel par le chemin du signal. `None` partout ailleurs.
+    pub surechantillonnage: Option<SurechDuFlux>,
+}
+
+/// rc14 — ce que l'étage de suréchantillonnage a fait au flux servi.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurechDuFlux {
+    pub de_hz: u32,
+    pub vers_hz: u32,
+    pub filtre: String,
+    /// La réserve fixe du filtre, en dB (≤ 0).
+    pub reserve_db: f64,
 }
 
 /// #6221 — un fichier VIRTUEL servi par la branche fichier (`serve_file`) :

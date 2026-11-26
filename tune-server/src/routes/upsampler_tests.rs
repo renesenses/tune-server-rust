@@ -170,9 +170,20 @@ async fn le_bit_perfect_strict_de_la_zone_est_dit_a_l_ecran_8149() {
 /// dit, avec le même code que le chemin du signal.
 #[tokio::test]
 async fn une_zone_reseau_est_dite_non_prise_en_charge_8149() {
-    let (state, id) = zone_prete("dlna:uuid:eversolo-dmp-a8").await;
+    // rc14 — DLNA et OpenHome portent le suréchantillonnage ; AirPlay non.
+    let (state, id) = zone_prete("airplay:salon-8149").await;
     let Json(v) = lire_zone(State(state), Path(id)).await;
     assert_eq!(v["constraint"], "output_not_supported", "{v}");
+}
+
+/// rc14 — une zone DLNA : aucune contrainte de sortie, le réglage vaut à la
+/// piste suivante (le fichier refait à la cible), jamais en cours de piste.
+#[tokio::test]
+async fn une_zone_dlna_porte_le_surechantillonnage_a_la_piste_suivante() {
+    let (state, id) = zone_prete("dlna:uuid:eversolo-dmp-a8").await;
+    let Json(v) = lire_zone(State(state), Path(id)).await;
+    assert!(v["constraint"].is_null(), "{v}");
+    assert_eq!(v["applies_at"], "next_track", "{v}");
 }
 
 /// Relecture du 20/11 (5) — sur une zone dont la sortie n'est pas locale, le
@@ -181,7 +192,7 @@ async fn une_zone_reseau_est_dite_non_prise_en_charge_8149() {
 async fn zone_reseau_le_reglage_n_agit_jamais() {
     let state = etat();
     let id = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
-        .create("Salon", Some("dlna"), Some("dlna:renderer-9218"))
+        .create("Salon", Some("airplay"), Some("airplay:renderer-9218"))
         .unwrap();
     let r = ecrire_zone(
         State(state.clone()),

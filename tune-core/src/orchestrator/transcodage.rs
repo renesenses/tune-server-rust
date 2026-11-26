@@ -459,7 +459,7 @@ pub(super) async fn transcode_source_to_file(
 ) -> Result<(u64, Vec<u8>, u16), String> {
     transcode_source_to_file_avec_crossfeed(
         source, out_sr, channels, target_bd, target_fmt, eq, convolver, replaygain, dest, progres,
-        abandon, tranche, None, None,
+        abandon, tranche, None, None, None,
     )
     .await
 }
@@ -501,6 +501,12 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // #5071 — la compensation de niveau, DERNIER étage, bornée à la crête de
     // la piste entière. `None` : strictement la chaîne d'avant.
     compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
+    // rc14 — le suréchantillonnage PCM d'une zone de la famille UPnP :
+    // réglages du greffon et cadence de SORTIE. Le décodage et la chaîne
+    // restent à `out_sr` (la cadence de la source) ; l'étage, dernier avant
+    // la quantification, porte le flux à la cible, et c'est à elle que le
+    // fichier est encodé. `None` : strictement la chaîne d'avant.
+    surechantillonnage: Option<(crate::audio::surechantillonnage::UpsamplerSettings, u32)>,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // LAT-F1 (phase 2a) : le chemin fichier reste le seul où le renderer
     // attend le morceau ENTIER (cible FLAC, Content-Length exigé). Avant de
@@ -612,6 +618,25 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // constant, borné par la vraie crête de la piste traitée. Avant ce lot,
     // chaque étage relisait et réécrivait les octets (cinq requantifications
     // au plus).
+    // rc14 — l'étage de suréchantillonnage, bâti à la cadence RÉELLEMENT
+    // décodée. Un étage qui ne se bâtit pas (cadence décodée inattendue) est
+    // une erreur franche : jamais un fichier annoncé à la cible qui serait à
+    // la cadence de la source.
+    let surechantillonneur = match surechantillonnage.as_ref() {
+        Some((reglages, vers)) => Some(super::chaine_reseau_tess::SurechReseau::nouveau(
+            crate::audio::surechantillonnage::SurechantillonneurF64::nouveau(
+                reglages,
+                decoded_sample_rate,
+                *vers,
+                decoded_channels as u16,
+            )
+            .map_err(|e| format!("upsampler_network_build_failed: {e}"))?,
+        )),
+        None => None,
+    };
+    let cadence_encodee = surechantillonneur
+        .as_ref()
+        .map_or(decoded_sample_rate, |s| s.etage.cadence_sortie());
     let mut chaine = super::StreamingDsp {
         replaygain,
         eq,
@@ -620,9 +645,10 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         channels: decoded_channels as u16,
         compensation,
         sample_rate: decoded_sample_rate,
+        surechantillonneur,
         ..Default::default()
     };
-    chaine.process(&mut pcm_bytes, actual_bd);
+    chaine.process_piste(&mut pcm_bytes, actual_bd);
     let compensation_appliquee_db = chaine
         .compensation
         .as_ref()
@@ -633,7 +659,7 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // 2. Encode to the target format.
     let mut encoder = crate::audio::encoder::AudioEncoder::new(
         &target_fmt,
-        decoded_sample_rate,
+        cadence_encodee,
         actual_bd as u32,
         decoded_channels,
     );
@@ -667,7 +693,8 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         ecriture_ms = total_ms - decode_ms - traitement_ms - encode_ms,
         total_ms,
         octets = file_size,
-        sample_rate = decoded_sample_rate,
+        sample_rate = cadence_encodee,
+        cadence_decodee = decoded_sample_rate,
         channels = decoded_channels,
         source_bd,
         cible_bd = actual_bd,
