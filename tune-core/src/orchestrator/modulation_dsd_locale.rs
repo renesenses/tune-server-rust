@@ -873,6 +873,7 @@ impl PlaybackOrchestrator {
             channels: plan.voies,
             plugins_in_stream: greffons_dans_le_flux || mono,
             headroom_db,
+            modulator_margin_db: modulation::MARGE_DU_MODULATEUR_DB,
             continued: false,
         };
         let cle = CleFlux {

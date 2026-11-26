@@ -1245,8 +1245,26 @@ pub struct ModulationEnService {
     /// chaîne, une fois, plus la marge propre du modulateur, une fois
     /// ([`headroom_avant_le_modulateur`]).
     pub headroom_db: f64,
+    /// Décision de Bertrand du 26/11 — la marge propre du modulateur
+    /// ([`MARGE_DU_MODULATEUR_DB`]), comprise dans `headroom_db` mais publiée
+    /// À PART au chemin du signal (« Marge du modulateur DSD : −3 dB ») :
+    /// l'étage headroom n'affiche que la marge de l'utilisateur.
+    #[serde(default = "marge_du_modulateur_db")]
+    pub modulator_margin_db: f64,
     /// Le flux continue l'état de la piste précédente (enchaînement).
     pub continued: bool,
+}
+
+fn marge_du_modulateur_db() -> f64 {
+    MARGE_DU_MODULATEUR_DB
+}
+
+impl ModulationEnService {
+    /// La part du headroom qui vient de la CHAÎNE (la marge de
+    /// l'utilisateur, ou l'automatique), sans la marge du modulateur.
+    pub fn headroom_de_la_chaine_db(&self) -> f64 {
+        self.headroom_db - self.modulator_margin_db
+    }
 }
 
 /// L'état de la modulation DSD d'une piste.

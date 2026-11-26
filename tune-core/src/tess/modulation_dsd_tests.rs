@@ -493,6 +493,7 @@ fn en_service() -> ModulationEnService {
         channels: 2,
         plugins_in_stream: false,
         headroom_db: -3.0,
+        modulator_margin_db: MARGE_DU_MODULATEUR_DB,
         continued: false,
     }
 }
