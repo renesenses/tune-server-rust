@@ -186,6 +186,10 @@ const LECTURE: &[&str] = &["GET", "HEAD"];
 /// * `/cloud/sso/callback` (GET) : seul le retour du SSO est public (A5), le
 ///   navigateur y revient de mozaiklabs.fr ; `authorize`, `status` et
 ///   `disconnect` demandent une session ;
+/// * `/auth/admin/reinitialiser` (POST) : le mot de passe administrateur
+///   perdu. Sans jeton par nature ; le gestionnaire n'accepte qu'un appel de
+///   CETTE machine portant le code de `tune-server --reinitialiser-admin`
+///   (voir [`crate::recuperation_admin`]) ;
 /// * `/auth/login`, `/auth/logout` (POST), `/auth/config` et
 ///   `/auth/activation` (GET, lecture de l'état seulement). Le reste de
 ///   `/auth/` — inscription (seul un administrateur crée des comptes une fois
@@ -210,6 +214,7 @@ pub(crate) const LISTE_PUBLIQUE: &[(&str, &[&str])] = &[
     ("/auth/logout", &["POST"]),
     ("/auth/config", &["GET"]),
     ("/auth/activation", &["GET"]),
+    ("/auth/admin/reinitialiser", &["POST"]),
 ];
 
 /// Le chemin tel que la liste publique l'écrit : sans le préfixe `/api/v1`.
@@ -1572,6 +1577,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/activation/code", post(demander_un_code_d_activation))
         .route("/admin-scope", post(regler_la_portee_de_l_administration))
+        .route("/admin/reinitialiser", post(reinitialiser_l_administrateur))
 }
 
 #[derive(Deserialize)]
@@ -2288,7 +2294,7 @@ const ALPHABET_CODE: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 /// `getrandom`), en écartant les deux octets que la v4 fixe en partie
 /// (version, variante) et, par rejet, les valeurs au-delà du plus grand
 /// multiple de 31.
-fn nouveau_code_activation() -> String {
+pub(crate) fn nouveau_code_activation() -> String {
     let limite = (256 / ALPHABET_CODE.len() * ALPHABET_CODE.len()) as u8;
     let mut code = String::with_capacity(LONGUEUR_CODE);
     while code.len() < LONGUEUR_CODE {
@@ -2307,7 +2313,7 @@ fn nouveau_code_activation() -> String {
 }
 
 /// Normalise une saisie : majuscules, sans espaces ni tirets.
-fn normaliser_code(saisi: &str) -> String {
+pub(crate) fn normaliser_code(saisi: &str) -> String {
     saisi
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '-')
@@ -3520,6 +3526,224 @@ async fn activer_l_authentification(
         .headers_mut()
         .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
     response
+}
+
+// ---------------------------------------------------------------------------
+// Mot de passe administrateur perdu : réinitialisation depuis cette machine
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ReinitialisationAdmin {
+    code: String,
+    nouveau_mot_de_passe: String,
+}
+
+fn refus_reinitialisation(statut: StatusCode, erreur: &str, message: &str) -> Response {
+    (statut, Json(json!({ "error": erreur, "message": message }))).into_response()
+}
+
+/// `POST /auth/admin/reinitialiser` — `{code, nouveau_mot_de_passe}`.
+///
+/// Seulement depuis CETTE machine ([`DepuisCetteMachine`] : adresse réelle de
+/// la connexion en bouclage, aucun en-tête de mandataire, ni relais distant,
+/// ni relais du port 80 d'une appliance). Le code vient de
+/// `tune-server --reinitialiser-admin` ; la base n'en garde que l'empreinte.
+/// Succès : mot de passe du compte administrateur remplacé, code consommé,
+/// sessions révoquées (nouveau secret de signature, WebSocket fermées), et
+/// une session ouverte pour l'appelant. Les échecs sont journalisés sans le
+/// code.
+async fn reinitialiser_l_administrateur(
+    State(state): State<AppState>,
+    DepuisCetteMachine(cette_machine): DepuisCetteMachine,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ReinitialisationAdmin>,
+) -> Response {
+    use crate::recuperation_admin as ra;
+    // Plus strict que `DepuisCetteMachine` : une requête sans `Host` ni
+    // autorité (HTTP/1.1 d'un relais TCP brut) n'est pas tenue pour locale.
+    let nomme_un_hote = headers.contains_key(axum::http::header::HOST) || uri.authority().is_some();
+    if !cette_machine || !nomme_un_hote {
+        tracing::warn!(
+            relayee = crate::garde_du_relais::requete_relayee(&headers),
+            sans_hote = !nomme_un_hote,
+            "reinitialisation_admin_refusee_hors_machine"
+        );
+        return refus_reinitialisation(
+            StatusCode::FORBIDDEN,
+            "reset_not_local",
+            "The administrator password can only be reset from the server machine itself \
+             (http://localhost), never through a proxy or the remote relay.",
+        );
+    }
+    if body.nouveau_mot_de_passe.chars().count() < ra::LONGUEUR_MIN_MOT_DE_PASSE {
+        return refus_reinitialisation(
+            StatusCode::BAD_REQUEST,
+            "password_too_short",
+            "password must be at least 8 characters",
+        );
+    }
+    let Some((id, nom)) = ra::compte_administrateur(&state.backend) else {
+        return refus_reinitialisation(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no_admin_profile",
+            "No administrator account in this database.",
+        );
+    };
+    // Vérification, mot de passe, révocation et consommation du code : une
+    // seule opération, sous verrou, hors de l'exécuteur (Argon2).
+    let resultat = {
+        let backend = state.backend.clone();
+        let code = body.code.clone();
+        let mot_de_passe = body.nouveau_mot_de_passe.clone();
+        tokio::task::spawn_blocking(move || {
+            ra::reinitialiser_avec_code(&backend, id, &code, &mot_de_passe)
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()))
+    };
+    match resultat {
+        Ok(ra::Verdict::Juste) => {}
+        // « Aucun code », « code expiré » et « code faux » : la même réponse.
+        Ok(ra::Verdict::Faux { restants }) => {
+            tracing::warn!(restants, "reinitialisation_admin_code_faux");
+            return refus_code_de_reinitialisation();
+        }
+        Ok(ra::Verdict::AucunOuExpire) => {
+            tracing::warn!("reinitialisation_admin_code_absent_ou_expire");
+            return refus_code_de_reinitialisation();
+        }
+        Ok(ra::Verdict::Bloque) => {
+            tracing::warn!("reinitialisation_admin_code_bloque");
+            return refus_reinitialisation(
+                StatusCode::TOO_MANY_REQUESTS,
+                "reset_attempts_exceeded",
+                "Too many wrong codes: this code is destroyed. Run `tune-server --reinitialiser-admin` again.",
+            );
+        }
+        Err(e) => {
+            // Rien n'est changé (transaction annulée) : le code reste valable.
+            tracing::error!(error = %e, "reinitialisation_admin_echec");
+            return refus_reinitialisation(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "reset_failed",
+                "The new password could not be saved; nothing was changed. Try again.",
+            );
+        }
+    }
+    // Les WebSocket ouvertes avec l'ancien secret se ferment.
+    state.fermeture_websockets.send_modify(|n| *n += 1);
+    tracing::warn!(admin = %nom, "reinitialisation_admin_reussie");
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let secret = get_or_create_jwt_secret(&settings);
+    let Ok(token) = sign_jwt(id, "admin", &secret) else {
+        return Json(json!({ "reset": true, "username": nom })).into_response();
+    };
+    let mut response = Json(json!({
+        "reset": true,
+        "username": nom,
+        "token": token,
+        "token_type": "Bearer",
+        "expires_in": 86400,
+        "role": "admin",
+    }))
+    .into_response();
+    let cookie = session_cookie(&token, &headers);
+    if let Ok(valeur) = cookie.parse() {
+        response
+            .headers_mut()
+            .insert(axum::http::header::SET_COOKIE, valeur);
+    }
+    response
+}
+
+fn refus_code_de_reinitialisation() -> Response {
+    refus_reinitialisation(
+        StatusCode::FORBIDDEN,
+        "reset_code_invalid",
+        "Invalid or expired reset code. Run `tune-server --reinitialiser-admin` on the server \
+         machine to get a new one.",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Veille du secret de signature
+// ---------------------------------------------------------------------------
+
+/// Le secret de signature peut changer HORS de ce processus : la commande
+/// `tune-server --reinitialiser-admin --mot-de-passe-stdin` écrit dans la
+/// base pendant que le service tourne. Les jetons signés avec l'ancien sont
+/// refusés à la requête suivante (`valider_jeton` relit le secret), mais une
+/// WebSocket déjà ouverte ne présente plus de jeton : cette veille relit le
+/// secret et, s'il a changé sans que ce processus ait déjà fermé les
+/// WebSocket, les ferme (`fermeture_websockets`).
+pub struct VeilleDuSecret {
+    secret: Option<String>,
+    generation: u64,
+}
+
+impl VeilleDuSecret {
+    /// Retient le secret et la génération de fermeture du moment.
+    pub fn new(state: &AppState) -> Self {
+        Self {
+            secret: Self::lire(state).ok().flatten(),
+            generation: *state.fermeture_websockets.borrow(),
+        }
+    }
+
+    /// `Err` : lecture impossible POUR CE PASSAGE (SQLite occupé, coupure
+    /// PostgreSQL). Ce n'est pas un secret changé.
+    fn lire(state: &AppState) -> Result<Option<String>, String> {
+        // `get` lit par l'écrivain quand il est libre, par le pool sinon :
+        // jamais d'attente derrière un scan.
+        SettingsRepo::with_backend(state.backend.clone()).get("jwt_secret")
+    }
+
+    /// Un passage : `true` si le secret a changé ailleurs et que les
+    /// WebSocket viennent d'être fermées. Un changement déjà suivi d'une
+    /// fermeture par ce processus (activation, réinitialisation par la
+    /// route) n'en provoque pas une seconde. Une lecture en erreur est
+    /// ignorée : l'ancien secret est gardé, le passage suivant réessaie, et
+    /// aucune WebSocket (celles du pont comprises) n'est fermée.
+    pub fn verifier(&mut self, state: &AppState) -> bool {
+        let secret = match Self::lire(state) {
+            Ok(secret) => secret,
+            Err(e) => {
+                tracing::debug!(error = %e, "veille_du_secret_lecture_impossible_passage_ignore");
+                return false;
+            }
+        };
+        let generation = *state.fermeture_websockets.borrow();
+        let change = secret != self.secret;
+        let deja_fermees = generation != self.generation;
+        self.secret = secret;
+        if change && !deja_fermees {
+            tracing::warn!("secret_de_signature_change_hors_processus_websockets_fermees");
+            state.fermeture_websockets.send_modify(|n| *n += 1);
+        }
+        self.generation = *state.fermeture_websockets.borrow();
+        change && !deja_fermees
+    }
+}
+
+/// Période de la veille du secret en production.
+pub const PERIODE_VEILLE_DU_SECRET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Lance la veille du secret de signature, un passage par `periode`.
+pub fn surveiller_le_secret(
+    state: AppState,
+    periode: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut veille = VeilleDuSecret::new(&state);
+        let mut horloge = tokio::time::interval(periode);
+        horloge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            horloge.tick().await;
+            veille.verifier(&state);
+        }
+    })
 }
 
 #[cfg(test)]

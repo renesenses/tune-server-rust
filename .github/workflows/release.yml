@@ -973,6 +973,7 @@ jobs:
           copy "tune-server\tests\fixtures\plugins\playlists-converter\main.wasm" "plugins\playlists-converter\"
           copy "tune-server\tests\fixtures\plugins\playlists-converter\manifest.json" "plugins\playlists-converter\"
           @"
+          Unicode true
           !include "MUI2.nsh"
           !include "Sections.nsh"
           Name "Tune Server"
@@ -1050,6 +1051,18 @@ jobs:
             FileWrite `$0 'tune-server.exe --sans-console$\r$\n'
             FileClose `$0
 
+            ; rc14 - mot de passe administrateur oublie : la commande ecrit un
+            ; code a usage unique (console + tune-server.log), a saisir dans
+            ; l'ecran de connexion ouvert sur CETTE machine. Elle ne demarre
+            ; pas le serveur ; pause garde la fenetre ouverte pour lire le code.
+            FileOpen `$0 "`$INSTDIR\reinitialiser-admin.bat" w
+            FileWrite `$0 '@echo off$\r$\n'
+            FileWrite `$0 'cd /d "%~dp0"$\r$\n'
+            FileWrite `$0 'echo Tune : mot de passe administrateur oublie / forgotten administrator password$\r$\n'
+            FileWrite `$0 'tune-server.exe --reinitialiser-admin$\r$\n'
+            FileWrite `$0 'pause$\r$\n'
+            FileClose `$0
+
             ; Start menu
             ; #7637 - l'entree principale « Tune Server » et le raccourci du
             ; Bureau lancent le serveur SANS fenetre de terminal (l'interface
@@ -1057,11 +1070,17 @@ jobs:
             ; le depannage, par une entree distincte.
             CreateDirectory "`$SMPROGRAMS\Tune Server"
             CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server.lnk" "`$INSTDIR\start-tune-server-sans-console.bat" "" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
-            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server (avec console, depannage).lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
+            ; Noms accentues depuis la rc14 (script en UTF-8, Unicode true) :
+            ; les raccourcis d'avant, sans accents, sont retires.
+            Delete "`$SMPROGRAMS\Tune Server\Tune Server (avec console, depannage).lnk"
+            Delete "`$SMPROGRAMS\Tune Server\Mot de passe administrateur oublie.lnk"
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server (avec console, dépannage).lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
             CreateShortcut "`$SMPROGRAMS\Tune Server\Uninstall.lnk" "`$INSTDIR\uninstall.exe"
             CreateShortcut "`$SMPROGRAMS\Tune Server\Quitter Tune Server.lnk" "`$SYSDIR\taskkill.exe" "/F /IM tune-server.exe" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
             ; Journal du serveur (pas de console a rouvrir une fois cache).
             CreateShortcut "`$SMPROGRAMS\Tune Server\Journal de Tune Server.lnk" "`$WINDIR\notepad.exe" '"`$LOCALAPPDATA\TuneServer\tune-server.log"'
+            ; rc14 - recuperer l'acces administrateur depuis cette machine.
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Mot de passe administrateur oublié.lnk" "`$INSTDIR\reinitialiser-admin.bat" "" "`$INSTDIR\tune-server.exe"
             ; Ancien raccourci de la rc7 a la rc9, devenu l'entree principale.
             Delete "`$SMPROGRAMS\Tune Server\Tune Server (sans console).lnk"
             CreateShortcut "`$DESKTOP\Tune Server.lnk" "`$INSTDIR\start-tune-server-sans-console.bat" "" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
@@ -1089,14 +1108,14 @@ jobs:
             Pop `$0
             Pop `$1
             StrCmp `$0 "0" pf_regle_creee
-            DetailPrint "Pare-feu : regle Tune non creee (autorisation refusee ou echec)."
-            MessageBox MB_OK|MB_ICONINFORMATION "Tune est installe, mais la regle du pare-feu Windows n'a pas ete creee.$\r$\n$\r$\nSans elle, certains lecteurs reseau (DLNA/UPnP, AirPlay) peuvent rester invisibles ou muets. Au premier lancement, autorisez tune-server.exe sur les reseaux prives, ou relancez cet installeur." /SD IDOK
+            DetailPrint "Pare-feu : règle Tune non créée (autorisation refusée ou échec)."
+            MessageBox MB_OK|MB_ICONINFORMATION "Tune est installé, mais la règle du pare-feu Windows n'a pas été créée.$\r$\n$\r$\nSans elle, certains lecteurs réseau (DLNA/UPnP, AirPlay) peuvent rester invisibles ou muets. Au premier lancement, autorisez tune-server.exe sur les réseaux privés, ou relancez cet installeur." /SD IDOK
             Goto pf_fin
           pf_regle_creee:
-            DetailPrint "Pare-feu : regle entrante Tune creee (reseaux prives)."
+            DetailPrint "Pare-feu : règle entrante Tune créée (réseaux privés)."
             Goto pf_fin
           pf_regle_presente:
-            DetailPrint "Pare-feu : regle entrante Tune deja presente."
+            DetailPrint "Pare-feu : règle entrante Tune déjà présente."
           pf_fin:
 
             ; Registry for Add/Remove Programs
@@ -1114,7 +1133,7 @@ jobs:
           ; disponibles. Meme valeur, meme nom que l'interrupteur des Reglages
           ; (tune-server/src/routes/system/demarrage_avec_windows.rs).
           ; --sans-console : pas de fenetre, pas de navigateur ouvert.
-          Section "Demarrer Tune avec Windows" SecDemarrage
+          Section "Démarrer Tune avec Windows" SecDemarrage
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Tune Server" '"`$INSTDIR\tune-server.exe" --sans-console'
             ; Case cochee = choix explicite : on efface un eventuel
             ; "desactivee" pose par le Gestionnaire des taches.
@@ -1153,7 +1172,7 @@ jobs:
             ExecShellWait "runas" "`$SYSDIR\netsh.exe" 'advfirewall firewall delete rule name="Tune"' SW_HIDE
           pf_desinstallation_fin:
           SectionEnd
-          "@ | Out-File -Encoding ASCII installer.nsi
+          "@ | Out-File -Encoding utf8BOM installer.nsi
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" installer.nsi
 
       # L'installeur porte sa propre signature, distincte de celle du binaire
