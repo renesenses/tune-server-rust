@@ -168,7 +168,9 @@ fn plafond_absolu_de_90_jours(db: &Arc<dyn DbBackend>, id: i64) {
     let repo = JetonsDeRenouvellementRepo::with_backend(db.clone());
     let mut j = repo.ouvrir(id, None, T0).unwrap();
     for n in 1..=4 {
-        j = repo.renouveler(&j.jeton, CLE, T0 + n * 20 * 86400 + 1).unwrap();
+        j = repo
+            .renouveler(&j.jeton, CLE, T0 + n * 20 * 86400 + 1)
+            .unwrap();
     }
     assert_eq!(
         repo.renouveler(&j.jeton, CLE, T0 + PLAFOND_SESSION)

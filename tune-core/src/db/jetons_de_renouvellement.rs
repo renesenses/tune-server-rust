@@ -355,9 +355,7 @@ impl JetonsDeRenouvellementRepo {
         let Some(succ) = self.ligne(suivant)? else {
             return refuser("successeur_introuvable");
         };
-        if succ.famille != ligne.famille
-            || succ.remplace_le.is_some()
-            || succ.revoque_le.is_some()
+        if succ.famille != ligne.famille || succ.remplace_le.is_some() || succ.revoque_le.is_some()
         {
             return refuser("successeur_deja_tourne");
         }
@@ -484,10 +482,7 @@ pub fn revoquer_toutes_les_sessions_tx(
     maintenant: i64,
 ) -> Result<(), String> {
     tx.execute(SQL_REVOCATION_GLOBALE[0], &[])?;
-    tx.execute(
-        SQL_REVOCATION_GLOBALE[1],
-        &[&maintenant as &dyn ToSqlValue],
-    )?;
+    tx.execute(SQL_REVOCATION_GLOBALE[1], &[&maintenant as &dyn ToSqlValue])?;
     Ok(())
 }
 

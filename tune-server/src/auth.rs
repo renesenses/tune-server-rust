@@ -2088,9 +2088,11 @@ async fn refresh(
     // La clé qui dérive le successeur d'un jeton (rejeu idempotent) : le
     // secret de signature, propre au serveur ; le renouveler révoque tout.
     let secret = get_or_create_jwt_secret(&settings);
-    let emis = match JetonsDeRenouvellementRepo::with_backend(state.backend.clone())
-        .renouveler(body.refresh_token.trim(), secret.as_bytes(), maintenant)
-    {
+    let emis = match JetonsDeRenouvellementRepo::with_backend(state.backend.clone()).renouveler(
+        body.refresh_token.trim(),
+        secret.as_bytes(),
+        maintenant,
+    ) {
         Ok(e) => e,
         Err(r) => {
             return match r {

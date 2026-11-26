@@ -225,7 +225,10 @@ async fn renouvellement_avec_rotation() {
     let (st, v) = renouveler(&app, &rt).await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["refresh_token"], nouveau_rt, "rejeu idempotent");
-    assert_eq!(moi(&app, v["token"].as_str().unwrap()).await, StatusCode::OK);
+    assert_eq!(
+        moi(&app, v["token"].as_str().unwrap()).await,
+        StatusCode::OK
+    );
     let (st, v) = renouveler(&app, nouveau_rt).await;
     assert_eq!(st, StatusCode::OK, "le jeton tourné sert toujours : {v}");
 
@@ -301,7 +304,10 @@ async fn la_course_gagnee_par_le_voleur_revoque_la_session() {
     let (st, v) = renouveler(&app, &rt2).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
     assert_eq!(v["code"], "refresh_token_reused");
-    assert_eq!(renouveler(&app, &rt3_voleur).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        renouveler(&app, &rt3_voleur).await.0,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(moi(&app, &acces_voleur).await, StatusCode::UNAUTHORIZED);
 }
 
