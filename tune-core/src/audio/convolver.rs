@@ -605,8 +605,7 @@ impl<T: Flottant> Convolver<T> {
             self.remontee = None;
             return;
         }
-        let total = (f64::from(self.cadence)
-            * f64::from(crate::audio::eq::REMONTEE_RAPIDE_TESS_MS)
+        let total = (f64::from(self.cadence) * f64::from(crate::audio::eq::REMONTEE_RAPIDE_TESS_MS)
             / 1000.0)
             .max(1.0) as usize;
         self.remontee = Some(RemonteeSec {

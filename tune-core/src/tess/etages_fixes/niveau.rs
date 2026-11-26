@@ -160,8 +160,7 @@ impl BilanDeNiveau {
         // rc14 (Didier) — la marge du filtre de convolution (Auto seulement ;
         // 0 en manuel) : elle protège un gain que la réserve des égaliseurs ne
         // voit pas, elle s'ajoute donc à la leur.
-        let convolution =
-            marge_de_convolution(&e.headroom, e.gain_max_convolution_db).appliquee_db;
+        let convolution = marge_de_convolution(&e.headroom, e.gain_max_convolution_db).appliquee_db;
         let (headroom_db, absorbe) = match e.headroom {
             Headroom::Auto {} if resolu < 0.0 => {
                 // `resolu` vaut `HEADROOM_AUTO_DB` : la part que la réserve des

@@ -437,7 +437,8 @@ pub(super) fn gain_max_avec(
 
 /// Le cache des gains maximaux : un `f64` par (contenu, cadence).
 const GAINS_MAX: usize = 256;
-static GAINS: LazyLock<Mutex<HashMap<CleCache, f64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static GAINS: LazyLock<Mutex<HashMap<CleCache, f64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Octets occupés par le cache (tests, diagnostic).
 pub fn octets_en_cache() -> usize {

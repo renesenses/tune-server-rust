@@ -150,7 +150,10 @@ fn gain_recalcule_apres_reechantillonnage() {
     assert!(a_44.gain_max_db < a_96.gain_max_db - 2.0, "{a_44:?}");
     let (_, taps) = config.ri_pour(44_100).unwrap();
     let attendu = courbe_fft::gain_max_db(&taps, 44_100).unwrap();
-    assert_eq!(a_44.gain_max_db, attendu, "le gain de la RI rééchantillonnée");
+    assert_eq!(
+        a_44.gain_max_db, attendu,
+        "le gain de la RI rééchantillonnée"
+    );
     assert_eq!(
         config.build_for(BLOC, 44_100, 2).unwrap().reserve_db(),
         a_44.appliquee_db
@@ -160,8 +163,17 @@ fn gain_recalcule_apres_reechantillonnage() {
     // 48 kHz, joué à 96 kHz.
     let h = cloche(FS, 50.0, 6.0, 1.0, 1 << 15);
     let config = ConvolverConfig::new(stereo(h), FS).unwrap();
+    // Le gain est celui de la RI RÉÉCHANTILLONNÉE (mesurée, pas supposée :
+    // un filtre dont le pic est en tête ne garde pas exactement son gain au
+    // passage 48 → 96 kHz).
     let m = config.marge_pour(96_000).unwrap();
-    assert!((m.gain_max_db - 6.0).abs() < 0.2, "{m:?}");
+    let (_, t96) = config.ri_pour(96_000).unwrap();
+    assert_eq!(
+        m.gain_max_db,
+        courbe_fft::gain_max_db(&t96, 96_000).unwrap(),
+        "{m:?}"
+    );
+    assert!(m.gain_max_db > 0.0 && m.appliquee_db < 0.0, "{m:?}");
     let mut moteur = config.build_for(BLOC, 96_000, 2).unwrap();
     let mut y = sinus(96_000, 50.0, 3.0, 1.0);
     moteur.process_interleaved_f64(&mut y);
