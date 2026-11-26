@@ -56,9 +56,12 @@ pub(crate) struct EqEnVol {
     pub(crate) format_independant_du_traitement: bool,
     /// #8422 — le dernier dépôt vient d'une entrée en PURE : le préampli que
     /// garde l'égaliseur coupé remonte vers le signal SEC en
-    /// `TRANSITION_PURE_MS`, borné par le volume (rc14, #6741), pour que la
+    /// `REMONTEE_RAPIDE_TESS_MS`, borné par le volume (rc14, #6741), pour que la
     /// chaîne se vide et rende les octets décodés tels quels.
     vers_le_sec: std::sync::atomic::AtomicBool,
+    /// rc14 (TESS) — le retour au sec demandé est RAPIDE
+    /// (`EqProcessor::rendre_le_sec_vite`, A/B), et non la remontée de PURE.
+    sec_rapide: std::sync::atomic::AtomicBool,
     /// #6741 — volume de la zone (millièmes, sans trim), tenu à jour par
     /// l'orchestrateur à chaque consigne ; `u32::MAX` : inconnu.
     volume_zone: AtomicU32,
@@ -128,6 +131,7 @@ impl Default for EqEnVol {
             flux_sans_fin: false,
             format_independant_du_traitement: false,
             vers_le_sec: std::sync::atomic::AtomicBool::new(false),
+            sec_rapide: std::sync::atomic::AtomicBool::new(false),
             volume_zone: AtomicU32::new(VOLUME_INCONNU),
             volume_avant: AtomicU32::new(VOLUME_INCONNU),
             niveau_publie: AtomicU32::new(1.0_f32.to_bits()),
@@ -298,13 +302,25 @@ impl EqEnVol {
     /// #8422 — l'entrée en PURE, déposée en vol : couper l'égaliseur ET
     /// rendre le signal sec. Le fondu de #5215 efface la courbe, et le
     /// préampli gardé rejoint le niveau d'avant l'égaliseur en
-    /// `TRANSITION_PURE_MS` (rc14, décision du 25/11), BORNÉ par le volume
+    /// `REMONTEE_RAPIDE_TESS_MS` (rc14, décision du 25/11), BORNÉ par le volume
     /// comme toute remontée (#6741) ; revenu à 0 dB, le neutre quitte la
     /// chaîne et le flux redevient les octets décodés, à l'échantillon près.
     /// Volume monté pendant l'égaliseur : le préampli reste gardé.
     pub(crate) fn poser_vers_le_sec(&self) {
+        self.poser_vers_le_sec_avec(false);
+    }
+
+    /// rc14 (TESS) — [`Self::poser_vers_le_sec`], retour RAPIDE (moins de
+    /// 0,5 s, `EqProcessor::rendre_le_sec_vite`) et BORNÉ : vers le niveau
+    /// d'avant l'égaliseur (#6741), pas au-delà, comme PURE (rc14).
+    pub(crate) fn poser_vers_le_sec_rapide(&self) {
+        self.poser_vers_le_sec_avec(true);
+    }
+
+    fn poser_vers_le_sec_avec(&self, rapide: bool) {
         let mut attente = self.attente.lock().unwrap_or_else(|e| e.into_inner());
         self.vers_le_sec.store(true, Ordering::SeqCst);
+        self.sec_rapide.store(rapide, Ordering::SeqCst);
         *attente = Some(None);
         self.poses.fetch_add(1, Ordering::Relaxed);
     }
@@ -349,6 +365,13 @@ impl EqEnVol {
             .filter(EqProcessor::is_enabled);
         let actif = neuf.is_some();
         *courant = EqProcessor::prendre_la_releve(neuf, courant.take());
+        // rc14 (TESS, #9540) — égaliseur DÉCOCHÉ dans TESS : retour RAPIDE au
+        // sec (`rendre_le_sec_vite`), borné au niveau d'avant l'égaliseur.
+        // Posé avant l'extinction ci-dessous : sa cible est alors le sec.
+        let rapide = vers_le_sec && self.sec_rapide.swap(false, Ordering::SeqCst);
+        if rapide && let Some(eq) = courant.as_mut() {
+            eq.rendre_le_sec_vite();
+        }
         self.suivre_le_niveau_d_avant(courant);
         if self.flux_sans_fin
             && let Some(eq) = courant.as_mut()
@@ -357,17 +380,28 @@ impl EqEnVol {
         }
         // rc14 (sécurité auditive, décision du 25/11) — l'entrée en PURE ne
         // remonte plus vers le sec SANS borne : le préampli gardé rejoint le
-        // niveau d'avant l'égaliseur en `TRANSITION_PURE_MS`, vers
+        // niveau d'avant l'égaliseur en `REMONTEE_RAPIDE_TESS_MS`, vers
         // `min(1, borne de volume)` (#6741), jamais au-delà. Volume inchangé :
         // le sec à l'échantillon près, le neutre se retire. Volume monté (ou
         // inconnu) : le préampli reste gardé, voyant et « Rendre le niveau ».
         // Posé APRÈS la borne et l'extinction, qui relancent la rampe.
-        if vers_le_sec && let Some(eq) = courant.as_mut() {
-            eq.rendre_le_niveau_d_avant_en(crate::audio::eq::TRANSITION_PURE_MS);
+        // Hors du retour rapide de TESS (traité plus haut).
+        if vers_le_sec
+            && !rapide
+            && let Some(eq) = courant.as_mut()
+        {
+            eq.rendre_le_niveau_d_avant_en();
         }
         self.publier(courant);
         self.releves.fetch_add(1, Ordering::Relaxed);
         tracing::info!(sample_rate, channels, actif, "eq_en_vol_releve");
+    }
+
+    /// rc14 (TESS) — le dernier dépôt rend-il le signal SEC (préampli gardé
+    /// libéré) ? Témoins seulement.
+    #[cfg(test)]
+    pub(crate) fn vers_le_sec_en_attente(&self) -> bool {
+        self.vers_le_sec.load(Ordering::SeqCst)
     }
 
     /// Combien de profils ont été déposés.

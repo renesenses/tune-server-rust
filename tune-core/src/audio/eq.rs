@@ -31,21 +31,6 @@ pub const RAMPE_DE_BASCULE_MS: u32 = 300;
 /// biquad hérite de l'historique et ne claque pas.
 pub const SEUIL_DE_RAMPE_DB: f64 = 1.0;
 
-/// rc14 (sécurité auditive, série TESS #9520) — durée de la remontée d'une
-/// hausse de préampli RETENUE entre deux égaliseurs ACTIFS (voir
-/// [`EqProcessor::retenir_la_hausse_de`]). Décocher un maillon d'une série,
-/// baisser ses bandes ou changer de préréglage fait baisser la marge : le
-/// niveau rejoint celui de la nouvelle chaîne en moins de 0,5 s (A/B, comme
-/// le retour au sec de TESS), jamais au-delà du niveau d'avant l'égaliseur.
-pub const REMONTEE_SERIE_MS: u32 = 450;
-
-/// rc14 (sécurité auditive, décision de Bertrand du 25/11) — durée du fondu
-/// d'ENTRÉE en PURE ou en « Bypass all » : la chaîne n'est plus contournée
-/// d'un bloc à l'autre (jusqu'à +24 dB d'une série) ; l'égaliseur s'efface
-/// et le niveau rejoint celui d'avant l'égaliseur en ce temps, jamais
-/// au-delà (voir [`EqProcessor::rendre_le_niveau_d_avant_en`]).
-pub const TRANSITION_PURE_MS: u32 = 450;
-
 /// #6211 — durée du fondu qui éteint le préampli GARDÉ d'un égaliseur coupé
 /// sur un flux SANS FIN (radio).
 ///
@@ -85,6 +70,26 @@ pub const EXTINCTION_SUR_FLUX_SANS_FIN_MS: u32 = 3_000;
 /// cible est bornée au niveau d'avant l'égaliseur, volume compris (voir
 /// [`EqProcessor::borner_la_remontee`]).
 pub const REMONTEE_DB_PAR_SECONDE: f64 = 2.0;
+
+/// rc14 (décision de Bertrand du 25/11, retour de Rémi) — durée de la
+/// remontée du préampli gardé quand un égaliseur est DÉCOCHÉ dans TESS : le
+/// geste sert une comparaison A/B, le signal sec revient en moins d'une
+/// demi-seconde, par la même rampe linéaire en dB (aucune marche). Hors de
+/// TESS, la règle du 10/10 et [`REMONTEE_DB_PAR_SECONDE`] restent.
+///
+/// rc14 (sécurité auditive, décision de Bertrand du 25/11) — même durée pour
+/// le fondu d'ENTRÉE en PURE ou en « Bypass all » : la chaîne n'est plus
+/// contournée d'un bloc à l'autre (jusqu'à +24 dB d'une série) ; l'égaliseur
+/// s'efface et le niveau rejoint celui d'avant l'égaliseur, jamais au-delà
+/// (voir [`EqProcessor::rendre_le_niveau_d_avant_en`]).
+///
+/// rc14 (sécurité auditive, série TESS #9520) — même durée pour la remontée
+/// d'une hausse de préampli RETENUE entre deux égaliseurs ACTIFS (voir
+/// [`EqProcessor::retenir_la_hausse_de`]) : décocher un maillon d'une série,
+/// baisser ses bandes ou changer de préréglage fait rejoindre le niveau de la
+/// nouvelle chaîne en moins de 0,5 s, jamais au-delà du niveau d'avant
+/// l'égaliseur.
+pub const REMONTEE_RAPIDE_TESS_MS: u32 = 450;
 
 /// #6211 — extinction en cours du préampli gardé : `depart` est le gain par
 /// coefficient au début de la rampe, `vers` celui de la fin
@@ -221,6 +226,9 @@ pub struct EqProcessor {
     /// Porté par l'égaliseur COUPÉ de la transition : tant qu'il est là, le
     /// neutre n'est pas au repos.
     chaine_sortante: Option<ChaineSortante>,
+    /// rc14 (TESS) — la remontée vers le sec dure
+    /// [`REMONTEE_RAPIDE_TESS_MS`] au lieu de suivre [`REMONTEE_DB_PAR_SECONDE`].
+    rampe_rapide: bool,
     clipping: CompteurDEcretage,
     closed: AtomicBool,
 }
@@ -235,7 +243,7 @@ pub struct EqProcessor {
 /// de cette chaîne MESURÉ sur la musique (rapport des énergies, jamais
 /// au-dessus de 1). Le fondu fini, ce gain rejoint le gain gardé de
 /// l'égaliseur coupé, qui remonte vers le niveau d'avant le traitement en
-/// [`TRANSITION_PURE_MS`], jamais au-delà ([`EqProcessor::terminer_la_chaine_sortante`]).
+/// [`REMONTEE_RAPIDE_TESS_MS`], jamais au-delà ([`EqProcessor::terminer_la_chaine_sortante`]).
 pub struct ChaineSortante {
     /// Le crossfeed retiré de la sortie (stéréo seulement).
     pub crossfeed: Option<super::crossfeed::CrossfeedProcessor>,
@@ -355,6 +363,7 @@ impl EqProcessor {
             borne_de_remontee: 0.0,
             libere: false,
             chaine_sortante: None,
+            rampe_rapide: false,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
@@ -399,6 +408,7 @@ impl EqProcessor {
             borne_de_remontee: precedent.borne_de_remontee,
             libere: false,
             chaine_sortante: None,
+            rampe_rapide: false,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
@@ -554,6 +564,7 @@ impl EqProcessor {
             borne_de_remontee: self.borne_de_remontee,
             libere: self.libere,
             chaine_sortante: None,
+            rampe_rapide: self.rampe_rapide,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         };
@@ -671,7 +682,7 @@ impl EqProcessor {
     /// monterait d'un coup — +12,9 dB en 300 ms mesurés à 40 Hz. La règle du
     /// 10/10 (#6741, fil 1974) vaut ici comme pour une coupure : la hausse
     /// est RETENUE (gain gardé appliqué après le filtre), puis rendue par
-    /// une rampe de [`REMONTEE_SERIE_MS`] jusqu'à la borne de remontée — le
+    /// une rampe de [`REMONTEE_RAPIDE_TESS_MS`] jusqu'à la borne de remontée — le
     /// niveau d'avant l'égaliseur, volume compris —, jamais au-delà. À volume
     /// inchangé, le niveau rejoint donc exactement celui de la nouvelle
     /// chaîne en moins de 0,5 s ; volume monté, le surplus reste gardé, se
@@ -747,15 +758,14 @@ impl EqProcessor {
     /// (identité exacte) ; volume monté, le surplus reste gardé, avec le
     /// voyant et « Rendre le niveau » (#6524). `libere` n'est pas posé. Sans
     /// effet hors d'un égaliseur coupé.
-    pub fn rendre_le_niveau_d_avant_en(&mut self, ms: u32) {
-        if !self.est_neutre() {
-            return;
-        }
-        self.relancer_depuis_le_gain_atteint();
-        let total = (u64::from(self.sample_rate) * u64::from(ms) / 1000).max(1) as usize;
-        if let Some(ext) = self.extinction.as_mut() {
-            ext.total = total;
-        }
+    ///
+    /// La durée, [`REMONTEE_RAPIDE_TESS_MS`], est portée par `rampe_rapide`
+    /// (relecture du 26/11) et non posée sur la rampe en cours : une rampe
+    /// RELANCÉE (geste de volume, piste suivante par
+    /// [`Self::reporter_le_preampli_garde`]) la garde, au lieu de retomber
+    /// sur [`REMONTEE_DB_PAR_SECONDE`] (3 s et plus).
+    pub fn rendre_le_niveau_d_avant_en(&mut self) {
+        self.rendre_le_sec_vite();
     }
 
     /// rc14 (sécurité auditive) — un égaliseur COUPÉ qui ne garde rien
@@ -775,6 +785,7 @@ impl EqProcessor {
             borne_de_remontee: 0.0,
             libere: false,
             chaine_sortante: None,
+            rampe_rapide: false,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
@@ -920,6 +931,23 @@ impl EqProcessor {
         }
     }
 
+    /// rc14 (décision de Bertrand du 25/11) — égaliseur DÉCOCHÉ dans TESS :
+    /// le gain gardé remonte en [`REMONTEE_RAPIDE_TESS_MS`], tout de suite,
+    /// même pendant le fondu de la courbe (les deux se recouvrent, sans
+    /// marche), vers `min(1, borne de volume)` comme toute remontée (#6741,
+    /// sécurité auditive, fil 1974) : à volume inchangé, le signal sec au bit
+    /// près en moins de 0,5 s ; si le volume a monté pendant que
+    /// l'égaliseur jouait, le niveau d'avant l'égaliseur, jamais au-dessus —
+    /// le reste demeure gardé, avec son voyant et « Rendre le niveau »
+    /// (#6524). `libere` n'est PAS posé. Sans effet hors d'un égaliseur coupé.
+    pub fn rendre_le_sec_vite(&mut self) {
+        if !self.est_neutre() {
+            return;
+        }
+        self.rampe_rapide = true;
+        self.relancer_depuis_le_gain_atteint();
+    }
+
     /// Relance la rampe du gain gardé depuis le gain atteint, vers la cible
     /// courante : une rampe en cours ne fait pas sauter le niveau.
     fn relancer_depuis_le_gain_atteint(&mut self) {
@@ -957,8 +985,12 @@ impl EqProcessor {
             .filter(|(d, v)| v > d && **d > 0.0)
             .map(|(d, v)| 20.0 * f64::from(v / d).log10())
             .fold(0.0_f64, f64::max);
-        let ms = f64::from(EXTINCTION_SUR_FLUX_SANS_FIN_MS)
-            .max(ecart_db / REMONTEE_DB_PAR_SECONDE * 1000.0);
+        let ms = if self.rampe_rapide {
+            f64::from(REMONTEE_RAPIDE_TESS_MS)
+        } else {
+            f64::from(EXTINCTION_SUR_FLUX_SANS_FIN_MS)
+                .max(ecart_db / REMONTEE_DB_PAR_SECONDE * 1000.0)
+        };
         let total = (f64::from(self.sample_rate) * ms / 1000.0).max(1.0) as usize;
         self.extinction = Some(Extinction {
             depart,
@@ -967,9 +999,10 @@ impl EqProcessor {
             fait: 0,
         });
         // rc14 (série TESS) — la retenue d'un égaliseur ACTIF revient en
-        // `REMONTEE_SERIE_MS` (bornée, voir `retenir_la_hausse_de`).
+        // `REMONTEE_RAPIDE_TESS_MS` (bornée, voir `retenir_la_hausse_de`).
         if !self.est_neutre() {
-            let total = (u64::from(self.sample_rate) * u64::from(REMONTEE_SERIE_MS) / 1000).max(1);
+            let total =
+                (u64::from(self.sample_rate) * u64::from(REMONTEE_RAPIDE_TESS_MS) / 1000).max(1);
             if let Some(ext) = self.extinction.as_mut() {
                 ext.total = total as usize;
             }
@@ -1005,8 +1038,11 @@ impl EqProcessor {
             return;
         }
         self.borne_de_remontee = borne;
-        if !self.est_neutre() || self.fondu.is_some() {
-            // Pendant le fondu de la courbe, la borne sert à la fin du fondu.
+        // Pendant le fondu de la courbe, la borne sert à la fin du fondu —
+        // sauf si une rampe est DÉJÀ en cours (flux sans fin, retour rapide
+        // de TESS) : elle est reciblée tout de suite, sinon elle finirait
+        // vers l'ancienne borne, au-dessus du niveau d'avant l'égaliseur.
+        if !self.est_neutre() || (self.fondu.is_some() && self.extinction.is_none()) {
             return;
         }
         self.relancer_depuis_le_gain_atteint();
@@ -1020,6 +1056,16 @@ impl EqProcessor {
         // rc14 (série TESS) — un égaliseur actif qui retient une hausse le
         // dit aussi : c'est le même voyant, le même geste.
         if !self.est_neutre() && !self.retient() {
+            return None;
+        }
+        // rc14 (série TESS, relecture du 26/11) — une retenue qui revient
+        // ENTIÈRE (volume inchangé, rampe de `REMONTEE_RAPIDE_TESS_MS`) n'est
+        // pas un « niveau réduit » : rien ne restera gardé à la fin. Seul un
+        // surplus qui demeure (volume monté) allume le voyant.
+        if !self.est_neutre()
+            && let Some(ext) = &self.extinction
+            && ext.vers.iter().all(|v| (v - 1.0).abs() < 1e-6)
+        {
             return None;
         }
         let gains: Vec<f32> = match &self.extinction {

@@ -271,3 +271,69 @@ async fn la_correction_appliquee_reste_dans_la_chaine_tess_apres_un_nouveau_prof
         "la correction appliquée a changé de façade : {v}"
     );
 }
+
+/// rc14 (égaliseurs en série, suite de #9532) — `apply` sur une série
+/// `[graphique, correction de pièce]` met la correction à jour et garde le
+/// graphique. L'ancienne écriture directe d'`eq_profile` remplaçait le
+/// graphique (principal) et supprimait la correction comme doublon.
+#[tokio::test]
+async fn appliquer_un_profil_garde_le_graphique_de_la_serie() {
+    let (state, app) = serveur().await;
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .create("Salon", Some("local"), Some("local:DAC"))
+        .unwrap();
+    let tess = format!("/api/v1/zones/{zone}/tess");
+    let (status, v) = appel(&app, "GET", &tess, None).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let gains: Vec<Value> = (0..10)
+        .map(|i| json!(if i == 4 { 3.0 } else { 0.0 }))
+        .collect();
+    let grille = [
+        31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+    ];
+    let bandes: Vec<Value> = grille
+        .iter()
+        .zip(&gains)
+        .map(|(f, g)| json!({"freq": f, "gain": g, "q": 1.0, "type": "peak"}))
+        .collect();
+    let mut chaine = v["chain"].clone();
+    chaine["plugins"] = json!([
+        {"id": "equalizer-graphic", "enabled": true, "settings": {
+            "listening": "speakers", "room_size": "medium", "speaker_placement": "free_standing",
+            "bass_gain_db": 0.0, "mid_gain_db": 0.0, "treble_gain_db": 0.0, "bands": bandes}},
+        {"id": "room-correction", "enabled": true, "settings": null},
+    ]);
+    let (status, v) = appel(&app, "PUT", &tess, Some(chaine)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+
+    let chemin = format!("/api/v1/room-correction/profiles/{zone}");
+    let corps = json!({
+        "name": "Salon",
+        "filters": [{"frequency_hz": 63.0, "gain_db": -8.0, "q_factor": 1.0, "filter_type": "peaking"}],
+    });
+    let (status, c) = appel(&app, "POST", &chemin, Some(corps)).await;
+    assert!(status.is_success(), "{status} {c}");
+    let (status, c) = appel(&app, "POST", &format!("{chemin}/apply"), None).await;
+    assert_eq!(status, StatusCode::OK, "{c}");
+    // L'écran peut dire que le graphique joue aussi.
+    assert_eq!(c["in_series_with"], json!(["equalizer-graphic"]), "{c}");
+    assert_eq!(c["warnings"], json!(["other_equalizers_in_series"]), "{c}");
+
+    let (status, v) = appel(&app, "GET", &tess, None).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let plugins = v["chain"]["plugins"].as_array().expect("chaîne");
+    let ids: Vec<(&str, bool)> = plugins
+        .iter()
+        .map(|m| (m["id"].as_str().unwrap(), m["enabled"] == true))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![("equalizer-graphic", true), ("room-correction", true)],
+        "le graphique de la série a été perdu : {v}"
+    );
+    assert_eq!(
+        plugins[1]["settings"]["bands"][0]["freq"],
+        json!(63.0),
+        "{v}"
+    );
+}

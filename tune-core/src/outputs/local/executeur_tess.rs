@@ -557,7 +557,7 @@ impl MoteursLocaux<'_> {
                 Some(p) if chaine.fait >= chaine.total => {
                     p.terminer_la_chaine_sortante(
                         chaine.gain,
-                        crate::audio::eq::TRANSITION_PURE_MS,
+                        crate::audio::eq::REMONTEE_RAPIDE_TESS_MS,
                     );
                     // Rien à garder (niveau mesuré à l'unité) : identité
                     // exacte, l'étage se retire tout de suite.

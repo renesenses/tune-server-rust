@@ -220,7 +220,8 @@ async fn microphones(State(etat): State<EtatRoutes>) -> Response {
                     "frequences": e.frequences,
                     "bits_servis": e.bits_servis,
                     "virtuelle": e.virtuelle,
-                    "mesurable": e.frequence_courante == Some(crate::mesure::FREQUENCE_MESURE),
+                    // rc14 — toute fréquence de `cadence::FREQUENCES_ACCEPTEES`.
+                    "mesurable": e.frequence_courante.is_some_and(crate::cadence::acceptee),
                 })
             })
             .collect(),
@@ -230,7 +231,9 @@ async fn microphones(State(etat): State<EtatRoutes>) -> Response {
     };
     Json(json!({
         "pile": pile,
+        // Gardée pour les clients d'avant la rc14 ; la liste fait foi.
         "frequence_requise": crate::mesure::FREQUENCE_MESURE,
+        "frequences_acceptees": crate::cadence::FREQUENCES_ACCEPTEES,
         "entrees": entrees,
         "etalonnages": etat.controleur.etalonnages(),
     }))
@@ -286,6 +289,9 @@ struct DemandeMesure {
     /// Plafonds plus stricts seulement ; les valeurs par défaut sont des maxima.
     max_spl_db: Option<f64>,
     max_play_dbfs: Option<f64>,
+    /// Mesure de vérification : la zone joue avec sa correction.
+    #[serde(default)]
+    avec_correction: bool,
 }
 
 // Le refus est la réponse HTTP prête, comme `proposition_pour`.
@@ -327,6 +333,7 @@ fn demande_de(zone: i64, d: DemandeMesure) -> Result<Demande, Response> {
         demande.politique.max_play_dbfs = p;
     }
     demande.voies = voies;
+    demande.avec_correction = d.avec_correction;
     Ok(demande)
 }
 

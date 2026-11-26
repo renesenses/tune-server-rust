@@ -1751,7 +1751,7 @@ impl LocalOutput {
         {
             self.reserve_du_surechantillonneur.ramper_la_garde(
                 self.cible_de_la_garde_du_rendu(),
-                super::super::audio::eq::TRANSITION_PURE_MS,
+                super::super::audio::eq::REMONTEE_RAPIDE_TESS_MS,
             );
         }
     }
@@ -1760,6 +1760,15 @@ impl LocalOutput {
     /// remonte, progressivement, jusqu'au niveau sans égaliseur, sans la borne
     /// de volume de #6741 (voir `EqProcessor::liberer_le_gain_garde`). Sans
     /// effet si la chaîne ne porte pas d'égaliseur coupé.
+    pub fn rendre_le_sec_vite(&self) {
+        // rc14 (TESS) — voir `EqProcessor::rendre_le_sec_vite`.
+        if let Ok(mut eq) = self.eq.lock()
+            && let Some(p) = eq.as_mut()
+        {
+            p.rendre_le_sec_vite();
+        }
+    }
+
     pub fn liberer_le_preampli_garde(&self) {
         if let Ok(mut eq) = self.eq.lock()
             && let Some(p) = eq.as_mut()
@@ -1769,7 +1778,7 @@ impl LocalOutput {
         // rc14 — et la garde du rendu de l'entrée en PURE.
         if self.reserve_du_surechantillonneur.garde() < 1.0 - 1e-6 {
             self.reserve_du_surechantillonneur
-                .ramper_la_garde(1.0, super::super::audio::eq::TRANSITION_PURE_MS);
+                .ramper_la_garde(1.0, super::super::audio::eq::REMONTEE_RAPIDE_TESS_MS);
         }
     }
 
@@ -2082,6 +2091,24 @@ impl LocalOutput {
         }
     }
 
+    /// rc14 (TESS) — fait passer UN bloc entrelacé par la chaîne DSP de la
+    /// sortie (`apply_local_dsp`, au nombre de canaux du format déclaré) et le
+    /// rend traité : les témoins comparent la sortie à l'entrée au bit près.
+    #[cfg(test)]
+    pub(crate) fn traiter_un_bloc_pour_test(&self, pcm: &mut [f32]) {
+        let (_, canaux) = self.current_format().expect("format déclaré");
+        apply_local_dsp(
+            pcm,
+            &self.eq,
+            &self.convolver,
+            &self.crossfeed,
+            &self.pure_bypass,
+            &self.mono_downmix,
+            canaux,
+            false,
+        );
+    }
+
     /// Lecture du drapeau PURE, pour les tests : c'est lui que `apply_local_dsp`
     /// consulte, donc lui qui dit si l'égaliseur installé travaille encore.
     #[cfg(test)]
@@ -2341,7 +2368,7 @@ impl LocalOutput {
         // « Bypass all » ne saute plus d'un bloc au signal sec (toute la
         // marge d'une série, jusqu'à +24 dB) : l'égaliseur en place devient
         // un égaliseur coupé qui efface sa courbe par le fondu de #5215 et
-        // rejoint le niveau d'avant l'égaliseur en `TRANSITION_PURE_MS`,
+        // rejoint le niveau d'avant l'égaliseur en `REMONTEE_RAPIDE_TESS_MS`,
         // jamais au-delà (#6741). Seul cet étage joue pendant la transition
         // (`executeur_tess`) ; revenu à 0 dB il se retire et PURE redevient
         // bit-perfect. Volume monté : le surplus reste gardé, avec le voyant
@@ -2368,7 +2395,7 @@ impl LocalOutput {
         if entree && self.reserve_du_surechantillonneur.garde() < 1.0 - 1e-6 {
             self.reserve_du_surechantillonneur.ramper_la_garde(
                 self.cible_de_la_garde_du_rendu(),
-                super::super::audio::eq::TRANSITION_PURE_MS,
+                super::super::audio::eq::REMONTEE_RAPIDE_TESS_MS,
             );
         }
     }
@@ -2410,7 +2437,7 @@ impl LocalOutput {
     /// sans égaliseur monté, un égaliseur coupé de transition la porte. Ni
     /// égaliseur ni chaîne : rien à faire. Jamais en DoP.
     fn entrer_en_pure_par_un_fondu(&self) {
-        use super::super::audio::eq::{ChaineSortante, EqProcessor, TRANSITION_PURE_MS};
+        use super::super::audio::eq::{ChaineSortante, EqProcessor};
         let dop = self.dop_active.load(Ordering::Relaxed);
         let format = self.current_format();
         let chaine = if dop {
@@ -2461,7 +2488,7 @@ impl LocalOutput {
         }
         if let Some(t) = transition.as_mut() {
             t.borner_la_remontee(borne);
-            t.rendre_le_niveau_d_avant_en(TRANSITION_PURE_MS);
+            t.rendre_le_niveau_d_avant_en();
         }
         *emplacement = transition;
     }
