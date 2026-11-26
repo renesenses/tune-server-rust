@@ -816,7 +816,10 @@ async fn refus_pendant_la_revocation_annule_toute_la_recuperation() {
         .unwrap();
     let avant = hachage_admin(&state);
     let r = ra::poser_le_mot_de_passe(&state.backend, 1, "pose-refusee");
-    assert!(r.is_err(), "la révocation refusée doit faire échouer la pose");
+    assert!(
+        r.is_err(),
+        "la révocation refusée doit faire échouer la pose"
+    );
     assert_eq!(hachage_admin(&state), avant, "mot de passe inchangé");
     assert_eq!(
         settings(&state).get("jwt_secret").unwrap().as_deref(),

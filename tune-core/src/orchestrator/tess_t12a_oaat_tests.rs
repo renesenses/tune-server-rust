@@ -158,20 +158,32 @@ async fn faux_recepteur_oaat(paquets: Paquets, premier: Premier) -> u16 {
     port_controle
 }
 
-/// Les trames `[gauche, droite]` reçues, dans l'ordre des positions, et leur
-/// profondeur.
-fn trames_recues(paquets: &Paquets) -> (Vec<[i32; 2]>, u32) {
+/// Les trames `[gauche, droite]` reçues, PLACÉES à leur position
+/// (`sample_offset` du paquet, compté depuis le premier paquet reçu), et leur
+/// profondeur. Une trame qu'aucun paquet n'a livrée vaut `None` : un paquet
+/// UDP perdu sur un banc chargé laisse un trou au lieu de décaler toute la
+/// suite (voir [`banc::constater_par_position`]).
+fn trames_recues(paquets: &Paquets) -> (Vec<Option<[i32; 2]>>, u32) {
     let mut p = paquets.lock().unwrap().clone();
     p.sort_by_key(|(offset, _, _)| *offset);
     p.dedup_by_key(|(offset, _, _)| *offset);
-    let mut trames = Vec::new();
+    let origine = p.first().map_or(0, |(offset, _, _)| *offset);
+    let mut trames: Vec<Option<[i32; 2]>> = Vec::new();
     let mut bits = 16;
-    for (_, format, charge) in p {
+    for (offset, format, charge) in p {
+        let mut position = usize::try_from(offset - origine).unwrap();
+        let mut poser = |trame: [i32; 2]| {
+            if trames.len() <= position {
+                trames.resize(position + 1, None);
+            }
+            trames[position].get_or_insert(trame);
+            position += 1;
+        };
         match format {
             AudioFormat::PcmS16le => {
                 bits = 16;
                 for t in charge.chunks_exact(4) {
-                    trames.push([
+                    poser([
                         i32::from(i16::from_le_bytes([t[0], t[1]])),
                         i32::from(i16::from_le_bytes([t[2], t[3]])),
                     ]);
@@ -181,7 +193,7 @@ fn trames_recues(paquets: &Paquets) -> (Vec<[i32; 2]>, u32) {
                 bits = 24;
                 for t in charge.chunks_exact(6) {
                     let v = |o: usize| i32::from_le_bytes([0, t[o], t[o + 1], t[o + 2]]) >> 8;
-                    trames.push([v(0), v(3)]);
+                    poser([v(0), v(3)]);
                 }
             }
             autre => panic!("format inattendu au banc : {autre:?}"),
@@ -200,7 +212,7 @@ enum Chaine {
 }
 
 struct Lecture {
-    trames: Vec<[i32; 2]>,
+    trames: Vec<Option<[i32; 2]>>,
     bits: u32,
     source: Vec<[i16; 2]>,
     file_path_remis: bool,
@@ -341,7 +353,7 @@ async fn jouer(chaine: Chaine) -> Lecture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crossfeed_sur_oaat_allume_la_voie_droite_t12a() {
     let l = jouer(Chaine::Crossfeed).await;
-    let c = banc::constater(&l.trames, l.bits, &l.source, 1.0);
+    let c = banc::constater_par_position(&l.trames, l.bits, &l.source, 1.0);
     println!(
         "T12a crossfeed OAAT : {c:?}, lecture directe = {}, premier paquet {:?}",
         l.file_path_remis, l.premier_paquet
@@ -368,9 +380,15 @@ async fn crossfeed_sur_oaat_allume_la_voie_droite_t12a() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn greffon_natif_tiers_sur_oaat_t12a() {
     let l = jouer(Chaine::GreffonTiers).await;
-    let c = banc::constater(&l.trames, l.bits, &l.source, 0.5);
+    let c = banc::constater_par_position(&l.trames, l.bits, &l.source, 0.5);
     println!("T12a greffon tiers OAAT : {c:?}");
     assert!(c.trames > TRAMES / 2, "{c:?}");
+    // Les trous du transport (paquets UDP perdus au banc) ne sont pas
+    // comparés : ils restent bornés, sinon le témoin ne témoigne de rien.
+    assert!(
+        c.trous <= TRAMES / 4,
+        "trop de trames perdues au banc pour juger le greffon ({c:?})"
+    );
     assert!(
         c.ecart_gauche <= 2.0,
         "le greffon natif tiers doit diviser la gauche par deux ({c:?})"
@@ -383,7 +401,7 @@ async fn greffon_natif_tiers_sur_oaat_t12a() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pure_sur_oaat_rien_n_est_traite_t12a() {
     let l = jouer(Chaine::CrossfeedSousPure).await;
-    let c = banc::constater(&l.trames, l.bits, &l.source, 1.0);
+    let c = banc::constater_par_position(&l.trames, l.bits, &l.source, 1.0);
     println!("T12a Pure OAAT : {c:?}");
     assert!(
         c.identique,
@@ -396,7 +414,7 @@ async fn pure_sur_oaat_rien_n_est_traite_t12a() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sans_chaine_oaat_recoit_la_source_t12a() {
     let l = jouer(Chaine::Aucune).await;
-    let c = banc::constater(&l.trames, l.bits, &l.source, 1.0);
+    let c = banc::constater_par_position(&l.trames, l.bits, &l.source, 1.0);
     println!(
         "T12a sans chaîne OAAT : {c:?}, lecture directe = {}, premier paquet {:?}",
         l.file_path_remis, l.premier_paquet
