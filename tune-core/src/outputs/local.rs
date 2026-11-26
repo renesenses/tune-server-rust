@@ -889,6 +889,10 @@ pub struct LocalOutput {
     /// jamais au-delà : si le volume a été monté entre-temps, la remontée
     /// s'arrête au rapport `avant / courant` (`EqProcessor::borner_la_remontee`).
     volume_avant_egaliseur: AtomicU32,
+    /// rc14 (Didier) — le même repère pour la marge d'un filtre de
+    /// convolution : le volume de l'auditeur quand un filtre qui en porte une
+    /// a été posé ; `u32::MAX` : aucun (la remontée va alors au signal sec).
+    volume_avant_convolution: AtomicU32,
     /// #3973 — « bit-perfect strict » de la zone qui joue sur cette sortie.
     /// Armé, une conversion de fréquence (ouverture cpal ou changement de
     /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
@@ -1546,6 +1550,7 @@ impl LocalOutput {
             volume_pose: AtomicBool::new(false),
             flux_sans_fin: AtomicBool::new(false),
             volume_avant_egaliseur: AtomicU32::new(u32::MAX),
+            volume_avant_convolution: AtomicU32::new(u32::MAX),
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
             pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
@@ -1647,15 +1652,27 @@ impl LocalOutput {
     /// locale est un gain numérique linéaire (`effective_volume_units`). 0
     /// (gain gardé) sans référence ; 1 à volume nul (rien ne sort).
     fn borne_de_remontee(&self) -> f64 {
-        let avant = self.volume_avant_egaliseur.load(Ordering::SeqCst);
+        self.borne_depuis(self.volume_avant_egaliseur.load(Ordering::SeqCst), 0.0)
+    }
+
+    /// Le rapport `avant / courant` borné à 1 ; `sans_repere` quand `avant`
+    /// n'a pas été retenu (`u32::MAX`).
+    fn borne_depuis(&self, avant: u32, sans_repere: f64) -> f64 {
         let courant = self.volume_de_l_auditeur();
         if avant == u32::MAX {
-            0.0
+            sans_repere
         } else if courant == 0 {
             1.0
         } else {
             (f64::from(avant) / f64::from(courant)).min(1.0)
         }
+    }
+
+    /// rc14 (Didier) — la borne de remontée de la marge d'un filtre de
+    /// convolution retiré : la règle de #6741, depuis le volume retenu à la
+    /// pose du filtre ; sans repère, le signal sec (rien n'a bougé).
+    fn borne_de_la_convolution(&self) -> f64 {
+        self.borne_depuis(self.volume_avant_convolution.load(Ordering::SeqCst), 1.0)
     }
 
     fn borner_la_remontee(&self, eq: &mut Option<super::super::audio::eq::EqProcessor>) {
@@ -1671,6 +1688,13 @@ impl LocalOutput {
     fn reborner_le_preampli_garde(&self) {
         if let Ok(mut eq) = self.eq.lock() {
             self.borner_la_remontee(&mut eq);
+        }
+        // rc14 (Didier) — la marge gardée d'un filtre de convolution retiré.
+        let borne = self.borne_de_la_convolution();
+        if let Ok(mut c) = self.convolver.lock()
+            && let Some(c) = c.as_mut()
+        {
+            c.borner_la_remontee(borne);
         }
     }
 
@@ -2100,8 +2124,22 @@ impl LocalOutput {
             )),
             _ => None,
         };
+        let borne = self.borne_de_la_convolution();
+        let volume = self.volume_de_l_auditeur();
         {
             let mut actif = self.convolver.lock().unwrap();
+            // rc14 (Didier) — retenir le volume quand un filtre à marge arrive
+            // là où aucune marge ne tournait ; borner la remontée de celle
+            // qu'on retire (jamais au-dessus du niveau d'avant le filtre).
+            if nouveau.as_ref().is_some_and(|n| n.reserve_db() < 0.0)
+                && !actif.as_ref().is_some_and(|a| a.porte_une_marge())
+            {
+                self.volume_avant_convolution
+                    .store(volume, Ordering::SeqCst);
+            }
+            if let Some(a) = actif.as_mut() {
+                a.borner_la_remontee(borne);
+            }
             // Le droit est relu SOUS le verrou : un retrait du Premium
             // concurrent (`set_convolution_autorisee`) n'est jamais ignoré.
             let nouveau = match nouveau {
@@ -2172,9 +2210,11 @@ impl LocalOutput {
                 .unwrap_or(0);
             // Les moteurs retirés sortent du verrou avant d'être libérés.
             let mut a_liberer = [None, None];
+            let borne = self.borne_de_la_convolution();
             if let Ok(mut c) = self.convolver.lock()
                 && let Some(conv) = c.as_mut()
             {
+                conv.borner_la_remontee(borne);
                 a_liberer = conv.eteindre_en_fondu_en_rendant(trames);
                 tracing::info!(device = %self.device_name, trames, "convolution_eteinte_sans_licence");
             }

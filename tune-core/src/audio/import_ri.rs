@@ -142,6 +142,51 @@ impl JeuImporte {
     }
 }
 
+/// rc14 (Didier) — clé i18n de l'avertissement « ce filtre amplifie » :
+/// l'écran la traduit avec les paramètres bruts de [`AvertissementDeGain`].
+pub const CLE_GAIN_POSITIF: &str = "api.roomCorrection.import.filter_gain_positive";
+
+/// rc14 (Didier) — un filtre du jeu qui AMPLIFIE (gain maximal au-dessus de
+/// 0 dB) : il est importé tel quel, l'utilisateur est prévenu. La marge est
+/// celle que le moteur appliquera en Auto à la cadence du fichier.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AvertissementDeGain {
+    /// Code stable : `filter_gain_positive`.
+    pub code: &'static str,
+    /// [`CLE_GAIN_POSITIF`].
+    pub message_key: &'static str,
+    /// Le nom d'origine de la réponse.
+    pub name: String,
+    pub sample_rate: u32,
+    /// `max |H(f)|`, dB, pire canal.
+    pub gain_max_db: f64,
+    /// La marge automatique correspondante (dB, ≤ 0).
+    pub headroom_db: f64,
+}
+
+/// rc14 (Didier) — les avertissements de gain d'un jeu importé, une FFT par
+/// réponse et par canal (hors temps réel). Le filtre n'est JAMAIS modifié.
+pub fn avertissements_de_gain(jeu: &JeuImporte) -> Vec<AvertissementDeGain> {
+    jeu.reponses
+        .iter()
+        .filter_map(|r| {
+            let g = super::convolver::courbe_fft::gain_max_db(&r.taps, r.sample_rate)?;
+            let marge = crate::tess::etages_fixes::marge_de_convolution(
+                &crate::tess::chaine::Headroom::Auto {},
+                g,
+            );
+            (marge.requise_db < 0.0).then(|| AvertissementDeGain {
+                code: "filter_gain_positive",
+                message_key: CLE_GAIN_POSITIF,
+                name: r.nom.clone(),
+                sample_rate: r.sample_rate,
+                gain_max_db: (g * 100.0).round() / 100.0,
+                headroom_db: (marge.requise_db * 100.0).round() / 100.0,
+            })
+        })
+        .collect()
+}
+
 /// `true` si les octets commencent comme une archive zip.
 pub fn est_une_archive_zip(octets: &[u8]) -> bool {
     octets.starts_with(b"PK\x03\x04") || octets.starts_with(b"PK\x05\x06")

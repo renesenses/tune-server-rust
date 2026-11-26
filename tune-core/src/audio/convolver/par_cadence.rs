@@ -399,6 +399,46 @@ pub(super) fn ri_a_la_cadence(variante: &Variante, vers: u32) -> Result<Arc<[Vec
     Ok(ri)
 }
 
+/// rc14 (Didier) — le gain maximal (`max |H(f)|`, dB, pire canal) de la RI
+/// de `variante` À LA CADENCE `vers`, donc APRÈS rééchantillonnage : le
+/// repli garde la somme des coefficients (le gain continu), pas la crête du
+/// spectre, et un filtre réexporté à une autre cadence n'a pas le même gain.
+/// Calculé une fois par (contenu, cadence) et gardé en cache ; jamais dans
+/// le fil audio (construction du moteur, préchauffe, chemin du signal).
+pub(super) fn gain_max_a_la_cadence(variante: &Variante, vers: u32) -> Result<f64, String> {
+    gain_max_avec(variante, vers, None)
+}
+
+/// [`gain_max_a_la_cadence`], avec la RI à cette cadence déjà en main (la
+/// construction du moteur) : une RI trop grosse pour le cache n'est pas
+/// rééchantillonnée deux fois.
+pub(super) fn gain_max_avec(
+    variante: &Variante,
+    vers: u32,
+    taps: Option<&[Vec<f32>]>,
+) -> Result<f64, String> {
+    let cle = (variante.cle.clone(), vers);
+    if let Some(g) = GAINS.lock().ok().and_then(|c| c.get(&cle).copied()) {
+        return Ok(g);
+    }
+    let g = match taps {
+        Some(t) => super::courbe_fft::gain_max_db(t, vers),
+        None => super::courbe_fft::gain_max_db(&ri_a_la_cadence(variante, vers)?, vers),
+    }
+    .unwrap_or(0.0);
+    if let Ok(mut c) = GAINS.lock() {
+        if c.len() >= GAINS_MAX {
+            c.clear();
+        }
+        c.insert(cle, g);
+    }
+    Ok(g)
+}
+
+/// Le cache des gains maximaux : un `f64` par (contenu, cadence).
+const GAINS_MAX: usize = 256;
+static GAINS: LazyLock<Mutex<HashMap<CleCache, f64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Octets occupés par le cache (tests, diagnostic).
 pub fn octets_en_cache() -> usize {
     CACHE.lock().map(|c| c.octets).unwrap_or(0)
@@ -449,6 +489,9 @@ pub struct JeuDeZone {
     pub principal: String,
     pub supplementaires: Vec<String>,
     pub reechantillonner: bool,
+    /// rc14 (Didier) — le headroom de la chaîne TESS de la zone : il décide
+    /// de la marge que le moteur applique au filtre.
+    pub headroom: crate::tess::chaine::Headroom,
 }
 
 impl JeuDeZone {
@@ -478,6 +521,7 @@ impl JeuDeZone {
             principal,
             supplementaires,
             reechantillonner,
+            headroom: crate::tess::egaliseurs_en_serie::headroom_de_zone(settings, zone_id),
         }
     }
 
@@ -505,6 +549,7 @@ impl JeuDeZone {
 
     pub fn charger(&self) -> Result<ConvolverConfig, String> {
         ConvolverConfig::depuis_jeu(&self.chemins(), self.reechantillonner)
+            .map(|c| c.avec_headroom(self.headroom))
     }
 }
 

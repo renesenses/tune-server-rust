@@ -32,6 +32,9 @@ mod epreuves_tests;
 pub use finale::{EtapeFinaleChoisie, choisir_etape_finale, placement_du_volume};
 pub use headroom::{EtageHeadroom, ID_HEADROOM};
 pub use mise_en_forme::{QuantificationMiseEnForme, formeur_pour};
-pub use niveau::{BilanDeNiveau, EntreesNiveau, GainDeRendu};
+pub use niveau::{
+    BilanDeNiveau, EntreesNiveau, GainDeRendu, MARGE_DE_SECURITE_CONVOLUTION_DB, MargeDeConvolution,
+    marge_de_convolution,
+};
 pub use rampe::{RAMPE_MS, decibels, lineaire};
 pub use volume::{ConsigneVolume, EtageVolume, ID_VOLUME};

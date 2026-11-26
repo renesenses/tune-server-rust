@@ -421,6 +421,8 @@ fn balayer_les_depots_provisoires(ir_dir: &std::path::Path) {
 struct JeuPose {
     jeu: tune_core::audio::import_ri::JeuImporte,
     chemin_principal: String,
+    /// rc14 (Didier) — les filtres du jeu qui amplifient (importés tels quels).
+    avertissements_de_gain: Vec<tune_core::audio::import_ri::AvertissementDeGain>,
 }
 
 /// Refus d'un import, au format de l'API.
@@ -692,9 +694,20 @@ fn importer_bloquant(
     for cote in ["L", "R"] {
         std::fs::remove_file(ir_dir.join(format!("zone_{zone_id}_{cote}.wav"))).ok();
     }
+    let avertissements_de_gain = import_ri::avertissements_de_gain(&jeu);
+    for a in &avertissements_de_gain {
+        tracing::info!(
+            zone_id,
+            nom = %a.name,
+            sample_rate = a.sample_rate,
+            gain_max_db = a.gain_max_db,
+            "convolver_import_filtre_qui_amplifie"
+        );
+    }
     Ok(JeuPose {
         jeu,
         chemin_principal,
+        avertissements_de_gain,
     })
 }
 
@@ -728,6 +741,7 @@ async fn importer_le_jeu(
     let JeuPose {
         jeu,
         chemin_principal,
+        avertissements_de_gain,
     } = match pose {
         Ok(Ok(p)) => p,
         Ok(Err(reponse)) => return reponse,
@@ -766,6 +780,18 @@ async fn importer_le_jeu(
         "ignored": jeu.ecartes.iter().map(|(n, r)| json!({"name": n, "reason": r})).collect::<Vec<_>>(),
         "active": true,
         "warning": avertissement,
+        // rc14 (Didier) — un filtre qui amplifie : clé i18n et paramètres
+        // bruts (nom, cadence, gain maximal, marge automatique).
+        "gain_warnings": avertissements_de_gain.iter().map(|a| json!({
+            "code": a.code,
+            "message_key": a.message_key,
+            "params": {
+                "name": a.name,
+                "sample_rate": a.sample_rate,
+                "gain_db": a.gain_max_db,
+                "headroom_db": a.headroom_db,
+            },
+        })).collect::<Vec<_>>(),
         "applies_to": if is_local { "local" } else { "network (transcode)" },
     }))
     .into_response()

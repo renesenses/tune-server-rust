@@ -25,6 +25,10 @@ pub mod courbe_fft;
 #[path = "convolver/banc_f64_tests.rs"]
 mod banc_f64_tests;
 
+#[cfg(test)]
+#[path = "convolver/marge_tests.rs"]
+mod marge_tests;
+
 /// Réponse impulsionnelle en domaine temporel, indépendante d'un flux.
 ///
 /// La configuration conserve volontairement les taps et leur cadence source :
@@ -44,6 +48,10 @@ pub struct ConvolverConfig {
     reechantillonner: bool,
     /// Le chemin du fichier principal : clé de l'état effectif publié.
     cle_jeu: Option<String>,
+    /// rc14 (Didier) — le headroom de la chaîne de la zone : en Auto, le
+    /// moteur applique la marge que demande le gain maximal du filtre ; en
+    /// manuel, rien n'est forcé (voir [`Self::marge_pour`]).
+    headroom: crate::tess::chaine::Headroom,
 }
 
 impl ConvolverConfig {
@@ -62,6 +70,7 @@ impl ConvolverConfig {
             sample_rate,
             reechantillonner: true,
             cle_jeu: None,
+            headroom: Default::default(),
         })
     }
 
@@ -96,6 +105,7 @@ impl ConvolverConfig {
             variantes: variantes.into(),
             reechantillonner,
             cle_jeu: Some(principal.clone()),
+            headroom: Default::default(),
         })
     }
 
@@ -121,6 +131,39 @@ impl ConvolverConfig {
 
     pub fn reechantillonnage_autorise(&self) -> bool {
         self.reechantillonner
+    }
+
+    /// rc14 (Didier) — le headroom de la chaîne, dont dépend la marge que le
+    /// moteur applique (Auto par défaut).
+    pub fn avec_headroom(mut self, headroom: crate::tess::chaine::Headroom) -> Self {
+        self.headroom = headroom;
+        self
+    }
+
+    /// rc14 (Didier) — la marge de la convolution pour un flux à `cible` Hz :
+    /// le gain maximal du filtre QUI SERVIRA ce flux (rééchantillonné au
+    /// besoin), calculé une fois et mis en cache, puis la règle de
+    /// [`crate::tess::etages_fixes::marge_de_convolution`]. Hors temps réel.
+    pub fn marge_pour(
+        &self,
+        cible: u32,
+    ) -> Result<crate::tess::etages_fixes::MargeDeConvolution, String> {
+        self.marge_avec(cible, None)
+    }
+
+    fn marge_avec(
+        &self,
+        cible: u32,
+        taps: Option<&[Vec<f32>]>,
+    ) -> Result<crate::tess::etages_fixes::MargeDeConvolution, String> {
+        self.choix_pour(cible)?;
+        let (i, _) = par_cadence::planifier(&self.variantes, cible)
+            .ok_or("aucun fichier de réponse impulsionnelle")?;
+        let gain = par_cadence::gain_max_avec(&self.variantes[i], cible, taps)?;
+        Ok(crate::tess::etages_fixes::marge_de_convolution(
+            &self.headroom,
+            gain,
+        ))
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -192,7 +235,9 @@ impl ConvolverConfig {
         }
         for &c in cadences {
             if let Some((i, _)) = par_cadence::planifier(&self.variantes, c) {
-                if let Err(e) = par_cadence::ri_a_la_cadence(&self.variantes[i], c) {
+                // Le gain maximal passe par la RI rééchantillonnée : la
+                // préchauffer, c'est aussi préparer son gain.
+                if let Err(e) = par_cadence::gain_max_a_la_cadence(&self.variantes[i], c) {
                     tracing::warn!(cadence = c, error = %e, "convolver_ir_prechauffe_ecartee");
                 }
             }
@@ -227,7 +272,22 @@ impl ConvolverConfig {
             ));
         };
         par_cadence::noter_le_choix(self.cle_jeu.as_deref(), &choix);
-        Ok(Convolver::new(&adapted, block_size))
+        // rc14 (Didier) — la marge du filtre, calculée ICI (hors du fil
+        // audio), pour la cadence réellement servie.
+        let marge = self.marge_avec(target_sample_rate, Some(&taps))?;
+        if marge.appliquee_db < 0.0 || marge.insuffisante {
+            tracing::info!(
+                jeu = self.cle_jeu.as_deref().unwrap_or("(mémoire)"),
+                cadence = target_sample_rate,
+                gain_max_db = marge.gain_max_db,
+                marge_db = marge.appliquee_db,
+                requise_db = marge.requise_db,
+                insuffisante = marge.insuffisante,
+                "convolver_marge"
+            );
+        }
+        Ok(Convolver::new(&adapted, block_size)
+            .avec_reserve(marge.appliquee_db, target_sample_rate))
     }
 }
 
@@ -345,6 +405,40 @@ pub struct Convolver<T: Flottant = f64> {
     tampon_bascule: Vec<T>,
     /// Conversion des entrées `f32` et PCM, un bloc au plus.
     tampon_es: Vec<f64>,
+    /// rc14 (Didier) — la marge du filtre (dB, ≤ 0), DÉJÀ portée par les
+    /// partitions ([`Self::avec_reserve`]) : aucun calcul de plus par
+    /// échantillon. 0 : partitions intactes, au bit près.
+    reserve_db: f64,
+    /// rc14 — gain de l'entrée SÈCHE (fondu d'extinction, moteur éteint).
+    /// 1 hors retrait. Au retrait d'un filtre qui portait une marge, il part
+    /// de cette marge (le niveau ne saute pas) puis remonte ([`RemonteeSec`]).
+    gain_sec: f64,
+    remontee: Option<RemonteeSec>,
+    /// rc14 — la cible de la remontée, ≤ 1 : le niveau d'avant le filtre,
+    /// volume compris ([`Self::borner_la_remontee`]). 1 par défaut.
+    borne: f64,
+    /// Cadence du flux (durée de la remontée).
+    cadence: u32,
+}
+
+/// rc14 (Didier) — la remontée du gain sec quand un filtre qui portait une
+/// marge est retiré : en [`crate::audio::eq::REMONTEE_RAPIDE_TESS_MS`], comme
+/// un égaliseur décoché (`EqProcessor::rendre_le_sec_vite`), jamais au-dessus
+/// de la borne.
+#[derive(Debug, Clone, Copy)]
+struct RemonteeSec {
+    depart: f64,
+    vers: f64,
+    total: usize,
+    fait: usize,
+}
+
+impl RemonteeSec {
+    fn gain(&self) -> f64 {
+        let t = (self.fait as f64 / self.total.max(1) as f64).clamp(0.0, 1.0);
+        let forme = 0.5 - 0.5 * (std::f64::consts::PI * t).cos();
+        self.depart + (self.vers - self.depart) * forme
+    }
 }
 
 impl<T: Flottant> Convolver<T> {
@@ -435,7 +529,109 @@ impl<T: Flottant> Convolver<T> {
             retraite: None,
             tampon_bascule: vec![zero; block_size * channels],
             tampon_es: vec![0.0; block_size * channels],
+            reserve_db: 0.0,
+            gain_sec: 1.0,
+            remontee: None,
+            borne: 1.0,
+            cadence: 48_000,
         }
+    }
+
+    /// rc14 (Didier) — porter la marge du filtre (`reserve_db` ≤ 0) DANS ses
+    /// partitions, à la construction : la sortie convoluée est atténuée d'autant,
+    /// sans un calcul de plus par échantillon. 0 dB (ou une valeur illisible)
+    /// ne touche à rien. `cadence` : celle du flux (durée de la remontée au
+    /// retrait du filtre).
+    pub fn avec_reserve(mut self, reserve_db: f64, cadence: u32) -> Self {
+        self.cadence = cadence.max(1);
+        if !(reserve_db.is_finite() && reserve_db < 0.0) {
+            return self;
+        }
+        let g = T::de_f64(10f64.powf(reserve_db / 20.0));
+        for canal in &mut self.ir_partitions {
+            for partition in canal {
+                for h in partition.iter_mut() {
+                    *h = Complex::new(h.re * g, h.im * g);
+                }
+            }
+        }
+        self.reserve_db = reserve_db;
+        self
+    }
+
+    /// La marge que ce moteur applique au filtre (dB, ≤ 0).
+    pub fn reserve_db(&self) -> f64 {
+        self.reserve_db
+    }
+
+    /// Le moteur porte-t-il une marge (en service, ou gardée après le retrait
+    /// du filtre et pas encore rendue) ?
+    pub fn porte_une_marge(&self) -> bool {
+        (self.reserve_db < 0.0 && !self.eteint) || self.gain_sec < 1.0 || self.remontee.is_some()
+    }
+
+    /// rc14 — le gain sec atteint (1 hors retrait d'un filtre à marge).
+    pub fn gain_sec(&self) -> f64 {
+        self.remontee.map_or(self.gain_sec, |r| r.gain())
+    }
+
+    /// rc14 (Didier) — borner la remontée du gain sec au niveau d'avant le
+    /// filtre, volume compris : `borne` est le rapport du volume d'avant la
+    /// pose du filtre au volume courant (comme `EqProcessor::borner_la_remontee`,
+    /// #6741). Jamais au-dessus de 1, jamais sous le gain atteint (la remontée
+    /// ne fait pas baisser le niveau) ; une borne illisible garde le gain. Une
+    /// remontée en cours repart du gain atteint : pas de saut.
+    pub fn borner_la_remontee(&mut self, borne: f64) {
+        let borne = if borne.is_finite() && borne > 0.0 {
+            borne.min(1.0)
+        } else {
+            0.0
+        };
+        if (borne - self.borne).abs() < 1e-9 {
+            return;
+        }
+        self.borne = borne;
+        if self.eteint || self.fondu.is_some() {
+            self.lancer_la_remontee();
+        }
+    }
+
+    /// Lancer (ou relancer depuis le gain atteint) la remontée du gain sec.
+    fn lancer_la_remontee(&mut self) {
+        let depart = self.gain_sec();
+        let vers = self.borne.min(1.0).max(depart);
+        self.gain_sec = depart;
+        if (vers - depart).abs() < 1e-12 {
+            self.remontee = None;
+            return;
+        }
+        let total = (f64::from(self.cadence)
+            * f64::from(crate::audio::eq::REMONTEE_RAPIDE_TESS_MS)
+            / 1000.0)
+            .max(1.0) as usize;
+        self.remontee = Some(RemonteeSec {
+            depart,
+            vers,
+            total,
+            fait: 0,
+        });
+    }
+
+    /// Le gain sec de la trame courante, puis un pas de la remontée.
+    #[inline]
+    fn gain_sec_de_la_trame(&mut self) -> f64 {
+        let Some(mut r) = self.remontee else {
+            return self.gain_sec;
+        };
+        let g = r.gain();
+        r.fait += 1;
+        if r.fait >= r.total {
+            self.gain_sec = r.vers;
+            self.remontee = None;
+        } else {
+            self.remontee = Some(r);
+        }
+        g
     }
 
     /// Construire le moteur depuis des prises `f32` (lecture d'un WAV, jeu
@@ -482,6 +678,14 @@ impl<T: Flottant> Convolver<T> {
             self.eteint = true;
         } else {
             self.fondu = Some((trames, trames));
+            // rc14 (Didier) — la marge du filtre reste sur l'entrée sèche
+            // pendant le fondu : le niveau ne saute pas de la marge en 20 ms.
+            // Elle remonte ensuite vers le niveau d'avant le filtre, en
+            // `REMONTEE_RAPIDE_TESS_MS`, jamais au-dessus (la borne).
+            if self.reserve_db < 0.0 {
+                self.gain_sec = 10f64.powf(self.reserve_db / 20.0);
+                self.lancer_la_remontee();
+            }
         }
         rendus
     }
@@ -693,9 +897,17 @@ impl<T: Flottant> Convolver<T> {
                 self.direct_retarde[c].push_back(x);
             }
             if self.eteint {
-                for c in 0..ch {
-                    samples[frame * ch + c] =
-                        self.direct_retarde[c].pop_front().unwrap_or_default();
+                if self.gain_sec == 1.0 && self.remontee.is_none() {
+                    for c in 0..ch {
+                        samples[frame * ch + c] =
+                            self.direct_retarde[c].pop_front().unwrap_or_default();
+                    }
+                } else {
+                    let g = T::de_f64(self.gain_sec_de_la_trame());
+                    for c in 0..ch {
+                        samples[frame * ch + c] =
+                            self.direct_retarde[c].pop_front().unwrap_or_default() * g;
+                    }
                 }
                 continue;
             }
@@ -716,12 +928,19 @@ impl<T: Flottant> Convolver<T> {
             let gain_convolue = self
                 .fondu
                 .map(|(restant, total)| restant as f64 / total as f64);
+            // rc14 — pendant le fondu d'extinction, l'entrée sèche porte la
+            // marge du filtre retiré, qui remonte (1 sans marge).
+            let sec = if gain_convolue.is_some() {
+                self.gain_sec_de_la_trame()
+            } else {
+                1.0
+            };
             for c in 0..ch {
                 let convolue = self.output_buf[c].pop_front().unwrap_or_default();
                 let direct = self.direct_retarde[c].pop_front().unwrap_or_default();
                 samples[frame * ch + c] = match gain_convolue {
                     None => convolue,
-                    Some(g) => convolue * T::de_f64(g) + direct * T::de_f64(1.0 - g),
+                    Some(g) => convolue * T::de_f64(g) + direct * T::de_f64((1.0 - g) * sec),
                 };
             }
             if let Some((restant, total)) = self.fondu {
