@@ -79,7 +79,7 @@ pub(super) async fn list_proposals(
 /// La décision part ensuite au cloud au nom du compte : administrateur, ou
 /// cette machine sans authentification (`AdminOuCetteMachine`).
 pub(super) async fn decide_proposal(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<DecisionBody>,
@@ -105,7 +105,7 @@ pub(super) async fn decide_proposal(
 /// L'activer n'a donc jamais d'effet immediat sur la bibliotheque — ce qui
 /// laisse le temps de la desactiver si on s'est trompe de bouton.
 pub(super) async fn set_auto_apply(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     Json(body): Json<AutoApplyBody>,
 ) -> impl IntoResponse {
