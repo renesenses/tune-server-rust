@@ -63,7 +63,13 @@ services:
       # mandataire inverse devant Tune, cette variable l'ouvre aux appareils
       # du reseau local (jamais a la passerelle du conteneur). Memes reserves
       # que ci-dessus : pas en mode pont, ni sous Docker Desktop, ni derriere
-      # un mandataire, ni dans une VM en NAT.
+      # un mandataire, ni dans une VM en NAT, ni sous Podman sans root (son
+      # reseau par defaut fait voir toutes les connexions comme venant de
+      # 10.0.2.100). Un relais TCP pose sur une autre machine du reseau n'est
+      # pas detectable : dans ce cas, allumer le reglage « Administration
+      # depuis cette machine seulement ». Les plages d'un reseau superpose
+      # peuvent etre retirees du reseau local par
+      # TUNE_ADMIN_LAN_EXCLUDED_RANGES (ex. `fd12:3456:789a::/48`).
       # - TUNE_ADMIN_LAN_IN_CONTAINER=1
       # Spotify Connect (librespot)
       # - LIBRESPOT_NAME=Tune
