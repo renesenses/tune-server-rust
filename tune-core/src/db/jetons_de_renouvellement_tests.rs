@@ -46,6 +46,7 @@ pub(crate) fn epreuves_communes(db: Arc<dyn DbBackend>, id: i64) {
     mot_de_passe_change(&db, id);
     revocations(&db, id);
     jamais_de_jeton_en_clair(&db, id);
+    dernier_renouvellement_par_famille(&db, id);
 }
 
 fn rotation(db: &Arc<dyn DbBackend>, id: i64) {
@@ -268,6 +269,21 @@ fn jamais_de_jeton_en_clair(db: &Arc<dyn DbBackend>, id: i64) {
         .unwrap()
         .unwrap();
     assert_eq!(stockee[0].as_string(), Some(empreinte(&b.jeton)));
+}
+
+/// La date du dernier jeton émis, famille par famille : la connexion, puis
+/// chaque renouvellement (rc14, éviction au plafond par compte).
+fn dernier_renouvellement_par_famille(db: &Arc<dyn DbBackend>, id: i64) {
+    let repo = JetonsDeRenouvellementRepo::with_backend(db.clone());
+    let t = T0 + 10 * DUREE_RENOUVELLEMENT;
+    let ancienne = repo.ouvrir(id, None, t).unwrap();
+    let b = repo.renouveler(&ancienne.jeton, CLE, t + 86400).unwrap();
+    repo.renouveler(&b.jeton, CLE, t + 5 * 86400).unwrap();
+    let recente = repo.ouvrir(id, None, t + 2 * 86400).unwrap();
+    let vus = repo.derniers_renouvellements(id);
+    assert_eq!(vus.get(&ancienne.famille), Some(&(t + 5 * 86400)));
+    assert_eq!(vus.get(&recente.famille), Some(&(t + 2 * 86400)));
+    assert!(repo.derniers_renouvellements(id + 1_000_000).is_empty());
 }
 
 /// Les mêmes épreuves sur PostgreSQL, table créée par le script 125.
