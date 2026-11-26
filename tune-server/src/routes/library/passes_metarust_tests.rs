@@ -243,6 +243,7 @@ fn une_passe_coupee_par_un_redemarrage_se_reprend() {
 /// Sans jeton Discogs, la passe ne part pas : `412`, comme la fiche.
 #[tokio::test]
 async fn sans_jeton_la_passe_discogs_ne_part_pas() {
+    let _pauses = crate::pauses_de_fond_tests::isoler().await;
     let e = etat();
     let (s, v) = appeler(&e, "POST", "/discogs-all").await;
     assert_eq!(s, StatusCode::PRECONDITION_FAILED, "{v}");
