@@ -2054,6 +2054,7 @@ fn code_de_refus_reseau(code: &str) -> &'static str {
         r::VOIE_NON_PORTEE,
         r::LECTEUR_SANS_SONDE,
         r::PISTE_TROP_LOURDE,
+        r::TROP_LENT_POUR_LE_FICHIER,
         r::STRICT,
         E::FrequenceFixe.code(),
         E::PremiumRequis.code(),
@@ -2117,6 +2118,7 @@ pub(super) fn cle_du_refus_selon_la_plateforme(raison: &str, os: &str) -> &'stat
         "progressive_stream_not_supported" | "track_too_heavy_for_upsampling" => {
             "upsampling_network_file_only"
         }
+        "upsampling_too_slow_for_file" => "upsampling_network_too_slow",
         _ => "upsampling_not_applied",
     }
 }

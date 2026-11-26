@@ -409,6 +409,10 @@ pub mod refus_reseau {
     /// La piste, une fois suréchantillonnée, serait trop lourde pour le
     /// fichier refait (mémoire de la machine).
     pub const PISTE_TROP_LOURDE: &str = "track_too_heavy_for_upsampling";
+    /// Le fichier refait mettrait trop longtemps avant la première note sur
+    /// cette machine (voir [`super::delai_estime_du_fichier_s`]) : on ne
+    /// suréchantillonne pas plutôt que d'imposer un long silence.
+    pub const TROP_LENT_POUR_LE_FICHIER: &str = "upsampling_too_slow_for_file";
     /// Bit-perfect strict : aucune conversion de cadence.
     pub const STRICT: &str = "strict_bitperfect";
 }
@@ -436,6 +440,41 @@ pub fn cible_reseau(
     choix
         .negocier(source_hz, &acceptees)
         .ok_or(refus_reseau::AUCUNE_CADENCE_PLUS_HAUTE)
+}
+
+/// rc14 — le délai au-delà duquel une piste n'est pas suréchantillonnée par
+/// le fichier refait : la première note ne doit jamais attendre plus que
+/// cela (décision du 26/11, tant que le relais progressif ne porte pas
+/// l'étage).
+pub const DELAI_MAX_AVANT_LA_PREMIERE_NOTE_S: f64 = 3.0;
+
+/// Ce que coûte le fichier refait autour de l'étage (décodage, encodage FLAC
+/// de L fois plus de données, écriture), en multiple du coût de l'étage seul.
+/// Mesuré le 26/11 (banc `banc_charge_piste_de_10_minutes_44_1_vers_176_4`,
+/// Ryzen 9 9950X) : 7,3 s pour le fichier, 4,5 s pour l'étage seul, soit
+/// ×1,6 ; arrondi à ×2 par prudence.
+pub const FACTEUR_DU_FICHIER: f64 = 2.0;
+
+/// rc14 — le délai ESTIMÉ avant la première note d'une piste de `duree_s`
+/// secondes, suréchantillonnée à `vers` par le fichier refait, sur CETTE
+/// machine : le facteur temps réel que le test de la machine a mesuré pour
+/// `filtre` au couple de référence (au moins aussi coûteux que `vers`),
+/// ramené à `vers`, multiplié par [`FACTEUR_DU_FICHIER`]. `None` : aucune
+/// mesure pour ce filtre et cette famille (on ne sait pas : on s'abstient).
+pub fn delai_estime_du_fichier_s(
+    verdict: &VerdictMachine,
+    filtre: &str,
+    vers: u32,
+    duree_s: f64,
+) -> Option<f64> {
+    let (de, ref_vers) = greffon::machine_reference_pair(vers)?;
+    let facteur = verdict
+        .results
+        .iter()
+        .find(|r| r.filter == filtre && r.from_hz == de && r.to_hz == ref_vers)
+        .map(|r| r.realtime_factor)
+        .filter(|f| *f > 0.0)?;
+    Some(duree_s.max(0.0) / facteur * (f64::from(vers) / f64::from(ref_vers)) * FACTEUR_DU_FICHIER)
 }
 
 /// rc14 — le MÊME greffon (une [`Instance`]) en `f64`, pour la chaîne

@@ -44,6 +44,9 @@ pub(crate) struct SurechPlanifie {
     pub(crate) proposees: Vec<u32>,
     /// La cible a été lue pour un fichier FLAC (sinon WAV/LPCM).
     pub(crate) flac: bool,
+    /// Le verdict du test de la machine : de quoi estimer le délai du
+    /// fichier refait (`delai_estime_du_fichier_s`).
+    pub(crate) verdict: su::VerdictMachine,
 }
 
 impl SurechPlanifie {
@@ -338,6 +341,7 @@ impl PlaybackOrchestrator {
             .unwrap_or_default();
         match su::cible_reseau(&choix, d.source_hz, &proposees, d.plafond_zone) {
             Ok(vers) => Ok(SurechPlanifie {
+                verdict: choix.verdict,
                 reglages: choix.reglages,
                 de: d.source_hz,
                 vers,

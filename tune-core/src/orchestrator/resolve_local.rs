@@ -4084,13 +4084,58 @@ impl PlaybackOrchestrator {
                         decision.channels,
                         format.out_bd,
                     ));
-            if porte {
+            // Décision du 26/11 : jamais de long silence avant la première
+            // note. Tant que le relais progressif ne porte pas l'étage, une
+            // piste dont le fichier refait prendrait plus de
+            // `DELAI_MAX_AVANT_LA_PREMIERE_NOTE_S` sur CETTE machine n'est
+            // pas suréchantillonnée — sauf si sa rendition est déjà en cache.
+            let delai = crate::audio::surechantillonnage::delai_estime_du_fichier_s(
+                &p.verdict,
+                &p.reglages.filter,
+                p.vers,
+                decision.track_duration_ms.max(0) as f64 / 1000.0,
+            );
+            let trop_lent = porte
+                && delai.is_none_or(|d| {
+                    d > crate::audio::surechantillonnage::DELAI_MAX_AVANT_LA_PREMIERE_NOTE_S
+                })
+                && {
+                    let mut essai = FormatDeSortie {
+                        out_sr: p.vers,
+                        out_mime: format.out_mime.clone(),
+                        out_ext: format.out_ext.clone(),
+                        target_format_str: format.target_format_str.clone(),
+                        info: format.info.clone(),
+                        surech: Some(p.clone()),
+                        ..format
+                    };
+                    essai.info.sample_rate = p.vers;
+                    !self
+                        .chemin_du_rendu_en_cache(req, decision, &essai)
+                        .is_some_and(|cp| crate::transcode_cache::is_hit(&cp))
+                };
+            if trop_lent {
+                info!(
+                    zone_id = req.zone_id,
+                    delai_estime_s = ?delai,
+                    duree_ms = decision.track_duration_ms,
+                    filtre = %p.reglages.filter,
+                    vers_hz = p.vers,
+                    "upsampler_network_too_slow_for_file"
+                );
+                self.ecarter_le_surechantillonnage(
+                    req,
+                    decision,
+                    refus_reseau::TROP_LENT_POUR_LE_FICHIER,
+                );
+            } else if porte {
                 info!(
                     zone_id = req.zone_id,
                     de_hz = p.de,
                     vers_hz = p.vers,
                     cible = %format.target_format_str,
                     profondeur = format.out_bd,
+                    delai_estime_s = ?delai,
                     "upsampler_network_file_transcode"
                 );
                 format.out_sr = p.vers;

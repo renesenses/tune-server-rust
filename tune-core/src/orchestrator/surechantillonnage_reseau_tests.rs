@@ -72,7 +72,13 @@ fn orchestrateur() -> PlaybackOrchestrator {
     )
 }
 
+/// Une machine rapide (×1 000 temps réel au couple de référence) : le
+/// fichier refait d'une piste de 5 min est prêt en 0,3 s estimées.
 fn verdict() -> su::VerdictMachine {
+    verdict_a(1_000.0)
+}
+
+fn verdict_a(temps_reel: f64) -> su::VerdictMachine {
     let mut results = Vec::new();
     for f in su::greffon::OFFERED_FILTERS {
         for (de, vers) in [
@@ -85,7 +91,7 @@ fn verdict() -> su::VerdictMachine {
                 filter: f.to_string(),
                 from_hz: de,
                 to_hz: vers,
-                realtime_factor: 10.0,
+                realtime_factor: temps_reel,
                 admitted: true,
             });
         }
@@ -120,6 +126,10 @@ fn zone_dlna(orch: &PlaybackOrchestrator, uuid: &str, sink: &[&str]) -> i64 {
 }
 
 fn piste(orch: &PlaybackOrchestrator, id: i64, format: &str, cadence: u32) {
+    piste_de(orch, id, format, cadence, 300_000);
+}
+
+fn piste_de(orch: &PlaybackOrchestrator, id: i64, format: &str, cadence: u32, duree_ms: u64) {
     orch.db
         .execute(
             "INSERT OR IGNORE INTO artists (id, name) VALUES (1, 'Banc')",
@@ -138,7 +148,7 @@ fn piste(orch: &PlaybackOrchestrator, id: i64, format: &str, cadence: u32) {
                 "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
                  duration_ms, sample_rate, bit_depth, channels) \
                  VALUES ({id}, 'Piste', 1, 1, '/m/banc/piste-{id}.{format}', '{format}', \
-                 300000, {cadence}, 16, 2)"
+                 {duree_ms}, {cadence}, 16, 2)"
             ),
             &[],
         )
@@ -265,6 +275,56 @@ async fn pure_refuse_et_reste_bit_perfect() {
     assert_eq!(f.out_sr, 44_100, "PURE : la cadence de la source");
     let etat = orch.surechantillonnage_reseau_de_la_zone(zone_id).unwrap();
     assert_eq!(etat.reason.as_deref(), Some(su::refus_reseau::PURE));
+}
+
+/// Décision du 26/11 : jamais de long silence. Sur une machine lente (×10
+/// temps réel au couple de référence), le fichier refait d'une piste de
+/// 5 min prendrait ~30 s estimées : refus `upsampling_too_slow_for_file`,
+/// la piste part à sa cadence. Une piste de 20 s (~2 s) passe.
+#[tokio::test]
+async fn une_machine_trop_lente_ne_surechantillonne_pas_une_longue_piste() {
+    let orch = orchestrateur();
+    let zone_id = zone_dlna(&orch, "uuid:banc-surech-lent", SINK_192);
+    su::enregistrer_le_verdict(
+        &SettingsRepo::with_backend(orch.db.clone()),
+        &verdict_a(10.0),
+    )
+    .unwrap();
+    piste(&orch, 1, "flac", 44_100);
+    let f = orch
+        .format_de_sortie_pour_test(&requete(zone_id, 1))
+        .await
+        .unwrap();
+    assert!(f.surech.is_none(), "pas de long silence");
+    assert_eq!(f.out_sr, 44_100);
+    let etat = orch.surechantillonnage_reseau_de_la_zone(zone_id).unwrap();
+    assert!(!etat.active);
+    assert_eq!(
+        etat.reason.as_deref(),
+        Some(su::refus_reseau::TROP_LENT_POUR_LE_FICHIER)
+    );
+    // Contre-épreuve : une piste courte passe.
+    piste_de(&orch, 2, "flac", 44_100, 20_000);
+    let f = orch
+        .format_de_sortie_pour_test(&requete(zone_id, 2))
+        .await
+        .unwrap();
+    assert_eq!(f.out_sr, 176_400);
+    assert!(f.surech.is_some());
+}
+
+#[test]
+fn le_delai_estime_suit_la_machine_la_duree_et_la_cadence() {
+    let v = verdict_a(100.0);
+    // 300 s / 100 × (176,4 / 352,8) × 2 = 3 s.
+    let d = su::delai_estime_du_fichier_s(&v, "polyvalent", 176_400, 300.0).unwrap();
+    assert!((d - 3.0).abs() < 1e-9, "{d}");
+    let d = su::delai_estime_du_fichier_s(&v, "polyvalent", 352_800, 300.0).unwrap();
+    assert!((d - 6.0).abs() < 1e-9, "{d}");
+    // Filtre non mesuré : on ne sait pas.
+    let mut v = v;
+    v.results.retain(|r| r.filter != "precision");
+    assert!(su::delai_estime_du_fichier_s(&v, "precision", 176_400, 300.0).is_none());
 }
 
 /// DSD : refus motivé (le DoP en UPnP n'est pas dans ce périmètre).

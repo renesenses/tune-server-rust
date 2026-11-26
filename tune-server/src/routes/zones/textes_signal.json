@@ -112,7 +112,8 @@
     "upsampling_network_rate_not_higher": "Suréchantillonnage inactif : ce lecteur n'annonce aucune cadence plus haute multiple entière de la source",
     "upsampling_network_source": "Suréchantillonnage inactif : sur un lecteur réseau, il ne s'applique pour l'instant qu'aux pistes de la bibliothèque",
     "upsampling_network_no_probe": "Suréchantillonnage inactif : ce type de lecteur ne dit pas quelles cadences il accepte",
-    "upsampling_network_file_only": "Suréchantillonnage inactif pour cette piste : elle part en flux progressif ou est trop longue pour être convertie d'avance"
+    "upsampling_network_file_only": "Suréchantillonnage inactif pour cette piste : elle part en flux progressif ou est trop longue pour être convertie d'avance",
+    "upsampling_network_too_slow": "Suréchantillonnage inactif pour cette piste : la convertir d'avance retarderait trop la première note sur cette machine"
   },
   "en": {
     "pregain": "auto pre-gain {0} dB",
@@ -227,7 +228,8 @@
     "upsampling_network_rate_not_higher": "Upsampling inactive: this renderer announces no higher rate that is an integer multiple of the source",
     "upsampling_network_source": "Upsampling inactive: on a network renderer it currently applies to library tracks only",
     "upsampling_network_no_probe": "Upsampling inactive: this type of renderer does not report the sample rates it accepts",
-    "upsampling_network_file_only": "Upsampling inactive for this track: it is streamed progressively or is too long to be converted in advance"
+    "upsampling_network_file_only": "Upsampling inactive for this track: it is streamed progressively or is too long to be converted in advance",
+    "upsampling_network_too_slow": "Upsampling inactive for this track: converting it in advance would delay the first note too much on this machine"
   },
   "de": {
     "pregain": "automatische Vorverstärkung {0} dB",
@@ -342,7 +344,8 @@
     "upsampling_network_rate_not_higher": "Upsampling inaktiv: dieser Renderer gibt keine höhere Rate an, die ein ganzzahliges Vielfaches der Quelle ist",
     "upsampling_network_source": "Upsampling inaktiv: an einem Netzwerk-Renderer gilt es derzeit nur für Titel der Bibliothek",
     "upsampling_network_no_probe": "Upsampling inaktiv: dieser Renderer-Typ meldet die akzeptierten Abtastraten nicht",
-    "upsampling_network_file_only": "Upsampling für diesen Titel inaktiv: er wird progressiv gestreamt oder ist zu lang für eine Vorab-Konvertierung"
+    "upsampling_network_file_only": "Upsampling für diesen Titel inaktiv: er wird progressiv gestreamt oder ist zu lang für eine Vorab-Konvertierung",
+    "upsampling_network_too_slow": "Upsampling für diesen Titel inaktiv: eine Vorab-Konvertierung würde den ersten Ton auf diesem Rechner zu sehr verzögern"
   },
   "es": {
     "pregain": "preganancia automática {0} dB",
@@ -457,7 +460,8 @@
     "upsampling_network_rate_not_higher": "Sobremuestreo inactivo: este reproductor no anuncia ninguna frecuencia superior múltiplo entero de la fuente",
     "upsampling_network_source": "Sobremuestreo inactivo: en un reproductor de red, por ahora solo se aplica a las pistas de la biblioteca",
     "upsampling_network_no_probe": "Sobremuestreo inactivo: este tipo de reproductor no indica qué frecuencias acepta",
-    "upsampling_network_file_only": "Sobremuestreo inactivo para esta pista: se transmite de forma progresiva o es demasiado larga para convertirla de antemano"
+    "upsampling_network_file_only": "Sobremuestreo inactivo para esta pista: se transmite de forma progresiva o es demasiado larga para convertirla de antemano",
+    "upsampling_network_too_slow": "Sobremuestreo inactivo para esta pista: convertirla de antemano retrasaría demasiado la primera nota en este equipo"
   },
   "it": {
     "pregain": "pre-guadagno automatico {0} dB",
@@ -572,7 +576,8 @@
     "upsampling_network_rate_not_higher": "Sovracampionamento inattivo: questo renderer non dichiara alcuna frequenza superiore multipla intera della sorgente",
     "upsampling_network_source": "Sovracampionamento inattivo: su un renderer di rete per ora si applica solo ai brani della libreria",
     "upsampling_network_no_probe": "Sovracampionamento inattivo: questo tipo di renderer non indica le frequenze che accetta",
-    "upsampling_network_file_only": "Sovracampionamento inattivo per questo brano: è trasmesso in modo progressivo o è troppo lungo per essere convertito in anticipo"
+    "upsampling_network_file_only": "Sovracampionamento inattivo per questo brano: è trasmesso in modo progressivo o è troppo lungo per essere convertito in anticipo",
+    "upsampling_network_too_slow": "Sovracampionamento inattivo per questo brano: convertirlo in anticipo ritarderebbe troppo la prima nota su questa macchina"
   },
   "zh": {
     "pregain": "自动预增益 {0} dB",
@@ -687,7 +692,8 @@
     "upsampling_network_rate_not_higher": "升采样未启用：该播放器未声明任何高于音源且为其整数倍的采样率",
     "upsampling_network_source": "升采样未启用：在网络播放器上，目前仅适用于音乐库中的曲目",
     "upsampling_network_no_probe": "升采样未启用：此类播放器不报告其接受的采样率",
-    "upsampling_network_file_only": "此曲目未启用升采样：它以渐进流方式传输，或过长而无法预先转换"
+    "upsampling_network_file_only": "此曲目未启用升采样：它以渐进流方式传输，或过长而无法预先转换",
+    "upsampling_network_too_slow": "此曲目未启用升采样：在本机上预先转换会使第一个音符延迟过久"
   },
   "ja": {
     "pregain": "自動プリアンプ {0} dB",
@@ -802,7 +808,8 @@
     "upsampling_network_rate_not_higher": "アップサンプリング無効：このレンダラーはソースの整数倍となる高いレートを通知していません",
     "upsampling_network_source": "アップサンプリング無効：ネットワークレンダラーでは現在、ライブラリの曲にのみ適用されます",
     "upsampling_network_no_probe": "アップサンプリング無効：この種類のレンダラーは受け付けるサンプルレートを報告しません",
-    "upsampling_network_file_only": "この曲ではアップサンプリング無効：プログレッシブ配信されるか、事前変換するには長すぎます"
+    "upsampling_network_file_only": "この曲ではアップサンプリング無効：プログレッシブ配信されるか、事前変換するには長すぎます",
+    "upsampling_network_too_slow": "この曲ではアップサンプリング無効：このマシンでは事前変換で最初の音が遅れすぎます"
   },
   "ko": {
     "pregain": "자동 프리게인 {0} dB",
@@ -917,7 +924,8 @@
     "upsampling_network_rate_not_higher": "업샘플링 비활성: 이 렌더러는 소스의 정수배인 더 높은 레이트를 알리지 않습니다",
     "upsampling_network_source": "업샘플링 비활성: 네트워크 렌더러에서는 현재 라이브러리 트랙에만 적용됩니다",
     "upsampling_network_no_probe": "업샘플링 비활성: 이 유형의 렌더러는 허용하는 샘플 레이트를 보고하지 않습니다",
-    "upsampling_network_file_only": "이 트랙은 업샘플링 비활성: 점진적 스트림으로 전송되거나 미리 변환하기에 너무 깁니다"
+    "upsampling_network_file_only": "이 트랙은 업샘플링 비활성: 점진적 스트림으로 전송되거나 미리 변환하기에 너무 깁니다",
+    "upsampling_network_too_slow": "이 트랙은 업샘플링 비활성: 이 기기에서 미리 변환하면 첫 음이 너무 늦어집니다"
   },
   "ro": {
     "pregain": "pre-amplificare automată {0} dB",
@@ -1032,7 +1040,8 @@
     "upsampling_network_rate_not_higher": "Supraeșantionare inactivă: acest dispozitiv nu anunță nicio frecvență mai mare, multiplu întreg al sursei",
     "upsampling_network_source": "Supraeșantionare inactivă: pe un dispozitiv de rețea se aplică deocamdată doar pieselor din bibliotecă",
     "upsampling_network_no_probe": "Supraeșantionare inactivă: acest tip de dispozitiv nu raportează frecvențele pe care le acceptă",
-    "upsampling_network_file_only": "Supraeșantionare inactivă pentru această piesă: este transmisă progresiv sau e prea lungă pentru conversie în avans"
+    "upsampling_network_file_only": "Supraeșantionare inactivă pentru această piesă: este transmisă progresiv sau e prea lungă pentru conversie în avans",
+    "upsampling_network_too_slow": "Supraeșantionare inactivă pentru această piesă: conversia în avans ar întârzia prea mult prima notă pe acest calculator"
   },
   "sv": {
     "pregain": "automatisk förförstärkning {0} dB",
@@ -1147,7 +1156,8 @@
     "upsampling_network_rate_not_higher": "Uppsampling inaktiv: spelaren anger ingen högre frekvens som är en heltalsmultipel av källan",
     "upsampling_network_source": "Uppsampling inaktiv: på en nätverksspelare gäller det än så länge bara spår i biblioteket",
     "upsampling_network_no_probe": "Uppsampling inaktiv: den här typen av spelare rapporterar inte vilka frekvenser den accepterar",
-    "upsampling_network_file_only": "Uppsampling inaktiv för det här spåret: det strömmas progressivt eller är för långt för att konverteras i förväg"
+    "upsampling_network_file_only": "Uppsampling inaktiv för det här spåret: det strömmas progressivt eller är för långt för att konverteras i förväg",
+    "upsampling_network_too_slow": "Uppsampling inaktiv för det här spåret: att konvertera det i förväg skulle fördröja första tonen för mycket på den här datorn"
   },
   "vi": {
     "pregain": "tiền khuếch đại tự động {0} dB",
@@ -1262,7 +1272,8 @@
     "upsampling_network_rate_not_higher": "Lấy mẫu tăng không hoạt động: trình phát không thông báo tần số cao hơn là bội số nguyên của nguồn",
     "upsampling_network_source": "Lấy mẫu tăng không hoạt động: trên trình phát mạng, hiện chỉ áp dụng cho bài hát trong thư viện",
     "upsampling_network_no_probe": "Lấy mẫu tăng không hoạt động: loại trình phát này không báo các tần số nó chấp nhận",
-    "upsampling_network_file_only": "Lấy mẫu tăng không hoạt động cho bài này: bài được phát dạng luồng liên tục hoặc quá dài để chuyển đổi trước"
+    "upsampling_network_file_only": "Lấy mẫu tăng không hoạt động cho bài này: bài được phát dạng luồng liên tục hoặc quá dài để chuyển đổi trước",
+    "upsampling_network_too_slow": "Lấy mẫu tăng không hoạt động cho bài này: chuyển đổi trước sẽ làm nốt nhạc đầu tiên bị trễ quá lâu trên máy này"
   },
   "hu": {
     "pregain": "automatikus előerősítés {0} dB",
@@ -1377,7 +1388,8 @@
     "upsampling_network_rate_not_higher": "Felülmintavételezés inaktív: a lejátszó nem jelez a forrás egész számú többszörösét jelentő magasabb frekvenciát",
     "upsampling_network_source": "Felülmintavételezés inaktív: hálózati lejátszón egyelőre csak a könyvtár számaira vonatkozik",
     "upsampling_network_no_probe": "Felülmintavételezés inaktív: ez a lejátszótípus nem jelzi, milyen frekvenciákat fogad el",
-    "upsampling_network_file_only": "Felülmintavételezés inaktív ennél a számnál: folyamatosan streamelődik, vagy túl hosszú az előzetes átalakításhoz"
+    "upsampling_network_file_only": "Felülmintavételezés inaktív ennél a számnál: folyamatosan streamelődik, vagy túl hosszú az előzetes átalakításhoz",
+    "upsampling_network_too_slow": "Felülmintavételezés inaktív ennél a számnál: az előzetes átalakítás ezen a gépen túlságosan késleltetné az első hangot"
   },
   "nb": {
     "pregain": "automatisk forsterkning før behandling {0} dB",
@@ -1492,7 +1504,8 @@
     "upsampling_network_rate_not_higher": "Oppsampling inaktiv: spilleren oppgir ingen høyere frekvens som er et heltallsmultiplum av kilden",
     "upsampling_network_source": "Oppsampling inaktiv: på en nettverksspiller gjelder det foreløpig bare spor i biblioteket",
     "upsampling_network_no_probe": "Oppsampling inaktiv: denne spillertypen rapporterer ikke hvilke frekvenser den godtar",
-    "upsampling_network_file_only": "Oppsampling inaktiv for dette sporet: det strømmes progressivt eller er for langt til å konverteres på forhånd"
+    "upsampling_network_file_only": "Oppsampling inaktiv for dette sporet: det strømmes progressivt eller er for langt til å konverteres på forhånd",
+    "upsampling_network_too_slow": "Oppsampling inaktiv for dette sporet: å konvertere det på forhånd ville forsinke første tone for mye på denne maskinen"
   },
   "pl": {
     "pregain": "automatyczne wzmocnienie wstępne {0} dB",
@@ -1607,7 +1620,8 @@
     "upsampling_network_rate_not_higher": "Nadpróbkowanie nieaktywne: odtwarzacz nie podaje wyższej częstotliwości będącej całkowitą wielokrotnością źródła",
     "upsampling_network_source": "Nadpróbkowanie nieaktywne: na odtwarzaczu sieciowym dotyczy na razie tylko utworów z biblioteki",
     "upsampling_network_no_probe": "Nadpróbkowanie nieaktywne: ten typ odtwarzacza nie zgłasza akceptowanych częstotliwości",
-    "upsampling_network_file_only": "Nadpróbkowanie nieaktywne dla tego utworu: jest przesyłany progresywnie lub jest zbyt długi do wcześniejszej konwersji"
+    "upsampling_network_file_only": "Nadpróbkowanie nieaktywne dla tego utworu: jest przesyłany progresywnie lub jest zbyt długi do wcześniejszej konwersji",
+    "upsampling_network_too_slow": "Nadpróbkowanie nieaktywne dla tego utworu: wcześniejsza konwersja zbyt opóźniłaby pierwszy dźwięk na tym komputerze"
   },
   "el": {
     "pregain": "αυτόματη προ-ενίσχυση {0} dB",
@@ -1722,7 +1736,8 @@
     "upsampling_network_rate_not_higher": "Υπερδειγματοληψία ανενεργή: ο αναπαραγωγέας δεν δηλώνει υψηλότερη συχνότητα, ακέραιο πολλαπλάσιο της πηγής",
     "upsampling_network_source": "Υπερδειγματοληψία ανενεργή: σε αναπαραγωγέα δικτύου ισχύει προς το παρόν μόνο για κομμάτια της βιβλιοθήκης",
     "upsampling_network_no_probe": "Υπερδειγματοληψία ανενεργή: αυτός ο τύπος αναπαραγωγέα δεν αναφέρει τις συχνότητες που δέχεται",
-    "upsampling_network_file_only": "Υπερδειγματοληψία ανενεργή για αυτό το κομμάτι: μεταδίδεται προοδευτικά ή είναι πολύ μεγάλο για μετατροπή εκ των προτέρων"
+    "upsampling_network_file_only": "Υπερδειγματοληψία ανενεργή για αυτό το κομμάτι: μεταδίδεται προοδευτικά ή είναι πολύ μεγάλο για μετατροπή εκ των προτέρων",
+    "upsampling_network_too_slow": "Υπερδειγματοληψία ανενεργή για αυτό το κομμάτι: η εκ των προτέρων μετατροπή θα καθυστερούσε πολύ την πρώτη νότα σε αυτό το μηχάνημα"
   },
   "tr": {
     "pregain": "otomatik ön kazanç {0} dB",
@@ -1837,7 +1852,8 @@
     "upsampling_network_rate_not_higher": "Upsampling devre dışı: bu oynatıcı kaynağın tam katı olan daha yüksek bir hız bildirmiyor",
     "upsampling_network_source": "Upsampling devre dışı: ağ oynatıcısında şimdilik yalnızca kitaplık parçalarına uygulanır",
     "upsampling_network_no_probe": "Upsampling devre dışı: bu oynatıcı türü kabul ettiği örnekleme hızlarını bildirmiyor",
-    "upsampling_network_file_only": "Bu parça için upsampling devre dışı: aşamalı akışla gönderiliyor ya da önceden dönüştürülemeyecek kadar uzun"
+    "upsampling_network_file_only": "Bu parça için upsampling devre dışı: aşamalı akışla gönderiliyor ya da önceden dönüştürülemeyecek kadar uzun",
+    "upsampling_network_too_slow": "Bu parça için upsampling devre dışı: önceden dönüştürmek bu makinede ilk notayı çok geciktirir"
   },
   "nl": {
     "pregain": "automatische pre-gain {0} dB",
@@ -1952,7 +1968,8 @@
     "upsampling_network_rate_not_higher": "Upsampling inactief: deze speler geeft geen hogere frequentie op die een geheel veelvoud van de bron is",
     "upsampling_network_source": "Upsampling inactief: op een netwerkspeler geldt het voorlopig alleen voor nummers uit de bibliotheek",
     "upsampling_network_no_probe": "Upsampling inactief: dit type speler meldt niet welke samplefrequenties het accepteert",
-    "upsampling_network_file_only": "Upsampling inactief voor dit nummer: het wordt progressief gestreamd of is te lang om vooraf te converteren"
+    "upsampling_network_file_only": "Upsampling inactief voor dit nummer: het wordt progressief gestreamd of is te lang om vooraf te converteren",
+    "upsampling_network_too_slow": "Upsampling inactief voor dit nummer: vooraf converteren zou de eerste noot op deze computer te veel vertragen"
   },
   "zh-Hant": {
     "pregain": "自動前置增益 {0} dB",
@@ -2067,7 +2084,8 @@
     "upsampling_network_rate_not_higher": "升頻未啟用：此播放器未宣告任何高於音源且為其整數倍的取樣率",
     "upsampling_network_source": "升頻未啟用：在網路播放器上，目前僅適用於音樂庫中的曲目",
     "upsampling_network_no_probe": "升頻未啟用：此類播放器不回報其接受的取樣率",
-    "upsampling_network_file_only": "此曲目未啟用升頻：它以漸進串流傳輸，或過長而無法預先轉換"
+    "upsampling_network_file_only": "此曲目未啟用升頻：它以漸進串流傳輸，或過長而無法預先轉換",
+    "upsampling_network_too_slow": "此曲目未啟用升頻：在本機上預先轉換會使第一個音符延遲過久"
   },
   "ru": {
     "pregain": "автоматическое предусиление {0} dB",
@@ -2182,7 +2200,8 @@
     "upsampling_network_rate_not_higher": "Передискретизация неактивна: плеер не сообщает более высокой частоты, кратной частоте источника",
     "upsampling_network_source": "Передискретизация неактивна: на сетевом плеере она пока применяется только к трекам библиотеки",
     "upsampling_network_no_probe": "Передискретизация неактивна: этот тип плеера не сообщает, какие частоты он принимает",
-    "upsampling_network_file_only": "Передискретизация неактивна для этого трека: он передается потоком или слишком длинный для предварительного преобразования"
+    "upsampling_network_file_only": "Передискретизация неактивна для этого трека: он передается потоком или слишком длинный для предварительного преобразования",
+    "upsampling_network_too_slow": "Передискретизация неактивна для этого трека: предварительное преобразование слишком задержало бы первую ноту на этом компьютере"
   },
   "uk": {
     "pregain": "автоматичне попереднє підсилення {0} dB",
@@ -2297,6 +2316,7 @@
     "upsampling_network_rate_not_higher": "Передискретизація неактивна: плеєр не повідомляє вищої частоти, кратної частоті джерела",
     "upsampling_network_source": "Передискретизація неактивна: на мережевому плеєрі вона поки застосовується лише до треків бібліотеки",
     "upsampling_network_no_probe": "Передискретизація неактивна: цей тип плеєра не повідомляє, які частоти він приймає",
-    "upsampling_network_file_only": "Передискретизація неактивна для цього треку: він передається потоком або задовгий для попереднього перетворення"
+    "upsampling_network_file_only": "Передискретизація неактивна для цього треку: він передається потоком або задовгий для попереднього перетворення",
+    "upsampling_network_too_slow": "Передискретизація неактивна для цього треку: попереднє перетворення надто затримало б першу ноту на цьому комп’ютері"
   }
 }
