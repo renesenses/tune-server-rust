@@ -368,7 +368,10 @@ fn les_autres_baisses_de_marge_ne_font_pas_sauter_le_niveau() {
 #[test]
 fn decocher_un_maillon_volume_inchange_pas_de_voyant_pendant_la_rampe() {
     let (mut banc, mut eq, ..) = decocher_b(5000.0, 1.0);
-    assert!(eq.en_extinction(), "la retenue doit être en train de revenir");
+    assert!(
+        eq.en_extinction(),
+        "la retenue doit être en train de revenir"
+    );
     assert!(
         eq.preampli_garde().is_none(),
         "rampe ordinaire : pas de « niveau réduit »"
