@@ -262,8 +262,51 @@ fn mesurer_la_resolution_seule(state: &AppState) {
     );
 }
 
+/// Une rafale dans le processus client. Comme dans le navigateur, les
+/// allocations, le décodage et la libération des 22 réponses JSON ne
+/// disputent pas l'allocateur du serveur aux deux fils Tokio.
+fn jouer_le_client(addr: SocketAddr, chemins: Vec<String>, resultat: Option<&std::ffi::OsStr>) {
+    let requetes: Vec<_> = chemins
+        .into_iter()
+        .map(|c| {
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                let r = obtenir(addr, &c);
+                (c, r, t0.elapsed())
+            })
+        })
+        .collect();
+    let mut durees = Vec::new();
+    let reponses: Vec<(String, (u16, Value))> = requetes
+        .into_iter()
+        .map(|r| {
+            let (c, r, d) = r.join().unwrap();
+            durees.push((d, c.clone()));
+            (c, r)
+        })
+        .collect();
+
+    if let Some(fichier) = resultat {
+        serde_json::to_writer(
+            std::io::BufWriter::new(std::fs::File::create(fichier).unwrap()),
+            &(reponses, durees),
+        )
+        .unwrap();
+    }
+}
+
 #[test]
 fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
+    if let Ok(addr) = std::env::var("TUNE_BANC_5438_CLIENT") {
+        let chemins =
+            serde_json::from_str(&std::env::var("TUNE_BANC_5438_CHEMINS").unwrap()).unwrap();
+        jouer_le_client(
+            addr.parse().unwrap(),
+            chemins,
+            std::env::var_os("TUNE_BANC_5438_RESULTAT").as_deref(),
+        );
+        return;
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(FILS_EXECUTEUR)
         .enable_all()
@@ -362,10 +405,12 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
                 let (fait, recu) = std::sync::mpsc::channel();
                 let t0 = Instant::now();
                 executeur.spawn(async move {
-                    let _ = fait.send(());
+                    let _ = fait.send(Instant::now());
                 });
-                recu.recv().unwrap();
-                attentes.push((t0, t0.elapsed()));
+                // Horodater la prise sur le fil Tokio. Le réveil ultérieur de
+                // la sonde par le système ne fait pas partie de cette attente.
+                let prise = recu.recv().unwrap();
+                attentes.push((t0, prise - t0));
                 std::thread::sleep(CADENCE_FLUX);
             }
             attentes
@@ -404,7 +449,7 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
     ));
 
     let mut clics = Vec::new();
-    let mut premiere_rafale = None;
+    let premiere_rafale = dossier.path().join("premier-clic.json");
     for clic in 0..CLICS {
         if clic > 0 {
             bus.emit_typed(
@@ -414,31 +459,31 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
             std::thread::sleep(Duration::from_millis(100));
         }
         let debut = Instant::now();
-        let requetes: Vec<_> = chemins
-            .iter()
-            .cloned()
-            .map(|c| {
-                std::thread::spawn(move || {
-                    let t0 = Instant::now();
-                    let r = obtenir(addr, &c);
-                    (c, r, t0.elapsed())
-                })
-            })
-            .collect();
-        let mut durees = Vec::new();
-        let reponses: Vec<(String, (u16, Value))> = requetes
-            .into_iter()
-            .map(|r| {
-                let (c, r, d) = r.join().unwrap();
-                durees.push((d, c.clone()));
-                (c, r)
-            })
-            .collect();
+        let mut client = std::process::Command::new(std::env::current_exe().unwrap());
+        client
+            .args([
+                "--exact",
+                "un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux",
+                "--nocapture",
+            ])
+            .env("TUNE_BANC_5438_CLIENT", addr.to_string())
+            .env(
+                "TUNE_BANC_5438_CHEMINS",
+                serde_json::to_string(&chemins).unwrap(),
+            )
+            .env_remove("TUNE_BANC_5438_RESULTAT");
+        if clic == 0 {
+            client.env("TUNE_BANC_5438_RESULTAT", &premiere_rafale);
+        }
+        assert!(client.status().expect("processus client du banc").success());
         let fin = Instant::now();
         clics.push((debut, fin));
-        premiere_rafale.get_or_insert((reponses, durees));
     }
-    let (reponses, mut durees) = premiere_rafale.unwrap();
+    type Rafale = (Vec<(String, (u16, Value))>, Vec<(Duration, String)>);
+    let (reponses, mut durees): Rafale = serde_json::from_reader(std::io::BufReader::new(
+        std::fs::File::open(premiere_rafale).unwrap(),
+    ))
+    .unwrap();
     std::thread::sleep(Duration::from_millis(50));
     arret.store(true, Ordering::Relaxed);
     let arrivees = renderer.join().unwrap();
