@@ -6771,6 +6771,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-dsp-contextuel"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-core",
+]
+
+[[package]]
 name = "tune-entree-audio"
 version = "1.0.0"
 dependencies = [
