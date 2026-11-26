@@ -213,6 +213,29 @@ fn horodatage() -> String {
     )
 }
 
+/// La table `jetons_de_renouvellement` existe-t-elle ? Test d'existence dans
+/// le catalogue du moteur (`sqlite_master` / `information_schema.tables`), pas
+/// une lecture de la table : une erreur de lecture est une ERREUR, jamais un
+/// « absente ».
+pub fn table_des_jetons_existe(backend: &Arc<dyn DbBackend>) -> Result<bool, String> {
+    use tune_core::db::engine::Engine;
+    let sql = match backend.engine() {
+        Engine::Sqlite => {
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'jetons_de_renouvellement'"
+        }
+        Engine::Postgres => {
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = 'jetons_de_renouvellement'"
+        }
+    };
+    let n = backend
+        .query_one(sql, &[])?
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .ok_or_else(|| "sonde de la table des jetons : réponse illisible".to_string())?;
+    Ok(n > 0)
+}
+
 /// Pose le mot de passe du compte `id` et révoque les sessions, en UNE
 /// transaction : mot de passe, nouveau secret de signature, clé d'API et
 /// code effacés, sessions longues et jetons de renouvellement révoqués. Tout ou rien : si une écriture échoue (base occupée au-delà
@@ -233,12 +256,10 @@ pub fn poser_le_mot_de_passe(
     // l'UPDATE de la révocation échouerait, et toute la récupération avec.
     // Sans la table, aucun jeton de renouvellement n'existe : seules les
     // sessions longues inscrites sont désinscrites.
-    let avec_jetons = backend
-        .query_one(
-            "SELECT COUNT(*) FROM jetons_de_renouvellement WHERE 1 = 0",
-            &[],
-        )
-        .is_ok();
+    // Relecture de #9576 : la sonde ne doit jamais ÉCHOUER OUVERT. Une erreur
+    // passagère de lecture ne vaut pas « table absente » : elle remonte, et la
+    // récupération s'arrête plutôt que de sauter la révocation des jetons.
+    let avec_jetons = table_des_jetons_existe(backend)?;
     backend.write_tx(&mut |tx| {
         let n = tx.execute(
             "UPDATE profiles SET password_hash_v2 = ?, password_hash = NULL WHERE id = ?",
