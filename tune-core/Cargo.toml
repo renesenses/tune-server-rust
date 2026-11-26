@@ -188,6 +188,7 @@ objc2-core-audio = { version = "0.3", default-features = false, features = ["std
 objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"], optional = true }
 
 [dev-dependencies]
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 tracing-subscriber = { workspace = true }
 # Fabrique de laissez-passer (cles de TEST publiees) : tests de l'ecoute
 # directe (#6785). Jamais dans un binaire livre.

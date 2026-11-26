@@ -6729,6 +6729,7 @@ dependencies = [
  "sqlx",
  "subtle",
  "symphonia",
+ "syn 2.0.119",
  "tar",
  "tempfile",
  "thiserror 2.0.18",

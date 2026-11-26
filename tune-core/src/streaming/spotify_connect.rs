@@ -772,6 +772,7 @@ impl LibrespotDaemon {
     fn preparer_le_script(&self) -> Option<String> {
         #[cfg(unix)]
         {
+            use std::io::Write;
             use std::os::unix::fs::PermissionsExt;
             let mut garde = self.dossier_script.lock().ok()?;
             if garde.is_none() {
@@ -788,8 +789,18 @@ impl LibrespotDaemon {
                 warn!(chemin = %texte, "librespot_onevent_chemin_avec_espace");
                 return None;
             }
-            std::fs::write(&chemin, script_onevent()).ok()?;
-            std::fs::set_permissions(&chemin, std::fs::Permissions::from_mode(0o700)).ok()?;
+            if !chemin.exists() {
+                // Fermer le seul descripteur en écriture avant de publier le
+                // nom que librespot exécute, y compris lors d’un redémarrage.
+                let mut fichier = tempfile::NamedTempFile::new_in(garde.as_ref()?.path()).ok()?;
+                fichier
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o700))
+                    .ok()?;
+                fichier.write_all(script_onevent().as_bytes()).ok()?;
+                let temporaire = fichier.into_temp_path();
+                temporaire.persist(&chemin).ok()?;
+            }
             Some(texte)
         }
         #[cfg(not(unix))]
@@ -1609,11 +1620,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn evenement_6018_le_script_relaie_les_variables_de_librespot() {
-        let dossier = tempfile::tempdir().unwrap();
-        let script = dossier.path().join("onevent.sh");
-        std::fs::write(&script, script_onevent()).unwrap();
-        let sortie = std::process::Command::new("/bin/sh")
-            .arg(&script)
+        let daemon = LibrespotDaemon::new("banc".into(), None, None);
+        let script = daemon.preparer_le_script().expect("script publié");
+        use std::os::unix::fs::MetadataExt;
+        let inode = std::fs::metadata(&script).unwrap().ino();
+        let ouvert = std::fs::File::open(&script).unwrap();
+        ouvert
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(
+            daemon.preparer_le_script().as_deref(),
+            Some(script.as_str())
+        );
+        assert_eq!(std::fs::metadata(&script).unwrap().ino(), inode);
+        assert_eq!(
+            ouvert.metadata().unwrap().modified().unwrap(),
+            std::time::SystemTime::UNIX_EPOCH
+        );
+        assert_eq!(ouvert.metadata().unwrap().mode() & 0o777, 0o700);
+        let sortie = std::process::Command::new(&script)
             .env("PLAYER_EVENT", "track_changed")
             .env("TRACK_ID", "4uLU6hMCjMI75M1A2tKUQC")
             .env("DURATION_MS", "213000")
