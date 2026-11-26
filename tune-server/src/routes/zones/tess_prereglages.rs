@@ -655,7 +655,7 @@ async fn appliquer_toute_l_attente(state: &AppState) {
         // `PUT` en mode immédiat : sur une zone réseau qui joue, l'égaliseur
         // relance le flux à la position ; le crossfeed réseau attend la piste
         // suivante ; le reste n'agit qu'en local.
-        servir_l_attente(state, zone_id, true).await;
+        servir_l_attente(state, zone_id, true, true).await;
     }
 }
 
@@ -924,7 +924,21 @@ pub(super) async fn appliquer_selon_le_mode(
 /// réseau, lui, vient d'être fabriqué avec les clés déjà écrites : rien à
 /// relancer (jamais de relance juste après un démarrage).
 pub async fn appliquer_a_la_lecture(state: &AppState, zone_id: i64) {
-    servir_l_attente(state, zone_id, false).await;
+    servir_l_attente(state, zone_id, false, false).await;
+}
+
+/// À la REPRISE après pause (`resumed`) : comme au démarrage, et un flux
+/// modulé vers le DSD peut être relancé (il joue encore avec l'ancienne
+/// chaîne). Au démarrage (`started`), jamais : la piste vient d'être décidée
+/// avec la chaîne écrite (relecture de #9575).
+pub async fn appliquer_a_la_reprise(state: &AppState, zone_id: i64) {
+    servir_l_attente(state, zone_id, false, true).await;
+}
+
+/// L'événement de lecture permet-il de relancer un flux modulé vers le DSD ?
+/// Seulement la reprise : au démarrage, la piste porte déjà la chaîne.
+pub fn relance_dsd_permise(evenement: &str) -> bool {
+    evenement == "resumed"
 }
 
 /// Combien de rafraîchissements de la sortie vivante la file d'attente a
@@ -948,7 +962,7 @@ fn rafraichis() -> &'static Mutex<HashMap<i64, usize>> {
 /// Sert la file d'une zone. `toutes_sorties` : rafraîchit aussi une sortie
 /// réseau (passage en immédiat) ; sinon, au démarrage d'une lecture, seule
 /// une sortie locale l'est (le flux réseau vient d'être fabriqué).
-async fn servir_l_attente(state: &AppState, zone_id: i64, toutes_sorties: bool) {
+async fn servir_l_attente(state: &AppState, zone_id: i64, toutes_sorties: bool, relance_dsd: bool) {
     // Sous le verrou des `PUT` de la zone : un `PUT` (ou un chargement) en
     // cours écrit ses clés et décide de leur sort avant que la file soit lue.
     let verrou = verrou_des_put(zone_id);
@@ -967,10 +981,10 @@ async fn servir_l_attente(state: &AppState, zone_id: i64, toutes_sorties: bool) 
             .unwrap_or_else(|e| e.into_inner())
             .entry(zone_id)
             .or_default() += 1;
-        rafraichir(state, &zone, &cles).await;
+        super::tess::rafraichir_avec(state, &zone, &cles, relance_dsd).await;
         apres_le_rafraichissement(state, zone_id, &cles).await;
     }
-    info!(zone_id, cles = ?cles, locale, "tess_applique_au_demarrage");
+    info!(zone_id, cles = ?cles, locale, relance_dsd, "tess_applique_au_demarrage");
 }
 
 /// rc14 (retour de Rémi sur la rc13.90) — ce que la chaîne réécrite doit
@@ -1034,7 +1048,11 @@ pub fn spawn_application_au_demarrage(state: &AppState) {
                 Err(RecvError::Closed) => break,
             };
             if est_une_prochaine_lecture(&ev.event) && !cles_en_attente(ev.zone_id).is_empty() {
-                appliquer_a_la_lecture(&state, ev.zone_id).await;
+                if relance_dsd_permise(&ev.event) {
+                    appliquer_a_la_reprise(&state, ev.zone_id).await;
+                } else {
+                    appliquer_a_la_lecture(&state, ev.zone_id).await;
+                }
             }
         }
     });
@@ -1056,6 +1074,44 @@ mod reprise_rc14_tests {
         // Contre-épreuve : une pause n'applique rien.
         assert!(!est_une_prochaine_lecture("paused"));
         assert!(!est_une_prochaine_lecture("stopped"));
+    }
+
+    /// Relecture de #9575 — au démarrage d'une piste (`started`), la file est
+    /// servie SANS relance du flux modulé vers le DSD (la piste vient d'être
+    /// décidée avec la chaîne écrite) ; à la reprise (`resumed`), la relance
+    /// est demandée.
+    #[tokio::test]
+    async fn le_demarrage_ne_relance_pas_le_dsd_la_reprise_si() {
+        assert!(relance_dsd_permise("resumed"));
+        assert!(!relance_dsd_permise("started"));
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        // Numéro de zone propre au test : la file est commune au processus.
+        for i in 0..140 {
+            repo.create(&format!("Avant {i}"), Some("local"), None)
+                .unwrap();
+        }
+        let zone = repo
+            .create("Salon", Some("local"), Some("local:Realtek HD"))
+            .unwrap();
+        let cle = tune_core::tess::migration::Partie::Surechantillonnage.cle(zone);
+        let avant = super::super::tess::relances_dsd_demandees(zone);
+        ajouter_en_attente(zone, vec![cle.clone()]);
+        appliquer_a_la_lecture(&state, zone).await;
+        assert!(
+            cles_en_attente(zone).is_empty(),
+            "le démarrage sert la file"
+        );
+        assert_eq!(
+            super::super::tess::relances_dsd_demandees(zone),
+            avant,
+            "aucune relance DSD au démarrage"
+        );
+        // Contre-épreuve : la reprise demande la relance.
+        ajouter_en_attente(zone, vec![cle]);
+        appliquer_a_la_reprise(&state, zone).await;
+        assert!(cles_en_attente(zone).is_empty());
+        assert_eq!(super::super::tess::relances_dsd_demandees(zone), avant + 1);
     }
 
     #[tokio::test]

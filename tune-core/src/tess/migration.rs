@@ -2195,6 +2195,21 @@ fn ecrire_chaine_avec(
         if r.bypass_all != chaine.bypass_all {
             bilan.cles_modifiees.push(super::cle_chaine_zone(zone_id));
         }
+        // rc14 (fil 3103) — la cible DSD (DSD128 → DSD256, filtre) ou le
+        // passage DSD ↔ éteint ne se lit que dans la chaîne : l'ancienne clé
+        // du suréchantillonneur, qui ne sait pas dire « dsd », ne bouge pas.
+        // Sans cette clé, un préréglage ou le panneau en mode immédiat ne
+        // relançait rien (`cles=[]`) et la nouvelle cadence attendait la
+        // piste suivante. La clé de l'étage fixe fait suivre la voie
+        // existante : `rafraichir` relance un flux modulé à sa position
+        // (`relancer_si_flux_dsd_module`, qui repasse par toutes les gardes
+        // de la décision DSD).
+        let cle_surech = Partie::Surechantillonnage.cle(zone_id);
+        if r.fixed.upsampling != chaine.fixed.upsampling
+            && !bilan.cles_modifiees.contains(&cle_surech)
+        {
+            bilan.cles_modifiees.push(cle_surech);
+        }
         if super::egaliseurs_en_serie::ordre_des_coches(r)
             != super::egaliseurs_en_serie::ordre_des_coches(chaine)
         {
