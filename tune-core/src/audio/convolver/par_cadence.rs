@@ -493,6 +493,12 @@ pub struct JeuDeZone {
     /// rc14 (Didier) — le headroom de la chaîne TESS de la zone : il décide
     /// de la marge que le moteur applique au filtre.
     pub headroom: crate::tess::chaine::Headroom,
+    /// Revue de #9561 — en marge MANUELLE, l'égaliseur que le moteur fait
+    /// tourner pour la zone (`profil_du_moteur` : la série, ou le gain fixe M
+    /// de la sortie locale), qui porte déjà `min(M, L1)` ; `None` : aucun
+    /// (sortie réseau sans égaliseur), le convolueur porte alors M lui-même.
+    /// Toujours `None` en Auto (inutile).
+    pub egaliseur_amont: Option<crate::audio::eq::EqProfile>,
 }
 
 impl JeuDeZone {
@@ -518,11 +524,16 @@ impl JeuDeZone {
             .ok()
             .flatten()
             .is_none_or(|v| v.trim() != "false" && v.trim() != "0");
+        let headroom = crate::tess::egaliseurs_en_serie::headroom_de_zone(settings, zone_id);
+        let egaliseur_amont = matches!(headroom, crate::tess::chaine::Headroom::Manual { .. })
+            .then(|| egaliseur_en_service(settings, zone_id))
+            .flatten();
         Self {
             principal,
             supplementaires,
             reechantillonner,
-            headroom: crate::tess::egaliseurs_en_serie::headroom_de_zone(settings, zone_id),
+            headroom,
+            egaliseur_amont,
         }
     }
 
@@ -549,9 +560,24 @@ impl JeuDeZone {
     }
 
     pub fn charger(&self) -> Result<ConvolverConfig, String> {
-        ConvolverConfig::depuis_jeu(&self.chemins(), self.reechantillonner)
-            .map(|c| c.avec_headroom(self.headroom))
+        ConvolverConfig::depuis_jeu(&self.chemins(), self.reechantillonner).map(|c| {
+            c.avec_headroom(self.headroom)
+                .avec_egaliseur_amont(self.egaliseur_amont.clone())
+        })
     }
+}
+
+/// L'égaliseur que le moteur construit pour la zone, s'il touche au signal
+/// (la même lecture que le chemin du signal, `active_zone_eq_profile`). Le
+/// droit Premium est tenu pour acquis : la convolution l'exige déjà.
+fn egaliseur_en_service(
+    settings: &crate::db::settings_repo::SettingsRepo,
+    zone_id: i64,
+) -> Option<crate::audio::eq::EqProfile> {
+    let p = crate::tess::egaliseurs_en_serie::profil_du_moteur(settings, zone_id, true)?;
+    crate::audio::eq::EqProcessor::new(&p, 48_000, 2)
+        .is_enabled()
+        .then_some(p)
 }
 
 #[cfg(test)]

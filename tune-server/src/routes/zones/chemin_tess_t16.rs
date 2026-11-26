@@ -126,10 +126,23 @@ pub(crate) fn marge_manuelle_en_service(
         return None;
     }
     let dsp_actif = etapes(sp).iter().any(|e| a_le_nom(e, "DSP") && altere(e));
-    if !dsp_actif {
-        return None;
+    if dsp_actif && let Some(r) = reserve_de_l_etage_eq(sp) {
+        return (r < 0.0).then_some(r);
     }
-    reserve_de_l_etage_eq(sp).filter(|r| *r < 0.0)
+    // Revue de #9561 — sans étage d'égaliseur (sortie réseau), c'est le
+    // convolueur qui porte M : la marge qu'il applique, telle qu'il la publie.
+    marge_portee_par_la_convolution(sp)
+}
+
+/// La marge que le convolueur applique au filtre en service (dB, < 0),
+/// `headroom_db` de l'étape `room_correction` appliquée.
+fn marge_portee_par_la_convolution(sp: &Value) -> Option<f64> {
+    etapes(sp)
+        .iter()
+        .find(|e| a_le_code(e, "room_correction") && e.get("applied") == Some(&Value::Bool(true)))
+        .and_then(|e| e.get("headroom_db"))
+        .and_then(Value::as_f64)
+        .filter(|r| r.is_finite() && *r < 0.0)
 }
 
 /// La réserve que l'étage des égaliseurs applique (dB, ≤ 0), la plus forte

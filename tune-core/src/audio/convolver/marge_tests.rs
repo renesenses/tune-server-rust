@@ -226,33 +226,36 @@ fn retrait_du_filtre_remonte_en_un_demi_seconde_sans_depasser() {
     }
 }
 
-/// La règle elle-même : Auto, borne à −24 dB, et manuel jamais forcé.
+/// La règle elle-même : Auto, borne à −24 dB ; en manuel, M une seule fois
+/// (revue de #9561 : par le convolueur quand aucun égaliseur ne la porte).
 #[test]
 fn regle_de_la_marge_auto_et_manuelle() {
-    let auto = marge_de_convolution(&Headroom::Auto {}, 6.0);
+    let auto = marge_de_convolution(&Headroom::Auto {}, 6.0, None);
     assert_eq!(auto.appliquee_db, -6.5);
     assert!(!auto.insuffisante);
     assert_eq!(
-        marge_de_convolution(&Headroom::Auto {}, 40.0).appliquee_db,
+        marge_de_convolution(&Headroom::Auto {}, 40.0, None).appliquee_db,
         HEADROOM_MANUEL_MIN_DB
     );
     assert_eq!(
-        marge_de_convolution(&Headroom::Auto {}, f64::NAN).appliquee_db,
+        marge_de_convolution(&Headroom::Auto {}, f64::NAN, None).appliquee_db,
         0.0
     );
-    let manuel = marge_de_convolution(&Headroom::Manual { db: -3.0 }, 6.0);
-    assert_eq!(manuel.appliquee_db, 0.0, "le manuel n'est jamais forcé");
+    // L'étage des égaliseurs porte M : le convolueur ne la repose pas.
+    let manuel = marge_de_convolution(&Headroom::Manual { db: -3.0 }, 6.0, Some(-3.0));
+    assert_eq!(manuel.appliquee_db, 0.0, "jamais deux fois");
     assert!(manuel.insuffisante);
     assert_eq!(manuel.requise_db, -6.5);
-    let assez = marge_de_convolution(&Headroom::Manual { db: -8.0 }, 6.0);
+    let assez = marge_de_convolution(&Headroom::Manual { db: -8.0 }, 6.0, Some(-8.0));
     assert!(!assez.insuffisante);
-    assert!(!marge_de_convolution(&Headroom::Manual { db: 0.0 }, -2.0).insuffisante);
-    // Le moteur suit le mode de la chaîne.
+    assert!(!marge_de_convolution(&Headroom::Manual { db: 0.0 }, -2.0, None).insuffisante);
+    // Le moteur suit le mode de la chaîne : sans étage d'égaliseur connu,
+    // c'est lui qui porte M.
     let h = cloche(FS, 50.0, 6.0, 1.0, 1 << 14);
     let config = ConvolverConfig::new(stereo(h), FS)
         .unwrap()
         .avec_headroom(Headroom::Manual { db: -3.0 });
     let m = config.marge_pour(FS).unwrap();
-    assert!(m.insuffisante && m.appliquee_db == 0.0, "{m:?}");
-    assert_eq!(config.build_for(BLOC, FS, 2).unwrap().reserve_db(), 0.0);
+    assert!(m.insuffisante && m.appliquee_db == -3.0, "{m:?}");
+    assert_eq!(config.build_for(BLOC, FS, 2).unwrap().reserve_db(), -3.0);
 }

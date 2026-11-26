@@ -174,6 +174,7 @@ pub fn avertissements_de_gain(jeu: &JeuImporte) -> Vec<AvertissementDeGain> {
             let marge = crate::tess::etages_fixes::marge_de_convolution(
                 &crate::tess::chaine::Headroom::Auto {},
                 g,
+                None,
             );
             (marge.requise_db < 0.0).then(|| AvertissementDeGain {
                 code: "filter_gain_positive",

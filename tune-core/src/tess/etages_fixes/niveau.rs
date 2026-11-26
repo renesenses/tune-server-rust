@@ -59,12 +59,14 @@ pub struct MargeDeConvolution {
     /// pas 0 dBFS : `−(gain_max + 0,5)`, bornée à [`HEADROOM_MANUEL_MIN_DB`] ;
     /// 0 pour un filtre qui n'amplifie pas.
     pub requise_db: f64,
-    /// La marge que le CONVOLUEUR applique (≤ 0) : la requise en Auto, 0 en
-    /// manuel (le choix de l'utilisateur, appliqué par l'étage de
-    /// l'égaliseur, n'est jamais forcé).
+    /// La marge que le CONVOLUEUR applique (≤ 0) : la requise en Auto ; en
+    /// manuel, M quand aucun étage d'égaliseur ne la porte (sortie réseau
+    /// sans égaliseur : personne d'autre ne l'appliquerait), 0 sinon (l'étage
+    /// des égaliseurs pose déjà `min(M, L1)`, #9520 : jamais deux fois).
     pub appliquee_db: f64,
     /// Marge MANUELLE plus faible que la requise : le chemin du signal le
-    /// dit, rien n'est changé.
+    /// dit, rien n'est changé. Avec un égaliseur empilé, c'est ce que sa
+    /// réserve L1 laisse de M au filtre qui compte (`min(M, L1) − L1`).
     pub insuffisante: bool,
 }
 
@@ -75,9 +77,18 @@ pub struct MargeDeConvolution {
 ///
 /// - Auto : `min(HEADROOM_AUTO_DB, −(gain_max + 0,5))`, bornée à −24 dB ;
 ///   un filtre qui n'amplifie pas (gain ≤ 0 dB) ne change rien.
-/// - Manuel : rien n'est forcé ; `insuffisante` si la marge choisie est
-///   au-dessus de la requise.
-pub fn marge_de_convolution(headroom: &Headroom, gain_max_db: f64) -> MargeDeConvolution {
+/// - Manuel M, UNE seule autorité (#9546) : `laissee_par_l_egaliseur_db` est
+///   ce que l'étage des égaliseurs, quand il tourne, laisse de M au filtre
+///   (`min(M, L1) − L1`, ≤ 0 ; le gain fixe M sans bande laisse M). `None` :
+///   aucun étage d'égaliseur ne tourne (sortie réseau sans égaliseur), et
+///   c'est le convolueur qui porte M — sans quoi le filtre jouerait à 0 dB,
+///   sans aucune protection. `insuffisante` si la marge qui reste au filtre
+///   est au-dessus de la requise.
+pub fn marge_de_convolution(
+    headroom: &Headroom,
+    gain_max_db: f64,
+    laissee_par_l_egaliseur_db: Option<f64>,
+) -> MargeDeConvolution {
     let gain = fini(gain_max_db);
     let requise_db = if gain > TOLERANCE_GAIN_CONVOLUTION_DB {
         (-(gain + MARGE_DE_SECURITE_CONVOLUTION_DB)).max(HEADROOM_MANUEL_MIN_DB)
@@ -85,12 +96,19 @@ pub fn marge_de_convolution(headroom: &Headroom, gain_max_db: f64) -> MargeDeCon
         0.0
     };
     match headroom {
-        Headroom::Manual { db } => MargeDeConvolution {
-            gain_max_db: gain,
-            requise_db,
-            appliquee_db: 0.0,
-            insuffisante: requise_db < 0.0 && fini(*db).min(0.0) > requise_db + 1e-9,
-        },
+        Headroom::Manual { db } => {
+            let manuelle = fini(*db).min(0.0);
+            let (appliquee_db, laissee) = match laissee_par_l_egaliseur_db {
+                Some(l) => (0.0, fini(l).min(0.0)),
+                None => (manuelle, manuelle),
+            };
+            MargeDeConvolution {
+                gain_max_db: gain,
+                requise_db,
+                appliquee_db,
+                insuffisante: requise_db < 0.0 && laissee > requise_db + 1e-9,
+            }
+        }
         Headroom::Auto {} | Headroom::Unknown => MargeDeConvolution {
             gain_max_db: gain,
             requise_db,
@@ -157,10 +175,12 @@ impl BilanDeNiveau {
     pub fn calculer(e: &EntreesNiveau) -> Self {
         let reserve = fini(e.gain_moyen_greffons_db).min(0.0);
         let resolu = fini(e.headroom_resolu_db).min(0.0);
-        // rc14 (Didier) — la marge du filtre de convolution (Auto seulement ;
-        // 0 en manuel) : elle protège un gain que la réserve des égaliseurs ne
-        // voit pas, elle s'ajoute donc à la leur.
-        let convolution = marge_de_convolution(&e.headroom, e.gain_max_convolution_db).appliquee_db;
+        // rc14 (Didier) — la marge du filtre de convolution (comptée en Auto
+        // seulement ; en manuel, le headroom résolu porte déjà M) : elle
+        // protège un gain que la réserve des égaliseurs ne voit pas, elle
+        // s'ajoute donc à la leur.
+        let convolution =
+            marge_de_convolution(&e.headroom, e.gain_max_convolution_db, None).appliquee_db;
         let (headroom_db, absorbe) = match e.headroom {
             Headroom::Auto {} if resolu < 0.0 => {
                 // `resolu` vaut `HEADROOM_AUTO_DB` : la part que la réserve des

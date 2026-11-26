@@ -597,6 +597,13 @@ fn la_marge_manuelle_est_en_service_quand_l_etage_dsp_tourne_rc14() {
         "PURE la contourne"
     );
     assert_eq!(marge_manuelle_en_service(&c, &json!({"steps": []})), None);
+    // Revue de #9561 — sortie réseau sans égaliseur : le convolueur porte M,
+    // c'est sa marge appliquée qui s'affiche.
+    let reseau = json!({"steps": [
+        {"name": "DSP", "bit_perfect": false},
+        {"code": "room_correction", "applied": true, "headroom_db": -7.5},
+    ]});
+    assert_eq!(marge_manuelle_en_service(&c, &reseau), Some(-7.5));
     // Automatique, ou 0 dB : jamais un gain à part.
     c.fixed.headroom = Headroom::Manual { db: 0.0 };
     assert_eq!(
