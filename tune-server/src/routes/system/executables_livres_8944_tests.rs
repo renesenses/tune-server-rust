@@ -28,7 +28,7 @@ fn un_demon_plus_ancien_que_le_serveur_est_signale_8944() {
         maintenant - Duration::from_secs(40 * 86_400),
     );
 
-    let releves = relever(&dir.join("tune-server"), &dir, "");
+    let releves = relever(&dir.join("tune-server"), "", false);
     let md = section_markdown(&releves, None);
 
     let ligne = md
@@ -74,7 +74,7 @@ fn un_demon_pose_avec_le_serveur_n_est_pas_signale_8944() {
     );
     poser(&dir, "librespot", b"librespot", maintenant);
 
-    let releves = relever(&dir.join("tune-server"), &dir, "");
+    let releves = relever(&dir.join("tune-server"), "", false);
     let md = section_markdown(&releves, None);
 
     assert!(!md.contains('⚠'), "#8944 : rien à signaler ici : {md}");
@@ -101,7 +101,7 @@ fn le_demon_lance_ailleurs_est_nomme_8944() {
         maintenant - Duration::from_secs(3 * 86_400),
     );
 
-    let releves = relever(&dir.join("tune-server"), &dir, "");
+    let releves = relever(&dir.join("tune-server"), "", false);
     let lance = relever_un("airplay-daemon", &ailleurs.join("airplay-daemon"));
     let md = section_markdown(&releves, Some(&lance));
 
@@ -111,4 +111,84 @@ fn le_demon_lance_ailleurs_est_nomme_8944() {
         "{md}"
     );
     assert!(md.contains("older than tune-server by 3 day(s)"), "{md}");
+}
+
+fn verifier_paquet(serveur: &str, suffixe: &str, conteneur: bool, attendu: &str) {
+    let livre = chemin_livre(Path::new(serveur), "airplay-daemon", suffixe, conteneur);
+    assert_eq!(livre, Path::new(attendu));
+    let releves = relever(Path::new(serveur), suffixe, conteneur);
+    let lance = demon_hors_paquet(Path::new(attendu), &livre);
+    let rapport = json(&releves, lance.as_ref());
+    assert_eq!(
+        rapport["files"][1]["path"],
+        livre.to_string_lossy().as_ref()
+    );
+    assert!(rapport["airplay_daemon_resolved"].is_null());
+    assert!(!section_markdown(&releves, lance.as_ref()).contains("not the bundled one"));
+    let tiers = Path::new("ancien").join(format!("airplay-daemon{suffixe}"));
+    assert_eq!(demon_hors_paquet(&tiers, &livre).unwrap().chemin, tiers);
+}
+
+#[test]
+fn image_docker_officielle_8944() {
+    verifier_paquet(
+        "/app/tune-server",
+        "",
+        true,
+        "/usr/local/bin/airplay-daemon",
+    );
+    let serveur = Path::new("/app/tune-server");
+    for nom in ["fpcalc", "librespot"] {
+        assert_eq!(
+            chemin_livre(serveur, nom, "", true),
+            Path::new("/usr/local/bin").join(nom)
+        );
+    }
+    // Dockerfile.dist ne livre pas ffmpeg dans /usr/local/bin.
+    assert_eq!(
+        chemin_livre(serveur, "ffmpeg", "", true),
+        Path::new("/app/ffmpeg")
+    );
+    verifier_paquet("/app/tune-server", "", false, "/app/airplay-daemon");
+}
+
+#[test]
+fn paquet_debian_8944() {
+    // current_exe résout le lien /usr/bin/tune-server, y compris dans un LXC.
+    verifier_paquet(
+        "/opt/tune/tune-server",
+        "",
+        true,
+        "/opt/tune/airplay-daemon",
+    );
+}
+
+#[test]
+fn image_tune_os_8944() {
+    verifier_paquet(
+        "/opt/tune/tune-server",
+        "",
+        false,
+        "/opt/tune/airplay-daemon",
+    );
+}
+
+#[test]
+fn application_macos_8944() {
+    verifier_paquet(
+        "/Applications/Tune Server.app/Contents/Resources/tune-server",
+        "",
+        false,
+        "/Applications/Tune Server.app/Contents/Resources/airplay-daemon",
+    );
+}
+
+#[test]
+fn installateur_windows_8944() {
+    verifier_paquet(
+        "C:/Users/test/AppData/Local/Programs/Tune Server/tune-server.exe",
+        ".exe",
+        false,
+        "C:/Users/test/AppData/Local/Programs/Tune Server/airplay-daemon.exe",
+    );
 }

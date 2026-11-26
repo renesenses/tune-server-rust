@@ -8,13 +8,12 @@
 //!
 //! Le rapport relève donc, pour `tune-server` et chaque nom de
 //! [`EXECUTABLES_LIVRES`](super::update::compagnons::EXECUTABLES_LIVRES)
-//! posé à côté de lui : la date de modification, la taille et une empreinte
+//! à son emplacement dans le paquet : la date de modification, la taille et une empreinte
 //! SHA-256 courte (16 chiffres, comparable à celle du fichier de l'archive de release). Un
 //! exécutable livré plus ancien que `tune-server` de plus d'un jour est
 //! signalé : c'est exactement la signature d'un démon qui n'a pas suivi la
 //! mise à jour. Pour `airplay-daemon`, le rapport dit aussi le chemin que le
-//! serveur lancerait, quand ce n'est pas celui d'à côté (Docker,
-//! `/usr/local/bin`, `PATH`).
+//! serveur lancerait, quand il diffère de celui du paquet.
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -83,14 +82,33 @@ pub(crate) fn relever_un(nom: &str, chemin: &Path) -> Releve {
     }
 }
 
-/// `tune-server` (le binaire en cours) puis chaque exécutable livré attendu
-/// dans `exe_dir`, avec le suffixe de la plateforme.
-pub(crate) fn relever(serveur: &Path, exe_dir: &Path, suffixe: &str) -> Vec<Releve> {
+/// Le .deb et Tune OS extraient l'archive dans /opt/tune. Le DMG place
+/// serveur et compagnons dans Contents/Resources, Windows dans le dossier
+/// d'installation. Seule l'image Docker a deux répertoires (Dockerfile.dist).
+fn chemin_livre(serveur: &Path, nom: &str, suffixe: &str, conteneur: bool) -> PathBuf {
+    if conteneur
+        && serveur == Path::new("/app/tune-server")
+        && matches!(nom, "airplay-daemon" | "librespot" | "fpcalc")
+    {
+        return Path::new("/usr/local/bin").join(nom);
+    }
+    serveur.with_file_name(format!("{nom}{suffixe}"))
+}
+
+fn relever(serveur: &Path, suffixe: &str, conteneur: bool) -> Vec<Releve> {
     let mut releves = vec![relever_un("tune-server", serveur)];
     for nom in super::update::compagnons::EXECUTABLES_LIVRES {
-        releves.push(relever_un(nom, &exe_dir.join(format!("{nom}{suffixe}"))));
+        releves.push(relever_un(
+            nom,
+            &chemin_livre(serveur, nom, suffixe, conteneur),
+        ));
     }
     releves
+}
+
+fn demon_hors_paquet(lance: &Path, livre: &Path) -> Option<Releve> {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    (canon(lance) != canon(livre)).then(|| relever_un("airplay-daemon", lance))
 }
 
 fn date_utc(t: SystemTime) -> String {
@@ -115,7 +133,7 @@ fn retard_en_jours(t: SystemTime, serveur: SystemTime) -> Option<u64> {
 
 /// La section Markdown du rapport. Le premier relevé est `tune-server`.
 /// `demon_lance` : le chemin du démon AirPlay 2 que le serveur lance, s'il
-/// diffère de celui d'à côté.
+/// diffère de celui du paquet.
 pub(crate) fn section_markdown(releves: &[Releve], demon_lance: Option<&Releve>) -> String {
     let serveur = releves
         .first()
@@ -183,24 +201,17 @@ pub(crate) fn json(releves: &[Releve], demon_lance: Option<&Releve>) -> serde_js
 }
 
 /// Le relevé complet, pour le rapport : binaire courant, son dossier, et le
-/// démon AirPlay 2 que le serveur lancerait, s'il n'est pas celui d'à côté.
+/// démon AirPlay 2 que le serveur lancerait, s'il diffère du démon du paquet.
 pub(crate) fn relever_l_installation() -> (Vec<Releve>, Option<Releve>) {
     let Ok(serveur) = std::env::current_exe() else {
         return (Vec::new(), None);
     };
-    let Some(dir) = serveur.parent() else {
-        return (Vec::new(), None);
-    };
     let suffixe = std::env::consts::EXE_SUFFIX;
-    let releves = relever(&serveur, dir, suffixe);
-    let a_cote = dir.join(format!("airplay-daemon{suffixe}"));
+    let conteneur = serveur == Path::new("/app/tune-server") && super::update::running_in_docker();
+    let releves = relever(&serveur, suffixe, conteneur);
+    let livre = chemin_livre(&serveur, "airplay-daemon", suffixe, conteneur);
     let demon_lance = tune_core::outputs::airplay2::chemin_du_demon_lance()
-        .map(PathBuf::from)
-        .filter(|p| {
-            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-            canon(p) != canon(&a_cote)
-        })
-        .map(|p| relever_un("airplay-daemon", &p));
+        .and_then(|p| demon_hors_paquet(Path::new(&p), &livre));
     (releves, demon_lance)
 }
 

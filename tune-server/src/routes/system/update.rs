@@ -511,7 +511,7 @@ fn probe_dir_writable(dir: &std::path::Path) -> Result<(), String> {
 /// `container` env var some runtimes set. Non-Linux hosts are never
 /// containerised this way, so they always return false.
 #[cfg(target_os = "linux")]
-fn running_in_docker() -> bool {
+pub(super) fn running_in_docker() -> bool {
     if std::path::Path::new("/.dockerenv").exists() {
         return true;
     }
@@ -531,7 +531,7 @@ fn running_in_docker() -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn running_in_docker() -> bool {
+pub(super) fn running_in_docker() -> bool {
     false
 }
 
