@@ -3113,3 +3113,45 @@ fn retirer_la_correction_de_piece_efface_la_trace_de_la_correction_appliquee() {
     ecrire_chaine(&s, z, &sans).unwrap();
     assert_eq!(s.get(&cle_correction_appliquee(z)).unwrap(), None);
 }
+
+/// rc14 (fil 3103) — changer la seule cible DSD de l'étage fixe (DSD128 →
+/// DSD256) n'écrit aucune ancienne clé : la clé du suréchantillonneur figure
+/// tout de même au bilan, pour que la route qui écrit relance le flux modulé.
+#[test]
+fn changer_la_seule_cible_dsd_rend_la_cle_du_surechantillonneur() {
+    let (_b, s) = base();
+    let z = 55;
+    let cle = Partie::Surechantillonnage.cle(z);
+    let dsd = |rate| {
+        let mut c = ChaineTess::default();
+        c.fixed.upsampling = Upsampling::Dsd {
+            rate,
+            filter: OFFERED_FILTERS[0].into(),
+        };
+        c
+    };
+    ecrire_chaine(&s, z, &dsd(TauxDsd::Dsd128)).unwrap();
+    let avant = hors_tess(&s);
+    let b = ecrire_chaine(&s, z, &dsd(TauxDsd::Dsd256)).unwrap();
+    // Aucune ancienne clé réécrite (l'ancien suréchantillonneur reste éteint)…
+    assert_eq!(hors_tess(&s), avant);
+    // … mais l'étage fixe a changé : sa clé est au bilan, une seule fois.
+    assert_eq!(b.cles_modifiees, vec![cle.clone()], "{b:?}");
+    assert!(matches!(
+        lire_zone(&s, z, true).unwrap().chaine.fixed.upsampling,
+        Upsampling::Dsd {
+            rate: TauxDsd::Dsd256,
+            ..
+        }
+    ));
+    // Contre-épreuve : la même cible réécrite ne rend rien.
+    assert!(
+        ecrire_chaine(&s, z, &dsd(TauxDsd::Dsd256))
+            .unwrap()
+            .cles_modifiees
+            .is_empty()
+    );
+    // DSD → éteint : l'ancienne clé ne bouge pas non plus, la clé est rendue.
+    let b = ecrire_chaine(&s, z, &ChaineTess::default()).unwrap();
+    assert_eq!(b.cles_modifiees, vec![cle], "{b:?}");
+}

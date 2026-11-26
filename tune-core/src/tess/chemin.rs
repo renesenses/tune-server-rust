@@ -50,7 +50,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use super::chaine::{ChaineTess, Dither, Upsampling};
+use super::chaine::{ChaineTess, Dither, TauxDsd, Upsampling};
 use super::etages_fixes::{BilanDeNiveau, GainDeRendu};
 use super::greffon::Catalogue;
 use super::migration::MARQUE_MONO_INERTE;
@@ -278,6 +278,26 @@ pub fn params_du_modulateur(m: &ModulationEnService) -> Map<String, Value> {
     );
     p.insert("reference_level".into(), json!("0 dB SACD"));
     p
+}
+
+/// rc14 (fil 3103) — la cible DSD de la chaîne, quand elle diffère de la
+/// cadence du flux modulé qui joue : elle ne s'entendra qu'à la piste
+/// suivante (ou à la relance du flux).
+pub fn cible_dsd_a_venir(chaine: &ChaineTess, m: &ModulationEnService) -> Option<TauxDsd> {
+    match &chaine.fixed.upsampling {
+        Upsampling::Dsd { rate, .. } if *rate != m.rate => Some(*rate),
+        _ => None,
+    }
+}
+
+/// « DSD256 at the next track » : le détail publié sur l'upsampling et le
+/// modulateur tant que la nouvelle cible attend.
+pub fn detail_cible_a_venir(cible: TauxDsd) -> String {
+    let nom = serde_json::to_value(cible)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_uppercase))
+        .unwrap_or_else(|| "DSD".into());
+    format!("{nom} at the next track")
 }
 
 fn etape_vide(code: CodeEtape) -> EtapeResolue {
@@ -508,6 +528,21 @@ pub fn chemin_du_signal(
         }
         _ => {}
     }
+    // rc14 (fil 3103) — la cible DSD a changé pendant une piste modulée
+    // (préréglage ou panneau, zone en pause, relance pas encore faite) : le
+    // chemin dit la cadence EN COURS, et la nouvelle « à la piste suivante ».
+    let cible_a_venir = match modulation {
+        Some(EtatModulation::EnService(m)) => cible_dsd_a_venir(chaine, m),
+        _ => None,
+    };
+    if let Some(cible) = cible_a_venir
+        && let Some(Value::Object(p)) = upsampling.params.as_mut()
+        && let Some(EtatModulation::EnService(m)) = modulation
+    {
+        p.insert("rate".into(), json!(m.rate));
+        p.insert("pending_rate".into(), json!(cible));
+        upsampling.detail = Some(detail_cible_a_venir(cible));
+    }
 
     if volume.effective && !en_service.volume_logiciel {
         eteindre_pas_en_service(&mut volume, &mut ecarts);
@@ -534,6 +569,9 @@ pub fn chemin_du_signal(
         f.params = upsampling.params.clone();
         if let Some(EtatModulation::EnService(m)) = modulation {
             fusionner_params(&mut f, params_du_modulateur(m));
+        }
+        if let Some(cible) = cible_a_venir {
+            f.detail = Some(detail_cible_a_venir(cible));
         }
         f
     } else {
