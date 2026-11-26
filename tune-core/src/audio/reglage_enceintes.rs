@@ -355,6 +355,11 @@ struct TransitionPure {
     phase: PhasePure,
     borne: f64,
     libre: bool,
+    /// rc14 (suite de la relecture de #9556) — une COUPURE hors PURE
+    /// (« Bypass all », greffon décoché, réglage retiré) : même fondu, même
+    /// remontée bornée, mais au bout le réglage neutre continue d'être
+    /// joué (pas de contournement), et seule une nouvelle pose la quitte.
+    coupure: bool,
 }
 
 /// Les paramètres effectifs pour un format : délai et facteur par voie.
@@ -435,6 +440,9 @@ pub struct ProcesseurEnceintes {
     contourne: bool,
     /// rc14 — entrée en PURE en cours ([`PhasePure`]).
     transition: Option<TransitionPure>,
+    /// rc14 — la borne de volume de la prochaine coupure
+    /// ([`Self::definir_borne`]).
+    borne_de_coupure: f64,
 }
 
 impl ProcesseurEnceintes {
@@ -456,6 +464,7 @@ impl ProcesseurEnceintes {
             historique: 0,
             contourne: false,
             transition: None,
+            borne_de_coupure: 1.0,
         }
     }
 
@@ -498,10 +507,32 @@ impl ProcesseurEnceintes {
     /// fondu de [`RAMPE_MS`] dès le bloc suivant (après un fondu en cours, et
     /// dès que l'historique couvre les délais demandés).
     pub fn definir(&mut self, reglages: ReglagesEnceintes) {
-        if self.canaux == 0 && self.en_attente.is_none() {
+        self.definir_borne(reglages, 1.0);
+    }
+
+    /// [`Self::definir`], avec la borne de volume (#6741) d'une COUPURE :
+    /// rc14 (sécurité auditive, suite de la relecture de #9556) — un réglage
+    /// qui agit et qu'on coupe pendant la lecture (« Bypass all », greffon
+    /// décoché) rendait sa réserve en [`RAMPE_MS`] (20 ms), jusqu'à +10 dB.
+    /// Il passe désormais comme l'entrée en PURE : fondu vers le sec tenu
+    /// au niveau de chaque voie, puis remontée en [`REMONTEE_PURE_MS`] vers
+    /// `borne`, jamais au-delà (voyant, « Rendre le niveau »). Une nouvelle
+    /// pose qui agit pendant ce temps repart du point atteint.
+    pub fn definir_borne(&mut self, reglages: ReglagesEnceintes, borne: f64) {
+        if self.canaux == 0 && self.en_attente.is_none() && self.transition.is_none() {
             self.reglages = reglages;
             return;
         }
+        let coupe = Parametres::de(&reglages, self.canaux, self.cadence).neutre();
+        let coupure_en_cours = self.transition.as_ref().is_some_and(|t| t.coupure);
+        if coupure_en_cours && !coupe {
+            // Le réglage revient (ou un autre) : depuis le point atteint.
+            self.reglages = reglages.clone();
+            self.en_attente = Some(reglages);
+            self.sortir_de_pure();
+            return;
+        }
+        self.borne_de_coupure = Self::borne_lisible(borne);
         self.en_attente = Some(reglages);
         self.demarrer_si_possible();
     }
@@ -526,6 +557,21 @@ impl ProcesseurEnceintes {
         let r = self.en_attente.take().expect("vu ci-dessus");
         self.reglages = r;
         if nouveaux == self.actuel {
+            return;
+        }
+        // rc14 (suite de la relecture de #9556) — une COUPURE d'un réglage
+        // qui agit (« Bypass all », greffon décoché) ne rend plus sa réserve
+        // en 20 ms : fondu vers le sec tenu, puis remontée bornée. Sans
+        // voie baissée (délais, inversions seuls), rien ne monte : le fondu
+        // habituel suffit.
+        if nouveaux.neutre() && self.actuel.facteurs.iter().any(|f| f.abs() < 1.0) {
+            self.transition = Some(TransitionPure {
+                phase: PhasePure::Armee,
+                borne: self.borne_de_coupure,
+                libre: false,
+                coupure: true,
+            });
+            self.commencer_le_fondu_vers_le_sec();
             return;
         }
         let ancien = std::mem::replace(&mut self.actuel, nouveaux);
@@ -636,6 +682,7 @@ impl ProcesseurEnceintes {
             phase: PhasePure::Armee,
             borne: Self::borne_lisible(borne),
             libre: false,
+            coupure: false,
         });
     }
 
@@ -728,7 +775,7 @@ impl ProcesseurEnceintes {
     pub fn transition_commencee(&self) -> bool {
         self.transition
             .as_ref()
-            .is_some_and(|t| t.phase != PhasePure::Armee)
+            .is_some_and(|t| t.phase != PhasePure::Armee && !t.coupure)
     }
 
     /// rc14 — le niveau tenu par l'entrée en PURE (le plus bas des voies,
@@ -761,7 +808,15 @@ impl ProcesseurEnceintes {
         if self.actuel.retards.iter().all(|d| *d == 0)
             && self.actuel.facteurs.iter().all(|f| *f == 1.0)
         {
+            let coupure = t.coupure;
             self.transition = None;
+            if coupure {
+                // Coupure finie : le réglage neutre joue, à l'identité.
+                if let Some(r) = self.en_attente.take() {
+                    self.reglages = r;
+                }
+                return;
+            }
             self.contourne = true;
             self.anneau.fill(0.0);
             self.historique = 0;
@@ -818,6 +873,19 @@ impl ProcesseurEnceintes {
         }
         let vers = Parametres::de(&self.reglages, self.canaux, self.cadence);
         if vers == self.actuel {
+            return;
+        }
+        // rc14 (suite de la relecture de #9556) — vers un réglage NEUTRE
+        // (le seul que connaisse une piste lancée sous PURE) : la sortie
+        // ferait REMONTER les voies tenues en 20 ms. Elle devient une
+        // coupure : remontée bornée depuis le point atteint.
+        if vers.neutre() && self.actuel.facteurs.iter().any(|f| f.abs() < 1.0) {
+            self.transition = Some(TransitionPure {
+                phase: PhasePure::Tenu,
+                coupure: true,
+                ..t
+            });
+            self.avancer_la_transition();
             return;
         }
         let depuis = std::mem::replace(&mut self.actuel, vers);

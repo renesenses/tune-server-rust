@@ -70,10 +70,24 @@ fn creneau(cle: &AtomicBool) -> Option<Creneau> {
 /// - Greffon hors de la chaîne : un créneau existant fond vers le neutre ; il
 ///   disparaîtra à la prochaine lecture. Aucun créneau n'est créé.
 pub(crate) fn poser(cle: &AtomicBool, dans_la_chaine: bool, reglages: Option<ReglagesEnceintes>) {
+    poser_borne(cle, dans_la_chaine, reglages, 1.0);
+}
+
+/// [`poser`], avec la borne de volume (#6741) d'une COUPURE (« Bypass
+/// all », greffon décoché) : rc14, suite de la relecture de #9556 — un
+/// réglage qui agit ne rend plus sa réserve en 20 ms, il passe par un fondu
+/// vers le sec tenu puis une remontée bornée par `borne`
+/// (`ProcesseurEnceintes::definir_borne`).
+pub(crate) fn poser_borne(
+    cle: &AtomicBool,
+    dans_la_chaine: bool,
+    reglages: Option<ReglagesEnceintes>,
+    borne: f64,
+) {
     let r = reglages.unwrap_or_default();
     if let Some(c) = creneau(cle) {
         if let Ok(mut p) = c.lock() {
-            p.definir(r);
+            p.definir_borne(r, borne);
         }
         return;
     }

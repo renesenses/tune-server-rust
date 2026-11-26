@@ -1748,14 +1748,9 @@ impl LocalOutput {
         if let Ok(mut eq) = self.eq.lock() {
             self.borner_la_remontee(&mut eq);
         }
-        // rc14 (relecture de #9556) — l'entrée en PURE du réglage des
-        // enceintes suit la même borne.
-        if self.pure_bypass.load(Ordering::Relaxed) {
-            enceintes_de_sortie::borner_en_pure(
-                &self.pure_bypass,
-                self.borne_de_la_transition_pure(),
-            );
-        }
+        // rc14 (relecture de #9556) — l'entrée en PURE ou la coupure du
+        // réglage des enceintes suit la même borne.
+        enceintes_de_sortie::borner_en_pure(&self.pure_bypass, self.borne_de_la_transition_pure());
         // rc14 — la garde du rendu suit la même borne (jamais vers le bas).
         if self.pure_bypass.load(Ordering::Relaxed)
             && self.reserve_du_surechantillonneur.garde() < 1.0 - 1e-6
@@ -1816,11 +1811,7 @@ impl LocalOutput {
         };
         // rc14 (relecture de #9556) — le niveau que tient l'entrée en PURE du
         // réglage des enceintes s'y ajoute : même voyant, même geste.
-        let etage = match (
-            etage,
-            enceintes_de_sortie::garde_en_pure(&self.pure_bypass)
-                .filter(|_| self.pure_bypass.load(Ordering::Relaxed)),
-        ) {
+        let etage = match (etage, enceintes_de_sortie::garde_en_pure(&self.pure_bypass)) {
             (Some(e), Some((db, en_retour))) => Some(super::super::audio::eq::PreampliGarde {
                 db: e.db + db,
                 en_retour: e.en_retour || en_retour,
@@ -2784,7 +2775,15 @@ impl LocalOutput {
         dans_la_chaine: bool,
         reglages: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
     ) {
-        enceintes_de_sortie::poser(&self.pure_bypass, dans_la_chaine, reglages);
+        // rc14 (suite de la relecture de #9556) — une coupure (« Bypass
+        // all », greffon décoché) rejoint le niveau d'avant le réglage, borné
+        // par le volume, jamais au-delà.
+        enceintes_de_sortie::poser_borne(
+            &self.pure_bypass,
+            dans_la_chaine,
+            reglages,
+            self.borne_de_la_transition_pure(),
+        );
         self.suivre_le_volume_avant_le_traitement();
     }
 
