@@ -605,13 +605,8 @@ async fn cette_machine_reste_sans_code_hors_fenetre() {
 
 #[test]
 fn seule_une_base_absente_est_neuve() {
-    let dossier = std::env::temp_dir().join(format!(
-        "tune-premiere-configuration-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dossier).unwrap();
-    let base = dossier.join("tune.db");
-    let _ = std::fs::remove_file(&base);
+    let dossier = tune_core::test_scratch::scratch_dir("tune-premiere-configuration");
+    let base = dossier.path().join("tune.db");
     let chemin = base.to_str().unwrap();
     assert!(base_neuve_avant_ouverture(chemin, None));
     assert!(base_neuve_avant_ouverture(chemin, Some("sqlite://tune.db")));
@@ -623,7 +618,6 @@ fn seule_une_base_absente_est_neuve() {
     assert!(!base_neuve_avant_ouverture(":memory:", None));
     std::fs::write(&base, b"").unwrap();
     assert!(!base_neuve_avant_ouverture(chemin, None));
-    let _ = std::fs::remove_dir_all(&dossier);
 }
 
 #[test]
