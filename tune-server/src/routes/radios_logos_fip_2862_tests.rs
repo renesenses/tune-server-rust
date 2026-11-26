@@ -31,7 +31,7 @@ fn stations_fip(repo: &RadioRepo) -> Vec<RadioStation> {
 
 #[test]
 fn chaque_radio_fip_semee_recoit_le_logo_de_sa_fiche() {
-    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let state = AppState::new_avec_catalogue_de_radios(":memory:", 0, Default::default()).unwrap();
     let repo = RadioRepo::with_backend(state.backend.clone());
     let annuaire = annuaire_fip();
 
@@ -66,7 +66,7 @@ fn chaque_radio_fip_semee_recoit_le_logo_de_sa_fiche() {
 
 #[test]
 fn fip_monde_et_nouveautes_portent_leur_propre_logo() {
-    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let state = AppState::new_avec_catalogue_de_radios(":memory:", 0, Default::default()).unwrap();
     let repo = RadioRepo::with_backend(state.backend.clone());
     rattraper_les_logos(&repo, &annuaire_fip(), &mut RattrapageLogos::default());
 

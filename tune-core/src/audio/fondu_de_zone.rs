@@ -55,7 +55,8 @@ pub fn duree_reglee_s(db: &Arc<dyn DbBackend>, zone_id: i64) -> f64 {
 #[must_use]
 pub fn duree_appliquee_ms(db: &Arc<dyn DbBackend>, zone_id: i64) -> u32 {
     // #8513 — ni pendant une mesure de pièce : la rampe mangerait le balayage.
-    if super::audiophile::traitements_contournes(db, zone_id)
+    // rc14 — « Bypass all » garde la rampe anti-clic (`pure_ou_mesure`).
+    if super::audiophile::pure_ou_mesure(db, zone_id)
         || super::bitperfect_strict::zone_enabled(db, zone_id)
     {
         return 0;

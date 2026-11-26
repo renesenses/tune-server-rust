@@ -2047,6 +2047,19 @@ impl PlaybackManager {
         });
     }
 
+    /// rc14 — publie le volume et la sourdine de la zone pour la
+    /// modulation DSD de TESS, SOUS le verrou des zones : une sourdine posée
+    /// en même temps ne peut pas être écrasée par une valeur lue avant elle.
+    pub async fn publier_le_volume_dsd(&self, zone_id: i64) {
+        let zones = self.zones.lock().await;
+        let (volume, muet) = zones
+            .get(&zone_id)
+            .map_or((ZoneState::default().volume, false), |s| {
+                (s.volume, s.muted)
+            });
+        crate::tess::modulation_dsd::publier_volume(zone_id, volume, muet);
+    }
+
     pub async fn set_volume(&self, zone_id: i64, volume: f64) {
         let mut zones = self.zones.lock().await;
         let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
@@ -2054,6 +2067,8 @@ impl PlaybackManager {
             ..Default::default()
         });
         state.volume = volume.clamp(0.0, 1.0);
+        // rc14 — publié pour la modulation DSD de TESS (lu sans verrou).
+        crate::tess::modulation_dsd::publier_volume(zone_id, state.volume, state.muted);
         self.emit(PlaybackEvent {
             event: "volume".into(),
             zone_id,
@@ -2126,6 +2141,7 @@ impl PlaybackManager {
         let mute_change = state.muted != muted;
         state.volume = volume;
         state.muted = muted;
+        crate::tess::modulation_dsd::publier_volume(zone_id, volume, muted);
         if volume_change {
             self.emit(PlaybackEvent {
                 event: "volume".into(),
@@ -2177,6 +2193,7 @@ impl PlaybackManager {
             zones.get_mut(&zone_id).map(|state| {
                 state.muted = muted;
                 state.last_mute_set_at = Some(Instant::now());
+                crate::tess::modulation_dsd::publier_volume(zone_id, state.volume, muted);
                 state.volume
             })
         };
@@ -2630,9 +2647,70 @@ impl PlaybackManager {
         });
     }
 
+    /// [`Self::update_now_playing`], seulement si la zone joue TOUJOURS le
+    /// flux d'où viennent ces métadonnées (`lu_sur` : le now-playing de
+    /// l'instantané qu'a lu l'appelant). Vérifié sous le même verrou que
+    /// l'écriture. Rend `false`, sans rien écrire ni émettre, si la zone joue
+    /// un autre flux ou ne joue plus rien.
+    ///
+    /// Fil 3095 (rc13.90) : le sondeur radio lit l'état de la zone, puis
+    /// attend les métadonnées de la station (ICY, relais : jusqu'à plusieurs
+    /// secondes). Si l'on change de station pendant ce temps, son écriture
+    /// reposait l'ANCIENNE station — titre, pochette, `source_id`,
+    /// `stream_id` — par-dessus la nouvelle, et les tours suivants
+    /// continuaient de sonder l'ancienne : l'écran restait sur elle.
+    pub async fn update_now_playing_du_meme_flux(
+        &self,
+        zone_id: i64,
+        lu_sur: &NowPlaying,
+        np: NowPlaying,
+    ) -> bool {
+        let mut zones = self.zones.lock().await;
+        let Some(state) = zones.get_mut(&zone_id) else {
+            return false;
+        };
+        if !state
+            .now_playing
+            .as_ref()
+            .is_some_and(|courant| meme_flux(courant, lu_sur))
+        {
+            return false;
+        }
+        if metadata_identity_changed(state.now_playing.as_ref(), &np) {
+            state.metadata_changed_at_ms = Some(epoch_ms());
+        }
+        state.now_playing = Some(np);
+        let data = now_playing_event_data(state);
+        self.emit(PlaybackEvent {
+            event: "track_changed".into(),
+            zone_id,
+            data,
+        });
+        true
+    }
+
+    /// Vrai si la zone joue un AUTRE flux que `lu_sur` (et pas seulement
+    /// « rien ») : lecture rapide, sans verrou tenu, pour ne pas lancer
+    /// d'effet de bord (DIDL vers le renderer, historique) au nom d'une
+    /// station qu'on vient de quitter (fil 3095).
+    pub async fn joue_un_autre_flux(&self, zone_id: i64, lu_sur: &NowPlaying) -> bool {
+        self.zones
+            .lock()
+            .await
+            .get(&zone_id)
+            .and_then(|s| s.now_playing.as_ref())
+            .is_some_and(|courant| !meme_flux(courant, lu_sur))
+    }
+
     fn emit(&self, event: PlaybackEvent) {
         let _ = self.event_tx.send(event);
     }
+}
+
+/// Deux now-playing parlent-ils du même flux ? Même source, même identifiant
+/// chez la source (la station), même session de flux.
+fn meme_flux(a: &NowPlaying, b: &NowPlaying) -> bool {
+    a.source == b.source && a.source_id == b.source_id && a.stream_id == b.stream_id
 }
 
 /// Build the JSON payload for a now-playing WS event (`started` /

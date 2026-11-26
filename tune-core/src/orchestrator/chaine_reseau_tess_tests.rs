@@ -603,3 +603,154 @@ fn t06_une_longue_piste_compensee_reste_en_f32_et_reserve_sa_place() {
     // Et le seuil de production borne une piste de 10 min en 192 kHz.
     assert!(192_000 * 2 * 600 > SEUIL_STOCKAGE_F64);
 }
+
+/// rc14 — le réglage des enceintes dans un flux que Tune fabrique (relais
+/// progressif, flux tiré) : dernier étage de l'exécuteur. Un délai seul rend
+/// chaque mot EXACT, décalé du nombre entier d'échantillons attendu, en 16 et
+/// 24 bits, au fil de tampons successifs ; la voie la plus lointaine garde ses
+/// octets. Le délai n'est pas retiré comme une amorce de latence : la
+/// longueur du flux est conservée.
+#[test]
+fn le_reglage_des_enceintes_decale_une_voie_au_mot_pres_rc14() {
+    use crate::audio::reglage_enceintes::{ProcesseurEnceintes, ReglagesEnceintes, VoieEnceinte};
+    let reglages = ReglagesEnceintes {
+        channels: vec![
+            VoieEnceinte {
+                distance_cm: Some(343.0 / 2.0), // 5 ms plus près : 240 trames à 48 kHz
+                ..VoieEnceinte::default()
+            },
+            VoieEnceinte {
+                distance_cm: Some(343.0),
+                ..VoieEnceinte::default()
+            },
+        ],
+        invert_all: false,
+    };
+    assert_eq!(reglages.retards_en_echantillons(2, 48_000), vec![240, 0]);
+    for bits in [16u16, 24] {
+        let w = usize::from(bits / 8);
+        let src = source(bits, 9_600 * 2, 0.9, 21);
+        let mut dsp = StreamingDsp {
+            enceintes: Some(ProcesseurEnceintes::new(reglages.clone())),
+            ..porteur(None)
+        };
+        assert!(dsp.is_active());
+        let mut servi = Vec::new();
+        for bloc in src.chunks(1_000 * 2 * w) {
+            let mut b = bloc.to_vec();
+            dsp.process_flux(&mut b, bits);
+            assert_eq!(b.len(), bloc.len(), "aucune amorce retirée");
+            servi.extend(b);
+        }
+        let trame = 2 * w;
+        for n in 0..9_600 {
+            // Voie droite (la plus lointaine) : ses octets, intacts.
+            assert_eq!(
+                servi[n * trame + w..(n + 1) * trame],
+                src[n * trame + w..(n + 1) * trame],
+                "{bits} bits, trame {n}, droite"
+            );
+            // Voie gauche : le mot de la trame n − 240, exact.
+            let attendu = if n < 240 {
+                vec![0u8; w]
+            } else {
+                src[(n - 240) * trame..(n - 240) * trame + w].to_vec()
+            };
+            assert_eq!(
+                servi[n * trame..n * trame + w],
+                attendu[..],
+                "{bits} bits, trame {n}, gauche"
+            );
+        }
+    }
+    // Contre-épreuve : sans réglage, le porteur est inactif (bit-perfect).
+    let mut vide = porteur(None);
+    assert!(!vide.is_active());
+    let src = source(16, 2_000, 0.9, 3);
+    let mut pcm = src.clone();
+    vide.process(&mut pcm, 16);
+    assert_eq!(pcm, src);
+}
+
+/// rc14 (relecture de #9523, M1) — convolveur PUIS réglage des enceintes avec
+/// inversion, sur un relais : la queue que le convolveur rend en fin de flux
+/// (`Passage::Fin`) passe ELLE AUSSI par le réglage des enceintes (délai,
+/// gain, phase). Avant, les dernières trames (la latence du convolveur)
+/// sortaient non inversées : saut de −8000 à +8000. Sinus de 50 Hz,
+/// amplitude 0,8 ; écart à la référence ≤ 2 LSB sur TOUT le flux, queue
+/// comprise.
+#[test]
+fn la_queue_du_convolveur_passe_par_le_reglage_des_enceintes_rc14() {
+    use crate::audio::reglage_enceintes::{ProcesseurEnceintes, ReglagesEnceintes, VoieEnceinte};
+    let reglages = ReglagesEnceintes {
+        channels: vec![
+            VoieEnceinte {
+                distance_cm: Some(343.0),
+                ..VoieEnceinte::default()
+            },
+            VoieEnceinte {
+                distance_cm: Some(343.0 / 2.0), // 240 trames à 48 kHz
+                gain_db: -3.0,
+                invert: false,
+            },
+        ],
+        invert_all: true,
+    };
+    let n = 7_000;
+    let x: Vec<i16> = (0..n)
+        .flat_map(|i| {
+            let v =
+                (0.8 * (2.0 * std::f64::consts::PI * 50.0 * i as f64 / 48_000.0).sin() * 32_767.0)
+                    .round() as i16;
+            [v, v]
+        })
+        .collect();
+    let octets: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut dsp = StreamingDsp {
+        convolver: Some(Convolver::new(&[vec![1.0f32], vec![1.0f32]], 64)),
+        enceintes: Some(ProcesseurEnceintes::new(reglages.clone())),
+        ..porteur(None)
+    };
+    let mut servi = Vec::new();
+    for bloc in octets.chunks(500 * 4) {
+        let mut b = bloc.to_vec();
+        dsp.process_flux(&mut b, 16);
+        servi.extend(b);
+    }
+    let queue = dsp.terminer_flux(16);
+    assert!(!queue.is_empty(), "le convolveur rend sa queue");
+    servi.extend(queue);
+    assert_eq!(servi.len(), octets.len(), "amorce retirée, queue rendue");
+    let y: Vec<i16> = servi
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    // Référence : le réglage seul sur le flux entier.
+    let mut attendu: Vec<f64> = x.iter().map(|v| f64::from(*v) / 32_768.0).collect();
+    ProcesseurEnceintes::new(reglages).traiter(&mut attendu, 2, 48_000);
+    let pire = y
+        .iter()
+        .zip(&attendu)
+        .map(|(a, b)| (f64::from(*a) - b * 32_768.0).abs())
+        .fold(0.0, f64::max);
+    assert!(pire <= 2.0, "écart {pire} LSB (queue non traitée ?)");
+    // Et aucun saut d'un échantillon au suivant au-delà de 3 fois le pas
+    // naturel (0,8 × 2π × 50 / 48 000 pleine échelle).
+    let pas = 0.8 * 2.0 * std::f64::consts::PI * 50.0 / 48_000.0 * 32_768.0;
+    for voie in 0..2 {
+        let v: Vec<f64> = y
+            .iter()
+            .skip(voie)
+            .step_by(2)
+            .map(|s| f64::from(*s))
+            .collect();
+        let saut = v
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "saut_mesure reseau convolveur+enceintes voie {voie} : {saut} LSB (pas {pas:.1})"
+        );
+        assert!(saut <= 3.0 * pas, "voie {voie} : saut {saut} LSB");
+    }
+}

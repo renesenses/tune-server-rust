@@ -1184,6 +1184,9 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // thermique. Remplace `analyses_bridees` et `analyses_bridage_leve`
         // (#5410, #6713) : une température illisible ne bride plus.
         "temperature_illisible": temperature_illisible,
+        // rc14 — où sont les pochettes, pourquoi là, et l'avertissement
+        // (`artwork_cache_unwritable`, `artwork_cache_relative_to_working_dir`).
+        "artwork_cache": fiche_du_cache_de_pochettes(),
         "db_backend": db_backend,
         "active_zones": zone_count,
         "zone_poller_metrics": zone_poller_metrics,
@@ -1488,7 +1491,14 @@ pub(super) async fn diagnostics_oaat(State(state): State<AppState>) -> Json<Valu
 }
 
 pub(super) async fn health_monitor(State(state): State<AppState>) -> Json<Value> {
-    let report = state.health_monitor.run_checks().await;
+    let mut report = state.health_monitor.run_checks().await;
+    // rc14 — un cache de pochettes impossible à écrire, ou qui dépend du
+    // dossier de lancement, met la sonde en `warning` : la barre latérale et
+    // l'écran « État du serveur » le montrent sans nouvelle page.
+    ajouter_le_controle_du_cache(
+        &mut report,
+        crate::chemins_de_donnees::avertissement_du_cache_retenu(),
+    );
     // #8805 — le `COUNT(*) FROM tracks` de cette route a tenu un fil de
     // l'exécuteur 108 s dans le rapport du fil 2841. Même cache que
     // `/system/health`, qui compte la même table.
@@ -1515,6 +1525,57 @@ pub(super) async fn health_monitor(State(state): State<AppState>) -> Json<Value>
         "checks": report.checks,
         "alerts": report.alerts,
     }))
+}
+
+/// Le contrôle `artwork_cache` de la sonde de santé : présent seulement
+/// quand il y a quelque chose à dire, et il ne fait jamais redescendre un
+/// état plus grave.
+pub(crate) fn ajouter_le_controle_du_cache(
+    report: &mut tune_core::health_monitor::HealthReport,
+    avertissement: Option<&crate::chemins_de_donnees::AvertissementDuCache>,
+) {
+    use tune_core::health_monitor::{AlertLevel, CheckResult};
+    let Some(a) = avertissement else {
+        return;
+    };
+    report.checks.insert(
+        "artwork_cache".into(),
+        CheckResult {
+            status: AlertLevel::Warning,
+            details: json!({ "code": a.code, "message": a.message }),
+        },
+    );
+    if report.status == AlertLevel::Ok {
+        report.status = AlertLevel::Warning;
+    }
+}
+
+/// Le bloc `artwork_cache` de `/system/diagnostics` et la ligne du rapport
+/// de bogue : où sont les pochettes, pourquoi là, et ce qui ne va pas.
+pub(crate) fn fiche_du_cache_de_pochettes() -> Value {
+    let avertissement = crate::chemins_de_donnees::avertissement_du_cache_retenu();
+    json!({
+        "path": crate::routes::library::artwork_cache_dir().display().to_string(),
+        "origin": if std::env::var_os("TUNE_ARTWORK_DIR").is_some() {
+            Some("env")
+        } else {
+            crate::chemins_de_donnees::origine_du_cache_retenu().map(|o| o.id())
+        },
+        "warning": avertissement.map(|a| json!({ "code": a.code, "message": a.message })),
+    })
+}
+
+/// La ligne Markdown du rapport de bogue pour le cache de pochettes.
+pub(crate) fn ligne_du_cache_de_pochettes(fiche: &Value) -> String {
+    let mut ligne = format!(
+        "**Artwork cache**: {} ({})\n",
+        fiche["path"].as_str().unwrap_or("?"),
+        fiche["origin"].as_str().unwrap_or("unknown")
+    );
+    if let Some(message) = fiche["warning"]["message"].as_str() {
+        ligne.push_str(&format!("**⚠️ Artwork cache**: {message}\n"));
+    }
+    ligne
 }
 
 pub(super) async fn health_alerts(State(state): State<AppState>) -> Json<Value> {
@@ -2772,6 +2833,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     if let Some(rss) = rss_mb {
         md.push_str(&format!("**Memory**: {rss} MB RSS\n"));
     }
+    md.push_str(&ligne_du_cache_de_pochettes(&fiche_du_cache_de_pochettes()));
     md.push_str(&format!(
         "**ASIO warm scan**: {} — {}\n",
         asio_warm_scan.state, asio_warm_scan.message
@@ -6340,5 +6402,64 @@ mod tests_journal_refuse_au_demarrage_9118 {
 
         assert_eq!(v["source"], "file", "{v}");
         assert!(v["logs"].as_str().unwrap().contains("temoin-9118-lu"));
+    }
+}
+
+#[cfg(test)]
+mod cache_de_pochettes_visible_rc14 {
+    use super::*;
+    use crate::chemins_de_donnees::{AvertissementDuCache, CACHE_INSCRIPTIBLE_IMPOSSIBLE};
+    use tune_core::health_monitor::{AlertLevel, CheckResult, HealthReport};
+
+    fn rapport(status: AlertLevel) -> HealthReport {
+        HealthReport {
+            status,
+            uptime_seconds: 0,
+            checks: std::collections::HashMap::new(),
+            alerts: Vec::new(),
+        }
+    }
+
+    /// Un cache impossible à écrire met la sonde de santé en `warning` (la
+    /// barre latérale et « État du serveur ») ; il ne fait pas redescendre un
+    /// `critical`, et sans avertissement rien n'est ajouté.
+    #[test]
+    fn la_sonde_de_sante_porte_l_avertissement() {
+        let a = AvertissementDuCache {
+            code: CACHE_INSCRIPTIBLE_IMPOSSIBLE,
+            message: "le cache ne peut pas être écrit".into(),
+        };
+        let mut r = rapport(AlertLevel::Ok);
+        ajouter_le_controle_du_cache(&mut r, Some(&a));
+        assert_eq!(r.status, AlertLevel::Warning);
+        let c: &CheckResult = &r.checks["artwork_cache"];
+        assert_eq!(c.status, AlertLevel::Warning);
+        assert_eq!(c.details["code"], CACHE_INSCRIPTIBLE_IMPOSSIBLE);
+
+        let mut r = rapport(AlertLevel::Critical);
+        ajouter_le_controle_du_cache(&mut r, Some(&a));
+        assert_eq!(r.status, AlertLevel::Critical);
+
+        let mut r = rapport(AlertLevel::Ok);
+        ajouter_le_controle_du_cache(&mut r, None);
+        assert_eq!(r.status, AlertLevel::Ok);
+        assert!(r.checks.is_empty());
+    }
+
+    /// Le rapport de bogue dit où sont les pochettes, et l'avertissement.
+    #[test]
+    fn le_rapport_de_bogue_porte_le_cache_et_l_avertissement() {
+        let fiche = json!({
+            "path": "/srv/tune/artwork_cache",
+            "origin": "data_dir",
+            "warning": { "code": CACHE_INSCRIPTIBLE_IMPOSSIBLE, "message": "impossible d'écrire" },
+        });
+        let ligne = ligne_du_cache_de_pochettes(&fiche);
+        assert!(ligne.contains("**Artwork cache**: /srv/tune/artwork_cache (data_dir)"));
+        assert!(ligne.contains("impossible d'écrire"));
+        let sans = ligne_du_cache_de_pochettes(&json!({
+            "path": "/srv/tune/artwork_cache", "origin": "data_dir", "warning": null,
+        }));
+        assert_eq!(sans.lines().count(), 1);
     }
 }

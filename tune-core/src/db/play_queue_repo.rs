@@ -210,6 +210,15 @@ pub mod sql {
         )
     }
 
+    /// Fil 3094 — les lignes de service d'une `source` donnée.
+    pub fn count_de_la_source<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM queue_items WHERE zone_id = {} AND track_id IS NULL AND source = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Unified single-position-space API (Lot 1 of the queue unification).
     // These builders treat the whole zone queue as ONE ordered sequence,
@@ -1111,6 +1120,19 @@ impl PlayQueueRepo {
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
             .unwrap_or(0);
         Ok(n)
+    }
+
+    /// Fil 3094 — combien de lignes de la `source` dans la file de la zone :
+    /// la question d'une requête, avant de lire toute la file.
+    pub fn count_de_la_source(&self, zone_id: i64, source: &str) -> Result<i64, String> {
+        let count_sql = self.dialect_sql(sql::count_de_la_source, sql::count_de_la_source);
+        let params: [&dyn ToSqlValue; 2] = [&zone_id, &source];
+        Ok(self
+            .db
+            .query_one(&count_sql, &params)?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0))
     }
 
     /// Recette du 14/11 — donne sa durée à un titre de service de la file

@@ -1570,6 +1570,18 @@ path = "tests/tess_migration_routes_t02.rs"
 name = "tess_api_routes_t08"
 path = "tests/tess_api_routes_t08.rs"
 
+# rc14 — l'égaliseur paramétrique est Premium sur les routes historiques
+# (`/zones/{id}/dsp`, `/zones/{id}/eq`, `/eq/presets/{id}/activate`) comme
+# par TESS ; graphique et casque libres.
+[[test]]
+name = "eq_parametrique_premium_rc14"
+path = "tests/eq_parametrique_premium_rc14.rs"
+
+# rc14 — TESS vers le DSD sur la sortie locale : capacités, 402, 409, chemin.
+[[test]]
+name = "tess_dsd_sortie_locale_rc14"
+path = "tests/tess_dsd_sortie_locale_rc14.rs"
+
 # TESS T09a — import d'un jeu de convolution (.zip de RI, .cfg Convolver),
 # archive piégée refusée sans toucher au jeu en place.
 [[test]]

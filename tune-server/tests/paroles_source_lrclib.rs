@@ -277,7 +277,12 @@ async fn route_by_meta_nomme_lrclib_sur_des_paroles_non_synchronisees() {
 #[tokio::test]
 async fn reglage_eteint_ne_sert_aucune_parole_distante() {
     let (app, state) = make_app_with_state();
-    // `lyrics_lrclib_enabled` volontairement NON positionné.
+    // `lyrics_lrclib_enabled` DÉCOCHÉ. Depuis la rc14, une base neuve naît
+    // avec le réglage activé : le refus doit être posé, comme l'interface le
+    // pose quand on décoche la case.
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set("lyrics_lrclib_enabled", "false")
+        .unwrap();
     let tid = insert_track(&state, "Chanson Distante", "Artiste Distant");
     semer_cache(
         &state,
