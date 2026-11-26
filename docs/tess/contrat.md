@@ -432,6 +432,20 @@ ordre et tous leurs réglages.
 - **`PATCH /tess/presets/{preset_id}`** ← `{ "name" }` : renomme, l'id ne
   change pas. **`DELETE /tess/presets/{preset_id}`** → 204 (Pure compris) ;
   les zones qui l'avaient chargé ne le marquent plus.
+- **`PUT /tess/presets/{preset_id}`** (rc14, Rémi) ← `{ "zone_id" }` ou
+  `{ "chain" }`, lus comme au `POST` : **écrase** la chaîne du préréglage
+  (l'id et le nom restent) → 200, le préréglage. Un préréglage livré
+  (`builtin`, « Pure ») est refusé : 409 `builtin_preset_read_only` (le
+  client propose « Enregistrer sous… », c'est-à-dire le `POST`). Écrasé
+  depuis une zone, il y redevient « ACTIVE » ; les autres zones qui le
+  marquaient « ACTIVE » ne le décrivent plus et perdent ce marqueur.
+- **Origine et retouche** (rc14, Rémi) : `zone_{id}_tess_base_preset` suit le
+  marqueur « ACTIVE » (chargement, enregistrement, écrasement) mais n'est pas
+  effacé par un `PUT` qui modifie la chaîne. `zone_response` porte alors,
+  champs facultatifs, `base_preset` (ce préréglage, s'il existe encore) et
+  `preset_modified: true` (l'origine n'est plus « ACTIVE ») : l'écran
+  propose « Enregistrer » (le `PUT` ci-dessus) et « Recharger » (le
+  chargement de l'origine, tel qu'enregistré).
 - **`PUT /tess/apply-mode`** ← `{ "apply_mode": "immediately" | "at_next_playback" }`
   → `presets` ; toute autre valeur : 400 `invalid_apply_mode`.
 - **`POST /zones/{id}/tess/presets/{preset_id}/apply`** : la chaîne du
@@ -445,7 +459,8 @@ ordre et tous leurs réglages.
   `plugin_unavailable`…). Un refus garde la forme `refusal`.
 - Erreurs propres aux préréglages : `{ "error", "message", "preset_id" }`
   (`preset_not_found` en 404, `invalid_name`, `invalid_body`,
-  `invalid_apply_mode` en 400, `too_many_presets` en 409 au-delà de 200).
+  `invalid_apply_mode` en 400, `too_many_presets` en 409 au-delà de 200,
+  `builtin_preset_read_only` en 409).
 - **Marqueur « ACTIVE »** : posé sous le verrou des `PUT` de la zone ; au
   chargement, le verrou de la liste est tenu jusqu'à sa pose (une suppression
   concurrente ne laisse jamais de marqueur orphelin). À l'enregistrement, la

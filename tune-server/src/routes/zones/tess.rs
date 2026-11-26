@@ -73,6 +73,14 @@ pub fn cle_prereglage_actif(zone_id: i64) -> String {
     format!("zone_{zone_id}_tess_active_preset")
 }
 
+/// rc14 (Rémi) — le préréglage d'ORIGINE de la chaîne de la zone : posé avec
+/// le marqueur « ACTIVE » (chargement, enregistrement, écrasement), il n'est
+/// pas effacé par une retouche. « ACTIVE » absent et origine présente : la
+/// chaîne a été modifiée depuis (`preset_modified`).
+pub fn cle_prereglage_de_base(zone_id: i64) -> String {
+    format!("zone_{zone_id}_tess_base_preset")
+}
+
 // ── Catalogue ───────────────────────────────────────────────────────
 
 const SCHEMA_EGALISEUR: &str =
@@ -463,6 +471,19 @@ pub(super) async fn reponse_de_zone(
                 .map(|l| l.get(p).is_some())
                 .unwrap_or(true)
         });
+    // rc14 (Rémi) — l'origine de la chaîne, si ce préréglage existe encore.
+    let base = settings
+        .get(&cle_prereglage_de_base(zone_id))
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty())
+        .filter(|p| {
+            tune_core::tess::prereglages::lire(&settings)
+                .map(|l| l.get(p).is_some())
+                .unwrap_or(false)
+        })
+        .or_else(|| actif.clone());
+    let modifie = base.is_some() && actif.is_none();
     let mut reponse = ReponseTessZone::depuis_avec_le_lecteur(
         zone_id,
         lecture.chaine,
@@ -474,6 +495,9 @@ pub(super) async fn reponse_de_zone(
     // rc14 — ce que la sortie fait de chaque cible DSD (sans sonder le
     // pilote), reporté sur le chemin résolu.
     .avec_capacites_dsd(capacites_dsd);
+    // rc14 (Rémi) — l'origine de la chaîne et sa retouche éventuelle.
+    reponse.base_preset = base;
+    reponse.preset_modified = modifie;
     preciser_les_paquets_a_installer(&mut reponse, &settings);
 
     // rc14 (rc13.91) — la sortie locale a refusé de suréchantillonner la

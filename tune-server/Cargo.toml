@@ -1593,6 +1593,11 @@ path = "tests/import_convolution_t09a.rs"
 name = "tess_prereglages_routes_t17"
 path = "tests/tess_prereglages_routes_t17.rs"
 
+# rc14 (Rémi) — « Enregistrer » écrase le préréglage d'origine, « Recharger ».
+[[test]]
+name = "tess_prereglage_ecraser_rc14"
+path = "tests/tess_prereglage_ecraser_rc14.rs"
+
 # #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
 # et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans
 # cette cible, le fichier ne serait jamais compilé.
