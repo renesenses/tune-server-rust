@@ -667,3 +667,247 @@ fn banc_charge_etage_seul() {
         );
     }
 }
+
+// ── PR 2 : le relais progressif LPCM porte l'étage ───────────────────────
+
+/// Lecteur qui annonce le LPCM 24 bits jusqu'à 192 kHz (et le FLAC sans
+/// cadence) : le relais progressif.
+const SINK_L24_192: &[&str] = &[
+    "http-get:*:audio/flac:*",
+    "http-get:*:audio/L24;rate=44100;channels=2:*",
+    "http-get:*:audio/L24;rate=88200;channels=2:*",
+    "http-get:*:audio/L24;rate=176400;channels=2:*",
+    "http-get:*:audio/L24;rate=192000;channels=2:*",
+];
+
+/// Un lecteur qui annonce le LPCM : la piste part en WAV progressif à la
+/// cible (première note immédiate), même longue, même sur une machine lente
+/// — le garde-fou des 3 s ne vaut que pour le fichier refait.
+#[tokio::test]
+async fn un_lecteur_lpcm_recoit_le_wav_progressif_a_la_cible() {
+    let orch = orchestrateur();
+    let zone_id = zone_dlna(&orch, "uuid:banc-surech-l24", SINK_L24_192);
+    su::enregistrer_le_verdict(
+        &SettingsRepo::with_backend(orch.db.clone()),
+        &verdict_a(10.0),
+    )
+    .unwrap();
+    piste(&orch, 1, "flac", 44_100);
+    let f = orch
+        .format_de_sortie_pour_test(&requete(zone_id, 1))
+        .await
+        .unwrap();
+    assert!(!f.use_file_transcode, "relais progressif, pas le fichier");
+    assert_eq!(f.target_format_str, "wav");
+    assert_eq!(f.out_sr, 176_400);
+    assert_eq!(
+        f.info.sample_rate, 176_400,
+        "Content-Length et DIDL à la cible"
+    );
+    let p = f.surech.as_ref().expect("étage posé");
+    assert!(!p.flac);
+    assert_eq!(p.proposees, vec![44_100, 88_200, 176_400, 192_000]);
+    let etat = orch.surechantillonnage_reseau_de_la_zone(zone_id).unwrap();
+    assert!(etat.active, "{etat:?}");
+}
+
+/// L'en-tête WAV du décodeur (cadence de la source) est réécrit à la cible.
+#[test]
+fn l_en_tete_wav_est_reecrit_a_la_cible() {
+    let mut h = crate::audio::wav::build_wav_header(2, 44_100, 24);
+    super::super::chaine_reseau_tess::reecrire_l_en_tete_wav(&mut h, 176_400, 4);
+    assert_eq!(h, crate::audio::wav::build_wav_header(2, 176_400, 24));
+    let mut h = crate::audio::wav::build_wav_header_with_data_size(2, 44_100, 16, 1_000);
+    super::super::chaine_reseau_tess::reecrire_l_en_tete_wav(&mut h, 176_400, 4);
+    assert_eq!(
+        h,
+        crate::audio::wav::build_wav_header_with_data_size(2, 176_400, 16, 4_000)
+    );
+    // Pas un en-tête : rien ne change.
+    let mut pcm = vec![7u8; 64];
+    super::super::chaine_reseau_tess::reecrire_l_en_tete_wav(&mut pcm, 176_400, 4);
+    assert_eq!(pcm, vec![7u8; 64]);
+}
+
+/// Le relais progressif, de bout en bout : en-tête puis tampons de tailles
+/// quelconques (trames coupées), fin de flux. Le flux servi est à 176,4 kHz,
+/// exactement 4·n trames, crête < 0 dBFS, et son contenu est celui de la
+/// piste entière suréchantillonnée (même moteur, au dither près).
+#[tokio::test]
+async fn le_relais_progressif_sert_le_flux_surechantillonne_complet() {
+    let n = 44_100usize;
+    let mut source = Vec::with_capacity(n * 6);
+    for i in 0..n {
+        let x = 1.414
+            * (std::f64::consts::TAU * 11_025.0 * i as f64 / 44_100.0
+                + std::f64::consts::FRAC_PI_4)
+                .sin();
+        let mot = (x * 8_388_607.0).round().clamp(-8_388_608.0, 8_388_607.0) as i32;
+        let b = mot.to_le_bytes();
+        for _ in 0..2 {
+            source.extend_from_slice(&b[..3]);
+        }
+    }
+    let porteur = || super::super::StreamingDsp {
+        channels: 2,
+        sample_rate: 44_100,
+        surechantillonneur: Some(super::super::chaine_reseau_tess::SurechReseau::nouveau(
+            su::SurechantillonneurF64::nouveau(&reglages(), 44_100, 176_400, 2).unwrap(),
+        )),
+        ..Default::default()
+    };
+    // Référence : la piste entière.
+    let mut piste = source.clone();
+    porteur().process_piste(&mut piste, 24);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let entree = super::super::spawn_streaming_dsp_relay(porteur(), 24, true, tx);
+    let entete = crate::audio::wav::build_wav_header(2, 44_100, 24);
+    let producteur = tokio::spawn(async move {
+        entree.send(entete.to_vec()).await.unwrap();
+        // Des tampons qui coupent les trames (6 octets) n'importe où.
+        let mut i = 0;
+        let mut k = 0usize;
+        while i < source.len() {
+            let t = [1_001usize, 4_096, 17, 32_768, 6_143][k % 5].min(source.len() - i);
+            entree.send(source[i..i + t].to_vec()).await.unwrap();
+            i += t;
+            k += 1;
+        }
+    });
+    let mut recu = Vec::new();
+    while let Some(c) = rx.recv().await {
+        recu.extend_from_slice(&c);
+    }
+    producteur.await.unwrap();
+    let (h, pcm) = recu.split_at(44);
+    assert_eq!(h, crate::audio::wav::build_wav_header(2, 176_400, 24));
+    assert_eq!(pcm.len(), 4 * n * 6, "exactement 4·n trames");
+    assert_eq!(pcm.len(), piste.len());
+    let mot = |o: &[u8; 3]| f64::from(i32::from_le_bytes([0, o[0], o[1], o[2]]) >> 8) / 8_388_608.0;
+    let mut crete = 0.0f64;
+    let mut ecart = 0.0f64;
+    for (a, b) in pcm.as_chunks::<3>().0.iter().zip(piste.as_chunks::<3>().0) {
+        crete = crete.max(mot(a).abs());
+        ecart = ecart.max((mot(a) - mot(b)).abs());
+    }
+    assert!(crete < 1.0, "crête {crete}");
+    assert!(
+        ecart < 4.0 / 8_388_608.0,
+        "le relais rend la piste entière au dither près : écart {ecart}"
+    );
+}
+
+/// PR 2 (b) — un service (Qobuz, FLAC 96 kHz) vers un lecteur qui annonce le
+/// LPCM jusqu'à 192 kHz : WAV progressif, servi à 192 kHz, sans attendre la
+/// piste entière (le CDN ne répond pas encore).
+#[tokio::test(flavor = "multi_thread")]
+async fn un_service_part_en_wav_progressif_a_la_cible() {
+    use super::super::service_wav_progressif_5080 as s5080;
+    let orch = orchestrateur();
+    let zone_id = zone_dlna(&orch, "uuid:banc-surech-qobuz", SINK_L24_192);
+    let (url, liberer) = s5080::cdn_muet().await;
+    let flux = s5080::flux_qobuz(url, 96_000, 24);
+    let req = s5080::requete_qobuz(zone_id);
+    let resolu = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        orch.relayer_le_flux(
+            &req,
+            "441697196",
+            "qobuz",
+            &flux,
+            s5080::info_amont(&flux),
+            false,
+            "flac".into(),
+            None,
+            None,
+        ),
+    )
+    .await;
+    let _ = liberer.send(true);
+    let (_, session, mime, _) = resolu
+        .expect("WAV progressif : pas d'attente de la piste entière")
+        .expect("la résolution réussit");
+    assert_eq!(mime, "audio/wav");
+    let wire = orch
+        .streamer
+        .stream_output_wire(session.as_deref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(wire.sample_rate, 192_000, "servi à la cible");
+    let s = wire
+        .surechantillonnage
+        .expect("l'étage est dit par le flux");
+    assert_eq!((s.de_hz, s.vers_hz), (96_000, 192_000));
+    let etat = orch.surechantillonnage_reseau_de_la_zone(zone_id).unwrap();
+    assert!(etat.active, "{etat:?}");
+}
+
+/// PR 2 (b) — une radio : la session publie la cadence SERVIE (la cible),
+/// le relais bâtit l'étage à la cadence de la station et sert 4·n trames.
+#[tokio::test]
+async fn une_radio_est_servie_surechantillonnee() {
+    let orch = orchestrateur();
+    let zone_id = zone_dlna(&orch, "uuid:banc-surech-radio", SINK_L24_192);
+    let cibles = orch
+        .preparer_le_surechantillonnage_radio(zone_id, Some("dlna"), "uuid:banc-surech-radio")
+        .await
+        .expect("des cibles");
+    assert_eq!(cibles.cible(44_100), Some(176_400));
+    assert_eq!(cibles.cible(48_000), Some(192_000));
+    let info = crate::http::streamer::StreamInfo {
+        format: "wav".into(),
+        mime_type: "audio/wav".into(),
+        sample_rate: 44_100,
+        bit_depth: 16,
+        channels: 2,
+        ..Default::default()
+    };
+    let (_, _tx, _pret, session) = orch.streamer.create_radio_session(info, 256).await;
+    session.surechantillonnage_radio.set(cibles).unwrap();
+    session.publish_detected_pcm_format(44_100, 2, 16);
+    assert_eq!(session.detected_output_format(), Some((176_400, 2)));
+    assert_eq!(session.detected_source_output_format(), Some((44_100, 2)));
+    let wire = session.effective_output_info();
+    assert_eq!(wire.sample_rate, 176_400);
+    assert_eq!(
+        wire.surechantillonnage
+            .as_ref()
+            .map(|s| (s.de_hz, s.vers_hz)),
+        Some((44_100, 176_400))
+    );
+
+    let (aval, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let entree = super::super::chaine_radio_9346::relayer_la_radio(
+        None,
+        zone_id,
+        Some(orch.noteur_surech(zone_id)),
+        session.clone(),
+        aval,
+    );
+    let n = 22_050usize;
+    let bloc: Vec<u8> = (0..n)
+        .flat_map(|i| {
+            let x = (0.5 * (std::f64::consts::TAU * 997.0 * i as f64 / 44_100.0).sin() * 32_767.0)
+                as i16;
+            let b = x.to_le_bytes();
+            [b[0], b[1], b[0], b[1]]
+        })
+        .collect();
+    for morceau in bloc.chunks(4_410) {
+        entree.send(morceau.to_vec()).await.unwrap();
+    }
+    drop(entree);
+    let mut recu = 0usize;
+    while let Some(c) = rx.recv().await {
+        recu += c.len();
+    }
+    assert_eq!(
+        recu,
+        4 * n * 4,
+        "4·n trames de 16 bits stéréo, queue comprise"
+    );
+    let etat = orch.surechantillonnage_reseau_de_la_zone(zone_id).unwrap();
+    assert!(etat.active);
+    assert_eq!((etat.from_hz, etat.to_hz), (Some(44_100), Some(176_400)));
+}

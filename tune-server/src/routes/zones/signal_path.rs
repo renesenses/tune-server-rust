@@ -1973,13 +1973,14 @@ pub(super) fn etat_du_surechantillonneur_lang(
     } else if upnp {
         // rc14 — la famille UPnP : la raison que la LECTURE a donnée à la
         // dernière piste de la bibliothèque, ou celle de la source.
-        let code: &'static str = if !reseau.source_de_la_bibliotheque {
-            tune_core::audio::surechantillonnage::refus_reseau::SOURCE_NON_PORTEE
-        } else {
-            reseau
-                .refus
-                .map(code_de_refus_reseau)
-                .unwrap_or("not_applied")
+        // rc14 (PR 2) — la lecture note aussi les services et les radios :
+        // son refus fait foi ; à défaut, la source dit ce qu'elle peut.
+        let code: &'static str = match reseau.refus {
+            Some(r) => code_de_refus_reseau(r),
+            None if !reseau.source_de_la_bibliotheque => {
+                tune_core::audio::surechantillonnage::refus_reseau::SOURCE_NON_PORTEE
+            }
+            None => "not_applied",
         };
         (code, texte_du_refus_surechantillonnage(code))
     } else if output_type != "local" {

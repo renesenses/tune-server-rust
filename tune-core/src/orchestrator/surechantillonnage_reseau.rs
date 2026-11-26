@@ -47,9 +47,39 @@ pub(crate) struct SurechPlanifie {
     /// Le verdict du test de la machine : de quoi estimer le délai du
     /// fichier refait (`delai_estime_du_fichier_s`).
     pub(crate) verdict: su::VerdictMachine,
+    /// Ce que le lecteur annonce pour chaque famille (FLAC, WAV/LPCM) et le
+    /// plafond de la zone : de quoi refaire la cible quand la voie change
+    /// (relais progressif WAV, ou fichier FLAC).
+    pub(crate) cadences_flac: Vec<u32>,
+    pub(crate) cadences_lpcm: Vec<u32>,
+    pub(crate) plafond_zone: Option<u32>,
 }
 
 impl SurechPlanifie {
+    /// La même décision pour la famille `flac` (sinon WAV/LPCM) : cible
+    /// refaite sur ce que le lecteur annonce pour CE format. `Err` : refus
+    /// motivé et cadences annoncées.
+    pub(crate) fn pour_la_famille(&self, flac: bool) -> Result<Self, (&'static str, Vec<u32>)> {
+        let proposees = if flac {
+            self.cadences_flac.clone()
+        } else {
+            self.cadences_lpcm.clone()
+        };
+        let choix = su::ChoixSurechantillonnage {
+            reglages: self.reglages.clone(),
+            verdict: self.verdict.clone(),
+        };
+        match su::cible_reseau(&choix, self.de, &proposees, self.plafond_zone) {
+            Ok(vers) => Ok(Self {
+                vers,
+                proposees,
+                flac,
+                ..self.clone()
+            }),
+            Err(code) => Err((code, proposees)),
+        }
+    }
+
     /// Ce que l'étage change au fichier servi, pour sa clé de cache : le
     /// filtre et les deux cadences (la cible est déjà dans la clé, la source
     /// et le filtre non).
@@ -121,7 +151,41 @@ pub fn etat_publie_pour_le_chemin_du_signal(zone_id: i64) -> Option<EtatSurechRe
         .cloned()
 }
 
+/// La mémoire des décisions, par zone (partagée avec les relais radio, qui
+/// ne connaissent la cadence de la station qu'au premier bloc).
+pub(crate) type MemoireSurech =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i64, EtatSurechReseau>>>;
+
+/// Ce qu'un relais emporte pour noter la décision de SA zone.
+#[derive(Clone)]
+pub(crate) struct NoteurSurech {
+    memoire: MemoireSurech,
+    zone_id: i64,
+}
+
+impl NoteurSurech {
+    pub(crate) fn noter(&self, etat: Option<EtatSurechReseau>) {
+        miroir_pour_le_chemin_du_signal(self.zone_id, etat.clone());
+        let mut m = self.memoire.lock().unwrap_or_else(|e| e.into_inner());
+        match etat {
+            Some(e) => {
+                m.insert(self.zone_id, e);
+            }
+            None => {
+                m.remove(&self.zone_id);
+            }
+        }
+    }
+}
+
 impl PlaybackOrchestrator {
+    pub(crate) fn noteur_surech(&self, zone_id: i64) -> NoteurSurech {
+        NoteurSurech {
+            memoire: self.surech_reseau.clone(),
+            zone_id,
+        }
+    }
+
     /// Garde la décision de la dernière piste résolue pour la zone. `None` :
     /// suréchantillonneur désactivé, rien à dire.
     pub(crate) fn noter_le_surechantillonnage_reseau(
@@ -129,16 +193,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         etat: Option<EtatSurechReseau>,
     ) {
-        miroir_pour_le_chemin_du_signal(zone_id, etat.clone());
-        let mut m = self.surech_reseau.lock().unwrap_or_else(|e| e.into_inner());
-        match etat {
-            Some(e) => {
-                m.insert(zone_id, e);
-            }
-            None => {
-                m.remove(&zone_id);
-            }
-        }
+        self.noteur_surech(zone_id).noter(etat);
     }
 
     /// La décision de la dernière piste de la bibliothèque résolue pour la
@@ -151,6 +206,9 @@ impl PlaybackOrchestrator {
             .cloned()
     }
 }
+
+/// Les cadences qu'une station de radio peut avoir.
+const CADENCES_DES_STATIONS: [u32; 7] = [32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
 
 /// Les cadences explicitement annoncées (`rate=`) par les entrées du Sink
 /// dont le MIME de base est celui que Tune servira : `audio/flac` (et
@@ -243,17 +301,19 @@ pub(crate) struct DemandeSurechReseau<'a> {
 }
 
 impl PlaybackOrchestrator {
-    /// Les cadences que le lecteur annonce pour le format servi, ou `None` :
-    /// sortie hors registre, sans Sink (ni DLNA ni OpenHome), ou sonde
-    /// inconcluante.
+    /// Les cadences que le lecteur annonce, en FLAC puis en WAV/LPCM, ou
+    /// `None` : sortie hors registre, sans Sink (ni DLNA ni OpenHome), ou
+    /// sonde inconcluante.
     pub(crate) async fn cadences_du_lecteur(
         &self,
         device_id: &str,
-        flac: bool,
-    ) -> Option<Vec<u32>> {
+    ) -> Option<(Vec<u32>, Vec<u32>)> {
         #[cfg(test)]
         if let Some(sink) = sink_de_test(device_id) {
-            return Some(cadences_annoncees(&sink, flac));
+            return Some((
+                cadences_annoncees(&sink, true),
+                cadences_annoncees(&sink, false),
+            ));
         }
         if device_id.is_empty() {
             return None;
@@ -274,7 +334,54 @@ impl PlaybackOrchestrator {
         if !caps.probed {
             return None;
         }
-        Some(cadences_annoncees(&caps.sink, flac))
+        Some((
+            cadences_annoncees(&caps.sink, true),
+            cadences_annoncees(&caps.sink, false),
+        ))
+    }
+
+    /// rc14 — une radio servie à un lecteur de la famille UPnP : la cadence
+    /// de la station n'est connue qu'après sa sonde ; les cibles sont donc
+    /// calculées pour chaque cadence qu'elle peut avoir, en WAV/LPCM (une
+    /// radio part toujours en WAV progressif). `None` : désactivé ou refus
+    /// motivé (noté).
+    pub(crate) async fn preparer_le_surechantillonnage_radio(
+        &self,
+        zone_id: i64,
+        type_de_zone: Option<&str>,
+        device_id: &str,
+    ) -> Option<crate::http::streamer::CiblesDeSurechantillonnage> {
+        let p = self
+            .decider_le_surechantillonnage_reseau(DemandeSurechReseau {
+                zone_id,
+                type_de_zone,
+                device_id,
+                source_format: None,
+                source_hz: 44_100,
+                plafond_zone: crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                    .get(zone_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|z| z.max_sample_rate),
+                flac: false,
+            })
+            .await?;
+        let cibles: Vec<(u32, u32)> = CADENCES_DES_STATIONS
+            .iter()
+            .filter_map(|&de| {
+                SurechPlanifie { de, ..p.clone() }
+                    .pour_la_famille(false)
+                    .ok()
+                    .map(|q| (de, q.vers))
+            })
+            .collect();
+        if cibles.is_empty() {
+            return None;
+        }
+        Some(crate::http::streamer::CiblesDeSurechantillonnage {
+            cibles,
+            filtre: p.reglages.filter,
+        })
     }
 
     /// LA décision du suréchantillonnage d'une piste de la bibliothèque vers
@@ -335,21 +442,26 @@ impl PlaybackOrchestrator {
         if !type_avec_sonde_de_cadences(d.type_de_zone) {
             return Err(Some((refus_reseau::LECTEUR_SANS_SONDE, Vec::new())));
         }
-        let proposees = self
-            .cadences_du_lecteur(d.device_id, d.flac)
+        let (cadences_flac, cadences_lpcm) = self
+            .cadences_du_lecteur(d.device_id)
             .await
             .unwrap_or_default();
-        match su::cible_reseau(&choix, d.source_hz, &proposees, d.plafond_zone) {
-            Ok(vers) => Ok(SurechPlanifie {
-                verdict: choix.verdict,
-                reglages: choix.reglages,
-                de: d.source_hz,
-                vers,
-                proposees,
-                flac: d.flac,
-            }),
-            Err(code) => Err(Some((code, proposees))),
-        }
+        // La famille attendue d'abord ; l'autre sert quand la voie change
+        // (relais progressif WAV vers un lecteur qui lit aussi le FLAC).
+        let base = SurechPlanifie {
+            verdict: choix.verdict,
+            reglages: choix.reglages,
+            de: d.source_hz,
+            vers: 0,
+            proposees: Vec::new(),
+            flac: d.flac,
+            cadences_flac,
+            cadences_lpcm,
+            plafond_zone: d.plafond_zone,
+        };
+        base.pour_la_famille(d.flac)
+            .or_else(|e| base.pour_la_famille(!d.flac).map_err(|_| e))
+            .map_err(Some)
     }
 }
 
