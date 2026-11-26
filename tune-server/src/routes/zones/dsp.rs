@@ -288,18 +288,28 @@ pub(super) async fn convolver_response(
     }
 }
 
-/// Les points de la courbe d'UN canal de l'IR.
-fn points_de_la_courbe(taps: &[f32], sample_rate: u32, freqs: &[f64]) -> Vec<Value> {
-    tune_core::audio::convolver::fir_frequency_response(taps, sample_rate, freqs)
-        .into_iter()
-        .map(|p| {
+/// La courbe d'UN canal de l'IR : ses points, et le retard principal retiré
+/// de la phase déroulée (rc14, Rémi : `tune_core::audio::convolver::courbe_fft`).
+fn courbe_du_canal(taps: &[f32], sample_rate: u32) -> (Vec<Value>, usize) {
+    let arrondi = |x: f64, p: f64| (x * p).round() / p;
+    let Some(c) = tune_core::audio::convolver::courbe_fft::courbe_du_canal(
+        taps,
+        sample_rate,
+        tune_core::audio::convolver::courbe_fft::POINTS_DE_LA_GRILLE,
+    ) else {
+        return (Vec::new(), 0);
+    };
+    let points = (0..c.freqs_hz.len())
+        .map(|i| {
             json!({
-                "f": (p.freq_hz * 10.0).round() / 10.0,
-                "db": (p.magnitude_db * 100.0).round() / 100.0,
-                "phase_deg": (p.phase_deg * 100.0).round() / 100.0,
+                "f": arrondi(c.freqs_hz[i], 10.0),
+                "db": arrondi(c.magnitude_db[i], 100.0),
+                "phase_deg": arrondi(c.phase_deg[i], 100.0),
+                "phase_unwrapped_deg": c.phase_deroulee_deg[i].map(|p| arrondi(p, 100.0)),
             })
         })
-        .collect()
+        .collect();
+    (points, c.retard_echantillons)
 }
 
 /// Le corps de `GET /zones/{id}/convolver/response` pour une IR déjà lue.
@@ -311,6 +321,15 @@ fn points_de_la_courbe(taps: &[f32], sample_rate: u32, freqs: &[f64]) -> Vec<Val
 /// canal de l'IR, dans l'ordre du fichier (0 = gauche, 1 = droit). `points`,
 /// `taps` et `latency_ms` restent ceux du canal 0, pour les clients qui ne
 /// lisent pas `channels`.
+///
+/// rc14 (Rémi, panneau Convolution de TESS) — la courbe est calculée par FFT
+/// sur 512 points logarithmiques (`grid_points`). Chaque point garde
+/// `phase_deg` (phase principale, retard compris, comme avant) et porte
+/// `phase_unwrapped_deg` : la phase DÉROULÉE, retard principal retiré
+/// (`phase_delay_samples` / `phase_delay_ms` du canal, la position du pic de
+/// la RI), `null` là où l'amplitude est à plus de 60 dB sous son maximum (la
+/// phase n'y a pas de sens). Pas de lissage. Calculée une fois par filtre
+/// (cache de l'appelant), sur le pool bloquant.
 fn reponse_du_convolueur(ir: &[Vec<f32>], sample_rate: u32) -> Result<Value, String> {
     let Some(premier) = ir.first() else {
         return Err("IR sans canal".into());
@@ -318,8 +337,6 @@ fn reponse_du_convolueur(ir: &[Vec<f32>], sample_rate: u32) -> Result<Value, Str
     if sample_rate == 0 {
         return Err("IR sample rate is 0".into());
     }
-    let f_hi = 20_000.0f64.min(sample_rate as f64 * 0.45);
-    let freqs = tune_core::audio::convolver::log_freq_grid(200, 20.0, f_hi);
     let latence = |taps: &[f32]| {
         let ms = taps.len() as f64 / 2.0 / sample_rate as f64 * 1000.0;
         (ms * 10.0).round() / 10.0
@@ -328,11 +345,14 @@ fn reponse_du_convolueur(ir: &[Vec<f32>], sample_rate: u32) -> Result<Value, Str
         .iter()
         .enumerate()
         .map(|(canal, taps)| {
+            let (points, retard) = courbe_du_canal(taps, sample_rate);
             json!({
                 "channel": canal,
                 "taps": taps.len(),
                 "latency_ms": latence(taps),
-                "points": points_de_la_courbe(taps, sample_rate, &freqs),
+                "phase_delay_samples": retard,
+                "phase_delay_ms": (retard as f64 / sample_rate as f64 * 1000.0 * 100.0).round() / 100.0,
+                "points": points,
             })
         })
         .collect();
@@ -342,6 +362,7 @@ fn reponse_du_convolueur(ir: &[Vec<f32>], sample_rate: u32) -> Result<Value, Str
         "taps": premier.len(),
         "sample_rate": sample_rate,
         "latency_ms": latence(premier),
+        "grid_points": tune_core::audio::convolver::courbe_fft::POINTS_DE_LA_GRILLE,
         "points": points,
         "channels": channels,
     }))
@@ -495,8 +516,28 @@ pub(super) async fn crossfeed_status_de_zone(
         progressif_arme,
         renderer_accepte_lpcm,
     );
-    // #9178 — OAAT et navigateur reçoivent le flux traité au fil de l'eau :
-    // réserve partielle, et non plus « sortie non locale » verrouillée.
+    // TESS T12a — OAAT reçoit TOUT par le flux traité : réglage honoré.
+    let sortie = tune_core::audio::crossfeed::avec_toute_la_chaine(
+        sortie,
+        tune_core::audio::crossfeed::sortie_porte_toute_la_chaine(
+            zone.as_ref().and_then(|z| z.output_type.as_deref()),
+            device.as_deref(),
+        ),
+    );
+    // TESS T12c (décision du 23/11) — HQPlayer et l'autre transport hors TESS :
+    // le crossfeed n'y passe qu'avec un traitement de zone conservé.
+    let sortie = tune_core::audio::crossfeed::avec_la_sortie_hors_tess(
+        sortie,
+        matches!(
+            tune_core::tess::TransportZone::depuis_type_de_sortie(
+                zone.as_ref().and_then(|z| z.output_type.as_deref()),
+            ),
+            tune_core::tess::TransportZone::HqPlayer | tune_core::tess::TransportZone::Diretta
+        ),
+        state.orchestrator.zone_traite_le_flux_hors_tess(zone_id),
+    );
+    // #9178 — le navigateur reçoit le flux traité au fil de l'eau : réserve
+    // partielle, et non plus « sortie non locale » verrouillée.
     let sortie = tune_core::audio::crossfeed::avec_le_flux_traite(
         sortie,
         tune_core::audio::crossfeed::sortie_porte_le_flux_traite(
@@ -535,6 +576,18 @@ pub(super) async fn set_zone_dsp(
         {
             return response;
         }
+    }
+    // rc14 — l'égaliseur paramétrique est Premium, ici comme par
+    // `PUT /zones/{id}/tess` ; le graphique et le casque restent libres.
+    // Vérifié avant toute écriture, comme le crossfeed.
+    if let Some(eq_val) = body.get("eq_profile")
+        && let Ok(profile) =
+            serde_json::from_value::<tune_core::audio::eq::EqProfile>(eq_val.clone())
+        && let Err(resp) =
+            crate::routes::eq_parametrique_premium::exiger_le_droit(&state, id, &profile, &headers)
+                .await
+    {
+        return resp;
     }
     // Handle eq_profile if present
     let mut eq_applique_a_chaud = false;

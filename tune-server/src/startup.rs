@@ -3384,7 +3384,8 @@ async fn noter_montage(
 /// le serveur : seule la chaîne `"true"` active ; toute autre valeur éteint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EtatConsentement {
-    /// Clé absente de la table : défaut (désactivé).
+    /// Clé absente de la table : défaut (désactivé). Depuis la rc14, une base
+    /// neuve naît avec les paroles en ligne POSÉES à « true ».
     Absent,
     Active,
     Desactive,

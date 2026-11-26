@@ -122,7 +122,8 @@ async fn chaque_licence_parametrique_402_sans_premium_graphique_et_casque_toujou
         );
         let ctx = ContexteValidation { premium };
 
-        // Graphique et casque : gratuits pour tous.
+        // Graphique et casque : gratuits pour tous, ensemble (rc14 : les
+        // égaliseurs sont combinables).
         chaine(vec![
             maillon("equalizer-graphic", true),
             maillon("equalizer-headphone", true),

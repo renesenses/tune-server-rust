@@ -47,7 +47,9 @@ pub struct Resume {
     pub profile_id: Option<i64>,
 }
 
-fn input(e: &QueueEntry) -> QueueInput {
+/// La ligne de file `e`, telle qu'on la ré-enfile (aussi la file rendue
+/// après une mesure de calibration, fil 3094).
+pub(crate) fn input(e: &QueueEntry) -> QueueInput {
     if let Some(track_id) = e.track_id {
         return QueueInput::Local { track_id };
     }

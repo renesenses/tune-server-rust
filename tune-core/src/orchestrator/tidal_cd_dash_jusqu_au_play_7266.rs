@@ -81,7 +81,7 @@ pub(super) async fn flac_cd(pcm: &[u8]) -> Vec<u8> {
 
 /// Le STREAMINFO (34 octets) et les trames du FLAC, chacune avec son nombre
 /// d'échantillons, lues par le démultiplexeur FLAC de symphonia.
-fn trames_flac(flac: &[u8]) -> ([u8; 34], Vec<(Vec<u8>, u32)>) {
+pub(super) fn trames_flac(flac: &[u8]) -> ([u8; 34], Vec<(Vec<u8>, u32)>) {
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::io::MediaSourceStream;
@@ -137,7 +137,7 @@ fn matrice() -> Vec<u8> {
 
 /// Le segment d'initialisation : `ftyp` + `moov` d'une piste audio `fLaC`
 /// dont le `dfLa` porte le STREAMINFO, `mvex` pour les fragments.
-fn segment_init(info: &[u8; 34]) -> Vec<u8> {
+pub(super) fn segment_init(info: &[u8; 34]) -> Vec<u8> {
     let ftyp = boite(b"ftyp", b"iso6\0\0\0\0iso6mp41");
     let mut mvhd = vec![0u8; 8]; // création, modification
     mvhd.extend_from_slice(&SR.to_be_bytes());
@@ -219,7 +219,7 @@ fn segment_init(info: &[u8; 34]) -> Vec<u8> {
 
 /// Un segment média : `moof` (`trun` avec durée et taille de chaque trame)
 /// puis `mdat` des trames FLAC, recopiées telles quelles.
-fn segment_media(numero: u32, debut: u64, trames: &[(Vec<u8>, u32)]) -> Vec<u8> {
+pub(super) fn segment_media(numero: u32, debut: u64, trames: &[(Vec<u8>, u32)]) -> Vec<u8> {
     let mfhd = boite_pleine(b"mfhd", 0, 0, &numero.to_be_bytes());
     // default-base-is-moof : les décalages partent du début du moof.
     let tfhd = boite_pleine(b"tfhd", 0, 0x02_0000, &1u32.to_be_bytes());
@@ -270,7 +270,7 @@ pub(super) fn decouper(flac: &[u8]) -> PisteDash {
 // ── Faux TIDAL et faux CDN ────────────────────────────────────────────────
 
 #[derive(Default)]
-struct JournalTidal {
+pub(super) struct JournalTidal {
     manifeste: Option<Instant>,
     init: Option<Instant>,
     dernier_segment: Option<Instant>,
@@ -301,7 +301,7 @@ pub(super) fn mpd(base: &str, codec: &str, piste: &PisteDash) -> String {
 
 /// Le faux TIDAL et son CDN. `codec` est celui que le MPD annonce, et que
 /// `formats` reprend (`FLAC` ou `AACLC`).
-async fn faux_tidal(
+pub(super) async fn faux_tidal(
     piste: Arc<PisteDash>,
     codec: &'static str,
 ) -> (String, Arc<Mutex<JournalTidal>>) {
@@ -530,16 +530,26 @@ async fn serveur_de_flux(
 
 // ── Le banc ───────────────────────────────────────────────────────────────
 
-struct Mesure {
+pub(super) struct Mesure {
     debut: Instant,
     tidal: Arc<Mutex<JournalTidal>>,
     renderer: Arc<Mutex<JournalRenderer>>,
     /// Durée de `play()` jusqu'à son retour.
     play_rendu: Duration,
-    resultat: Result<super::PlayResult, String>,
+    pub(super) resultat: Result<super::PlayResult, String>,
 }
 
 async fn jouer(piste: Arc<PisteDash>, codec: &'static str) -> Mesure {
+    jouer_avec(piste, codec, |_, _| {}).await.0
+}
+
+/// TESS T12b — le même banc, la zone réglée par `regler` avant le `play()` ;
+/// rend aussi l'orchestrateur et la zone pour lire l'état servi.
+pub(super) async fn jouer_avec(
+    piste: Arc<PisteDash>,
+    codec: &'static str,
+    regler: impl FnOnce(&PlaybackOrchestrator, i64),
+) -> (Mesure, PlaybackOrchestrator, i64) {
     let ecoute_flux = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = ecoute_flux.local_addr().unwrap().port();
     let streamer = Arc::new(crate::http::streamer::AudioStreamer::new(port));
@@ -585,6 +595,7 @@ async fn jouer(piste: Arc<PisteDash>, codec: &'static str) -> Mesure {
     let zone_id = ZoneRepo::with_backend(orch.db.clone())
         .create("Salon 7266", Some("dlna"), Some(&appareil))
         .unwrap();
+    regler(&orch, zone_id);
 
     let req = PlayRequest {
         zone_id,
@@ -607,13 +618,17 @@ async fn jouer(piste: Arc<PisteDash>, codec: &'static str) -> Mesure {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    Mesure {
-        debut,
-        tidal,
-        renderer,
-        play_rendu,
-        resultat,
-    }
+    (
+        Mesure {
+            debut,
+            tidal,
+            renderer,
+            play_rendu,
+            resultat,
+        },
+        orch,
+        zone_id,
+    )
 }
 
 fn depuis(debut: Instant, t: Option<Instant>) -> String {

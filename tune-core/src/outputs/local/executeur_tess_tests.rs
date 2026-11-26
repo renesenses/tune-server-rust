@@ -202,11 +202,7 @@ impl Chaine {
             executer_chaine_locale(&mut f, &self.moteurs(), ordre, 2, false);
             sortie.extend_from_slice(&f);
         }
-        sortie.extend(
-            vidanger_chaine_locale(&self.moteurs(), ordre, 2, false)
-                .into_iter()
-                .map(f64::from),
-        );
+        sortie.extend(vidanger_chaine_locale_f64(&self.moteurs(), ordre, 2, false));
         sortie
     }
 
@@ -248,15 +244,34 @@ fn bits_f32(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
 
+/// TESS T06 — l'écart permis entre l'ancien chemin `f32` (un arrondi par
+/// étage) et le nouveau (`f64` de bout en bout, un arrondi à la frontière) :
+/// 2⁻²¹ ≈ −126 dBFS, quatre ULP `f32` à pleine échelle. Inaudible.
+pub(in crate::outputs::local) const ECART_T06: f64 = 1.0 / (1u32 << 21) as f64;
+
+pub(in crate::outputs::local) fn ecart_f32(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (f64::from(*x) - f64::from(*y)).abs())
+        .fold(0.0, f64::max)
+}
+
 // ---------------------------------------------------------------------------
 // Preuves
 // ---------------------------------------------------------------------------
 
 /// NON-RÉGRESSION : avec les moteurs d'avant (égaliseur, convolveur,
 /// crossfeed, repli mono) dans l'ordre d'avant, le nouveau chemin rend, après
-/// la frontière `f32` du producteur, EXACTEMENT les mêmes bits que l'ancien,
-/// vidange comprise. Sources 16 et 24 bits, blocs petits, moyens et plus
-/// grands que la pile d'un adaptateur.
+/// la frontière `f32` du producteur, les sons d'avant, vidange comprise.
+/// Sources 16 et 24 bits, blocs petits, moyens et plus grands que la pile
+/// d'un adaptateur.
+///
+/// - Sans égaliseur ni crossfeed (convolveur `f32` et repli mono) : les
+///   MÊMES bits.
+/// - TESS T06 : l'égaliseur et le crossfeed calculent en `f64` de bout en
+///   bout ; le seul changement est la précision, arrondie une fois à la
+///   frontière au lieu d'une fois par étage : au plus quelques ULP `f32`,
+///   sous −126 dBFS (2⁻²¹), donc inaudible.
 #[test]
 fn la_chaine_d_avant_rend_les_memes_bits_que_l_ancien_chemin() {
     for bits in [16u16, 24] {
@@ -273,18 +288,32 @@ fn la_chaine_d_avant_rend_les_memes_bits_que_l_ancien_chemin() {
                 let n =
                     frontiere_f32(&nouveau.nouveau(&source, bits, OrdreLocal::HISTORIQUE, bloc));
                 let a = ancien.ancien(&source, bits, bloc);
-                assert_eq!(
-                    bits_f32(&n),
-                    bits_f32(&a),
-                    "{bits} bits, bloc {bloc}, eq={eq} conv={conv} cf={cf} mono={mono}"
-                );
+                // T06 : égaliseur et crossfeed en f64 ; T09b : convolution en
+                // f64 (le repli mono qui la suit reçoit ses échantillons
+                // EXACTS). Seuls les arrondis diffèrent alors, sous 2^-21.
+                if !eq && !cf && !(conv && mono) {
+                    assert_eq!(
+                        bits_f32(&n),
+                        bits_f32(&a),
+                        "{bits} bits, bloc {bloc}, eq={eq} conv={conv} cf={cf} mono={mono}"
+                    );
+                } else {
+                    assert_eq!(n.len(), a.len());
+                    let e = ecart_f32(&n, &a);
+                    assert!(
+                        e <= ECART_T06,
+                        "{bits} bits, bloc {bloc}, eq={eq} conv={conv} cf={cf} mono={mono} : \
+                         écart {e:e} (> 2^-21)"
+                    );
+                }
             }
         }
     }
 }
 
 /// L'entrée `f32` historique (`apply_local_dsp`, celle des témoins et du
-/// chemin compressé) rend aussi les bits d'avant.
+/// chemin compressé) rend aussi les sons d'avant (T06 : égaliseur et
+/// crossfeed en `f64`, écart sous 2⁻²¹, voir [`ECART_T06`]).
 #[test]
 fn l_entree_f32_historique_rend_les_memes_bits() {
     let source: Vec<f32> = mots(5_000, 24)
@@ -301,10 +330,16 @@ fn l_entree_f32_historique_rend_les_memes_bits() {
     );
     let mut y = source;
     ancien_apply_local_dsp(&mut y, &a.eq, &a.conv, &a.cf, &a.pure, &a.mono, 2, false);
-    assert_eq!(bits_f32(&x), bits_f32(&y));
+    assert!(ecart_f32(&x, &y) <= ECART_T06, "{:e}", ecart_f32(&x, &y));
+    assert_ne!(
+        bits_f32(&x),
+        bits_f32(&y),
+        "T06 : l'égaliseur doit être en f64"
+    );
     let qx = crate::outputs::local::flush_local_dsp(&n.conv, &n.cf, &n.pure, &n.mono, 2, false);
     let qy = ancien_flush_local_dsp(&a.conv, &a.cf, &a.mono, 2);
-    assert_eq!(bits_f32(&qx), bits_f32(&qy));
+    assert_eq!(qx.len(), qy.len());
+    assert!(ecart_f32(&qx, &qy) <= ECART_T06);
 }
 
 /// « 64 bits réels » sur la chaîne locale : une source 32 bits passe par
@@ -374,20 +409,24 @@ fn l_ordre_de_la_chaine_tess_est_celui_de_la_sortie_locale() {
     assert_ne!(sortie_a, sortie_b, "l'ordre doit changer la sortie");
 
     // Oracle : les moteurs appelés directement, dans l'ordre demandé, par
-    // blocs de 512 trames comme la chaîne.
+    // blocs de 512 trames comme la chaîne, en f64 (T06, T09b : les deux
+    // moteurs sont en f64 natif, aucun arrondi entre eux).
     let (mut eq, mut conv) = (egaliseur(), convolveur());
-    let mut attendu: Vec<f32> = Vec::new();
+    let mut attendu: Vec<f64> = Vec::new();
     for morceau in source.chunks(512 * 6) {
-        let mut f = crate::outputs::local::pcm_bytes_to_f32(morceau, 24);
-        conv.process_interleaved(&mut f);
-        eq.process_interleaved(&mut f);
+        let mut f = crate::outputs::local::pcm_bytes_to_f64(morceau, 24);
+        conv.process_interleaved_f64(&mut f);
+        let _ = eq.process_interleaved_f64(&mut f);
         attendu.extend_from_slice(&f);
     }
     // La queue du convolveur passe par ce qui le suit : l'égaliseur.
-    let mut queue = conv.flush();
-    eq.process_interleaved(&mut queue);
+    let mut queue = conv.flush_f64();
+    let _ = eq.process_interleaved_f64(&mut queue);
     attendu.extend_from_slice(&queue);
-    assert_eq!(bits_f32(&frontiere_f32(&sortie_b)), bits_f32(&attendu));
+    assert_eq!(
+        bits_f32(&frontiere_f32(&sortie_b)),
+        bits_f32(&frontiere_f32(&attendu))
+    );
 }
 
 /// « Bypass all » et PURE : aucun étage n'agit, le PCM ressort à l'octet ;
@@ -634,7 +673,10 @@ fn le_geste_du_producteur_est_la_chaine_testee() {
 }
 
 /// Le chemin natif exclusif (`prepare_windows_native_pcm`) : bit-perfect
-/// inchangé en PURE et sans étage ; avec un étage, les mots d'avant.
+/// inchangé en PURE et sans étage ; avec un étage, les mots d'avant — depuis
+/// T06 (crossfeed en `f64`), à l'arrondi près : le dither du bloc est semé
+/// par ses échantillons, un seul ULP `f32` d'écart change donc sa suite ;
+/// l'écart reste sous 2 LSB à 16 bits, 4 LSB à 24 bits et 2⁻²¹ à 32 bits.
 #[test]
 fn le_chemin_natif_rend_les_mots_d_avant() {
     use crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
@@ -657,6 +699,7 @@ fn le_chemin_natif_rend_les_mots_d_avant() {
                 &c.pure,
                 &c.mono,
                 None,
+                44_100,
             )
             .expect("bloc préparé");
             let a = Chaine::new(false, false, cf, false);
@@ -671,7 +714,26 @@ fn le_chemin_natif_rend_les_mots_d_avant() {
                 pure || !cf,
                 "{bits} bits, pure={pure}, cf={cf}"
             );
-            assert_eq!(natif.samples, attendu, "{bits} bits, pure={pure}, cf={cf}");
+            if pure || !cf {
+                assert_eq!(natif.samples, attendu, "{bits} bits, pure={pure}, cf={cf}");
+            } else {
+                let decalage = 32 - u32::from(bits);
+                // 2 LSB à 16 bits ; 2⁻²¹ de pleine échelle au-delà, soit
+                // 4 LSB à 24 bits.
+                let tolerance = (2i64 << decalage).max((ECART_T06 * 2_147_483_648.0) as i64);
+                let pire = natif
+                    .samples
+                    .iter()
+                    .zip(&attendu)
+                    .map(|(x, y)| (i64::from(*x) - i64::from(*y)).abs())
+                    .max()
+                    .unwrap_or(0);
+                assert_eq!(natif.samples.len(), attendu.len());
+                assert!(
+                    pire <= tolerance,
+                    "{bits} bits : écart {pire} > {tolerance}"
+                );
+            }
         }
     }
 }
@@ -715,11 +777,15 @@ fn mono_et_multicanal_rendent_les_bits_d_avant() {
         let source = octets(&signal, 24);
         let trame = 3 * usize::from(canaux);
         for bloc in source.chunks(777 * trame) {
-            assert_eq!(
-                bits_f32(&n.bloc_nouveau(bloc, 24, canaux)),
-                bits_f32(&a.bloc_ancien(bloc, 24, canaux)),
-                "{canaux} voies"
+            // T06 + T09b : égaliseur puis convolution sans arrondi f32 entre
+            // eux ; seul l'arrondi final diffère de l'ancien chemin, sous 2^-21.
+            let (x, y) = (
+                n.bloc_nouveau(bloc, 24, canaux),
+                a.bloc_ancien(bloc, 24, canaux),
             );
+            assert_eq!(x.len(), y.len(), "{canaux} voies");
+            let e = ecart_f32(&x, &y);
+            assert!(e <= ECART_T06, "{canaux} voies : écart {e:e} (> 2^-21)");
         }
     }
 }
@@ -727,8 +793,9 @@ fn mono_et_multicanal_rendent_les_bits_d_avant() {
 /// Bascules en cours de lecture, entre deux blocs : repli mono, PURE, relève
 /// d'égaliseur (nouveau profil fondu), COUPURE de l'égaliseur (fondu, le
 /// préampli reste gardé, #5215), « Remettre à plat » demandé PENDANT ce fondu
-/// (#4176 : la remontée part à la fin du fondu), puis retrait au repos. Mêmes bits que l'ancien chemin à chaque bloc,
-/// et l'égaliseur est retiré au même bloc.
+/// (#4176 : la remontée part à la fin du fondu), puis retrait au repos. Les
+/// sons de l'ancien chemin à chaque bloc (T06 : à 2⁻²¹ près, l'égaliseur et
+/// le crossfeed calculent en `f64`), et l'égaliseur est retiré au même bloc.
 #[test]
 fn les_bascules_en_cours_de_lecture_rendent_les_bits_d_avant() {
     let source = octets(&mots(4_410 * 300, 24), 24);
@@ -783,11 +850,8 @@ fn les_bascules_en_cours_de_lecture_rendent_les_bits_d_avant() {
                 _ => {}
             }
         }
-        assert_eq!(
-            bits_f32(&n.bloc_nouveau(bloc, 24, 2)),
-            bits_f32(&a.bloc_ancien(bloc, 24, 2)),
-            "bloc {i}"
-        );
+        let e = ecart_f32(&n.bloc_nouveau(bloc, 24, 2), &a.bloc_ancien(bloc, 24, 2));
+        assert!(e <= ECART_T06, "bloc {i} : écart {e:e}");
         if retraits.0.is_none() && n.eq.lock().unwrap().is_none() {
             retraits.0 = Some(i);
         }
@@ -819,12 +883,435 @@ pub(in crate::outputs::local) fn comparer_un_etage_casque_a_l_ancien(
     let source = octets(&mots(48_000, 24), 24);
     let mut blocs = 0;
     for bloc in source.chunks(4_800 * 6) {
-        assert_eq!(
-            bits_f32(&n.bloc_nouveau(bloc, 24, 2)),
-            bits_f32(&a.bloc_ancien(bloc, 24, 2)),
-            "bloc {blocs}"
-        );
+        // TESS T06 : le crossfeed intégré calcule en `f64` ; les natifs tiers
+        // restent convertis à leur frontière. Écart sous 2⁻²¹.
+        let e = ecart_f32(&n.bloc_nouveau(bloc, 24, 2), &a.bloc_ancien(bloc, 24, 2));
+        assert!(e <= ECART_T06, "bloc {blocs} : écart {e:e}");
         blocs += 1;
     }
     blocs
+}
+
+// ---------------------------------------------------------------------------
+// TESS T14 — natifs tiers dans l'hôte.
+// ---------------------------------------------------------------------------
+
+/// Un signal stéréo dont les valeurs occupent toute la mantisse d'un `f64` :
+/// aucune n'est représentable en `f32`.
+fn signal_double_precision(trames: usize) -> Vec<f64> {
+    (0..trames * 2)
+        .map(|i| (((i as f64) * 0.618_033_988_749_894_9).fract() - 0.5) * 0.9)
+        .collect()
+}
+
+/// L'étage casque d'un seul natif tiers `id`, gain 0,5 (exact en binaire),
+/// passé par la chaîne locale réelle ; rend l'écart maximal à `x × 0,5`.
+fn ecart_d_un_natif_tiers(id: &str) -> (f64, Vec<(String, bool)>) {
+    let cf = CrossfeedProcessor::composer(
+        44_100,
+        None,
+        &[(
+            id.to_string(),
+            serde_json::json!({"enabled": true, "gain": 0.5}),
+        )],
+    );
+    assert_eq!(cf.etages_tiers(), 1, "{id} : étage tiers non préparé");
+    let diagnostic = cf.etages_tiers_en_f64();
+    let chaine = Chaine::avec(None, None, Some(cf), false);
+    let source = signal_double_precision(4_096);
+    let mut x = source.clone();
+    executer_chaine_locale(&mut x, &chaine.moteurs(), OrdreLocal::HISTORIQUE, 2, false);
+    let ecart = x
+        .iter()
+        .zip(&source)
+        .map(|(y, s)| (y - s * 0.5).abs())
+        .fold(0.0, f64::max);
+    (ecart, diagnostic)
+}
+
+/// F64 NÉGOCIÉ : un natif tiers qui a demandé `audio-f64` reçoit les `f64`
+/// de la chaîne locale tels quels (écart nul au gain exact).
+/// CONTRE-ÉPREUVE : un natif tiers `f32`, même gain, même banc, porte
+/// l'arrondi du `f32` (≈ 1e-8) : le banc discrimine, et le greffon `f32`
+/// tourne inchangé par la conversion à sa frontière.
+#[test]
+fn t14_un_natif_tiers_f64_recoit_les_f64_de_la_chaine() {
+    let (_ids, _dossier) = crate::greffon_natif_de_test::enregistrer_les_bibliotheques_de_test(&[
+        "essai-t14-f64",
+        "essai-t14-f32",
+    ]);
+    let (e64, d64) = ecart_d_un_natif_tiers("essai-t14-f64");
+    assert_eq!(d64, [("essai-t14-f64".to_string(), true)]);
+    assert!(
+        e64 < 1e-15,
+        "F64 négocié : écart {e64:e}, le greffon a reçu du f32"
+    );
+
+    let (e32, d32) = ecart_d_un_natif_tiers("essai-t14-f32");
+    assert_eq!(d32, [("essai-t14-f32".to_string(), false)]);
+    assert!(
+        e32 > 1e-12 && e32 < 1e-6,
+        "le banc ne discrimine pas : greffon f32 à {e32:e}"
+    );
+}
+
+/// ORDRE LIBRE : un natif tiers CHARGÉ, nommé par la chaîne, place l'étage
+/// casque qui le porte, comme un membre de la famille du crossfeed.
+/// CONTRE-ÉPREUVES : un identifiant valide mais sans fournisseur natif chargé
+/// (greffon WASM, paquet absent), un greffon du catalogue de référence qui
+/// n'est pas un étage local et un identifiant invalide ne placent rien.
+#[test]
+fn t14_un_natif_tiers_place_l_etage_casque() {
+    use EtageLocal::*;
+    let (_ids, _dossier) =
+        crate::greffon_natif_de_test::enregistrer_les_bibliotheques_de_test(&["essai-t14-ordre"]);
+    assert_eq!(
+        OrdreLocal::depuis_ids(["essai-t14-ordre", "equalizer-graphic"], false).etages(),
+        [Crossfeed, Egaliseur, Convolution, RepliMono]
+    );
+    assert_eq!(
+        OrdreLocal::depuis_ids(
+            ["convolution", "essai-t14-ordre", "equalizer-graphic"],
+            false
+        )
+        .etages(),
+        [Convolution, Crossfeed, Egaliseur, RepliMono]
+    );
+    assert_eq!(
+        OrdreLocal::depuis_ids(["essai-t14-non-charge", "equalizer-graphic"], false).etages(),
+        [Egaliseur, Convolution, Crossfeed, RepliMono],
+        "un identifiant sans fournisseur chargé a déplacé l'étage casque"
+    );
+    assert_eq!(
+        OrdreLocal::depuis_ids(["declick-live", "Pas_Valide", "equalizer-graphic"], false).etages(),
+        [Egaliseur, Convolution, Crossfeed, RepliMono]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TESS T06 — moteurs de référence en `f64` dans la chaîne locale.
+// ---------------------------------------------------------------------------
+
+/// TÉMOIN « aucune conversion `f32` entre deux étages » (Q5), par
+/// l'exécution : égaliseur, crossfeed et repli mono actifs, le signal ne
+/// traverse AUCUNE frontière `f32` dans la chaîne. T09b : convolveur compris
+/// (il est en `f64` natif). CONTRE-ÉPREUVE : la sonde compte bien une
+/// frontière signalée — elle discrimine.
+#[test]
+fn t06_aucune_frontiere_f32_pour_l_egaliseur_et_le_crossfeed() {
+    let source = octets(&mots(4_000, 24), 24);
+    let sans = Chaine::new(true, false, true, true);
+    let n = crate::tess::sonde_f32::compter(|| {
+        sans.nouveau(&source, 24, OrdreLocal::HISTORIQUE, 1_000);
+    });
+    assert_eq!(
+        n, 0,
+        "{n} frontières f32 traversées par l'égaliseur ou le crossfeed"
+    );
+    let avec_conv = Chaine::new(true, true, true, true);
+    let n = crate::tess::sonde_f32::compter(|| {
+        avec_conv.nouveau(&source, 24, OrdreLocal::HISTORIQUE, 1_000);
+    });
+    assert_eq!(n, 0, "{n} frontières f32 avec le convolveur (T09b)");
+    let vue = crate::tess::sonde_f32::compter(|| {
+        crate::tess::sonde_f32::noter();
+        avec_conv.nouveau(&source, 24, OrdreLocal::HISTORIQUE, 1_000);
+    });
+    assert_eq!(vue, 1, "la sonde ne compte pas les frontières");
+}
+
+/// « 64 bits réels » pour l'égaliseur et le crossfeed DANS la chaîne locale :
+/// une source 32 bits traverse égaliseur, crossfeed et repli mono ; la sortie
+/// colle à 1e-12 près à la référence calculée hors chaîne (les moteurs `f64`
+/// du SDK appelés directement, puis le repli mono en `f64`). Leur propre
+/// exactitude face à une référence en précision étendue est prouvée par les
+/// bancs `sdk/*/tests/banc_f64_t06.rs`. CONTRE-ÉPREUVE : l'ancien chemin `f32`
+/// échoue au même banc.
+#[test]
+fn t06_soixante_quatre_bits_reels_egaliseur_et_crossfeed_sur_la_chaine_locale() {
+    let m = mots(8_000, 32);
+    let source = octets(&m, 32);
+    let mut reference = crate::outputs::local::pcm_bytes_to_f64(&source, 32);
+    let profil = EqProfile {
+        enabled: true,
+        bands: vec![
+            EqBandSpec {
+                freq: 2000.0,
+                gain: -12.0,
+                q: 0.71,
+                band_type: "high_shelf".into(),
+                ..Default::default()
+            },
+            EqBandSpec {
+                freq: 120.0,
+                gain: 6.0,
+                q: 1.0,
+                band_type: "peaking".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let mut eq_ref = tune_plugin_equalizer::EqProcessor::new(&profil, 44_100, 2);
+    let mut cf_ref = tune_plugin_crossfeed::CrossfeedProcessor::new(44_100, 0.6, 0.3);
+    for morceau in reference.chunks_mut(2 * 1_024) {
+        eq_ref.process_interleaved_f64(morceau);
+        cf_ref.process_interleaved_f64(morceau);
+        for t in morceau.as_chunks_mut::<2>().0 {
+            let v = (t[0] + t[1]) * 0.5;
+            *t = [v, v];
+        }
+    }
+    let ecart = |sortie: &[f64]| {
+        assert_eq!(sortie.len(), reference.len());
+        sortie
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max)
+    };
+    let chaine = Chaine::new(true, false, true, true);
+    let e = ecart(&chaine.nouveau(&source, 32, OrdreLocal::HISTORIQUE, 1_024));
+    assert!(
+        e < 1e-12,
+        "écart {e:e} : la chaîne locale n'est pas en 64 bits"
+    );
+
+    let chaine = Chaine::new(true, false, true, true);
+    let ancien: Vec<f64> = chaine
+        .ancien(&source, 32, 1_024)
+        .into_iter()
+        .map(f64::from)
+        .collect();
+    let e_ancien = ecart(&ancien);
+    assert!(
+        e_ancien > 1e-10,
+        "le banc ne discrimine pas : l'ancien chemin f32 passe ({e_ancien:e})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TESS T09b — la convolution, étage `f64` natif de la chaîne locale
+// ---------------------------------------------------------------------------
+
+/// Les prises du convolveur de test, en `f64`, par canal.
+fn prises_du_convolveur() -> [Vec<f64>; 2] {
+    let mut g = vec![0.0f64; 96];
+    g[0] = f64::from(0.8f32);
+    g[7] = f64::from(0.3f32);
+    g[40] = f64::from(-0.2f32);
+    let mut d = vec![0.0f64; 96];
+    d[0] = f64::from(0.7f32);
+    d[11] = f64::from(0.25f32);
+    d[63] = f64::from(0.1f32);
+    [g, d]
+}
+
+/// « 64 bits réels » AVEC la convolution : une source 32 bits traverse
+/// l'étage de convolution de la chaîne locale (adaptateur, exécuteur,
+/// vidange) et colle à la convolution DIRECTE calculée en double précision à
+/// moins de 1e-12. Aucune conversion `f32` entre le décodage et la sortie de
+/// la chaîne. CONTRE-ÉPREUVE : l'ancien chemin (`f32` entre étages) échoue au
+/// même banc.
+#[test]
+fn soixante_quatre_bits_reels_avec_la_convolution_t09b() {
+    let m = mots(6_000, 32);
+    let source = octets(&m, 32);
+    let trames = m.len() / 2;
+    let h = prises_du_convolveur();
+    let mut reference = vec![0.0f64; (trames + 64) * 2];
+    for c in 0..2 {
+        for n in 0..trames + 64 {
+            let mut acc = 0.0f64;
+            for (k, hk) in h[c].iter().enumerate() {
+                if n >= k && n - k < trames {
+                    acc += hk * f64::from(m[(n - k) * 2 + c]) / 2_147_483_648.0;
+                }
+            }
+            reference[n * 2 + c] = acc;
+        }
+    }
+    let ecart = |sortie: &[f64]| {
+        // La sortie de la chaîne porte la latence d'un bloc (64 trames) en
+        // tête ; la vidange rend la queue.
+        sortie[64 * 2..]
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max)
+    };
+    let chaine = Chaine::new(false, true, false, false);
+    let nouveau = chaine.nouveau(&source, 32, OrdreLocal::HISTORIQUE, 1_000);
+    assert_eq!(nouveau.len(), trames * 2 + 64 * 2);
+    let e = ecart(&nouveau);
+    assert!(
+        e < 1e-12,
+        "écart {e:e} : la convolution locale n'est pas en 64 bits"
+    );
+
+    let chaine = Chaine::new(false, true, false, false);
+    let ancien: Vec<f64> = chaine
+        .ancien(&source, 32, 1_000)
+        .into_iter()
+        .map(f64::from)
+        .collect();
+    let e_ancien = ecart(&ancien);
+    assert!(
+        e_ancien >= 1e-12,
+        "le banc ne discrimine pas : l'ancien chemin f32 passe ({e_ancien:e})"
+    );
+}
+
+/// La latence de l'étage de convolution est ANNONCÉE à l'exécuteur, et c'est
+/// la vraie : une impulsion ressort exactement `latence_totale_trames()`
+/// trames plus tard (pic de la réponse en tête).
+#[test]
+fn la_convolution_annonce_sa_latence_exacte_a_l_executeur_t09b() {
+    let conv = Mutex::new(Some(convolveur()));
+    let mut etage = AdaptateurConvolution {
+        moteur: &conv,
+        canaux: 2,
+    };
+    let mut ex = Executeur::new();
+    let format = FormatFlux {
+        channels: 2,
+        sample_rate_hz: 48_000,
+    };
+    let mut etages: [&mut dyn EtageTess; 1] = [&mut etage];
+    ex.preparer(&mut etages, format, 512, false).unwrap();
+    assert_eq!(ex.latence_totale_trames(), 64);
+    let mut x = vec![0.0f64; 512 * 2];
+    x[0] = 1.0;
+    x[1] = 1.0;
+    let sortie = ex.traiter(&mut etages, &mut x, 512).unwrap();
+    let pic = sortie
+        .echantillons
+        .chunks(2)
+        .position(|t| t[0].abs() > 0.5)
+        .unwrap();
+    assert_eq!(pic as u64, 64, "le pic sort à la latence annoncée");
+    assert!(
+        (sortie.echantillons[pic * 2] - f64::from(0.8f32)).abs() < 1e-14,
+        "gain du pic gauche"
+    );
+}
+
+/// Aucune allocation dans le traitement AVEC la convolution (T09b : le moteur
+/// `f64` réserve ses tampons FFT à la construction).
+#[test]
+fn le_traitement_avec_convolution_n_alloue_pas_t09b() {
+    let chaine = Chaine::new(true, true, true, true);
+    let mut f = crate::outputs::local::pcm_bytes_to_f64(&octets(&mots(512, 24), 24), 24);
+    executer_chaine_locale(&mut f, &chaine.moteurs(), OrdreLocal::HISTORIQUE, 2, false);
+    super::super::ringbuf_tests::assert_no_allocation(|| {
+        executer_chaine_locale(&mut f, &chaine.moteurs(), OrdreLocal::HISTORIQUE, 2, false);
+    });
+}
+
+// ── rc14 : l'ordre affiché de la chaîne TESS règle la sortie locale ──
+
+/// Un égaliseur à bande PAR CANAL (gauche seulement) : avant ou après le
+/// crossfeed, qui mélange les voies, le résultat diffère.
+fn egaliseur_gauche() -> EqProcessor {
+    let profile = EqProfile {
+        enabled: true,
+        bands: vec![EqBandSpec {
+            freq: 1000.0,
+            gain: -15.0,
+            q: 1.0,
+            band_type: "peak".into(),
+            channel: Some(0),
+        }],
+        ..Default::default()
+    };
+    EqProcessor::new(&profile, 44_100, 2)
+}
+
+fn chaine_tess(ids: &[&str]) -> ChaineTess {
+    serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "plugins": ids.iter().map(|id| serde_json::json!({"id": id, "enabled": true})).collect::<Vec<_>>()
+    }))
+    .unwrap()
+}
+
+/// Crossfeed puis égaliseur à bande par canal (ordre inversé par
+/// l'utilisateur) : la sortie diffère de l'ordre historique, et vaut
+/// exactement les moteurs appelés dans CET ordre.
+#[test]
+fn crossfeed_puis_egaliseur_par_canal_suit_l_ordre_affiche_rc14() {
+    use EtageLocal::*;
+    let inverse = OrdreLocal::depuis_chaine(&chaine_tess(&["crossfeed", "equalizer-parametric"]));
+    assert_eq!(
+        inverse.etages(),
+        [Crossfeed, Egaliseur, Convolution, RepliMono]
+    );
+    let source = octets(&mots(8_000, 24), 24);
+    let sortie = |ordre: OrdreLocal| {
+        let c = Chaine::avec(Some(egaliseur_gauche()), None, Some(crossfeed()), false);
+        let mut f = crate::outputs::local::pcm_bytes_to_f64(&source, 24);
+        executer_chaine_locale(&mut f, &c.moteurs(), ordre, 2, false);
+        f
+    };
+    let historique = sortie(OrdreLocal::HISTORIQUE);
+    let affiche = sortie(inverse);
+    assert_ne!(historique, affiche, "l'ordre doit changer la sortie");
+    // Oracle : crossfeed, puis égaliseur.
+    let (mut cf, mut eq) = (crossfeed(), egaliseur_gauche());
+    let mut attendu = crate::outputs::local::pcm_bytes_to_f64(&source, 24);
+    cf.process_interleaved_f64(&mut attendu);
+    let _ = eq.process_interleaved_f64(&mut attendu);
+    assert_eq!(affiche, attendu);
+    // Et l'ordre historique est bien égaliseur puis crossfeed.
+    let (mut cf, mut eq) = (crossfeed(), egaliseur_gauche());
+    let mut attendu = crate::outputs::local::pcm_bytes_to_f64(&source, 24);
+    let _ = eq.process_interleaved_f64(&mut attendu);
+    cf.process_interleaved_f64(&mut attendu);
+    assert_eq!(historique, attendu);
+}
+
+/// L'ordre par défaut d'une chaîne (celui de la migration, `rang`) EST
+/// l'ordre historique : même ordre, mêmes octets.
+#[test]
+fn l_ordre_par_defaut_est_l_historique_a_l_octet_pres_rc14() {
+    let defaut = chaine_tess(&[
+        "equalizer-graphic",
+        "equalizer-parametric",
+        "room-correction",
+        "convolution",
+        "crossfeed",
+        "crosstalk",
+        "mono-downmix",
+        "channel-remap",
+    ]);
+    assert_eq!(OrdreLocal::depuis_chaine(&defaut), OrdreLocal::HISTORIQUE);
+    assert_eq!(
+        OrdreLocal::depuis_chaine(&ChaineTess::default()),
+        OrdreLocal::HISTORIQUE
+    );
+    let source = octets(&mots(6_000, 24), 24);
+    let a = Chaine::new(true, true, true, true);
+    let b = Chaine::new(true, true, true, true);
+    let x = decoder_par_la_chaine_tess(
+        &source,
+        24,
+        &a.moteurs(),
+        OrdreLocal::depuis_chaine(&defaut),
+        2,
+        false,
+    );
+    let y = decoder_par_la_chaine_tess(&source, 24, &b.moteurs(), OrdreLocal::HISTORIQUE, 2, false);
+    assert_eq!(bits_f32(&x), bits_f32(&y));
+}
+
+/// L'ordre posé pour une sortie ne vaut que pour elle, et s'oublie.
+#[test]
+fn l_ordre_pose_ne_vaut_que_pour_sa_sortie_rc14() {
+    let (une, autre) = (AtomicBool::new(false), AtomicBool::new(false));
+    let inverse = OrdreLocal::depuis_chaine(&chaine_tess(&["crossfeed", "equalizer-graphic"]));
+    OrdreLocal::poser_pour_la_sortie(&une, inverse);
+    assert_eq!(OrdreLocal::de_la_sortie(&une), inverse);
+    assert_eq!(OrdreLocal::de_la_sortie(&autre), OrdreLocal::HISTORIQUE);
+    OrdreLocal::oublier_la_sortie(&une);
+    assert_eq!(OrdreLocal::de_la_sortie(&une), OrdreLocal::HISTORIQUE);
 }

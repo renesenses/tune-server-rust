@@ -104,8 +104,18 @@ async fn audio_offer_free_eq_crossfeed_and_paid_plugins_survive_real_startup() {
                 50000,
             ))),
         );
-        let eq =
-            json!({"enabled":true,"bands":[{"freq":1000.0,"gain":3.0,"q":1.41,"type":"peak"}]});
+        // rc14 (#9517) — the free equalizer is the GRAPHIC one: the web client's
+        // 10-band ISO grid at Q 1.0 (`eqGrilles.ts`). A free-form band is a
+        // parametric EQ, which is Premium.
+        let grid = [
+            31.0, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+        ];
+        let bands: Vec<Value> = grid
+            .iter()
+            .enumerate()
+            .map(|(i, f)| json!({"freq":f,"gain":if i == 5 { 3.0 } else { 0.0 },"q":1.0,"type":"peak"}))
+            .collect();
+        let eq = json!({"enabled":true,"bands":bands});
         let (status, response) = request(
             &app,
             "POST",
@@ -122,6 +132,29 @@ async fn audio_offer_free_eq_crossfeed_and_paid_plugins_survive_real_startup() {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "preset: {response}");
+        let parametric =
+            json!({"enabled":true,"bands":[{"freq":1000.0,"gain":3.0,"q":1.41,"type":"peak"}]});
+        let (status, response) = request(
+            &app,
+            "POST",
+            &format!("/api/v1/zones/{zone}/eq"),
+            parametric,
+        )
+        .await;
+        if premium {
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "parametric EQ (Premium): {response}"
+            );
+        } else {
+            assert_eq!(
+                status,
+                StatusCode::PAYMENT_REQUIRED,
+                "parametric EQ (Free): {response}"
+            );
+            assert_eq!(response["code"], "parametric_eq", "{response}");
+        }
         let dsp = format!("/api/v1/zones/{zone}/dsp");
         let (_, response) = request(&app, "GET", &dsp, Value::Null).await;
         assert_eq!(response["crossfeed_status"]["requested"], true);

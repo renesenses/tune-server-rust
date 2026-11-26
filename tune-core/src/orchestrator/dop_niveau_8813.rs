@@ -13,7 +13,9 @@ impl PlaybackOrchestrator {
         if !matches!(transport, TransportDsd::Dop | TransportDsd::NatifServiEnDop) {
             return false;
         }
-        if self.zone_audiophile(zone_id)
+        // rc14 (revue #9520) — PURE ou mesure seulement : « Bypass all » ne
+        // lève JAMAIS cette protection (un DSD à pleine échelle, volume à 6 %).
+        if crate::audio::audiophile::pure_ou_mesure(&self.db, zone_id)
             || crate::audio::bitperfect_strict::zone_enabled(&self.db, zone_id)
             || !crate::audio::dop_ecarte_7265::protection_du_niveau_active(&self.db, zone_id)
         {
@@ -89,6 +91,12 @@ impl PlaybackOrchestrator {
         let Some(device_id) = zone.output_device_id else {
             return false;
         };
+        // rc14 — un flux modulé vers le DSD par TESS (DoP OU natif) porte
+        // le volume de la zone dans ses bits : il est appliqué juste avant le
+        // modulateur (Q9), rien à protéger ni à relancer.
+        if self.modulation_dsd_en_service(zone_id).await {
+            return false;
+        }
         let etat = self.playback.get_state(zone_id).await;
         let Some(np) = etat.now_playing else {
             return false;

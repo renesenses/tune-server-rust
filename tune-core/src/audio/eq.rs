@@ -3,6 +3,7 @@
 //! the same persisted profile and producer locations (including radio).
 use super::ecretage::{CompteurDEcretage, EtageEcretant, Portee, REGISTRE, dire_fin, dire_premier};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tune_plugin_audio_support::echantillon::Echantillon;
 pub use tune_plugin_equalizer::{
     DEBIT_DE_REFERENCE_HZ, EqBandSpec, EqProcessStats, EqProfile, HeadroomMode, ListeningMode,
     RoomSize, SpeakerPlacement,
@@ -70,6 +71,13 @@ pub const EXTINCTION_SUR_FLUX_SANS_FIN_MS: u32 = 3_000;
 /// [`EqProcessor::borner_la_remontee`]).
 pub const REMONTEE_DB_PAR_SECONDE: f64 = 2.0;
 
+/// rc14 (décision de Bertrand du 25/11, retour de Rémi) — durée de la
+/// remontée du préampli gardé quand un égaliseur est DÉCOCHÉ dans TESS : le
+/// geste sert une comparaison A/B, le signal sec revient en moins d'une
+/// demi-seconde, par la même rampe linéaire en dB (aucune marche). Hors de
+/// TESS, la règle du 10/10 et [`REMONTEE_DB_PAR_SECONDE`] restent.
+pub const REMONTEE_RAPIDE_TESS_MS: u32 = 450;
+
 /// #6211 — extinction en cours du préampli gardé : `depart` est le gain par
 /// coefficient au début de la rampe, `vers` celui de la fin
 /// (`min(depart, 1)` au-dessus de 1, #6524 b ; la borne de remontée en
@@ -89,6 +97,69 @@ struct Fondu {
     total: usize,
     fait: usize,
     tampon: Vec<f32>,
+    /// TESS T06 — le même tampon pour le chemin `f64` de l'exécuteur : un
+    /// fondu n'arrondit jamais le signal vers `f32`.
+    tampon_f64: Vec<f64>,
+}
+
+/// TESS T06 — ce que la façade de l'égaliseur sait traiter : `f32` (chemins
+/// historiques, au bit près comme avant) et `f64` (exécuteur TESS, sans aucun
+/// aller-retour par `f32`). Les boucles sont écrites une fois.
+trait EchantillonHote: Echantillon {
+    fn tampon_du_fondu(f: &mut Fondu) -> &mut Vec<Self>;
+    /// `min(n / d, 1)`, calculé dans ce type (en `f32` comme avant pour
+    /// `f32`).
+    fn rapport_borne(n: usize, d: usize) -> Self;
+    fn moteur_integre(p: &mut tune_plugin_equalizer::EqProcessor, s: &mut [Self])
+    -> EqProcessStats;
+    fn moteur_natif(
+        p: &mut Stage,
+        s: &mut [Self],
+    ) -> Result<tune_plugin_sdk::audio::ProcessReport, tune_plugin_sdk::Error>;
+}
+
+impl EchantillonHote for f32 {
+    fn tampon_du_fondu(f: &mut Fondu) -> &mut Vec<Self> {
+        &mut f.tampon
+    }
+    fn rapport_borne(n: usize, d: usize) -> Self {
+        (n as f32 / d as f32).min(1.0)
+    }
+    fn moteur_integre(
+        p: &mut tune_plugin_equalizer::EqProcessor,
+        s: &mut [Self],
+    ) -> EqProcessStats {
+        p.process_interleaved(s)
+    }
+    fn moteur_natif(
+        p: &mut Stage,
+        s: &mut [Self],
+    ) -> Result<tune_plugin_sdk::audio::ProcessReport, tune_plugin_sdk::Error> {
+        p.process_f32(s)
+    }
+}
+
+impl EchantillonHote for f64 {
+    fn tampon_du_fondu(f: &mut Fondu) -> &mut Vec<Self> {
+        &mut f.tampon_f64
+    }
+    fn rapport_borne(n: usize, d: usize) -> Self {
+        (n as f64 / d as f64).min(1.0)
+    }
+    fn moteur_integre(
+        p: &mut tune_plugin_equalizer::EqProcessor,
+        s: &mut [Self],
+    ) -> EqProcessStats {
+        p.process_interleaved_f64(s)
+    }
+    /// Un greffon natif qui demande `audio-f64` reçoit le `f64` tel quel ;
+    /// un paquet `F32` plus ancien est converti à SA frontière (T05).
+    fn moteur_natif(
+        p: &mut Stage,
+        s: &mut [Self],
+    ) -> Result<tune_plugin_sdk::audio::ProcessReport, tune_plugin_sdk::Error> {
+        p.process_f64(s)
+    }
 }
 
 /// #6741 — le gain qu'un égaliseur COUPÉ applique encore (voir
@@ -136,6 +207,9 @@ pub struct EqProcessor {
     /// jusqu'au signal sec, sans la borne de volume de #6741. Suit le neutre
     /// d'une piste à l'autre ; un égaliseur réactivé repart sans.
     libere: bool,
+    /// rc14 (TESS) — la remontée vers le sec dure
+    /// [`REMONTEE_RAPIDE_TESS_MS`] au lieu de suivre [`REMONTEE_DB_PAR_SECONDE`].
+    rampe_rapide: bool,
     clipping: CompteurDEcretage,
     closed: AtomicBool,
 }
@@ -193,6 +267,7 @@ impl EqProcessor {
             // #6741 — 0 : sans borne posée par la sortie, rien ne remonte.
             borne_de_remontee: 0.0,
             libere: false,
+            rampe_rapide: false,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
@@ -233,6 +308,7 @@ impl EqProcessor {
             extinction: None,
             borne_de_remontee: precedent.borne_de_remontee,
             libere: false,
+            rampe_rapide: false,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
@@ -298,6 +374,7 @@ impl EqProcessor {
             total,
             fait: 0,
             tampon: Vec::new(),
+            tampon_f64: Vec::new(),
         });
     }
 
@@ -382,6 +459,7 @@ impl EqProcessor {
             extinction: None,
             borne_de_remontee: self.borne_de_remontee,
             libere: self.libere,
+            rampe_rapide: self.rampe_rapide,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         };
@@ -439,7 +517,7 @@ impl EqProcessor {
         self.borne_de_remontee.min(1.0).max(g)
     }
 
-    /// #4176 — « Remettre à plat » sur un égaliseur coupé : le geste explicite
+    /// #6524 — « Rendre le niveau » sur un égaliseur coupé : le geste explicite
     /// qui rend le niveau. Le gain gardé remonte jusqu'au signal sec, même si
     /// le volume a été monté pendant que l'égaliseur jouait (la borne de
     /// #6741 ne s'applique plus), par la même rampe progressive de
@@ -456,6 +534,23 @@ impl EqProcessor {
         if self.fondu.is_none() {
             self.relancer_depuis_le_gain_atteint();
         }
+    }
+
+    /// rc14 (décision de Bertrand du 25/11) — égaliseur DÉCOCHÉ dans TESS :
+    /// le gain gardé remonte en [`REMONTEE_RAPIDE_TESS_MS`], tout de suite,
+    /// même pendant le fondu de la courbe (les deux se recouvrent, sans
+    /// marche), vers `min(1, borne de volume)` comme toute remontée (#6741,
+    /// sécurité auditive, fil 1974) : à volume inchangé, le signal sec au bit
+    /// près en moins de 0,5 s ; si le volume a monté pendant que
+    /// l'égaliseur jouait, le niveau d'avant l'égaliseur, jamais au-dessus —
+    /// le reste demeure gardé, avec son voyant et « Rendre le niveau »
+    /// (#6524). `libere` n'est PAS posé. Sans effet hors d'un égaliseur coupé.
+    pub fn rendre_le_sec_vite(&mut self) {
+        if !self.est_neutre() {
+            return;
+        }
+        self.rampe_rapide = true;
+        self.relancer_depuis_le_gain_atteint();
     }
 
     /// Relance la rampe du gain gardé depuis le gain atteint, vers la cible
@@ -495,8 +590,12 @@ impl EqProcessor {
             .filter(|(d, v)| v > d && **d > 0.0)
             .map(|(d, v)| 20.0 * f64::from(v / d).log10())
             .fold(0.0_f64, f64::max);
-        let ms = f64::from(EXTINCTION_SUR_FLUX_SANS_FIN_MS)
-            .max(ecart_db / REMONTEE_DB_PAR_SECONDE * 1000.0);
+        let ms = if self.rampe_rapide {
+            f64::from(REMONTEE_RAPIDE_TESS_MS)
+        } else {
+            f64::from(EXTINCTION_SUR_FLUX_SANS_FIN_MS)
+                .max(ecart_db / REMONTEE_DB_PAR_SECONDE * 1000.0)
+        };
         let total = (f64::from(self.sample_rate) * ms / 1000.0).max(1.0) as usize;
         self.extinction = Some(Extinction {
             depart,
@@ -532,8 +631,11 @@ impl EqProcessor {
             return;
         }
         self.borne_de_remontee = borne;
-        if !self.est_neutre() || self.fondu.is_some() {
-            // Pendant le fondu de la courbe, la borne sert à la fin du fondu.
+        // Pendant le fondu de la courbe, la borne sert à la fin du fondu —
+        // sauf si une rampe est DÉJÀ en cours (flux sans fin, retour rapide
+        // de TESS) : elle est reciblée tout de suite, sinon elle finirait
+        // vers l'ancienne borne, au-dessus du niveau d'avant l'égaliseur.
+        if !self.est_neutre() || (self.fondu.is_some() && self.extinction.is_none()) {
             return;
         }
         self.relancer_depuis_le_gain_atteint();
@@ -642,26 +744,44 @@ impl EqProcessor {
         stats
     }
     pub fn process_interleaved(&mut self, samples: &mut [f32]) -> EqProcessStats {
+        self.traiter(samples)
+    }
+
+    /// TESS T06 — [`Self::process_interleaved`] sur le tampon **`f64`** de
+    /// l'exécuteur TESS : mêmes fondus (#5215), même extinction du préampli
+    /// gardé (#6211, #6741), même compensation portée (#5227), sans aucun
+    /// arrondi du signal vers `f32`. Un greffon natif `F32` ancien est
+    /// converti à sa propre frontière ([`Stage::process_f64`]).
+    pub fn process_interleaved_f64(&mut self, samples: &mut [f64]) -> EqProcessStats {
+        self.traiter(samples)
+    }
+
+    fn traiter<T: EchantillonHote>(&mut self, samples: &mut [T]) -> EqProcessStats {
         let Some(mut fondu) = self.fondu.take() else {
             return self.traiter_sans_fondu(samples);
         };
-        fondu.tampon.clear();
-        fondu.tampon.extend_from_slice(samples);
+        // Le tampon sort du fondu le temps du bloc (aucune allocation une
+        // fois sa capacité atteinte) : le départ le traite sans conflit
+        // d'emprunt.
+        let mut tampon = std::mem::take(T::tampon_du_fondu(&mut fondu));
+        tampon.clear();
+        tampon.extend_from_slice(samples);
         if let Some(depart) = fondu.depart.as_mut() {
-            depart.process_interleaved(&mut fondu.tampon);
+            depart.traiter(&mut tampon);
         }
         let stats = self.traiter_sans_fondu(samples);
         let canaux = self.channels.max(1) as usize;
         for (i, (trame, avant)) in samples
             .chunks_mut(canaux)
-            .zip(fondu.tampon.chunks(canaux))
+            .zip(tampon.chunks(canaux))
             .enumerate()
         {
-            let t = ((fondu.fait + i + 1) as f32 / fondu.total as f32).min(1.0);
+            let t = T::rapport_borne(fondu.fait + i + 1, fondu.total);
             for (s, a) in trame.iter_mut().zip(avant) {
                 *s = *a + (*s - *a) * t;
             }
         }
+        *T::tampon_du_fondu(&mut fondu) = tampon;
         fondu.fait += samples.len() / canaux;
         if fondu.fait < fondu.total {
             self.fondu = Some(fondu);
@@ -675,21 +795,21 @@ impl EqProcessor {
         }
         stats
     }
-    fn traiter_sans_fondu(&mut self, samples: &mut [f32]) -> EqProcessStats {
+    fn traiter_sans_fondu<T: EchantillonHote>(&mut self, samples: &mut [T]) -> EqProcessStats {
         // #6211 — un neutre (compensation 1,0) dont le préampli s'éteint.
         if self.extinction.is_some() {
             self.appliquer_l_extinction(samples);
             return EqProcessStats::default();
         }
         let stats = match &mut self.engine {
-            Engine::Bundled(p) => p.process_interleaved(samples),
-            Engine::Native(p) => record_native(&mut self.clipping, p.process_f32(samples)),
+            Engine::Bundled(p) => T::moteur_integre(p, samples),
+            Engine::Native(p) => record_native(&mut self.clipping, T::moteur_natif(p, samples)),
             Engine::Unavailable => EqProcessStats::default(),
             Engine::Neutre => {
                 if let Some(gains) = self.gain_garde.as_deref() {
                     for trame in samples.chunks_mut(gains.len().max(1)) {
                         for (s, g) in trame.iter_mut().zip(gains) {
-                            *s *= g;
+                            *s = *s * T::depuis_f32(*g);
                         }
                     }
                 }
@@ -699,8 +819,9 @@ impl EqProcessor {
         // #5227 — après le filtre, donc après ses compteurs d'écrêtage : le
         // rendu flottant dépasse l'unité ici, le volume le ramène au rappel.
         if self.compensation != 1.0 {
+            let compensation = T::depuis_f32(self.compensation);
             for s in samples.iter_mut() {
-                *s *= self.compensation;
+                *s = *s * compensation;
             }
         }
         stats
@@ -709,7 +830,7 @@ impl EqProcessor {
     /// #6211 — applique le préampli gardé en le ramenant vers 0 dB, trame par
     /// trame, puis retient le gain atteint (un report vers une piste suivante
     /// part de là). Rampe finie : plus rien de gardé.
-    fn appliquer_l_extinction(&mut self, samples: &mut [f32]) {
+    fn appliquer_l_extinction<T: EchantillonHote>(&mut self, samples: &mut [T]) {
         let Some(mut ext) = self.extinction.take() else {
             return;
         };
@@ -717,7 +838,7 @@ impl EqProcessor {
         let coefs = ext.depart.len().max(1);
         let gain_a = Self::gain_de_la_rampe;
         for (j, s) in samples.iter_mut().enumerate() {
-            *s *= gain_a(&ext, j / canaux + 1, j % coefs);
+            *s = *s * T::depuis_f32(gain_a(&ext, j / canaux + 1, j % coefs));
         }
         ext.fait += samples.len() / canaux;
         if ext.fait >= ext.total {
@@ -837,6 +958,10 @@ fn record_native(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "eq_f64_t06_tests.rs"]
+mod f64_t06;
 
 #[cfg(test)]
 mod rampe_de_bascule_5215 {

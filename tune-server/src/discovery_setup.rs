@@ -795,31 +795,114 @@ fn est_notre_propre_serveur_multimedia(
     nos_adresses: &[String],
     notre_udn: Option<&str>,
 ) -> bool {
+    annonce_de_notre_serveur_multimedia(
+        &ms.id,
+        &ms.host,
+        ms.port,
+        &ms.location,
+        port_api,
+        nos_adresses,
+        notre_udn,
+    )
+}
+
+/// La règle de [`est_notre_propre_serveur_multimedia`] sur les seuls champs
+/// d'une annonce : le registre durable (`media_servers` en base) les porte
+/// sans `MediaServerInfo`.
+fn annonce_de_notre_serveur_multimedia(
+    udn_annonce: &str,
+    hote: &str,
+    port: u16,
+    location: &str,
+    port_api: u16,
+    nos_adresses: &[String],
+    notre_udn: Option<&str>,
+) -> bool {
     if let Some(udn) = notre_udn
         && !udn.is_empty()
-        && ms.id == udn
+        && udn_annonce == udn
     {
         return true;
     }
-    if ms.port != port_api {
+    if port != port_api {
         return false;
     }
     let notre_mount = format!("{}/description.xml", tune_core::upnp_server::MOUNT_PATH);
-    if !ms.location.ends_with(&notre_mount) {
+    if !location.ends_with(&notre_mount) {
         return false;
     }
-    !ms.host.is_empty() && nos_adresses.iter().any(|a| a == &ms.host)
+    // Une IPv6 de lien local peut porter sa zone (`fe80::1%en0`) : elle ne
+    // change pas l'adresse.
+    let hote = hote.split('%').next().unwrap_or(hote);
+    !hote.is_empty() && nos_adresses.iter().any(|a| a == hote)
+}
+
+/// Fil du forum 3028 — ce serveur multimédia est-il CE Tune ?
+///
+/// Tune reste dans sa propre liste de serveurs (#3786 : on y parcourt ses
+/// dossiers), mais l'indexer dans sa propre bibliothèque recopie chaque album
+/// local en album `upnp` : la bibliothèque montre alors deux fois les mêmes
+/// albums, une fois en « Local », une fois sous le nom que Tune s'annonce
+/// (le nom de la machine — `…fritz.box` derrière une Fritz!Box).
+///
+/// Deux identités, prises toutes deux :
+/// - l'UDN, celui de l'état UPnP (persisté en `upnp_udn`, donc stable d'un
+///   démarrage à l'autre) ET celui de l'annonce en cours ;
+/// - à défaut d'UDN reconnu, l'adresse : une adresse de l'une de NOS
+///   interfaces (toutes, pas seulement l'élue — Wi-Fi et Ethernet d'un Mac),
+///   ou l'adresse annoncée, avec notre port d'API et notre chemin de montage.
+///   C'est ce qui couvre un UDN régénéré (base remise à zéro) dont l'ancienne
+///   annonce traîne encore.
+pub(crate) fn est_ce_serveur(
+    state: &AppState,
+    udn_annonce: &str,
+    hote: &str,
+    port: u16,
+    location: &str,
+) -> bool {
+    let adresses = nos_adresses(state.config.advertised_ip.as_deref());
+    let udn_de_l_etat = state.upnp.as_ref().map(|u| u.uuid.clone());
+    let udn_annonce_en_cours = tune_core::upnp_server::media_server_advert().map(|a| a.uuid);
+    [udn_de_l_etat, udn_annonce_en_cours, None]
+        .iter()
+        .any(|notre_udn| {
+            annonce_de_notre_serveur_multimedia(
+                udn_annonce,
+                hote,
+                port,
+                location,
+                state.config.port,
+                &adresses,
+                notre_udn.as_deref(),
+            )
+        })
 }
 
 /// Nos adresses, du point de vue d'une annonce reçue : l'IP du réseau local et
 /// les formes locales, qu'un M-SEARCH émis depuis la machine elle-même peut
 /// nous renvoyer.
 pub(crate) fn nos_adresses(annoncee: Option<&str>) -> Vec<String> {
-    nos_adresses_depuis(
-        &tune_core::discovery::ssdp::local_ipv4_addresses(),
-        tune_core::discovery::ssdp::get_local_ip(),
-        annoncee,
+    avec_nos_ipv6(
+        nos_adresses_depuis(
+            &tune_core::discovery::ssdp::local_ipv4_addresses(),
+            tune_core::discovery::ssdp::get_local_ip(),
+            annoncee,
+        ),
+        &tune_core::discovery::ssdp::local_ipv6_addresses(),
     )
+}
+
+/// Fil du forum 3028 — nos adresses IPv6 : la boucle locale `::1` et celles
+/// de nos interfaces, sous la forme de `Ipv6Addr::to_string` (sans crochets),
+/// celle que rendent `host_from_location` et une URL relue.
+fn avec_nos_ipv6(mut v: Vec<String>, interfaces: &[std::net::Ipv6Addr]) -> Vec<String> {
+    for ip in std::iter::once(std::net::Ipv6Addr::LOCALHOST).chain(interfaces.iter().copied()) {
+        let s = ip.to_string();
+        if !v.contains(&s) {
+            v.push(s);
+        }
+    }
+    v
 }
 
 /// L'assemblage seul, sans I/O — c'est lui que le test couvre.
@@ -2206,6 +2289,14 @@ pub fn spawn_mdns_handler(
                                     dev.port,
                                     dev.id.clone(),
                                     ap_dev_id,
+                                )
+                                // #9379 — Apple TV : appairage unique par le
+                                // code affiché (TXT `flags` bit 9).
+                                .avec_code_a_l_ecran(
+                                    dev.capabilities
+                                        .get(tune_core::discovery::mdns::CAP_AIRPLAY_CODE_A_L_ECRAN)
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
                                 );
                                 // #8402 — elle part du volume mémorisé de sa
                                 // zone, jamais de la pleine échelle.
@@ -6183,3 +6274,16 @@ mod decouverte_volume_6774_tests;
 #[cfg(test)]
 #[path = "discovery_setup/renderer_sur_cette_machine_7875_tests.rs"]
 mod renderer_sur_cette_machine_7875_tests;
+
+/// Fil du forum 3028 — nos adresses comptent l'IPv6.
+#[cfg(test)]
+mod nos_adresses_ipv6_3028 {
+    #[test]
+    fn nos_adresses_comptent_l_ipv6_de_nos_interfaces_et_la_boucle() {
+        let lien_local: std::net::Ipv6Addr = "fe80::1c2b:3aff:fe4d:5e6f".parse().unwrap();
+        let v = super::avec_nos_ipv6(vec!["127.0.0.1".into()], &[lien_local]);
+        assert!(v.iter().any(|a| a == "::1"), "{v:?}");
+        assert!(v.iter().any(|a| a == "fe80::1c2b:3aff:fe4d:5e6f"), "{v:?}");
+        assert!(v.iter().any(|a| a == "127.0.0.1"), "l'IPv4 reste : {v:?}");
+    }
+}

@@ -1295,6 +1295,8 @@ fn contexte_gratuit(dispo: &dyn Fn(&str) -> bool) -> ContexteExecution<'_> {
             control: ControleVolume::Software,
             db: 0.0,
         },
+        replaygain_actif: false,
+        voies_de_sortie: None,
     }
 }
 
@@ -2581,17 +2583,48 @@ fn d1_les_cles_tenues_par_le_serveur() {
         "room_profile_index",
         "zone_7_tess_chain",
         "zone_12_tess_chain_sync",
+        // rc14 : les profils d'égaliseur et les préréglages.
+        "zone_7_eq_profile",
+        "zone_7_eq_profile_before_tess",
+        "eq_presets",
     ] {
         assert!(cle_tenue_par_le_serveur(cle), "{cle}");
     }
     for cle in [
-        "zone_7_eq_profile",
+        "zone_7_eq_profilette",
+        "zone_x_eq_profile",
+        "eq_presets_index",
+        "eq_active_preset",
+        "eq_expert_bands",
         "zone_7_tess_chainette",
         "zone_x_tess_chain",
         "room_correction_enabled",
         "theme",
     ] {
         assert!(!cle_tenue_par_le_serveur(cle), "{cle}");
+    }
+}
+
+/// rc14 : un import ne réécrit jamais tels quels le profil de pièce ni la
+/// chaîne ; les profils d'égaliseur, eux, passent par la règle de leurs
+/// routes (`config_export::egaliseurs`).
+#[test]
+fn rc14_les_profils_d_egaliseur_s_importent_selon_leur_regle() {
+    for cle in [
+        "zone_7_eq_profile",
+        "zone_7_eq_profile_before_tess",
+        "eq_presets",
+    ] {
+        assert!(cle_de_profil_d_egaliseur(cle), "{cle}");
+        assert!(!cle_jamais_importee(cle), "{cle}");
+    }
+    for cle in [
+        "room_profile_7",
+        "zone_7_tess_chain",
+        "zone_7_tess_chain_sync",
+    ] {
+        assert!(cle_jamais_importee(cle), "{cle}");
+        assert!(!cle_de_profil_d_egaliseur(cle), "{cle}");
     }
 }
 
@@ -2652,4 +2685,431 @@ fn d1_une_chaine_de_version_future_est_relue_avec_l_origine_du_serveur() {
     let l = lire_zone(&s, z, false).unwrap();
     assert!(!l.conversion_piece);
     assert!(correction_estimee(&l.chaine.plugins[0]));
+}
+
+/// rc14 (retours rc13.90) — une correction de pièce ajoutée à la main dans
+/// TESS (réglages `null`, aucun profil de pièce : mesures ratées) reste une
+/// correction de pièce quand une ancienne route (`POST /zones/{id}/eq`,
+/// écran de l'égaliseur, client mobile) ne fait que l'éteindre ou la
+/// rallumer. Elle devenait « Égaliseur graphique » décoché.
+#[test]
+fn une_correction_de_piece_eteinte_par_une_ancienne_route_reste_une_correction_de_piece() {
+    let (_b, s) = base();
+    let z = 41;
+    let cle = format!("zone_{z}_eq_profile");
+    let mut c = ChaineTess::default();
+    c.plugins.push(MaillonGreffon {
+        id: ID_CORRECTION_PIECE.into(),
+        enabled: true,
+        settings: Value::Null,
+    });
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, true)]
+    );
+
+    // Éteinte par une ancienne route : même courbe, interrupteur coupé.
+    let mut p: EqProfile = serde_json::from_str(&s.get(&cle).unwrap().unwrap()).unwrap();
+    p.enabled = false;
+    s.set(&cle, &serde_json::to_string(&p).unwrap()).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, false)]
+    );
+    // Enregistrée ainsi (redémarrage : migration T03).
+    assert_eq!(
+        ids(&migrer_zone(&s, z).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, false)]
+    );
+
+    // Rallumée par l'ancienne route.
+    p.enabled = true;
+    s.set(&cle, &serde_json::to_string(&p).unwrap()).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, true)]
+    );
+
+    // Contre-épreuve : une NOUVELLE courbe graphique écrite par l'écran de
+    // l'égaliseur prend bien la façade graphique (un seul moteur).
+    let g = profil(
+        true,
+        graphique(10, |i| if i == 3 { 2.0 } else { 0.0 }, &[None]),
+    );
+    s.set(&cle, &serde_json::to_string(&g).unwrap()).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_EQ_GRAPHIQUE, true)]
+    );
+}
+
+/// Même règle pour une correction de pièce APPLIQUÉE dont le profil de pièce
+/// a été remplacé depuis (nouvelle mesure enregistrée, pas encore
+/// appliquée) : l'éteindre par une ancienne route ne la change pas en
+/// « Égaliseur paramétrique ».
+#[test]
+fn une_correction_appliquee_reste_une_correction_apres_un_nouveau_profil_de_piece() {
+    let (_b, s) = base();
+    let z = 42;
+    poser_la_piece(&s, z, "Calibration abc", None);
+    let b = migrer_zone(&s, z).unwrap();
+    assert_eq!(ids(&b.chaine), vec![(ID_CORRECTION_PIECE, true)]);
+
+    // Nouveau profil de pièce, pas appliqué.
+    let brut = s.get(&format!("room_profile_{z}")).unwrap().unwrap();
+    let mut autre: Value = serde_json::from_str(&brut).unwrap();
+    autre["filters"][0]["gain_db"] = json!(-2.0);
+    s.set(&format!("room_profile_{z}"), &autre.to_string())
+        .unwrap();
+
+    let cle = format!("zone_{z}_eq_profile");
+    let mut p: EqProfile = serde_json::from_str(&s.get(&cle).unwrap().unwrap()).unwrap();
+    p.enabled = false;
+    s.set(&cle, &serde_json::to_string(&p).unwrap()).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, false)]
+    );
+}
+
+/// rc14 — le réglage des enceintes : écriture croisée vers
+/// `zone_{id}_speaker_setup`, relecture, bornes refusées à l'écriture, et
+/// « Bypass all » qui demande le rafraîchissement sans réécrire la clé.
+#[test]
+fn le_reglage_des_enceintes_s_ecrit_et_se_relit_rc14() {
+    let (_db, s) = base();
+    let z = 41;
+    let cle = format!("zone_{z}_speaker_setup");
+    let reglages = json!({
+        "channels": [
+            { "distance_cm": 300, "gain_db": 0, "invert": false },
+            { "distance_cm": 250, "gain_db": -2.5, "invert": true }
+        ],
+        "invert_all": false
+    });
+    let mut c = ChaineTess::default();
+    c.plugins.push(MaillonGreffon {
+        id: ID_ENCEINTES.into(),
+        enabled: true,
+        settings: reglages.clone(),
+    });
+    let b = ecrire_chaine(&s, z, &c).unwrap();
+    assert!(b.cles_modifiees.contains(&cle), "{:?}", b.cles_modifiees);
+    let ecrit: Value = serde_json::from_str(&s.get(&cle).unwrap().unwrap()).unwrap();
+    assert_eq!(ecrit["enabled"], json!(true));
+    assert_eq!(ecrit["channels"], reglages["channels"]);
+    assert_eq!(
+        crate::audio::reglage_enceintes::reglages_configures(&s, z)
+            .unwrap()
+            .channels
+            .len(),
+        2
+    );
+    let lu = lire_zone(&s, z, true).unwrap();
+    assert_eq!(ids(&lu.chaine), vec![(ID_ENCEINTES, true)]);
+    assert_eq!(maillon(&lu.chaine, ID_ENCEINTES).settings, reglages);
+
+    // Réécrire la même chaîne ne touche rien.
+    assert!(ecrire_chaine(&s, z, &c).unwrap().cles_modifiees.is_empty());
+
+    // « Bypass all » : la clé ne change pas, mais elle est à rafraîchir (la
+    // sortie vivante coupe le greffon).
+    let mut contourne = c.clone();
+    contourne.bypass_all = true;
+    let b = ecrire_chaine(&s, z, &contourne).unwrap();
+    // (#9520 : la bascule de « Bypass all » rend aussi la clé de la chaîne.)
+    assert_eq!(
+        b.cles_modifiees,
+        vec![crate::tess::cle_chaine_zone(z), cle.clone()]
+    );
+    let apres: Value = serde_json::from_str(&s.get(&cle).unwrap().unwrap()).unwrap();
+    assert_eq!(apres, ecrit, "la clé n'est pas réécrite");
+
+    // Hors bornes : refusé, rien n'est écrit.
+    let mut hors = c.clone();
+    hors.plugins[0].settings = json!({ "channels": [{ "gain_db": 12 }] });
+    assert!(matches!(
+        ecrire_chaine(&s, z, &hors),
+        Err(ErreurMigration::ReglagesInvalides { .. })
+    ));
+    assert_eq!(
+        serde_json::from_str::<Value>(&s.get(&cle).unwrap().unwrap()).unwrap(),
+        ecrit
+    );
+
+    // Décoché : la clé est décochée, ses réglages restent.
+    let mut decoche = c.clone();
+    decoche.plugins[0].enabled = false;
+    ecrire_chaine(&s, z, &decoche).unwrap();
+    assert!(crate::audio::reglage_enceintes::reglages_configures(&s, z).is_none());
+    let v: Value = serde_json::from_str(&s.get(&cle).unwrap().unwrap()).unwrap();
+    assert_eq!(v["enabled"], json!(false));
+    assert_eq!(v["channels"], reglages["channels"]);
+
+    // Placé après la réaffectation à la relecture des anciennes clés.
+    let (_db2, s2) = base();
+    s2.set(
+        &cle.replace("41", "42"),
+        &json!({"enabled": true}).to_string(),
+    )
+    .unwrap();
+    s2.set(
+        "zone_42_channel_remap",
+        &json!({"enabled": true}).to_string(),
+    )
+    .unwrap();
+    let lu = lire_zone(&s2, 42, true).unwrap();
+    let ordre: Vec<&str> = lu.chaine.plugins.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ordre, vec![ID_REAFFECTATION, ID_ENCEINTES]);
+}
+
+fn maillon_eq(id: &str, enabled: bool, bandes: Vec<EqBandSpec>) -> MaillonGreffon {
+    let mut v = serde_json::to_value(profil(enabled, bandes)).unwrap();
+    v.as_object_mut().unwrap().remove("enabled");
+    MaillonGreffon {
+        id: id.into(),
+        enabled,
+        settings: v,
+    }
+}
+
+fn ecrire_ancienne_cle(s: &SettingsRepo, z: i64, p: &EqProfile) {
+    s.set(
+        &format!("zone_{z}_eq_profile"),
+        &serde_json::to_string(p).unwrap(),
+    )
+    .unwrap();
+}
+
+/// rc14 (suite de #9532, m1) — `[pièce décochée, graphique coché]`, éteinte
+/// puis rallumée par un ancien client : la correction de pièce reste, le
+/// graphique se rallume. Le rallumage reclassait la correction de pièce
+/// (première façade) en graphique et supprimait le vrai graphique.
+#[test]
+fn eteindre_puis_rallumer_par_l_ancienne_cle_garde_la_correction_de_piece_decochee() {
+    let (_b, s) = base();
+    let z = 43;
+    let piece = crate::room_correction::profil_eq_de_correction(&filtres_de_piece()).bands;
+    let g = graphique(10, |i| if i == 2 { 3.0 } else { 0.0 }, &[None]);
+    let mut c = ChaineTess::default();
+    c.plugins
+        .push(maillon_eq(ID_CORRECTION_PIECE, false, piece));
+    c.plugins.push(maillon_eq(ID_EQ_GRAPHIQUE, true, g.clone()));
+    ecrire_chaine(&s, z, &c).unwrap();
+
+    ecrire_ancienne_cle(&s, z, &profil(false, g.clone()));
+    // Enregistrée éteinte (redémarrage : migration T03).
+    assert_eq!(
+        ids(&migrer_zone(&s, z).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, false), (ID_EQ_GRAPHIQUE, false)]
+    );
+    ecrire_ancienne_cle(&s, z, &profil(true, g));
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_CORRECTION_PIECE, false), (ID_EQ_GRAPHIQUE, true)]
+    );
+}
+
+/// rc14 (suite de #9532, m3) — une correction de pièce devenue
+/// « paramétrique » en rc13.90 (mêmes bandes que le profil de pièce)
+/// redevient une correction de pièce. Contre-épreuve : un paramétrique d'une
+/// autre courbe reste paramétrique.
+#[test]
+fn un_parametrique_aux_bandes_du_profil_de_piece_redevient_une_correction_de_piece() {
+    let (_b, s) = base();
+    let z = 44;
+    poser_la_piece(&s, z, "Calibration abc", None);
+    let piece = crate::room_correction::profil_eq_de_correction(&filtres_de_piece()).bands;
+    let mut c = ChaineTess::default();
+    c.plugins.push(maillon_eq(ID_EQ_PARAMETRIQUE, true, piece));
+    ecrire_chaine(&s, z, &c).unwrap();
+    let l = lire_zone(&s, z, true).unwrap();
+    assert_eq!(ids(&l.chaine), vec![(ID_CORRECTION_PIECE, true)]);
+    assert_eq!(
+        maillon(&l.chaine, ID_CORRECTION_PIECE).settings["origin"],
+        json!("measured")
+    );
+
+    let z = 45;
+    poser_la_piece(&s, z, "Calibration abc", None);
+    let mut c = ChaineTess::default();
+    c.plugins.push(maillon_eq(
+        ID_EQ_PARAMETRIQUE,
+        true,
+        vec![bande(1000.0, 2.0, 1.0, "peak", None)],
+    ));
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_EQ_PARAMETRIQUE, true)]
+    );
+}
+
+/// rc14 (suite de #9532, M1) — appliquer un profil de pièce sur une série
+/// `[graphique coché, correction de pièce cochée]` met à jour la correction
+/// et garde le graphique ; `eq_profile` reste le graphique (principal).
+#[test]
+fn appliquer_un_profil_de_piece_garde_les_autres_egaliseurs_de_la_serie() {
+    let (_b, s) = base();
+    let z = 46;
+    let g = graphique(10, |i| if i == 5 { -2.0 } else { 0.0 }, &[None]);
+    let mut c = ChaineTess::default();
+    c.plugins.push(maillon_eq(ID_EQ_GRAPHIQUE, true, g.clone()));
+    c.plugins.push(maillon_eq(
+        ID_CORRECTION_PIECE,
+        true,
+        vec![bande(80.0, -4.0, 3.0, "peak", None)],
+    ));
+    ecrire_chaine(&s, z, &c).unwrap();
+
+    poser_la_piece(&s, z, "Calibration abc", None);
+    // `poser_la_piece` écrit aussi `eq_profile` comme l'ancienne route :
+    // on remet la clé du graphique, seul le profil de pièce compte ici.
+    ecrire_ancienne_cle(&s, z, &profil(true, g.clone()));
+    let nouveau = crate::room_correction::profil_eq_de_correction(&filtres_de_piece());
+    let pose = poser_la_correction_de_piece(&s, z, &nouveau).unwrap();
+    assert_eq!(pose.en_serie, vec![ID_EQ_GRAPHIQUE.to_owned()]);
+    assert_eq!(pose.remplacee, None);
+
+    let l = lire_zone(&s, z, true).unwrap();
+    assert_eq!(
+        ids(&l.chaine),
+        vec![(ID_EQ_GRAPHIQUE, true), (ID_CORRECTION_PIECE, true)]
+    );
+    let bandes: Vec<EqBandSpec> =
+        serde_json::from_value(maillon(&l.chaine, ID_CORRECTION_PIECE).settings["bands"].clone())
+            .unwrap();
+    assert!(memes_bandes(&bandes, &nouveau.bands));
+    let eq: EqProfile =
+        serde_json::from_str(&s.get(&format!("zone_{z}_eq_profile")).unwrap().unwrap()).unwrap();
+    assert!(memes_bandes(&eq.bands, &g));
+}
+
+/// rc14 (m4) — la règle commune que les gardes de droit des anciennes routes
+/// appliquent : éteindre ou rallumer une correction de pièce ajoutée à la
+/// main reste une correction de pièce ; une nouvelle courbe se reclasse.
+#[test]
+fn la_facade_d_une_ancienne_ecriture_suit_la_lecture_de_la_chaine() {
+    let (_b, s) = base();
+    let z = 47;
+    let mut c = ChaineTess::default();
+    c.plugins.push(MaillonGreffon {
+        id: ID_CORRECTION_PIECE.into(),
+        enabled: false,
+        settings: Value::Null,
+    });
+    ecrire_chaine(&s, z, &c).unwrap();
+    let mut p: EqProfile =
+        serde_json::from_str(&s.get(&format!("zone_{z}_eq_profile")).unwrap().unwrap()).unwrap();
+    p.enabled = true;
+    assert_eq!(
+        facade_d_une_ancienne_ecriture(&s, z, &p),
+        ID_CORRECTION_PIECE
+    );
+    let autre = profil(true, vec![bande(1000.0, 2.0, 1.0, "peak", None)]);
+    assert_eq!(
+        facade_d_une_ancienne_ecriture(&s, z, &autre),
+        ID_EQ_PARAMETRIQUE
+    );
+}
+
+/// rc14 (revue de #9534, M1) — `[paramétrique R1 coché]`, où R1 est une
+/// ancienne correction de pièce reclassée en rc13.90 après le remplacement
+/// de son profil : appliquer R2 REMPLACE R1 (une seule correction joue). R1
+/// est reconnue par la dernière correction appliquée. Contre-épreuves : un
+/// paramétrique de l'utilisateur reste et il est dit en série, y compris
+/// quand il était l'égaliseur d'avant TESS (`cle_sauvegarde_eq` n'est pas
+/// une preuve de correction de pièce).
+#[test]
+fn appliquer_un_profil_remplace_une_ancienne_correction_devenue_parametrique() {
+    let (_b, s) = base();
+    // R1 : l'ancien profil (différent du profil actuel, R2).
+    let r1 = vec![
+        bande(60.0, -5.0, 3.0, "peak", None),
+        bande(140.0, -2.0, 2.0, "peak", None),
+    ];
+    let r2 = crate::room_correction::profil_eq_de_correction(&filtres_de_piece());
+    let p_autre = vec![bande(1000.0, 2.0, 1.0, "peak", None)];
+    for (z, source) in [(51, "appliquee"), (52, "avant_tess"), (53, "aucune")] {
+        let mut c = ChaineTess::default();
+        let bandes = if source == "aucune" {
+            p_autre.clone()
+        } else {
+            r1.clone()
+        };
+        c.plugins.push(maillon_eq(ID_EQ_PARAMETRIQUE, true, bandes));
+        ecrire_chaine(&s, z, &c).unwrap();
+        let cle = match source {
+            "appliquee" => Some(cle_correction_appliquee(z)),
+            "avant_tess" => Some(cle_sauvegarde_eq(z)),
+            _ => None,
+        };
+        poser_la_piece(&s, z, "Calibration xyz", None);
+        // `poser_la_piece` écrit `eq_profile` comme l'ancienne route : on
+        // remet la clé que la chaîne porte, seul le profil de pièce compte.
+        let c2: ChaineTess =
+            serde_json::from_str(&s.get(&cle_chaine_zone(z)).unwrap().unwrap()).unwrap();
+        ecrire_chaine(&s, z, &c2).unwrap();
+        let ombre = s.get(&cle_ombre_zone(z)).unwrap().unwrap();
+        let o: BTreeMap<String, Option<String>> = serde_json::from_str(&ombre).unwrap();
+        s.set(
+            &format!("zone_{z}_eq_profile"),
+            o["eq_profile"].as_deref().unwrap(),
+        )
+        .unwrap();
+        // Posée après la remise en place (une écriture qui retire la
+        // correction de pièce efface la trace).
+        if let Some(cle) = cle {
+            s.set(
+                &cle,
+                &serde_json::to_string(&profil(true, r1.clone())).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let pose = poser_la_correction_de_piece(&s, z, &r2).unwrap();
+        let l = lire_zone(&s, z, true).unwrap();
+        if source != "appliquee" {
+            assert_eq!(
+                ids(&l.chaine),
+                vec![(ID_EQ_PARAMETRIQUE, true), (ID_CORRECTION_PIECE, true)],
+                "{source}"
+            );
+            assert_eq!(pose.en_serie, vec![ID_EQ_PARAMETRIQUE.to_owned()]);
+            assert_eq!(pose.remplacee, None);
+        } else {
+            assert_eq!(
+                ids(&l.chaine),
+                vec![(ID_CORRECTION_PIECE, true)],
+                "{source}"
+            );
+            assert!(pose.en_serie.is_empty(), "{source}");
+            assert_eq!(pose.remplacee.as_deref(), Some(ID_EQ_PARAMETRIQUE));
+            let b: Vec<EqBandSpec> = serde_json::from_value(
+                maillon(&l.chaine, ID_CORRECTION_PIECE).settings["bands"].clone(),
+            )
+            .unwrap();
+            assert!(memes_bandes(&b, &r2.bands), "{source}");
+        }
+    }
+}
+
+/// rc14 — la trace de la dernière correction appliquée disparaît quand la
+/// correction de pièce est retirée de la chaîne.
+#[test]
+fn retirer_la_correction_de_piece_efface_la_trace_de_la_correction_appliquee() {
+    let (_b, s) = base();
+    let z = 54;
+    let r2 = crate::room_correction::profil_eq_de_correction(&filtres_de_piece());
+    poser_la_correction_de_piece(&s, z, &r2).unwrap();
+    assert!(s.get(&cle_correction_appliquee(z)).unwrap().is_some());
+    // Une autre écriture qui la garde ne touche pas la trace.
+    let c = lire_zone(&s, z, true).unwrap().chaine;
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert!(s.get(&cle_correction_appliquee(z)).unwrap().is_some());
+    let mut sans = c.clone();
+    sans.plugins.retain(|m| m.id != ID_CORRECTION_PIECE);
+    ecrire_chaine(&s, z, &sans).unwrap();
+    assert_eq!(s.get(&cle_correction_appliquee(z)).unwrap(), None);
 }

@@ -210,6 +210,15 @@ pub mod sql {
         )
     }
 
+    /// Fil 3094 — les lignes de service d'une `source` donnée.
+    pub fn count_de_la_source<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM queue_items WHERE zone_id = {} AND track_id IS NULL AND source = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Unified single-position-space API (Lot 1 of the queue unification).
     // These builders treat the whole zone queue as ONE ordered sequence,
@@ -803,6 +812,17 @@ impl PlayQueueRepo {
     /// Une file qui perd des lignes le dit (#2394 : un compteur qui ment est pire
     /// qu'un compteur absent).
     pub fn set_queue(&self, zone_id: i64, track_ids: &[i64]) -> Result<SetQueueOutcome, String> {
+        self.set_queue_avec_cible(zone_id, track_ids, None)
+    }
+
+    /// #8832 — revalider la piste de départ dans la transaction de remplacement.
+    /// Son absence conserve la file précédente, même après une attente d'écriture.
+    pub fn set_queue_avec_cible(
+        &self,
+        zone_id: i64,
+        track_ids: &[i64],
+        cible: Option<i64>,
+    ) -> Result<SetQueueOutcome, String> {
         let delete_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
         // set_queue is a FULL replacement of the zone's queue: the streaming
         // subset must go too. It only deleted the local subset, so streaming
@@ -855,6 +875,17 @@ impl PlayQueueRepo {
             // fermeture rejouée ne compte pas deux fois la même perte.
             outcome.inserted = 0;
             outcome.skipped.clear();
+            if let Some(cible) = cible {
+                // SQLite tient déjà sa transaction d'écriture. Sur PostgreSQL,
+                // empêcher aussi un DELETE entre la vérification et l'INSERT.
+                let sql = match self.db.engine() {
+                    Engine::Sqlite => "SELECT id FROM tracks WHERE id = ?",
+                    Engine::Postgres => "SELECT id FROM tracks WHERE id = $1 FOR KEY SHARE",
+                };
+                if tx.query_one(sql, &[&cible])?.is_none() {
+                    return Err("track not found".into());
+                }
+            }
             let p: [&dyn ToSqlValue; 1] = [&zone_id];
             tx.execute(&delete_sql, &p)?;
             tx.execute(&delete_streaming_sql, &p)?;
@@ -1089,6 +1120,19 @@ impl PlayQueueRepo {
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
             .unwrap_or(0);
         Ok(n)
+    }
+
+    /// Fil 3094 — combien de lignes de la `source` dans la file de la zone :
+    /// la question d'une requête, avant de lire toute la file.
+    pub fn count_de_la_source(&self, zone_id: i64, source: &str) -> Result<i64, String> {
+        let count_sql = self.dialect_sql(sql::count_de_la_source, sql::count_de_la_source);
+        let params: [&dyn ToSqlValue; 2] = [&zone_id, &source];
+        Ok(self
+            .db
+            .query_one(&count_sql, &params)?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0))
     }
 
     /// Recette du 14/11 — donne sa durée à un titre de service de la file

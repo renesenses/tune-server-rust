@@ -69,6 +69,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     crate::routes::library::renvoi_images_artistes::armer(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);
+    // #9044 (rc14) — dater le départ des appareils, et oublier ceux partis
+    // depuis la durée réglée (30 j par défaut, 0 : jamais).
+    crate::routes::devices::oubli_auto_9044::armer(state);
     spawn_dash_temp_gc();
     spawn_position_poller(state);
     // #6155 — les zones d'un groupe suivent sa meneuse (lecture, pause,
@@ -206,6 +209,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config);
     spawn_social_sharing_listener(state);
+    // TESS T17 — mode « At next playback » : ce qui attend la prochaine
+    // lecture d'une zone locale l'atteint à son démarrage.
+    crate::routes::zones::tess_prereglages::spawn_application_au_demarrage(state);
     crate::routes::developer_api::spawn_webhook_dispatcher(state);
     #[cfg(feature = "oaat")]
     spawn_oaat_stall_supervisor(state);
@@ -3331,7 +3337,8 @@ fn spawn_replaygain_analysis(state: &AppState) {
 /// bouton. Cette ligne est ce qui manquait — sans elle, le cœur reste du code
 /// que rien n'atteint, exactement comme `spawn_scan_scheduler` avant #2469.
 ///
-/// Ne fait rien tant que `lyrics_lrclib_enabled` n'est pas activé, s'efface
+/// Ne fait rien tant que `lyrics_lrclib_enabled` n'est pas activé (posé à
+/// la naissance d'une base neuve depuis la rc14), s'efface
 /// devant toute zone qui joue, et ne demande jamais plus de `LOT_DE_FOND`
 /// paroles d'affilée.
 #[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]

@@ -459,3 +459,298 @@ fn cas_limites() {
     assert_eq!(pcm, src);
     let _ = Passage::Piste;
 }
+
+/// TESS T06 — l'égaliseur et le crossfeed du porteur RÉSEAU (OAAT, DLNA,
+/// transcodage) en `f64` de bout en bout. Une source 32 bits traverse
+/// ReplayGain, égaliseur, crossfeed et compensation : le signal ne traverse
+/// AUCUNE frontière `f32` (sonde des adaptateurs), et ce qui atteint la
+/// quantification unique colle à 1e-12 près à la référence calculée hors
+/// chaîne (moteurs `f64` du SDK appelés directement). CONTRE-ÉPREUVES : avec
+/// le convolveur (`f32` jusqu'à T09b), la sonde voit sa frontière ; et
+/// l'ancien chemin `f32` des deux moteurs s'écarte de la référence.
+#[test]
+fn t06_egaliseur_et_crossfeed_en_f64_sur_la_chaine_reseau() {
+    use crate::audio::eq::{EqBandSpec, EqProcessor, EqProfile};
+    let bits = 32;
+    let src = source(bits, 2 * 6_000, 0.6, 97);
+    let x = lire(&src, bits);
+    let profil = EqProfile {
+        enabled: true,
+        bands: vec![
+            EqBandSpec {
+                freq: 90.0,
+                gain: 5.0,
+                q: 0.8,
+                band_type: "peak".into(),
+                ..Default::default()
+            },
+            EqBandSpec {
+                freq: 4_000.0,
+                gain: -3.5,
+                q: 2.0,
+                band_type: "peak".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let facteur = 0.8;
+    let neuf = || {
+        let mut d = porteur(Some(facteur));
+        d.eq = Some(EqProcessor::new(&profil, 48_000, 2));
+        d.crossfeed = Some(CrossfeedProcessor::new(48_000, 0.3, 0.3));
+        d
+    };
+    let mut chaine = neuf();
+    let mut pcm = src.clone();
+    let mut vu = Vec::new();
+    let frontieres = crate::tess::sonde_f32::compter(|| {
+        vu = sonde::voir(|| chaine.process(&mut pcm, bits));
+    });
+    assert_eq!(
+        frontieres, 0,
+        "{frontieres} frontières f32 dans la chaîne réseau"
+    );
+
+    // Référence hors chaîne : gain, puis les moteurs f64 du SDK.
+    let mut reference: Vec<f64> = x.iter().map(|v| v * facteur).collect();
+    let mut eq_ref = tune_plugin_equalizer::EqProcessor::new(&profil, 48_000, 2);
+    let mut cf_ref = tune_plugin_crossfeed::CrossfeedProcessor::new(48_000, 0.3, 0.3);
+    eq_ref.process_interleaved_f64(&mut reference);
+    cf_ref.process_interleaved_f64(&mut reference);
+    let e = ecart_max(&vu, &reference);
+    assert!(
+        e < 1e-12,
+        "écart {e:e} : la chaîne réseau n'est pas en 64 bits"
+    );
+
+    // Contre-épreuve 1 : l'ancien chemin f32 des deux moteurs.
+    let mut ancien: Vec<f32> = x.iter().map(|v| (v * facteur) as f32).collect();
+    tune_plugin_equalizer::EqProcessor::new(&profil, 48_000, 2).process_interleaved(&mut ancien);
+    tune_plugin_crossfeed::CrossfeedProcessor::new(48_000, 0.3, 0.3)
+        .process_interleaved(&mut ancien);
+    let ancien: Vec<f64> = ancien.into_iter().map(f64::from).collect();
+    let e_ancien = ecart_max(&ancien, &reference);
+    assert!(e_ancien > 1e-10, "le banc ne discrimine pas ({e_ancien:e})");
+    // … et il reste inaudible (−120 dBFS).
+    assert!(e_ancien < 1e-6, "écart f32↔f64 {e_ancien:e}");
+
+    // T09b : avec le convolveur aussi, AUCUNE frontière f32 (il est en f64
+    // natif depuis T09b ; avant, la sonde y voyait son adaptateur).
+    let mut avec_conv = neuf();
+    avec_conv.convolver = Some(Convolver::new(
+        &[vec![0.5f32, 0.25, 0.125], vec![0.5f32, 0.25, 0.125]],
+        64,
+    ));
+    let mut pcm = src.clone();
+    let frontieres = crate::tess::sonde_f32::compter(|| avec_conv.process(&mut pcm, bits));
+    assert_eq!(
+        frontieres, 0,
+        "{frontieres} frontières f32 avec le convolveur"
+    );
+    // Contre-épreuve 2 : la sonde voit bien une frontière quand il y en a une.
+    let vue = crate::tess::sonde_f32::compter(|| {
+        crate::tess::sonde_f32::noter();
+        avec_conv.process(&mut pcm, bits);
+    });
+    assert_eq!(vue, 1, "la sonde ne compte pas les frontières");
+}
+
+/// Garde-fou mémoire (relecture de #9414) : une piste compensée plus longue
+/// que le seuil — 10 min en 192 kHz stéréo, 230 M échantillons, ≈ 1,8 Go en
+/// `f64` — reste en `f32` même quand l'égaliseur rend des valeurs que le
+/// `f32` n'atteint pas exactement, et la place est RÉSERVÉE d'emblée (aucune
+/// capacité doublée par `extend`). En deçà du seuil, la piste passe en `f64`,
+/// exacte, avec la même réservation. Le seuil est réduit ici pour ne pas
+/// allouer 1 Go dans un test.
+#[test]
+fn t06_une_longue_piste_compensee_reste_en_f32_et_reserve_sa_place() {
+    use super::{SEUIL_STOCKAGE_F64, Stockage};
+    const TOTAL: usize = 48_000;
+    // Des valeurs d'égaliseur : aucune n'est un f32 exact.
+    let y: Vec<f64> = (0..TOTAL)
+        .map(|i| 0.3 * (i as f64 * 0.0123).sin() + 1e-10)
+        .collect();
+    assert!(y.iter().all(|&x| f64::from(x as f32) != x));
+
+    // Au-delà du seuil : f32, place réservée, arrondi au plus proche.
+    let mut long = Stockage::pour(TOTAL, TOTAL / 2);
+    for m in y.chunks(4_801) {
+        long.ajouter(m);
+    }
+    match &long {
+        Stockage::F32 { v, .. } => {
+            assert_eq!(v.len(), TOTAL);
+            assert_eq!(v.capacity(), TOTAL, "place non réservée");
+            assert!(v.iter().zip(&y).all(|(a, b)| *a == *b as f32));
+        }
+        Stockage::F64(_) => panic!("piste longue passée en f64 : 8 octets par échantillon"),
+    }
+
+    // En deçà du seuil : f64 exact, place réservée.
+    assert!(TOTAL < SEUIL_STOCKAGE_F64);
+    let mut court = Stockage::pour(TOTAL, SEUIL_STOCKAGE_F64);
+    for m in y.chunks(4_801) {
+        court.ajouter(m);
+    }
+    match &court {
+        Stockage::F64(v) => {
+            assert_eq!(v, &y);
+            assert_eq!(v.capacity(), TOTAL, "place non réservée");
+        }
+        Stockage::F32 { .. } => panic!("piste courte arrondie en f32"),
+    }
+    // Et le seuil de production borne une piste de 10 min en 192 kHz.
+    assert!(192_000 * 2 * 600 > SEUIL_STOCKAGE_F64);
+}
+
+/// rc14 — le réglage des enceintes dans un flux que Tune fabrique (relais
+/// progressif, flux tiré) : dernier étage de l'exécuteur. Un délai seul rend
+/// chaque mot EXACT, décalé du nombre entier d'échantillons attendu, en 16 et
+/// 24 bits, au fil de tampons successifs ; la voie la plus lointaine garde ses
+/// octets. Le délai n'est pas retiré comme une amorce de latence : la
+/// longueur du flux est conservée.
+#[test]
+fn le_reglage_des_enceintes_decale_une_voie_au_mot_pres_rc14() {
+    use crate::audio::reglage_enceintes::{ProcesseurEnceintes, ReglagesEnceintes, VoieEnceinte};
+    let reglages = ReglagesEnceintes {
+        channels: vec![
+            VoieEnceinte {
+                distance_cm: Some(343.0 / 2.0), // 5 ms plus près : 240 trames à 48 kHz
+                ..VoieEnceinte::default()
+            },
+            VoieEnceinte {
+                distance_cm: Some(343.0),
+                ..VoieEnceinte::default()
+            },
+        ],
+        invert_all: false,
+    };
+    assert_eq!(reglages.retards_en_echantillons(2, 48_000), vec![240, 0]);
+    for bits in [16u16, 24] {
+        let w = usize::from(bits / 8);
+        let src = source(bits, 9_600 * 2, 0.9, 21);
+        let mut dsp = StreamingDsp {
+            enceintes: Some(ProcesseurEnceintes::new(reglages.clone())),
+            ..porteur(None)
+        };
+        assert!(dsp.is_active());
+        let mut servi = Vec::new();
+        for bloc in src.chunks(1_000 * 2 * w) {
+            let mut b = bloc.to_vec();
+            dsp.process_flux(&mut b, bits);
+            assert_eq!(b.len(), bloc.len(), "aucune amorce retirée");
+            servi.extend(b);
+        }
+        let trame = 2 * w;
+        for n in 0..9_600 {
+            // Voie droite (la plus lointaine) : ses octets, intacts.
+            assert_eq!(
+                servi[n * trame + w..(n + 1) * trame],
+                src[n * trame + w..(n + 1) * trame],
+                "{bits} bits, trame {n}, droite"
+            );
+            // Voie gauche : le mot de la trame n − 240, exact.
+            let attendu = if n < 240 {
+                vec![0u8; w]
+            } else {
+                src[(n - 240) * trame..(n - 240) * trame + w].to_vec()
+            };
+            assert_eq!(
+                servi[n * trame..n * trame + w],
+                attendu[..],
+                "{bits} bits, trame {n}, gauche"
+            );
+        }
+    }
+    // Contre-épreuve : sans réglage, le porteur est inactif (bit-perfect).
+    let mut vide = porteur(None);
+    assert!(!vide.is_active());
+    let src = source(16, 2_000, 0.9, 3);
+    let mut pcm = src.clone();
+    vide.process(&mut pcm, 16);
+    assert_eq!(pcm, src);
+}
+
+/// rc14 (relecture de #9523, M1) — convolveur PUIS réglage des enceintes avec
+/// inversion, sur un relais : la queue que le convolveur rend en fin de flux
+/// (`Passage::Fin`) passe ELLE AUSSI par le réglage des enceintes (délai,
+/// gain, phase). Avant, les dernières trames (la latence du convolveur)
+/// sortaient non inversées : saut de −8000 à +8000. Sinus de 50 Hz,
+/// amplitude 0,8 ; écart à la référence ≤ 2 LSB sur TOUT le flux, queue
+/// comprise.
+#[test]
+fn la_queue_du_convolveur_passe_par_le_reglage_des_enceintes_rc14() {
+    use crate::audio::reglage_enceintes::{ProcesseurEnceintes, ReglagesEnceintes, VoieEnceinte};
+    let reglages = ReglagesEnceintes {
+        channels: vec![
+            VoieEnceinte {
+                distance_cm: Some(343.0),
+                ..VoieEnceinte::default()
+            },
+            VoieEnceinte {
+                distance_cm: Some(343.0 / 2.0), // 240 trames à 48 kHz
+                gain_db: -3.0,
+                invert: false,
+            },
+        ],
+        invert_all: true,
+    };
+    let n = 7_000;
+    let x: Vec<i16> = (0..n)
+        .flat_map(|i| {
+            let v =
+                (0.8 * (2.0 * std::f64::consts::PI * 50.0 * i as f64 / 48_000.0).sin() * 32_767.0)
+                    .round() as i16;
+            [v, v]
+        })
+        .collect();
+    let octets: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut dsp = StreamingDsp {
+        convolver: Some(Convolver::new(&[vec![1.0f32], vec![1.0f32]], 64)),
+        enceintes: Some(ProcesseurEnceintes::new(reglages.clone())),
+        ..porteur(None)
+    };
+    let mut servi = Vec::new();
+    for bloc in octets.chunks(500 * 4) {
+        let mut b = bloc.to_vec();
+        dsp.process_flux(&mut b, 16);
+        servi.extend(b);
+    }
+    let queue = dsp.terminer_flux(16);
+    assert!(!queue.is_empty(), "le convolveur rend sa queue");
+    servi.extend(queue);
+    assert_eq!(servi.len(), octets.len(), "amorce retirée, queue rendue");
+    let y: Vec<i16> = servi
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    // Référence : le réglage seul sur le flux entier.
+    let mut attendu: Vec<f64> = x.iter().map(|v| f64::from(*v) / 32_768.0).collect();
+    ProcesseurEnceintes::new(reglages).traiter(&mut attendu, 2, 48_000);
+    let pire = y
+        .iter()
+        .zip(&attendu)
+        .map(|(a, b)| (f64::from(*a) - b * 32_768.0).abs())
+        .fold(0.0, f64::max);
+    assert!(pire <= 2.0, "écart {pire} LSB (queue non traitée ?)");
+    // Et aucun saut d'un échantillon au suivant au-delà de 3 fois le pas
+    // naturel (0,8 × 2π × 50 / 48 000 pleine échelle).
+    let pas = 0.8 * 2.0 * std::f64::consts::PI * 50.0 / 48_000.0 * 32_768.0;
+    for voie in 0..2 {
+        let v: Vec<f64> = y
+            .iter()
+            .skip(voie)
+            .step_by(2)
+            .map(|s| f64::from(*s))
+            .collect();
+        let saut = v
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "saut_mesure reseau convolveur+enceintes voie {voie} : {saut} LSB (pas {pas:.1})"
+        );
+        assert!(saut <= 3.0 * pas, "voie {voie} : saut {saut} LSB");
+    }
+}

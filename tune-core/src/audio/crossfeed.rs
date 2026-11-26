@@ -356,6 +356,37 @@ impl CrossfeedProcessor {
             }
         }
     }
+    /// TESS T06 — [`Self::process_interleaved`] sur le tampon stéréo **`f64`**
+    /// de l'exécuteur TESS. Le crossfeed intégré (v1, gratuit) calcule en
+    /// `f64` de bout en bout ; un greffon natif — crossfeed signé ou natif
+    /// tiers — reçoit le `f64` tel quel s'il demande `audio-f64`, sinon il est
+    /// converti à SA frontière (T05, `Stage::process_f64`), jamais entre deux
+    /// étages intégrés.
+    pub fn process_interleaved_f64(&mut self, samples: &mut [f64]) {
+        match &mut self.engine {
+            CrossfeedEngine::Bundled(p) => p.process_interleaved_f64(samples),
+            CrossfeedEngine::Native(p) => {
+                if let Err(error) = p.process_f64(samples) {
+                    tracing::error!(%error,"native_crossfeed_processing_failed");
+                }
+            }
+            CrossfeedEngine::Unavailable | CrossfeedEngine::Aucun => {}
+        }
+        for etage in &mut self.tiers {
+            if let Err(error) = etage.stage.process_f64(samples) {
+                tracing::error!(plugin = %etage.id, %error, "native_third_party_processing_failed");
+            }
+        }
+    }
+
+    /// TESS T14 — diagnostic : `(identifiant, traite le F64 lui-même)` par
+    /// étage tiers (F64 négocié avec le greffon, T05).
+    pub fn etages_tiers_en_f64(&self) -> Vec<(String, bool)> {
+        self.tiers
+            .iter()
+            .map(|t| (t.id.clone(), t.stage.processes_f64_natively()))
+            .collect()
+    }
     pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16, channels: u16) {
         if channels != 2 {
             return;
@@ -511,6 +542,12 @@ pub enum CrossfeedConstraint {
     /// qui ne VERROUILLE pas le contrôle ([`Self::verrouille`]). Mesuré par
     /// `orchestrator::tests::*_9178` sur la décision réelle.
     NonLocalPartial,
+    /// TESS T12c (décision du 23/11) — zone HORS TESS (HQPlayer et l'autre
+    /// transport) dont aucun traitement de zone conservé (égaliseur,
+    /// correction de pièce, ReplayGain) ne fait passer les pistes par le flux
+    /// traité : le crossfeed seul n'y est pas appliqué. Avec l'un d'eux, le
+    /// statut devient [`Self::NonLocalPartial`] ([`avec_la_sortie_hors_tess`]).
+    OutsideTess,
 }
 
 impl CrossfeedConstraint {
@@ -524,6 +561,7 @@ impl CrossfeedConstraint {
             Self::NetworkProgressiveOff => "network_progressive_off",
             Self::NetworkRendererNoLpcm => "network_renderer_no_lpcm",
             Self::NonLocalPartial => "non_local_partial",
+            Self::OutsideTess => "outside_tess",
         }
     }
 
@@ -538,11 +576,16 @@ impl CrossfeedConstraint {
                 "Le greffon crossfeed est indisponible. Réactivez-le dans les greffons ; vos réglages sont conservés."
             }
             Self::NonLocalOutput => {
-                "Le crossfeed est un effet de casque : il n'est appliqué que par \
-                 une sortie LOCALE (DAC USB ou carte son de la machine). Cette \
-                 zone ne joue pas par une sortie locale, le réglage est \
-                 enregistré mais n'atteint pas le son. Pour l'entendre, écoutez \
-                 sur une zone à sortie locale."
+                "Cette sortie ne reçoit pas le flux que Tune traite au fil de \
+                 l'eau : le crossfeed n'y est pas appliqué. Le réglage est \
+                 enregistré mais n'atteint pas le son."
+            }
+            Self::OutsideTess => {
+                "Cette zone est hors TESS : sa sortie applique son propre \
+                 traitement ou reçoit le fichier tel quel. Le crossfeed seul n'y \
+                 est pas appliqué ; il ne l'est qu'avec un égaliseur, une \
+                 correction de pièce ou un ReplayGain actif, qui font passer la \
+                 piste par le flux traité de Tune. Le réglage est enregistré."
             }
             Self::PureMode => {
                 "Le mode PURE garde le chemin bit-perfect : aucun traitement ne \
@@ -594,7 +637,7 @@ impl CrossfeedConstraint {
 
     /// Toutes les variantes. Sert la contre-épreuve permanente : une contrainte
     /// ajoutée sans code ni libellé fait tomber le test qui parcourt cette liste.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::PremiumRequired,
         Self::PluginUnavailable,
         Self::NonLocalOutput,
@@ -602,6 +645,7 @@ impl CrossfeedConstraint {
         Self::NetworkProgressiveOff,
         Self::NetworkRendererNoLpcm,
         Self::NonLocalPartial,
+        Self::OutsideTess,
     ];
 }
 
@@ -701,10 +745,11 @@ pub fn crossfeed_status(
         }
     } else {
         // Ni locale, ni réseau : OAAT, navigateur, sorties PULL, zone sans
-        // périphérique résolu. Elles ne sont PAS couvertes par ce correctif —
-        // certaines traversent probablement le relais (OAAT transcode en WAV
-        // par session), mais ce n'est pas mesuré, et annoncer « disponible »
-        // sans preuve est exactement le défaut de #2742 pris à l'envers.
+        // périphérique résolu. La réponse prudente par défaut ; les sorties
+        // dont le chemin est MESURÉ la lèvent ensuite : OAAT
+        // ([`avec_toute_la_chaine`], TESS T12a) et le navigateur
+        // ([`avec_le_flux_traite`], #9178). Annoncer « disponible » sans
+        // preuve serait le défaut de #2742 pris à l'envers.
         Some(CrossfeedConstraint::NonLocalOutput)
     };
     // Un motif n'est pas forcément un verrou (#2742, 23/09) : sous
@@ -726,16 +771,26 @@ pub fn crossfeed_status(
 /// son périphérique `oaat:` / `oaat-group:`, comme le fait l'orchestrateur,
 /// ou à son type) et le navigateur.
 ///
-/// Les sorties PULL (`airplay2`, `diretta`, `hqplayer`, `sendspin`,
-/// `devialet_air`, greffons) n'y sont pas : leurs pistes de la bibliothèque
-/// passent par le bras FICHIER, qui ne cuit le crossfeed que vers une zone
-/// réseau (`crossfeed_cuit_dans_le_fichier`).
+/// TESS T12c — AirPlay 1 et 2 et Devialet AIR aussi : Tune fabrique leur
+/// flux, et le crossfeed (ou un greffon natif tiers) seul y force le flux
+/// traité par le relais (`orchestrator::regles::sortie_tess_qui_tire_le_flux`).
+/// Réserve partielle : un DSD ou un ALAC servi tel quel part sans lui.
+///
+/// Les autres sorties PULL (`diretta`, `hqplayer` — hors TESS, décision Q8 —,
+/// `sendspin`, greffons) n'y sont pas.
 pub fn sortie_porte_le_flux_traite(
     output_type: Option<&str>,
     output_device_id: Option<&str>,
 ) -> bool {
     output_device_id.is_some_and(|d| d.starts_with("oaat:") || d.starts_with("oaat-group:"))
-        || matches!(output_type, Some("oaat") | Some("browser"))
+        || matches!(
+            output_type,
+            Some("oaat")
+                | Some("browser")
+                | Some("airplay")
+                | Some("airplay2")
+                | Some("devialet_air")
+        )
 }
 
 /// #9178 — sur une sortie qui porte le flux traité
@@ -752,6 +807,80 @@ pub fn avec_le_flux_traite(sortie: CrossfeedStatus, porte_le_flux_traite: bool) 
         requested: sortie.requested,
         effective: sortie.requested,
         unavailable: false,
+        reason: Some(reason),
+        detail: Some(reason.detail()),
+    }
+}
+
+/// TESS T12a — la sortie reçoit-elle TOUT ce qu'elle joue par le flux que
+/// Tune traite (crossfeed et greffons natifs tiers compris) ? OAAT seulement,
+/// reconnue comme dans [`sortie_porte_le_flux_traite`].
+///
+/// Mesuré sur un faux récepteur OAAT (`orchestrator::tess_t12a_oaat_tests`) :
+/// toute piste de la bibliothèque part en WAV progressif (`oaat_needs_wav`)
+/// par le relais qui porte la chaîne de la zone, et la lecture directe du
+/// fichier n'est plus permise qu'à une zone sans étage actif (#9176,
+/// `orchestrator::transport::oaat_peut_lire_le_fichier`). Les flux des services
+/// passent par `load_streaming_dsp`, comme partout. Il ne reste hors chaîne
+/// que le DSD natif, comme sur une sortie locale.
+pub fn sortie_porte_toute_la_chaine(
+    output_type: Option<&str>,
+    output_device_id: Option<&str>,
+) -> bool {
+    output_device_id.is_some_and(|d| d.starts_with("oaat:") || d.starts_with("oaat-group:"))
+        || output_type == Some("oaat")
+}
+
+/// TESS T12a — sur une sortie qui porte toute la chaîne
+/// ([`sortie_porte_toute_la_chaine`]), le refus « non mesuré »
+/// (`NonLocalOutput`) est levé : le réglage est honoré tel quel, sans motif,
+/// comme sur une sortie locale. Tout autre statut passe inchangé (PURE garde
+/// la priorité, les droits viennent après : [`avec_les_droits`]).
+pub fn avec_toute_la_chaine(
+    sortie: CrossfeedStatus,
+    porte_toute_la_chaine: bool,
+) -> CrossfeedStatus {
+    if !porte_toute_la_chaine || sortie.reason != Some(CrossfeedConstraint::NonLocalOutput) {
+        return sortie;
+    }
+    CrossfeedStatus {
+        requested: sortie.requested,
+        effective: sortie.requested,
+        unavailable: false,
+        reason: None,
+        detail: None,
+    }
+}
+
+/// TESS T12c (décision du 23/11) — sur une sortie hors TESS (HQPlayer et
+/// l'autre transport, `hors_tess` fourni par l'appelant), `NonLocalOutput`
+/// devient :
+///
+/// - [`CrossfeedConstraint::NonLocalPartial`] (contrôle actif) quand un
+///   traitement de zone conservé fait passer les pistes par le flux traité
+///   (`flux_traite`), qui porte aussi le crossfeed ;
+/// - [`CrossfeedConstraint::OutsideTess`] (verrouillé) sinon : le crossfeed
+///   seul n'y est pas appliqué.
+///
+/// Tout autre statut passe inchangé (PURE garde la priorité).
+pub fn avec_la_sortie_hors_tess(
+    sortie: CrossfeedStatus,
+    hors_tess: bool,
+    flux_traite: bool,
+) -> CrossfeedStatus {
+    if !hors_tess || sortie.reason != Some(CrossfeedConstraint::NonLocalOutput) {
+        return sortie;
+    }
+    let reason = if flux_traite {
+        CrossfeedConstraint::NonLocalPartial
+    } else {
+        CrossfeedConstraint::OutsideTess
+    };
+    let unavailable = reason.verrouille();
+    CrossfeedStatus {
+        requested: sortie.requested,
+        effective: sortie.requested && !unavailable,
+        unavailable,
         reason: Some(reason),
         detail: Some(reason.detail()),
     }
@@ -777,7 +906,10 @@ pub fn avec_les_droits(
     premium: bool,
     greffon_actif: bool,
 ) -> CrossfeedStatus {
-    if matches!(sortie.reason, Some(CrossfeedConstraint::NonLocalOutput)) {
+    if matches!(
+        sortie.reason,
+        Some(CrossfeedConstraint::NonLocalOutput | CrossfeedConstraint::OutsideTess)
+    ) {
         return sortie;
     }
     let droit = if !premium {
@@ -1424,16 +1556,15 @@ mod tests {
         );
         // TESS T04 — l'étage est exécuté par la chaîne réseau en `f64` : son
         // adaptateur reçoit le crossfeed du porteur ET figure parmi les étages
-        // que l'exécuteur appelle.
+        // que l'exécuteur appelle (rc14 : suivi du réglage des enceintes,
+        // dernier étage).
         const CHAINE_RESEAU: &str = include_str!("../orchestrator/chaine_reseau_tess.rs");
         assert!(
             CHAINE_RESEAU.contains("moteur: crossfeed,")
                 && CHAINE_RESEAU.contains(
-                    "let mut etages: [&mut dyn EtageTess; 3] = [&mut a_eq, &mut a_conv, &mut a_cf];"
+                    "let mut etages: [&mut dyn EtageTess; 4] = [&mut a_eq, &mut a_conv, &mut a_cf, &mut a_enc];"
                 )
-                && CHAINE_RESEAU.contains(
-                    "par_tranches_f32(&mut t[..trames * 2], 2, |f| c.process_interleaved(f));"
-                ),
+                && CHAINE_RESEAU.contains("c.process_interleaved_f64(&mut t[..trames * 2]);"),
             "`StreamingDsp::process` n'applique plus le crossfeed : il est \
              chargé, transporté, et jeté sans être exécuté"
         );

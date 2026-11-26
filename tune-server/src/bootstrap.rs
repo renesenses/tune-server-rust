@@ -412,6 +412,10 @@ pub async fn run_with(opts: RunOptions) {
     // données externe est absent (docs/DATA-RELOCATION.md).
     crate::boot_status::set_phase("attente du disque de données");
     crate::routes::appliance_storage::wait_for_data_volume(&config.db_path).await;
+    // rc14 — le cache de pochettes se crée et se sonde APRÈS le disque de
+    // données : un disque externe monté en retard ne doit pas laisser un
+    // faux « non inscriptible » pour toute la session.
+    crate::chemins_de_donnees::preparer_le_cache_retenu();
 
     // Dossier de données non inscriptible (image Docker sous `tune`, `/data`
     // monté depuis un dossier de l'hôte appartenant à root) : un rapport
@@ -1092,8 +1096,10 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
         // vrai.
         let console_ferait_doublon = crate::journal::la_console_ecrit_deja_dans(&chemin);
         let console_layer = (!console_ferait_doublon).then(|| {
+            use tracing_subscriber::Layer;
             couche_console(timer, la_console_veut_des_couleurs())
                 .with_writer(|| tune_core::confidentialite::EcrivainMasque(std::io::stdout()))
+                .with_filter(sans_la_ligne_du_code_d_activation())
         });
 
         tracing_subscriber::registry()
@@ -1127,14 +1133,28 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
             .join(" ; ");
         config::retenir_le_refus_du_journal(raison);
     }
-    tracing_subscriber::fmt()
-        .with_timer(timer)
-        .with_ansi(la_console_veut_des_couleurs())
-        .with_env_filter(env_filter)
-        .with_writer(|| tune_core::confidentialite::EcrivainMasque(std::io::stdout()))
-        .init();
+    {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                couche_console(timer, la_console_veut_des_couleurs())
+                    .with_writer(|| tune_core::confidentialite::EcrivainMasque(std::io::stdout()))
+                    .with_filter(sans_la_ligne_du_code_d_activation()),
+            )
+            .init();
+    }
     dire_les_refus(None);
     None
+}
+
+/// La ligne du code d'activation ([`crate::auth::CIBLE_CODE_ACTIVATION`]) ne
+/// va qu'au FICHIER journal : la console l'a déjà, écrite par `eprintln!`.
+fn sans_la_ligne_du_code_d_activation()
+-> tracing_subscriber::filter::FilterFn<impl Fn(&tracing::Metadata<'_>) -> bool> {
+    tracing_subscriber::filter::filter_fn(|m| m.target() != crate::auth::CIBLE_CODE_ACTIVATION)
 }
 
 /// #8922 — la console en couleurs SEULEMENT quand sa sortie est un terminal,
@@ -1202,6 +1222,13 @@ fn filtre_du_journal(niveau: &str) -> EnvFilter {
 fn poser_les_directives(filtre: EnvFilter, niveau: &str) -> EnvFilter {
     filtre
         .add_directive(format!("tune={niveau}").parse().unwrap())
+        // Le code d'activation passe quel que soit le niveau : sans lui,
+        // l'exploitant sans console ne peut pas activer l'authentification.
+        .add_directive(
+            format!("{}=warn", crate::auth::CIBLE_CODE_ACTIVATION)
+                .parse()
+                .unwrap(),
+        )
         // Cap chatty dependencies so a `debug` level (config or RUST_LOG=debug)
         // doesn't drown the useful lines. At debug, sqlx::query logs every SQL
         // statement and reqwest/hyper log every outbound connection: Elie's

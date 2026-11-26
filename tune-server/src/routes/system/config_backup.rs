@@ -211,10 +211,14 @@ pub(super) async fn import(
         "config_backup_import_started"
     );
 
+    // rc14 — le profil d'égaliseur et les préréglages suivent la règle de
+    // leurs routes : ce que la licence couvre (`config_export::egaliseurs`).
+    let premium = state.license.check_feature(Feature::ParametricEq).await;
     match tune_core::config_backup::import_config_with_secret(
         &state.backend,
         snapshot,
         secret.as_deref(),
+        premium,
     ) {
         Ok(mut report) => {
             report.warnings.extend(ecartees);

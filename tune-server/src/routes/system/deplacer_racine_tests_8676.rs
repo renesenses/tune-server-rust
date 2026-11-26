@@ -102,7 +102,7 @@ async fn remplacer_le_chemin_par_les_routes_8676() {
     // L'aperçu : trois pistes, deux retrouvées, une manquante.
     let (s, a) = corps(
         apercu(
-            RequireAdmin,
+            AdminOuCetteMachine,
             State(etat.clone()),
             demande(&ancienne, &nouvelle, None),
         )
@@ -131,7 +131,7 @@ async fn remplacer_le_chemin_par_les_routes_8676() {
     // Préfixe invalide : 400.
     let (s, a) = corps(
         apercu(
-            RequireAdmin,
+            AdminOuCetteMachine,
             State(etat.clone()),
             demande("/", &nouvelle, None),
         )
@@ -143,12 +143,31 @@ async fn remplacer_le_chemin_par_les_routes_8676() {
         (StatusCode::BAD_REQUEST, Some("invalid_prefix"))
     );
 
-    // Aucun fichier retrouvé : l'application est refusée, rien ne change.
+    // Le nouveau préfixe n'existe pas : ce n'est pas un dossier, 400.
     let (s, a) = corps(
         appliquer(
-            RequireAdmin,
+            AdminOuCetteMachine,
             State(etat.clone()),
             demande(&ancienne, "/nulle-part-8676", Some(3)),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        (s, a["refusal"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_prefix")),
+        "{a}"
+    );
+
+    // Un dossier vide : aucun fichier retrouvé, l'application est refusée,
+    // rien ne change.
+    let vide = base.path().join("Vide");
+    std::fs::create_dir_all(&vide).unwrap();
+    let (s, a) = corps(
+        appliquer(
+            AdminOuCetteMachine,
+            State(etat.clone()),
+            demande(&ancienne, &vide.to_string_lossy(), Some(3)),
         )
         .await,
     )
@@ -162,7 +181,7 @@ async fn remplacer_le_chemin_par_les_routes_8676() {
     // Confirmation absente ou périmée : 409, rien ne change.
     let (s, a) = corps(
         appliquer(
-            RequireAdmin,
+            AdminOuCetteMachine,
             State(etat.clone()),
             demande(&ancienne, &nouvelle, Some(2)),
         )
@@ -190,7 +209,7 @@ async fn remplacer_le_chemin_par_les_routes_8676() {
     // Application.
     let (s, a) = corps(
         appliquer(
-            RequireAdmin,
+            AdminOuCetteMachine,
             State(etat.clone()),
             demande(&ancienne, &nouvelle, Some(3)),
         )

@@ -238,6 +238,9 @@ struct ForcagesReseau {
     is_browser_output: bool,
     browser_needs_wav: bool,
     dsd_passthrough: bool,
+    /// #9184 — la tranche d'ISO SACD part en DSF virtuel
+    /// (`audio::dsf_depuis_iso`) : elle n'est plus une tranche à décoder.
+    dsf_depuis_iso: bool,
     bit_depth_wire: u16,
     dlna_wav24: bool,
     dlna_force_wav: bool,
@@ -280,11 +283,16 @@ struct TraitementsDeZone {
     egaliseur: bool,
     correction_de_piece: bool,
     replaygain: bool,
+    /// TESS T12c — l'étage casque (crossfeed, greffons natifs tiers) d'une
+    /// zone AirPlay ou Devialet AIR ([`super::regles::sortie_tess_qui_tire_le_flux`]).
+    /// Faux partout ailleurs : sur une zone réseau, le crossfeed a ses
+    /// propres règles (#2742, `crossfeed_bibliotheque_reseau`).
+    etage_casque: bool,
 }
 
 impl TraitementsDeZone {
     fn un_au_moins(self) -> bool {
-        self.egaliseur || self.correction_de_piece || self.replaygain
+        self.egaliseur || self.correction_de_piece || self.replaygain || self.etage_casque
     }
 
     fn noms(self) -> Vec<&'static str> {
@@ -292,6 +300,7 @@ impl TraitementsDeZone {
             (self.egaliseur, "egaliseur"),
             (self.correction_de_piece, "correction_de_piece"),
             (self.replaygain, "replaygain"),
+            (self.etage_casque, "etage_casque"),
         ]
         .into_iter()
         .filter_map(|(vrai, nom)| vrai.then_some(nom))
@@ -347,6 +356,40 @@ fn reconnaitre_les_sorties(
         is_local_output,
         local_needs_wav,
         is_network_output,
+    }
+}
+
+/// #9184 — le DSF virtuel d'une tranche d'ISO SACD (`audio::dsf_depuis_iso`).
+/// Ne lit que la structure du disque. `Err` sans tranche : une image ne part
+/// jamais entière.
+async fn preparer_dsf_depuis_iso(
+    file_path: &str,
+    tranche_cue: Option<TrancheCue>,
+) -> Result<crate::audio::dsf_depuis_iso::DsfDepuisIso, String> {
+    let t = tranche_cue.ok_or("dsf_depuis_iso: piste d'ISO sans tranche")?;
+    let chemin = std::path::PathBuf::from(file_path);
+    tokio::task::spawn_blocking(move || {
+        crate::audio::dsf_depuis_iso::DsfDepuisIso::preparer(
+            &chemin,
+            t.debut_ms,
+            t.duree_ms.map(|d| t.debut_ms + d),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// #9184 — la fenêtre du décodage-pour-niveaux d'un passthrough DSD, sur
+/// l'horloge du fichier : `(début, fin)`. Une tranche d'ISO SACD servie en
+/// DSF virtuel se mesure de son début à sa fin dans l'image ; tout autre
+/// passthrough sert un fichier entier, mesuré de 0 au bout.
+pub(super) fn fenetre_des_niveaux_du_passthrough(
+    dsf_depuis_iso: bool,
+    tranche_cue: Option<TrancheCue>,
+) -> (u64, Option<u64>) {
+    match tranche_cue.filter(|_| dsf_depuis_iso) {
+        Some(t) => (t.debut_ms, t.duree_ms.map(|d| t.debut_ms + d)),
+        None => (0, None),
     }
 }
 
@@ -410,6 +453,7 @@ fn assembler_la_decision(
     } = sorties;
     let ForcagesReseau {
         dsd_passthrough,
+        dsf_depuis_iso,
         is_browser_output,
         bit_depth_wire,
         dlna_wav24,
@@ -463,7 +507,9 @@ fn assembler_la_decision(
         // #3631 — une TRANCHE ne se sert jamais telle quelle. Le
         // passthrough enverrait le fichier image ENTIER : l'album complet
         // sous le nom d'une de ses pistes. Seul le décodage sait couper.
-        est_une_tranche_cue: tranche_cue.is_some(),
+        // #9184 — sauf la tranche d'ISO SACD servie en DSF virtuel : ce
+        // fichier fabriqué ne porte QUE la tranche.
+        est_une_tranche_cue: tranche_cue.is_some() && !dsf_depuis_iso,
         flac_ffmpeg_vers_le_reseau,
         // #4800 — l'en-tête neuf prêt, la réécriture du conteneur se fait
         // sans décoder : le motif de #4350 seul ne force plus le transcodage.
@@ -1111,7 +1157,14 @@ impl PlaybackOrchestrator {
             // only get MORE accurate, never worse — the initial Play already
             // ends at real EOF). Fall back to the scanned duration if the probe
             // fails, so a NAS timeout never blanks the duration entirely.
-            let probed_secs = crate::audio::analyzer::get_duration(&file_path).await.ok();
+            // #9184 — une tranche d'ISO SACD servie en DSF : l'image n'a pas
+            // de durée à sonder, celle de la PISTE est en base.
+            let probed_secs =
+                if crate::audio::sacd::est_extension_iso(std::path::Path::new(&file_path)) {
+                    None
+                } else {
+                    crate::audio::analyzer::get_duration(&file_path).await.ok()
+                };
             let duree = passthrough_didl_duration_ms(probed_secs, track.duration_ms);
             // #6059 — la DIDL décrit le flux SERVI : ce qui reste après le départ.
             Some(duree - depart_natif_ms.unwrap_or(0).min(duree.max(0) as u64) as i64)
@@ -1178,8 +1231,39 @@ impl PlaybackOrchestrator {
         {
             return Ok(DecisionOuResolu::Resolu(resolu));
         }
+        // rc14 — TESS vers le DSD sur la sortie locale : une piste PCM est
+        // modulée (T11b) et servie comme un DSD de fichier, en DoP ou en
+        // natif. `None` : la chaîne ne le demande pas, ou la piste repart en
+        // PCM par le chemin d'avant, inchangé (motif au chemin du signal).
+        if let Some(resolu) = self
+            .decider_la_modulation_dsd(
+                req,
+                track,
+                &file_path,
+                source_format.is_some_and(|f| f != AudioFormat::Dsd),
+                sorties.is_local_output && !sorties.is_oaat_output,
+                source.sample_rate,
+                // Voies inconnues en base (0) : la stéréo, imposée au décodeur.
+                if source.channels == 0 {
+                    2
+                } else {
+                    source.channels
+                },
+                tranche_cue.as_ref(),
+            )
+            .await?
+        {
+            return Ok(DecisionOuResolu::Resolu(resolu));
+        }
         let forcages = self
-            .decider_les_forcages_reseau(req, &file_path, source_format, &source, &sorties)
+            .decider_les_forcages_reseau(
+                req,
+                &file_path,
+                source_format,
+                &source,
+                &sorties,
+                tranche_cue,
+            )
             .await;
         let mut transcodage = self
             .decider_le_transcodage_pour_la_sortie(req, source_format, &source, &sorties, &forcages)
@@ -1586,6 +1670,7 @@ impl PlaybackOrchestrator {
         source_format: Option<AudioFormat>,
         source: &SourceEtZone,
         sorties: &Sorties,
+        tranche_cue: Option<TrancheCue>,
     ) -> ForcagesReseau {
         let SourceEtZone {
             bit_depth,
@@ -1611,6 +1696,9 @@ impl PlaybackOrchestrator {
         let is_browser_output = zone_output_type.as_deref() == Some("browser");
         let browser_needs_wav = navigateur_exige_le_wav(is_browser_output, source_format);
 
+        // #9184 — posé plus bas, seulement pour une tranche d'ISO SACD servie
+        // en DSF virtuel.
+        let mut dsf_depuis_iso = false;
         // DSD native passthrough: skip transcode when the renderer supports DSD natively.
         let dsd_passthrough = if source_format == Some(AudioFormat::Dsd)
             && is_network_output
@@ -1664,6 +1752,44 @@ impl PlaybackOrchestrator {
                     false
                 }
             }
+        } else if source_format == Some(AudioFormat::Dsd)
+            && is_network_output
+            && crate::audio::sacd::est_extension_iso(std::path::Path::new(file_path))
+        {
+            // #9184 — une piste d'ISO SACD est une TRANCHE de l'image : le
+            // passthrough ne peut pas servir le fichier (l'image entière,
+            // #3631). Quand la zone servirait en natif un `.dsf` (même règle :
+            // `should_dsd_passthrough`), il sert à sa place un DSF FABRIQUÉ
+            // depuis la tranche (`audio::dsf_depuis_iso`). Sinon, ou si ce DSF
+            // ne peut pas se préparer (zone multicanal, tranche sans fin), la
+            // tranche reste décodée en PCM, exactement comme avant.
+            let did = identifiant_du_renderer(
+                req.output_device_id.as_deref(),
+                zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
+            );
+            let natif = self.should_dsd_passthrough(req.zone_id, did).await;
+            if natif {
+                match preparer_dsf_depuis_iso(file_path, tranche_cue).await {
+                    Ok(dsf) => {
+                        dsf_depuis_iso = true;
+                        info!(
+                            zone_id = req.zone_id,
+                            file = %file_path,
+                            octets = dsf.total(),
+                            "iso_sacd_servi_en_dsf_virtuel"
+                        );
+                    }
+                    Err(motif) => {
+                        info!(
+                            zone_id = req.zone_id,
+                            file = %file_path,
+                            motif = %motif,
+                            "iso_sacd_tranche_decodee_en_pcm"
+                        );
+                    }
+                }
+            }
+            natif
         } else if source_format == Some(AudioFormat::Dsd) && is_network_output {
             let did = identifiant_du_renderer(
                 req.output_device_id.as_deref(),
@@ -1775,6 +1901,7 @@ impl PlaybackOrchestrator {
             is_browser_output,
             browser_needs_wav,
             dsd_passthrough,
+            dsf_depuis_iso,
             bit_depth_wire,
             dlna_wav24,
             dlna_force_wav,
@@ -2083,6 +2210,14 @@ impl PlaybackOrchestrator {
                 // passthrough. Enabling it is an explicit choice of processing;
                 // PURE zones are excluded upstream.
                 replaygain: self.zone_replaygain_changes_audio(req.zone_id, req.piste_rg()),
+                // TESS T12c — AirPlay et Devialet AIR : Tune fabrique le flux,
+                // la chaîne entière s'y applique. Le crossfeed et les greffons
+                // natifs tiers y forcent donc le flux traité comme l'égaliseur ;
+                // le relais progressif (`load_streaming_dsp`) les porte déjà.
+                etage_casque: super::regles::sortie_tess_qui_tire_le_flux(
+                    zone_output_type.as_deref(),
+                ) && (self.zone_has_active_crossfeed(req.zone_id)
+                    || self.zone_has_active_enceintes(req.zone_id)),
             }
         } else {
             TraitementsDeZone::default()
@@ -2120,7 +2255,11 @@ impl PlaybackOrchestrator {
             // `is_network_output &&` d'abord : sans lui, une zone LOCALE
             // paierait une lecture de réglages par piste pour un drapeau que
             // `cible_wav_pour_traitement` va de toute façon annuler.
-            let crossfeed_reseau = is_network_output && self.zone_has_active_crossfeed(req.zone_id);
+            // rc14 — le réglage des enceintes vit au même étage du relais
+            // progressif (dernier de `StreamingDsp`) : même règle.
+            let crossfeed_reseau = is_network_output
+                && (self.zone_has_active_crossfeed(req.zone_id)
+                    || self.zone_has_active_enceintes(req.zone_id));
             let traitement = eq_forces_transcode || crossfeed_reseau;
             // #2742 (24/09) — un crossfeed SEUL vaut consentement au WAV
             // progressif : `crossfeed_bibliotheque_reseau`, cas 2.
@@ -2188,7 +2327,7 @@ impl PlaybackOrchestrator {
     /// à `cadence_dop` (WASAPI partagé ou exclusif). La sonde est bloquante
     /// (COM) : elle part sur un fil de `spawn_blocking`. `Inconnu` partout
     /// ailleurs, et alors rien ne change.
-    async fn accueil_du_dop_local(
+    pub(super) async fn accueil_du_dop_local(
         &self,
         device_id: Option<&str>,
         cadence_dop: u32,
@@ -2228,6 +2367,69 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #8616 — sonde limitée à WASAPI exclusif, hors des verrous asynchrones.
+    async fn cadence_pcm_exclusive(
+        &self,
+        device_id: Option<&str>,
+        cadence: u32,
+        voies: u16,
+        plafond: Option<u32>,
+        repli: bool,
+    ) -> Result<Option<u32>, String> {
+        #[cfg(test)]
+        if let Some(acceptees) =
+            device_id.and_then(|id| cadences_pcm_de_test().lock().unwrap().get(id).cloned())
+        {
+            return crate::outputs::cadence_exclusive_8616::choisir_cadence(
+                cadence,
+                voies,
+                plafond,
+                repli,
+                |hz, _, _| {
+                    if acceptees.contains(&hz) {
+                        crate::outputs::negociation_format_exclusif_3837::ResultatSonde::Accepte
+                    } else {
+                        crate::outputs::negociation_format_exclusif_3837::ResultatSonde::Refuse {
+                            hr: 0x88890008u32 as i32,
+                            propose: None,
+                        }
+                    }
+                },
+            );
+        }
+        #[cfg(all(feature = "local-audio", target_os = "windows"))]
+        {
+            let Some(id) = device_id else {
+                return Ok(None);
+            };
+            let Some(sortie) = ({ self.outputs.lock().await.get(id) }) else {
+                return Ok(None);
+            };
+            let endpoint = {
+                let sortie = sortie.lock().await;
+                sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                    .and_then(crate::outputs::local::LocalOutput::endpoint_pcm_exclusif)
+            };
+            let Some(endpoint) = endpoint else {
+                return Ok(None);
+            };
+            tokio::task::spawn_blocking(move || {
+                crate::outputs::wasapi_exclusive::sonder_la_cadence_pcm(
+                    endpoint, cadence, voies, plafond, repli,
+                )
+            })
+            .await
+            .unwrap_or(Ok(None))
+        }
+        #[cfg(not(all(feature = "local-audio", target_os = "windows")))]
+        {
+            let _ = (device_id, cadence, voies, plafond, repli);
+            Ok(None)
+        }
+    }
+
     /// #5643 — ce que la sortie locale `device_id` permet en DSD natif.
     ///
     /// Le bras se lit sur la sortie elle-même (`sort_par_asio_exclusif`, la
@@ -2235,7 +2437,7 @@ impl PlaybackOrchestrator {
     /// `capacite_dsd_natif` ; absente, elle est sondée UNE fois, hors du fil
     /// asynchrone, et seulement si le verrou de périphérique ASIO est libre —
     /// jamais pendant qu'un autre flux tient le pilote.
-    async fn sortie_dsd_locale(&self, device_id: Option<&str>) -> SortieDsdLocale {
+    pub(super) async fn sortie_dsd_locale(&self, device_id: Option<&str>) -> SortieDsdLocale {
         #[cfg(feature = "local-audio")]
         {
             use crate::outputs::capacite_dsd_natif::{self as capacite, CapaciteConnue};
@@ -2815,7 +3017,9 @@ impl PlaybackOrchestrator {
             .await?
         {
             DecisionOuResolu::Decision(decision) => {
-                let format = self.decider_le_format_de_sortie(req, &decision, None)?;
+                let format = self
+                    .decider_le_format_de_sortie(req, &decision, None)
+                    .await?;
                 Ok(self.chemin_du_rendu_en_cache(req, &decision, &format))
             }
             DecisionOuResolu::Resolu(_) => Err("résolu sans transcodage".into()),
@@ -2899,7 +3103,9 @@ impl PlaybackOrchestrator {
             DecisionOuResolu::Decision(d) => d,
             DecisionOuResolu::Resolu(_) => return Err("résolu sans transcodage".into()),
         };
-        let format = self.decider_le_format_de_sortie(req, &decision, None)?;
+        let format = self
+            .decider_le_format_de_sortie(req, &decision, None)
+            .await?;
         let dsp = self.load_streaming_dsp(
             req.zone_id,
             req.piste_rg(),
@@ -2922,7 +3128,7 @@ impl PlaybackOrchestrator {
     /// `bascule` (#8558) : la piste est trop lourde pour le bras fichier et le
     /// renderer accepte le WAV — cible WAV en session progressive, à la
     /// profondeur dite. `None` : la décision d'avant, inchangée.
-    fn decider_le_format_de_sortie(
+    async fn decider_le_format_de_sortie(
         &self,
         req: &PlayRequest,
         decision: &DecisionLocale,
@@ -3086,10 +3292,12 @@ impl PlaybackOrchestrator {
                 out_sr = cible;
             }
         }
-        if !decision.dsd_passthrough
-            && let Some(rate) =
-                crate::audio::frequence_fixe::cible(&self.db, req.zone_id, zone_max_sample_rate)?
-        {
+        let frequence_fixe = if decision.dsd_passthrough {
+            None
+        } else {
+            crate::audio::frequence_fixe::cible(&self.db, req.zone_id, zone_max_sample_rate)?
+        };
+        if let Some(rate) = frequence_fixe {
             // Un DSD hors famille (48 kHz sous DSD64) est décimé dans sa
             // famille puis rééchantillonné vers `rate` par le décodeur
             // (`dsd_to_pcm::cadence_de_decimation`) : le flux sort bien à `rate`.
@@ -3104,6 +3312,42 @@ impl PlaybackOrchestrator {
                 );
             }
             out_sr = rate;
+        }
+        let mut repli_pcm_exclusif = None;
+        // #8616 — le porteur PCM est produit à la cadence acceptée, pas seulement
+        // étiqueté autrement à l'ouverture WASAPI. Le chemin du signal reçoit
+        // cette même cadence via StreamInfo et la session de transcodage.
+        if local_needs_wav {
+            if let Some(cible) = self
+                .cadence_pcm_exclusive(
+                    req.output_device_id.as_deref(),
+                    out_sr,
+                    channels,
+                    zone_max_sample_rate,
+                    frequence_fixe.is_none(),
+                )
+                .await?
+            {
+                if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
+                    out_sr,
+                    cible,
+                    crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
+                )
+                .refus()
+                {
+                    return Err(refus.sentinelle());
+                }
+                if cible != out_sr {
+                    info!(
+                        zone_id = req.zone_id,
+                        source_rate = out_sr,
+                        target_rate = cible,
+                        "wasapi_exclusive_cadence_refusee_repli_pcm"
+                    );
+                    repli_pcm_exclusif = Some((out_sr, cible));
+                    out_sr = cible;
+                }
+            }
         }
         let out_bd: u16 = if local_needs_wav {
             // Local output (cpal/WASAPI): always use 32-bit WAV.
@@ -3317,6 +3561,7 @@ impl PlaybackOrchestrator {
         );
 
         let info = StreamInfo {
+            repli_pcm_exclusif,
             format: out_ext.clone(),
             mime_type: out_mime.clone(),
             sample_rate: out_sr,
@@ -3725,7 +3970,9 @@ impl PlaybackOrchestrator {
         decision: &DecisionLocale,
     ) -> Result<FormatDeSortie, String> {
         use super::bascule_progressive_8558 as b;
-        let mut format = self.decider_le_format_de_sortie(req, decision, None)?;
+        let mut format = self
+            .decider_le_format_de_sortie(req, decision, None)
+            .await?;
         self.ajuster_m4a_au_sink(req, decision, &mut format).await?;
         if format.conteneur_natif || format.l16 || !format.use_file_transcode {
             return Ok(format);
@@ -3806,7 +4053,9 @@ impl PlaybackOrchestrator {
             profondeur = ?profondeur,
             "bras_fichier_trop_lourd_session_progressive_8558"
         );
-        let mut format = self.decider_le_format_de_sortie(req, decision, Some(profondeur))?;
+        let mut format = self
+            .decider_le_format_de_sortie(req, decision, Some(profondeur))
+            .await?;
         self.ajuster_m4a_au_sink(req, decision, &mut format).await?;
         Ok(format)
     }
@@ -4753,6 +5002,7 @@ impl PlaybackOrchestrator {
             ref fmt,
             ref zone,
             ref conteneur_flac_neuf,
+            tranche_cue,
             ..
         } = *decision;
         // #8082 — « Flux continu entre les pistes ».
@@ -4778,7 +5028,20 @@ impl PlaybackOrchestrator {
         } else {
             None
         };
-        let fmt = if dsf_depuis_dst.is_some() {
+        // #9184 — une tranche d'ISO SACD n'arrive ici que si la décision a
+        // préparé son DSF virtuel (sinon `est_une_tranche_cue` transcode) :
+        // le reprépare, et ne sert JAMAIS l'image elle-même.
+        let dsf_depuis_iso = if source_format == Some(AudioFormat::Dsd)
+            && is_network_output
+            && crate::audio::sacd::est_extension_iso(std::path::Path::new(file_path))
+        {
+            Some(Arc::new(
+                preparer_dsf_depuis_iso(file_path, tranche_cue).await?,
+            ))
+        } else {
+            None
+        };
+        let fmt = if dsf_depuis_dst.is_some() || dsf_depuis_iso.is_some() {
             "dsf".to_string()
         } else {
             fmt.clone()
@@ -4833,6 +5096,9 @@ impl PlaybackOrchestrator {
             let passthrough_disk_size = if let Some(dsf) = dsf_depuis_dst.as_ref() {
                 // #6221 — la taille du DSF fabriqué, pas celle du `.dff` DST.
                 Some(dsf.total())
+            } else if let Some(dsf) = dsf_depuis_iso.as_ref() {
+                // #9184 — la taille du DSF de la tranche, pas celle de l'image.
+                Some(dsf.total())
             } else if is_network_output {
                 tokio::fs::metadata(&file_path).await.ok().map(|m| m.len())
             } else {
@@ -4848,23 +5114,27 @@ impl PlaybackOrchestrator {
             // conteneur FLAC neuf de #4800, qui a déjà sa propre carte.
             // #6221 — pas sur le DSF fabriqué : la carte de #6059 réécrit
             // l'en-tête du fichier SUR DISQUE, qui est ici du DST.
-            let depart_natif =
-                if is_network_output && conteneur_flac_neuf.is_none() && dsf_depuis_dst.is_none() {
-                    let did = req
-                        .output_device_id
-                        .as_deref()
-                        .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()));
-                    self.preparer_depart_natif_6059(
-                        req.zone_id,
-                        did,
-                        req.seek_ms,
-                        file_path,
-                        Some(u32::from(bit_depth)),
-                    )
-                    .await
-                } else {
-                    None
-                };
+            // #9184 — pas non plus sur le DSF d'une tranche d'ISO.
+            let depart_natif = if is_network_output
+                && conteneur_flac_neuf.is_none()
+                && dsf_depuis_dst.is_none()
+                && dsf_depuis_iso.is_none()
+            {
+                let did = req
+                    .output_device_id
+                    .as_deref()
+                    .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()));
+                self.preparer_depart_natif_6059(
+                    req.zone_id,
+                    did,
+                    req.seek_ms,
+                    file_path,
+                    Some(u32::from(bit_depth)),
+                )
+                .await
+            } else {
+                None
+            };
             let passthrough_file_size = depart_natif
                 .as_ref()
                 .map(|d| d.carte.total)
@@ -4901,6 +5171,18 @@ impl PlaybackOrchestrator {
                     cadence = dsf.cadence(),
                     mime = %mime,
                     "dst_decompresse_en_dsf_servi"
+                );
+                self.streamer.set_source_virtuelle(&session_id, dsf).await;
+            }
+            if let Some(dsf) = dsf_depuis_iso.clone() {
+                info!(
+                    zone_id = req.zone_id,
+                    file = %file_path,
+                    octets = dsf.total(),
+                    canaux = dsf.canaux(),
+                    cadence = dsf.cadence(),
+                    mime = %mime,
+                    "iso_sacd_tranche_servie_en_dsf"
                 );
                 self.streamer.set_source_virtuelle(&session_id, dsf).await;
             }
@@ -4967,6 +5249,8 @@ impl PlaybackOrchestrator {
                 use crate::http::streamer::voie;
                 if dsf_depuis_dst.is_some() {
                     voie::DSF_RECONSTRUIT
+                } else if dsf_depuis_iso.is_some() {
+                    voie::DSF_DEPUIS_ISO
                 } else if conteneur_flac_neuf.is_some() {
                     voie::ENTETE_FLAC_NEUF
                 } else if depart_natif_pose {
@@ -5030,13 +5314,18 @@ impl PlaybackOrchestrator {
                     file = %file_path,
                     "dsd_passthrough_niveaux_sonde"
                 );
-                spawn_local_file_levels_decode_depuis(
+                // #9184 — une tranche d'ISO se mesure de son début à sa fin
+                // dans l'image, ni depuis le début du disque, ni au-delà.
+                let (debut_dans_le_fichier, fin_dans_le_fichier) =
+                    fenetre_des_niveaux_du_passthrough(dsf_depuis_iso.is_some(), tranche_cue);
+                spawn_local_file_levels_decode_tranche(
                     bus.clone(),
                     self.playback.clone(),
                     req.zone_id,
                     play_seq,
                     file_path.clone(),
-                    0,
+                    debut_dans_le_fichier,
+                    fin_dans_le_fichier,
                     0,
                 );
             }
@@ -5420,6 +5709,14 @@ mod duree_relue_5975_tests;
 #[cfg(test)]
 #[path = "niveaux_du_dsd_natif_7775.rs"]
 mod niveaux_du_dsd_natif_7775;
+
+#[cfg(test)]
+pub(super) fn cadences_pcm_de_test()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<u32>>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<u32>>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(Default::default)
+}
 
 #[cfg(test)]
 #[path = "niveaux_dsd_passthrough_reseau_9117.rs"]

@@ -123,5 +123,30 @@ class ArchiveInstructions(unittest.TestCase):
                     self.package(target, "macOS", extras)
 
 
+class WindowsZipSansGreffons(unittest.TestCase):
+    """Fil 3014 : le zip Windows (lu par la mise à jour intégrée) ne contient
+    pas `plugins\\` ; le setup.exe, lui, livre toujours les greffons."""
+
+    def etape(self, nom):
+        lines = (ROOT / ".github/workflows/release.yml").read_text().splitlines()
+        start = lines.index(f"      - name: {nom}")
+        fin = next((i for i in range(start + 1, len(lines))
+                    if lines[i].startswith("      - name: ")), len(lines))
+        return "\n".join(lines[start:fin])
+
+    def test_le_zip_windows_n_embarque_pas_plugins(self):
+        etape = self.etape("Package (windows zip)")
+        for ligne in etape.splitlines():
+            if ligne.strip().startswith("7z a "):
+                self.assertNotIn("plugins", ligne, ligne)
+        self.assertNotIn("package\\plugins", etape)
+        self.assertIn("Path = plugins", etape, "garde du zip absente")
+
+    def test_le_setup_windows_livre_toujours_les_greffons(self):
+        etape = self.etape("Create installer (windows)")
+        self.assertIn('File "plugins\\party\\main.wasm"', etape)
+        self.assertIn('File "plugins\\playlists-converter\\main.wasm"', etape)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

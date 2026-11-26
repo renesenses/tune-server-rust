@@ -403,7 +403,14 @@ impl OutputTarget for OaatMultiroomOutput {
 
             let stream_id = format!("tune-{stream_num}");
 
-            let resp = match http_client.get(&url).send().await {
+            let resp = match crate::http::client::marquer_si_flux_de_tune(
+                http_client.get(&url),
+                &url,
+                "oaat-multiroom",
+            )
+            .send()
+            .await
+            {
                 Ok(r) if r.status().is_success() => r,
                 Ok(r) => {
                     error!(device = %device_name, status = %r.status(), "oaat-multiroom: HTTP error");

@@ -1005,11 +1005,14 @@ pub(crate) async fn url_to_local_path(
         // Client partagé (voir `crate::http::client`) : TLS webpki plutôt que
         // le vérificateur de plateforme, et un délai d'attente — une piste
         // entière transite ici, d'où `long_timeout`.
-        let resp = crate::http::client::long_timeout()
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| format!("download {url}: {e}"))?;
+        let resp = crate::http::client::marquer_si_flux_de_tune(
+            crate::http::client::long_timeout().get(url),
+            url,
+            "airplay",
+        )
+        .send()
+        .await
+        .map_err(|e| format!("download {url}: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("download {url}: HTTP {}", resp.status()));
         }

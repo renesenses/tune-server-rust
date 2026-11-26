@@ -1113,7 +1113,25 @@ pub(crate) fn host_from_location(location: &str) -> Option<String> {
         .strip_prefix("http://")
         .or_else(|| location.strip_prefix("https://"))?;
     let host_port = after_scheme.split('/').next()?;
-    Some(host_port.split(':').next()?.to_string())
+    Some(hote_et_port(host_port).0.to_string())
+}
+
+/// Fil du forum 3028 — l'hôte et le port d'une autorité `hôte[:port]`.
+///
+/// Une adresse IPv6 s'écrit entre crochets dans une URL (`[fe80::1]:8888`,
+/// RFC 3986) : couper au premier `:` rendait l'hôte `[fe80` et le port
+/// `0` (illisible, donc 80). L'hôte est rendu SANS crochets, sous la forme
+/// qu'écrit `Ipv6Addr::to_string`, pour se comparer à nos adresses.
+fn hote_et_port(host_port: &str) -> (&str, Option<&str>) {
+    if let Some(reste) = host_port.strip_prefix('[')
+        && let Some((hote, apres)) = reste.split_once(']')
+    {
+        return (hote, apres.strip_prefix(':'));
+    }
+    match host_port.split_once(':') {
+        Some((hote, port)) => (hote, Some(port)),
+        None => (host_port, None),
+    }
 }
 
 fn base_url_from_location(location: &str) -> String {
@@ -1133,9 +1151,8 @@ pub(crate) fn port_from_location(location: &str) -> u16 {
         .or_else(|| location.strip_prefix("https://"))
         .unwrap_or(location);
     let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
-    host_port
-        .split(':')
-        .nth(1)
+    hote_et_port(host_port)
+        .1
         .and_then(|p| p.parse().ok())
         .unwrap_or(80)
 }
@@ -1945,6 +1962,26 @@ pub fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
                 continue;
             }
             if let std::net::IpAddr::V4(ip) = iface.ip()
+                && !v.contains(&ip)
+            {
+                v.push(ip);
+            }
+        }
+    }
+    v
+}
+
+/// Fil du forum 3028 — les adresses IPv6 de nos interfaces (boucle locale
+/// exclue, comme [`local_ipv4_addresses`]). Elles servent à SE RECONNAÎTRE
+/// dans une annonce ou une URL, jamais à s'annoncer.
+pub fn local_ipv6_addresses() -> Vec<std::net::Ipv6Addr> {
+    let mut v = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in &ifaces {
+            if iface.is_loopback() {
+                continue;
+            }
+            if let std::net::IpAddr::V6(ip) = iface.ip()
                 && !v.contains(&ip)
             {
                 v.push(ip);
@@ -2908,6 +2945,21 @@ mod tests {
         let loc2 = "http://10.0.0.1/desc.xml";
         assert_eq!(host_from_location(loc2), Some("10.0.0.1".into()));
         assert_eq!(port_from_location(loc2), 80);
+    }
+
+    /// Fil du forum 3028 — une LOCATION IPv6 garde son hôte et son port.
+    #[test]
+    fn host_port_extraction_ipv6_3028() {
+        let loc = "http://[fe80::1c2b:3aff:fe4d:5e6f]:8888/upnp/description.xml";
+        assert_eq!(
+            host_from_location(loc),
+            Some("fe80::1c2b:3aff:fe4d:5e6f".into())
+        );
+        assert_eq!(port_from_location(loc), 8888);
+
+        let sans_port = "http://[::1]/desc.xml";
+        assert_eq!(host_from_location(sans_port), Some("::1".into()));
+        assert_eq!(port_from_location(sans_port), 80);
     }
 
     #[test]

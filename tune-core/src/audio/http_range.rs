@@ -52,7 +52,7 @@ impl HttpRangeSource {
     /// refusée en 403 à qui ne rejoue pas son User-Agent). Liste vide ⇒
     /// requêtes identiques à `open`.
     pub fn open_avec_entetes(url: &str, entetes: &[(String, String)]) -> Result<Self, String> {
-        let client = crate::http::client::blocking_builder()
+        let client = crate::http::client::blocking_builder_pour(url, "plages")
             .timeout(None)
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
