@@ -765,7 +765,9 @@ impl Controleur {
                 },
             );
             let rsb = ri.snr_db();
-            let spl = etalonnage.and_then(|c| c.crete_spl(crete, d.gain_relatif_db));
+            // Version prudente (rc14) : la plus haute des deux conversions borne
+            // la montée des salves et le plafond SPL.
+            let spl = etalonnage.and_then(|c| c.crete_spl_prudente(crete, d.gain_relatif_db));
             let sonde = ProbeResult {
                 played_dbfs: em.niveau_dbfs,
                 captured_peak_dbfs: crete,

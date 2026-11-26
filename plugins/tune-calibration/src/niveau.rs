@@ -84,6 +84,18 @@ pub const DUREE_PALIER_S: f64 = 0.5;
 /// Plafond de pression acoustique, celui de la mesure
 /// (`LevelPolicy::default().max_spl_db`).
 pub const SPL_MAX_DB: f64 = 90.0;
+/// rc14 — niveau visé à la place d'écoute, en dB(C), et sa tolérance.
+pub const CIBLE_DBC: f64 = 75.0;
+pub const TOLERANCE_CIBLE_DB: f64 = 1.0;
+/// rc14 (version prudente, 26/11) — au-delà, le niveau est jugé élevé.
+pub const NIVEAU_ELEVE_DBC: f64 = 85.0;
+/// rc14 (version prudente) — aucune consigne de hausse quand l'estimation
+/// prudente dépasse ce niveau.
+pub const HAUSSE_INTERDITE_DBC: f64 = 80.0;
+/// rc14 (version prudente) — au-delà de cet écart entre l'ancienne et la
+/// nouvelle conversion, le verdict porte `conversion_non_verifiee`. La preuve
+/// au calibrateur physique est reportée en rc15.
+pub const ECART_NON_VERIFIE_DB: f64 = 3.0;
 /// Fondu de sortie du signal, à l'annulation comme à la coupure de sécurité.
 pub const FONDU_S: f64 = 0.02;
 /// Après un fondu, le temps que le chemin de lecture se vide (avance du
@@ -286,8 +298,19 @@ pub struct Verdict {
     pub rsb_db: f64,
     /// Pression de crête au micro (dB SPL), avec un étalonnage seulement.
     pub spl_db: Option<f64>,
-    /// Niveau efficace pondéré C du palier de référence.
+    /// Niveau efficace pondéré C du palier de référence, par la nouvelle
+    /// conversion (`94 − Sens − gain`). C'est la valeur AFFICHÉE.
     pub niveau_dbc: Option<f64>,
+    /// rc14 (version prudente) — le même niveau par la plus haute des deux
+    /// conversions (ancienne `dBFS + 112 − Sens`, nouvelle). Toute consigne
+    /// de hausse se règle sur elle.
+    pub estimation_prudente_db: Option<f64>,
+    /// `conversion_non_verifiee` quand les deux conversions divergent de plus
+    /// de [`ECART_NON_VERIFIE_DB`].
+    pub raison_prudence: Option<&'static str>,
+    /// `cible_atteinte`, `monter`, `baisser` ou `niveau_eleve` ; `None` sans
+    /// niveau en dB(C), ou quand monter serait imprudent.
+    pub consigne_volume: Option<&'static str>,
     /// La veille a coupé le signal pendant la montée (saturation ou SPL).
     pub coupe: bool,
     pub plage: Plage,
@@ -375,9 +398,56 @@ pub fn juger(bruit: Niveaux, signal: Niveaux, spl_db: Option<f64>, coupe: bool) 
         rsb_db,
         spl_db,
         niveau_dbc: None,
+        estimation_prudente_db: None,
+        raison_prudence: None,
+        consigne_volume: None,
         coupe,
         plage: PLAGE,
         message,
+    }
+}
+
+/// rc14 (version prudente) — la consigne de volume. L'affichage suit la
+/// nouvelle conversion ; la hausse, elle, n'est jamais conseillée quand
+/// l'estimation prudente dépasse [`HAUSSE_INTERDITE_DBC`].
+pub fn consigne_volume(niveau_dbc: Option<f64>, prudente_db: Option<f64>) -> Option<&'static str> {
+    let n = niveau_dbc.filter(|n| n.is_finite())?;
+    let prudente = prudente_db.filter(|p| p.is_finite()).unwrap_or(n).max(n);
+    if n > NIVEAU_ELEVE_DBC {
+        Some("niveau_eleve")
+    } else if (n - CIBLE_DBC).abs() <= TOLERANCE_CIBLE_DB {
+        Some("cible_atteinte")
+    } else if n > CIBLE_DBC {
+        Some("baisser")
+    } else if prudente > HAUSSE_INTERDITE_DBC {
+        None
+    } else {
+        Some("monter")
+    }
+}
+
+/// rc14 (version prudente) — complète le verdict : niveau affiché, estimation
+/// prudente, raison et consigne. `ecart_db` = ancienne − nouvelle conversion.
+pub fn appliquer_prudence(v: &mut Verdict, niveau_dbc: Option<f64>, ecart_db: Option<f64>) {
+    v.niveau_dbc = niveau_dbc;
+    v.estimation_prudente_db = niveau_dbc.map(|n| n + ecart_db.unwrap_or(0.0).max(0.0));
+    v.raison_prudence = ecart_db
+        .is_some_and(|e| e.abs() > ECART_NON_VERIFIE_DB)
+        .then_some("conversion_non_verifiee");
+    v.consigne_volume = if v.coupe {
+        None
+    } else {
+        consigne_volume(v.niveau_dbc, v.estimation_prudente_db)
+    };
+    if v.motif == "rsb_faible"
+        && v.estimation_prudente_db
+            .is_some_and(|p| p > HAUSSE_INTERDITE_DBC)
+    {
+        v.message = format!(
+            "faible mais mesurable : {:.0} dB au-dessus du bruit de fond. Ne montez pas le volume : \
+             l'estimation prudente dépasse {HAUSSE_INTERDITE_DBC:.0} dB(C) ; rapprochez plutôt le micro",
+            v.rsb_db
+        );
     }
 }
 
@@ -1646,7 +1716,9 @@ impl Controleur {
             let Some(m) = test.verrou().vumetre else {
                 return false;
             };
-            let spl = etalonnage.and_then(|c| c.crete_spl(m.crete_max_dbfs, d.gain_relatif_db));
+            // Version prudente : la plus haute des deux conversions.
+            let spl =
+                etalonnage.and_then(|c| c.crete_spl_prudente(m.crete_max_dbfs, d.gain_relatif_db));
             let danger =
                 m.crete_max_dbfs >= CRETE_SATURATION_DBFS || spl.is_some_and(|s| s > SPL_MAX_DB);
             if danger && !arme.coupe.load(Ordering::SeqCst) {
@@ -1683,8 +1755,13 @@ impl Controleur {
         }
         let bloc = trames(0.1) as usize;
         let signal = niveaux_du_signal(&capte, bloc, (DUREE_RETENUE_S / 0.1).round() as usize);
-        let spl = etalonnage.and_then(|c| c.crete_spl(signal.crete_dbfs, d.gain_relatif_db));
+        // Version prudente : le plafond se juge sur la plus haute des deux
+        // conversions ; seul l'affichage (`niveau_dbc`) suit la nouvelle.
+        let spl =
+            etalonnage.and_then(|c| c.crete_spl_prudente(signal.crete_dbfs, d.gain_relatif_db));
         let mut verdict = juger(bruit, signal, spl, coupe);
+        let ecart = etalonnage.and_then(|c| c.ecart_conversion_db(d.gain_relatif_db));
+        let mut niveau_dbc = None;
         if complet
             && !coupe
             && matches!(verdict.jugement, Jugement::Bon | Jugement::Faible)
@@ -1704,13 +1781,14 @@ impl Controleur {
                 .map(|(i, w)| (i, w.iter().sum::<f64>()))
                 .max_by(|a, b| a.1.total_cmp(&b.1))
             {
-                verdict.niveau_dbc = cal.niveau_c(
+                niveau_dbc = cal.niveau_c(
                     &capte[i * bloc..(i + n) * bloc],
                     tampon.format().frequence,
                     d.gain_relatif_db,
                 );
             }
         }
+        appliquer_prudence(&mut verdict, niveau_dbc, ecart);
         tracing::info!(
             test = %test.id,
             jugement = ?verdict.jugement,
@@ -1937,6 +2015,63 @@ mod tests {
             crete_dbfs: crete,
             rms_dbfs: rms,
         }
+    }
+
+    /// rc14 — 75,3 dB(C) est la cible atteinte (±1 dB), et les autres consignes.
+    #[test]
+    fn soixante_quinze_virgule_trois_est_la_cible_atteinte() {
+        let mut v = juger(n(-60.0, -70.0), n(-15.0, -27.0), Some(80.0), false);
+        appliquer_prudence(&mut v, Some(75.3), Some(0.0));
+        assert_eq!(v.consigne_volume, Some("cible_atteinte"), "{v:?}");
+        assert_eq!(v.estimation_prudente_db, Some(75.3));
+        assert_eq!(v.raison_prudence, None);
+        assert_eq!(consigne_volume(Some(74.0), None), Some("cible_atteinte"));
+        assert_eq!(consigne_volume(Some(76.0), None), Some("cible_atteinte"));
+        assert_eq!(consigne_volume(Some(73.9), Some(73.9)), Some("monter"));
+        assert_eq!(consigne_volume(Some(76.1), None), Some("baisser"));
+        assert_eq!(consigne_volume(Some(85.1), None), Some("niveau_eleve"));
+        assert_eq!(consigne_volume(None, Some(70.0)), None);
+    }
+
+    /// rc14, version prudente (26/11) — les conversions divergent de 18 dB :
+    /// l'affichage garde la nouvelle, la hausse n'est plus conseillée, la
+    /// raison est exposée. Un verdict coupé ne porte aucune consigne.
+    #[test]
+    fn la_prudence_interdit_la_hausse_et_signale_la_divergence() {
+        let bruit = n(-60.0, -70.0);
+        let mut v = juger(bruit, n(-15.0, -27.0), Some(80.0), false);
+        appliquer_prudence(&mut v, Some(70.0), Some(18.0));
+        assert_eq!(v.niveau_dbc, Some(70.0));
+        assert_eq!(v.estimation_prudente_db, Some(88.0));
+        assert_eq!(v.raison_prudence, Some("conversion_non_verifiee"));
+        assert_eq!(
+            v.consigne_volume, None,
+            "pas de « montez » à 88 dB prudents"
+        );
+        // La nouvelle conversion est la plus haute : elle fait foi.
+        appliquer_prudence(&mut v, Some(70.0), Some(-6.0));
+        assert_eq!(v.estimation_prudente_db, Some(70.0));
+        assert_eq!(v.raison_prudence, Some("conversion_non_verifiee"));
+        assert_eq!(v.consigne_volume, Some("monter"));
+        appliquer_prudence(&mut v, Some(70.0), Some(2.9));
+        assert_eq!(v.raison_prudence, None);
+        assert_eq!(v.consigne_volume, Some("monter"));
+        appliquer_prudence(&mut v, Some(70.0), Some(10.1));
+        assert_eq!(v.consigne_volume, None);
+        // Le message « rsb faible » ne dit plus de monter le volume.
+        let mut v = juger(bruit, n(-45.0, -65.0), None, false);
+        assert_eq!(v.motif, "rsb_faible");
+        assert!(v.message.contains("montez le volume de mesure"));
+        appliquer_prudence(&mut v, Some(70.0), Some(18.0));
+        assert!(
+            !v.message.contains("montez le volume de mesure"),
+            "{}",
+            v.message
+        );
+        // Coupé : aucune consigne.
+        let mut v = juger(bruit, n(-12.0, -24.0), Some(95.0), true);
+        appliquer_prudence(&mut v, Some(75.0), Some(0.0));
+        assert_eq!(v.consigne_volume, None);
     }
 
     /// Les cinq verdicts, aux seuils documentés.

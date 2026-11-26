@@ -151,6 +151,29 @@ impl MicCalibration {
             .or_else(|| self.spl_from_dbfs(dbfs))
     }
 
+    /// rc14 (version prudente, 26/11) — écart, en dB, entre l'ancienne
+    /// conversion (`dBFS + 112 − Sens`) et la nouvelle (`dBFS + 94 − Sens −
+    /// gain`). Positif quand l'ancienne estime plus haut. `None` sans les deux.
+    /// La nouvelle n'a été confirmée par aucun calibrateur physique (rc15).
+    pub fn ecart_conversion_db(&self, gain_relatif_db: Option<f64>) -> Option<f64> {
+        let nouvelle = self.reference_spl(gain_relatif_db)?;
+        let ancienne = self.spl_from_dbfs(0.0)?;
+        Some(ancienne - nouvelle)
+    }
+
+    /// rc14 (version prudente) — la plus haute des deux estimations de crête.
+    /// C'est elle, et elle seule, qui commande la coupure à 90 dB SPL et
+    /// borne toute consigne de hausse : on ne peut couper que trop tôt,
+    /// jamais trop tard, tant que la nouvelle conversion n'est pas vérifiée.
+    pub fn crete_spl_prudente(&self, dbfs: f64, gain_relatif_db: Option<f64>) -> Option<f64> {
+        let nouvelle = self.crete_spl(dbfs, gain_relatif_db);
+        let ancienne = self.spl_from_dbfs(dbfs);
+        match (nouvelle, ancienne) {
+            (Some(n), Some(a)) => Some(n.max(a)),
+            (n, a) => n.or(a),
+        }
+    }
+
     /// Niveau continu équivalent pondéré C sur le palier capté, à sa cadence native.
     pub fn niveau_c(&self, palier: &[f64], fs: u32, gain_relatif_db: Option<f64>) -> Option<f64> {
         let reference = self.reference_spl(gain_relatif_db)?;
@@ -249,6 +272,23 @@ mod tests {
         let sans_facteur =
             MicCalibration::parse("Sens Factor = , SERNO: 7001234\n63 0\n1000 0").unwrap();
         assert_eq!(sans_facteur.reference_spl(Some(0.0)), None);
+    }
+
+    #[test]
+    fn la_prudence_retient_la_plus_haute_des_deux_conversions() {
+        // Sens −12, gain 0 : l'ancienne dit 18 dB de plus que la nouvelle.
+        let cal = MicCalibration::parse("Sens Factor =-12dB\n63 0\n1000 0").unwrap();
+        assert_eq!(cal.crete_spl(-40.0, Some(0.0)), Some(66.0));
+        assert_eq!(cal.spl_from_dbfs(-40.0), Some(84.0));
+        assert_eq!(cal.crete_spl_prudente(-40.0, Some(0.0)), Some(84.0));
+        assert_eq!(cal.ecart_conversion_db(Some(0.0)), Some(18.0));
+        // Gain −18 : les deux conversions se rejoignent.
+        assert_eq!(cal.ecart_conversion_db(Some(-18.0)), Some(0.0));
+        // Gain −24 : la nouvelle est la plus haute, c'est elle qui compte.
+        assert_eq!(cal.crete_spl_prudente(-40.0, Some(-24.0)), Some(90.0));
+        // Sans gain, seule l'ancienne existe.
+        assert_eq!(cal.crete_spl_prudente(-40.0, None), Some(84.0));
+        assert_eq!(cal.ecart_conversion_db(None), None);
     }
 
     const UMIK: &str = "\"Sens Factor =-1.021dB, SERNO: 7001234\"\n10.058\t-5.2\n20.0\t-1.0\n1000\t0.0\n10000\t1.5\n20000\t3.0\n";

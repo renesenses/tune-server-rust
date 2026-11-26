@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tune_calibration::mic_cal::MicCalibration;
 use tune_calibration::sim::RoomSim;
 use tune_calibration_greffon::fournisseur::FournisseurBalayage;
 use tune_calibration_greffon::generateur::Voies;
@@ -19,7 +20,9 @@ use tune_calibration_greffon::mesure::{Controleur, Demande, Etat, FREQUENCE_MESU
 use tune_calibration_greffon::niveau::{
     DemandeNiveau, EtatTest, FournisseurNiveau, Jugement, RefusNiveau, ZoneDeTest,
 };
-use tune_calibration_greffon::niveau::{ElementDeTest, NIVEAU_REFERENCE_DBFS, RSB_MIN_DB};
+use tune_calibration_greffon::niveau::{
+    ElementDeTest, NIVEAU_REFERENCE_DBFS, RSB_MIN_DB, SPL_MAX_DB,
+};
 use tune_calibration_greffon::simulation::{Boucle, HoteSimule, MicroSimule, PieceEnDirect};
 use tune_core::source_pcm::FournisseurPcm;
 use tune_entree_audio::peripheriques::Peripheriques;
@@ -364,6 +367,34 @@ fn le_plafond_spl_coupe_le_signal() {
         v.niveau_dbc
             .is_some_and(|c| c.is_finite() && c < v.spl_db.unwrap())
     );
+    // Gain −18 : les deux conversions se rejoignent, rien à signaler.
+    assert_eq!(v.raison_prudence, None, "{v:?}");
+    assert_eq!(v.estimation_prudente_db, v.niveau_dbc, "{v:?}");
+    // rc14, version prudente (26/11) — même micro « fort », gain 0 : la
+    // nouvelle conversion (`94 − Sens − gain`) estime la crête ≈ 18 dB plus
+    // bas, ≈ 76 dB SPL, sous le plafond. L'ancienne (`dBFS + 112 − Sens`)
+    // dit ≈ 94. La coupure DOIT suivre la plus haute des deux.
+    let cal = MicCalibration::parse(fort).unwrap();
+    let crete_palier = -17.6;
+    assert!(cal.crete_spl(crete_palier, Some(0.0)).unwrap() < SPL_MAX_DB);
+    assert!(cal.crete_spl_prudente(crete_palier, Some(0.0)).unwrap() > SPL_MAX_DB);
+    let mut d = DemandeNiveau::signal(ZONE, MICRO);
+    d.etalonnage = Some("fort".into());
+    d.gain_relatif_db = Some(0.0);
+    let id = b.controleur.tester_niveau(d).unwrap();
+    assert_eq!(
+        attendre_fin(&b.controleur, &id, Duration::from_secs(30)),
+        EtatTest::Terminee
+    );
+    let v = b.controleur.test_niveau(&id).unwrap().verdict().unwrap();
+    assert_eq!(
+        (v.jugement, v.motif),
+        (Jugement::TropFort, "trop_fort_spl"),
+        "la coupure doit se déclencher sur le max des deux estimations : {v:?}"
+    );
+    assert!(v.coupe && v.spl_db.is_some_and(|s| s > SPL_MAX_DB), "{v:?}");
+    assert_eq!(v.raison_prudence, Some("conversion_non_verifiee"), "{v:?}");
+    assert_eq!(v.consigne_volume, None, "{v:?}");
     // Un étalonnage inconnu est refusé avant tout.
     let mut d = DemandeNiveau::signal(ZONE, MICRO);
     d.etalonnage = Some("absent".into());
