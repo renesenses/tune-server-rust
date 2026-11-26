@@ -161,7 +161,8 @@ async fn code_valide_change_le_mot_de_passe_et_revoque_les_sessions() {
     let (st, v) = reinitialiser(&state, CETTE_MACHINE, &[], &saisie, "nouveau-mot-de-passe").await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["reset"], true);
-    assert_eq!(v["username"], "default");
+    // #9562 : le profil administrateur d'origine s'appelle `admin` (158).
+    assert_eq!(v["username"], "admin");
     assert!(v["token"].as_str().is_some_and(|t| !t.is_empty()));
 
     assert!(mot_de_passe_est(&state, "nouveau-mot-de-passe"));
@@ -453,7 +454,7 @@ async fn sous_commande_emet_un_code_que_la_route_accepte() {
     };
     let backend = ra::ouvrir_la_base(&config).await.expect("base existante");
     let (id, nom) = ra::compte_administrateur(&backend).unwrap();
-    assert_eq!((id, nom.as_str()), (1, "default"));
+    assert_eq!((id, nom.as_str()), (1, "admin"), "#9562 : migration 158");
     let code = ra::emettre_un_code(&SettingsRepo::with_backend(backend)).unwrap();
     let (st, v) = reinitialiser(&state, CETTE_MACHINE, &[], &code, "nouveau-mot-de-passe").await;
     assert_eq!(st, StatusCode::OK, "{v}");
