@@ -651,3 +651,117 @@ async fn la_websocket_survit_a_l_expiration_mais_pas_a_la_revocation() {
     );
     tache.abort();
 }
+
+/// Vieillit la session `sid` : connexion et jetons de renouvellement datés
+/// d'il y a `secondes`.
+fn vieillir_session(state: &AppState, sid: &str, secondes: i64) {
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    let cle = format!("auth_session_token:{sid}");
+    let mut s: Value = serde_json::from_str(&reglages.get(&cle).unwrap().unwrap()).unwrap();
+    s["created_at"] = Value::from(s["created_at"].as_u64().unwrap() - secondes as u64);
+    reglages.set(&cle, &s.to_string()).unwrap();
+    state
+        .backend
+        .execute(
+            "UPDATE jetons_de_renouvellement \
+             SET cree_le = cree_le - ?, session_creee_le = session_creee_le - ? \
+             WHERE famille = ?",
+            &[&secondes as &dyn ToSqlValue, &secondes, &sid],
+        )
+        .unwrap();
+}
+
+fn sid_du_jeton(state: &AppState, rt: &str) -> String {
+    tune_core::db::jetons_de_renouvellement::JetonsDeRenouvellementRepo::with_backend(
+        state.backend.clone(),
+    )
+    .session_du_jeton(rt)
+    .unwrap()
+    .0
+}
+
+/// Au-delà de 20 sessions par compte, part celle qui a servi le MOINS
+/// RÉCEMMENT (dernier renouvellement), jamais une session ancienne mais
+/// renouvelée à l'instant (un téléphone actif) — même si une autre app se
+/// reconnecte chaque jour.
+#[tokio::test]
+async fn au_plafond_part_la_moins_recemment_renouvelee() {
+    let state = etat();
+    activer_l_authentification(&state);
+    compte(&state, "ana", false);
+    let app = app(&state, DISTANT);
+    const JOUR: i64 = 86400;
+
+    // 20 sessions. La n° 0 est la plus ANCIENNE (60 jours) ; les autres ont
+    // de 19 à 1 jour(s), sans renouvellement : la n° 1 est la moins
+    // récemment servie.
+    let mut sessions = Vec::new();
+    for _ in 0..20 {
+        let (acces, rt) = connexion(&app, "ana").await;
+        let sid = sid_du_jeton(&state, &rt);
+        sessions.push((acces, rt, sid));
+    }
+    vieillir_session(&state, &sessions[0].2, 60 * JOUR);
+    for (i, (_, _, sid)) in sessions.iter().enumerate().skip(1) {
+        vieillir_session(&state, sid, (20 - i as i64) * JOUR);
+    }
+
+    // La plus ancienne est renouvelée (il y a une minute).
+    let (st, v) = renouveler(&app, &sessions[0].1).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let acces_renouvele = v["token"].as_str().unwrap().to_string();
+    state
+        .backend
+        .execute(
+            "UPDATE jetons_de_renouvellement SET cree_le = cree_le - 60 \
+             WHERE famille = ? AND remplace_le IS NULL",
+            &[&sessions[0].2 as &dyn ToSqlValue],
+        )
+        .unwrap();
+
+    // Contre-épreuve de l'ancien ordre : par date de CONNEXION, c'est bien
+    // la renouvelée qui serait partie.
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    let connexion_de = |sid: &str| -> u64 {
+        let v: Value = serde_json::from_str(
+            &reglages
+                .get(&format!("auth_session_token:{sid}"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        v["created_at"].as_u64().unwrap()
+    };
+    let plus_ancienne = sessions
+        .iter()
+        .min_by_key(|(_, _, sid)| connexion_de(sid))
+        .unwrap();
+    assert_eq!(plus_ancienne.2, sessions[0].2);
+
+    // La 21ᵉ connexion.
+    let (nouvel_acces, _) = connexion(&app, "ana").await;
+    let restantes: Vec<String> = reglages
+        .par_prefixe("auth_session_token:")
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(restantes.len(), 20, "{restantes:?}");
+    assert!(
+        restantes.contains(&format!("auth_session_token:{}", sessions[0].2)),
+        "la session renouvelée à l'instant ne part JAMAIS"
+    );
+    assert!(
+        !restantes.contains(&format!("auth_session_token:{}", sessions[1].2)),
+        "la moins récemment renouvelée part"
+    );
+    assert_eq!(moi(&app, &acces_renouvele).await, StatusCode::OK);
+    assert_eq!(moi(&app, &sessions[1].0).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        renouveler(&app, &sessions[1].1).await.0,
+        StatusCode::UNAUTHORIZED,
+        "sa famille de renouvellement part avec elle"
+    );
+    assert_eq!(moi(&app, &sessions[2].0).await, StatusCode::OK);
+    assert_eq!(moi(&app, &nouvel_acces).await, StatusCode::OK);
+}

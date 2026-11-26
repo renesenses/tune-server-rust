@@ -133,7 +133,8 @@ pub fn verify_jwt(token: &str, secret: &str) -> Result<JwtClaims, String> {
 /// Préfixe des inscriptions de sessions longues dans `settings`.
 pub const PREFIXE_SESSION_LONGUE: &str = "auth_session_token:";
 
-/// Sessions longues gardées par compte ; la plus ancienne part au-delà.
+/// Sessions longues gardées par compte ; au-delà, part celle qui a servi le
+/// moins récemment (dernier renouvellement, à défaut la connexion).
 pub const MAX_SESSIONS_LONGUES_PAR_COMPTE: usize = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2308,12 +2309,27 @@ async fn login(
             ordre: prochain_ordre(),
         };
         // Les expirées partent au passage ; au-delà du plafond par compte,
-        // les plus anciennes aussi.
+        // celles qui ont servi le moins récemment aussi : la date du dernier
+        // jeton de renouvellement émis pour la session (connexion ou
+        // renouvellement), à défaut sa connexion. Une session ancienne mais
+        // renouvelée chaque jour reste ; l'ordre de création départage.
         let mut du_compte: Vec<(String, SessionLongue)> = sessions_longues(&settings)
             .into_iter()
             .filter(|(_, s)| s.user_id == profile_id)
             .collect();
-        du_compte.sort_by_key(|(_, s)| (s.created_at, s.ordre));
+        let renouvelees =
+            tune_core::db::jetons_de_renouvellement::JetonsDeRenouvellementRepo::with_backend(
+                state.backend.clone(),
+            )
+            .derniers_renouvellements(profile_id);
+        du_compte.sort_by_key(|(sid, s)| {
+            let servie = renouvelees
+                .get(sid)
+                .copied()
+                .unwrap_or(0)
+                .max(s.created_at as i64);
+            (servie, s.ordre)
+        });
         let en_trop = (du_compte.len() + 1).saturating_sub(MAX_SESSIONS_LONGUES_PAR_COMPTE);
         for (ancien, _) in du_compte.iter().take(en_trop) {
             oublier_session(&settings, ancien);

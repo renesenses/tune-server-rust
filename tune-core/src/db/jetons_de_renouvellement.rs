@@ -420,6 +420,31 @@ impl JetonsDeRenouvellementRepo {
             .is_some()
     }
 
+    /// Pour chaque famille du profil, la date du DERNIER jeton émis (la
+    /// connexion, puis chaque renouvellement) : la dernière fois que la
+    /// session a servi. Sert à choisir la session à retirer au plafond par
+    /// compte : la moins récemment renouvelée, pas la plus ancienne.
+    pub fn derniers_renouvellements(
+        &self,
+        profile_id: i64,
+    ) -> std::collections::HashMap<String, i64> {
+        self.db
+            .query_many_strong(
+                "SELECT famille, MAX(cree_le) FROM jetons_de_renouvellement \
+                 WHERE profile_id = ? GROUP BY famille",
+                &[&profile_id as &dyn ToSqlValue],
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|l| {
+                Some((
+                    l.first().and_then(|v| v.as_string())?,
+                    l.get(1).and_then(|v| v.as_i64())?,
+                ))
+            })
+            .collect()
+    }
+
     /// Révoque une famille : tous ses jetons, consommés ou non.
     pub fn revoquer_famille(&self, famille: &str, maintenant: i64) -> usize {
         self.db
