@@ -2405,7 +2405,18 @@ pub fn spawn_heartbeat(state: &AppState) {
                     // The server may or may not include license fields — if
                     // absent (old server, 204, empty body, etc.) we keep the
                     // cached state unchanged.
+                    let statut_battement = resp.status().as_u16();
                     if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        // Pourquoi le palier (affichage seulement) : retenir la
+                        // réponse du site quand elle parle de la clé.
+                        let parle_de_la_cle = body.get("session_conflict").is_some()
+                            || body.get("license_tier").and_then(|v| v.as_str()).is_some();
+                        if ls.license_key.is_some() && parle_de_la_cle {
+                            license.noter_reponse(tune_core::license::lire_reponse_licence(
+                                Some(statut_battement),
+                                Some(&body),
+                            ));
+                        }
                         // Floating-license single-session model: the cloud tells
                         // us when this key is currently held by ANOTHER server.
                         // Unlike a bare `license_valid:false` (which can be a
@@ -2613,9 +2624,15 @@ async fn revalider_la_cle(
             ))
         }
         tune_core::cloud::rate_limit::AppelCloud::Reponse(resp) if resp.status().is_success() => {
+            let statut = resp.status().as_u16();
             let Ok(body) = resp.json::<serde_json::Value>().await else {
+                license.noter_reponse(tune_core::license::lire_reponse_licence(Some(statut), None));
                 return Some((Verdict::Echec, "reponse illisible".into()));
             };
+            license.noter_reponse(tune_core::license::lire_reponse_licence(
+                Some(statut),
+                Some(&body),
+            ));
             // Meme lecture du verdict que le battement et que les deux routes.
             let (tier, expires_at) = match tune_core::license::verdict_licence(&body) {
                 tune_core::license::VerdictLicence::Absent => {
@@ -2653,6 +2670,10 @@ async fn revalider_la_cle(
             Some((Verdict::Succes, format!("cle revalidee, palier {tier}")))
         }
         tune_core::cloud::rate_limit::AppelCloud::Reponse(resp) => {
+            license.noter_reponse(tune_core::license::lire_reponse_licence(
+                Some(resp.status().as_u16()),
+                None,
+            ));
             debug!(status = %resp.status(), "license_revalidation_rejected");
             Some((
                 Verdict::Echec,
@@ -2660,6 +2681,7 @@ async fn revalider_la_cle(
             ))
         }
         tune_core::cloud::rate_limit::AppelCloud::Erreur(e) => {
+            license.noter_reponse(tune_core::license::lire_reponse_licence(None, None));
             debug!(error = %e, "license_revalidation_failed");
             Some((Verdict::Echec, "hote injoignable".into()))
         }

@@ -2282,6 +2282,12 @@ path = "tests/raccourcis_windows_sans_console_7637.rs"
 name = "licence_retrait_libere_la_machine_7726"
 path = "tests/licence_retrait_libere_la_machine_7726.rs"
 
+# rc14 — dire pourquoi le palier est gratuit : une raison par réponse du site
+# de licences, contre un faux serveur local.
+[[test]]
+name = "licence_raison_du_palier"
+path = "tests/licence_raison_du_palier.rs"
+
 # Durcissement de la configuration : écritures génériques de `settings` et
 # contrôle d'origine, par le vrai routeur. `autotests = false` plus haut : sans
 # cette cible, le banc ne serait JAMAIS compilé.
