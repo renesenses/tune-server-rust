@@ -9,20 +9,9 @@
 //! l'environnement du processus, ce qu'aucun autre essai ne doit voir.
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 use tune_core::streaming::youtube::{ENV_CLIENT_ID, ENV_CLIENT_SECRET, url_par_ytdlp_pour_essai};
-
-/// Un faux yt-dlp qui recopie ce qu'il reçoit des deux variables : dans l'URL
-/// (quatre lignes, comme le vrai avec `--print`), ou comme sa version.
-const FAUX_YTDLP: &str = r#"#!/bin/sh
-VU="${TUNE_YOUTUBE_CLIENT_ID-absent}/${TUNE_YOUTUBE_CLIENT_SECRET-absent}"
-if [ "$1" = "--version" ]; then echo "$VU"; exit 0; fi
-echo "http://127.0.0.1:9/flux/$VU"
-echo '{"User-Agent": "Mozilla/5.0"}'
-echo 'tune-format=251,opus,128.93'
-echo 'tune-disponible=NA'
-"#;
 
 #[tokio::test]
 async fn ytdlp_ne_recoit_pas_les_variables_du_client_oauth() {
@@ -32,10 +21,8 @@ async fn ytdlp_ne_recoit_pas_les_variables_du_client_oauth() {
         std::env::set_var(ENV_CLIENT_ID, "fuite-id");
         std::env::set_var(ENV_CLIENT_SECRET, "fuite-secret");
     }
-    let dossier = tempfile::tempdir().unwrap();
-    let binaire = dossier.path().join("yt-dlp");
-    std::fs::write(&binaire, FAUX_YTDLP).unwrap();
-    std::fs::set_permissions(&binaire, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let binaire = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/executables/yt-dlp-environnement.sh");
 
     // Contre-épreuve : lancé sans précaution, le fils HÉRITE des variables.
     let brut = tokio::process::Command::new(&binaire)

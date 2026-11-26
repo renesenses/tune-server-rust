@@ -443,3 +443,16 @@ mod tests {
         std::fs::remove_dir_all(&chemin).unwrap();
     }
 }
+
+/// Donne à une fixture exécutable son nom dans le répertoire privé du test.
+/// Le fichier que le noyau exécute est en lecture seule pendant le banc.
+#[cfg(all(test, unix))]
+pub(crate) fn lier_executable(destination: &std::path::Path, fixture: &str) {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/executables")
+        .join(fixture);
+    std::os::unix::fs::symlink(source, destination).expect("lier la fixture exécutable");
+}
+
+#[cfg(test)]
+mod garde_executables;

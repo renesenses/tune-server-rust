@@ -14,29 +14,10 @@ use super::*;
 const URL: &str = "postgres://tune:secret%40mdp@db.example:5432/tune";
 
 #[cfg(unix)]
-fn faux_pg_dump(dossier: &Path, corps: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
+fn faux_pg_dump(dossier: &Path, fixture: &str) -> PathBuf {
     let script = dossier.join("faux_pg_dump.sh");
-    fs::write(&script, format!("#!/bin/sh\n{corps}\n")).unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_scratch::lier_executable(&script, fixture);
     script
-}
-
-/// Le faux `pg_dump` qui réussit : arguments et `PGPASSWORD` dans `journal`.
-#[cfg(unix)]
-fn faux_pg_dump_qui_reussit(dossier: &Path, journal: &Path) -> PathBuf {
-    faux_pg_dump(
-        dossier,
-        &format!(
-            r#"printf '%s\n' "$@" > '{j}'
-echo "PGPASSWORD=$PGPASSWORD" >> '{j}'
-while [ $# -gt 0 ]; do
-  if [ "$1" = "--file" ]; then shift; printf 'PGDMP-faux' > "$1"; fi
-  shift
-done"#,
-            j = journal.display()
-        ),
-    )
 }
 
 fn noms(dossier: &Path) -> Vec<String> {
@@ -69,7 +50,7 @@ fn sauvegarde_pg_ecrit_un_dump_liste_sans_mot_de_passe_en_argument_7288() {
     let tmp = tempfile::tempdir().unwrap();
     let backups = tmp.path().join("backups");
     let journal = tmp.path().join("journal.txt");
-    let pg_dump = faux_pg_dump_qui_reussit(tmp.path(), &journal);
+    let pg_dump = faux_pg_dump(tmp.path(), "pg-dump-ok.sh");
 
     let info = create_pg_backup(URL, &backups, &pg_dump)
         .expect("la sauvegarde PostgreSQL doit aboutir quand pg_dump réussit");
@@ -122,15 +103,7 @@ fn pg_dump_introuvable_rend_une_erreur_qui_dit_quoi_faire_7288() {
 fn echec_de_pg_dump_ne_laisse_aucun_fichier_et_masque_le_mot_de_passe_7288() {
     let tmp = tempfile::tempdir().unwrap();
     let backups = tmp.path().join("backups");
-    let pg_dump = faux_pg_dump(
-        tmp.path(),
-        r#"while [ $# -gt 0 ]; do
-  if [ "$1" = "--file" ]; then shift; printf 'moitie' > "$1"; fi
-  shift
-done
-echo "pg_dump: error: password secret@mdp rejected" >&2
-exit 1"#,
-    );
+    let pg_dump = faux_pg_dump(tmp.path(), "pg-dump-echec.sh");
 
     let err = create_pg_backup(URL, &backups, &pg_dump).unwrap_err();
 
@@ -155,8 +128,7 @@ fn elagage_garde_cinq_dumps_et_ne_touche_pas_aux_sauvegardes_sqlite_7288() {
         fs::write(backups.join(format!("tune_pg_2020010{i}_000000.dump")), "x").unwrap();
     }
     fs::write(backups.join("tune_20200101_000000.db"), "sqlite").unwrap();
-    let journal = tmp.path().join("journal.txt");
-    let pg_dump = faux_pg_dump_qui_reussit(tmp.path(), &journal);
+    let pg_dump = faux_pg_dump(tmp.path(), "pg-dump-ok.sh");
 
     let info = create_pg_backup(URL, &backups, &pg_dump).unwrap();
 
@@ -188,14 +160,7 @@ fn mot_de_passe_en_parametre_retire_de_l_url_7288() {
 fn pg_dump_bloque_est_arrete_au_delai_sans_laisser_de_fichier_7288() {
     let tmp = tempfile::tempdir().unwrap();
     let backups = tmp.path().join("backups");
-    let pg_dump = faux_pg_dump(
-        tmp.path(),
-        r#"while [ $# -gt 0 ]; do
-  if [ "$1" = "--file" ]; then shift; printf 'debut' > "$1"; fi
-  shift
-done
-exec sleep 30"#,
-    );
+    let pg_dump = faux_pg_dump(tmp.path(), "pg-dump-bloque.sh");
 
     let debut = std::time::Instant::now();
     let err = create_pg_backup_avec_delai(URL, &backups, &pg_dump, Duration::from_millis(300))
@@ -220,11 +185,8 @@ exec sleep 30"#,
 fn pg_dump_sans_droit_d_execution_le_dit_7288() {
     let tmp = tempfile::tempdir().unwrap();
     let backups = tmp.path().join("backups");
-    let script = faux_pg_dump(tmp.path(), "exit 0");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
-    }
+    let script = tmp.path().join("pg_dump_sans_permission");
+    fs::File::create(&script).unwrap();
 
     let err = create_pg_backup(URL, &backups, &script).unwrap_err();
 
@@ -237,8 +199,7 @@ fn pg_dump_sans_droit_d_execution_le_dit_7288() {
 fn deux_sauvegardes_dans_la_meme_seconde_gardent_deux_fichiers_7288() {
     let tmp = tempfile::tempdir().unwrap();
     let backups = tmp.path().join("backups");
-    let journal = tmp.path().join("journal.txt");
-    let pg_dump = faux_pg_dump_qui_reussit(tmp.path(), &journal);
+    let pg_dump = faux_pg_dump(tmp.path(), "pg-dump-ok.sh");
 
     let mut fichiers = Vec::new();
     for _ in 0..3 {

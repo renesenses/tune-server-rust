@@ -772,6 +772,7 @@ impl LibrespotDaemon {
     fn preparer_le_script(&self) -> Option<String> {
         #[cfg(unix)]
         {
+            use std::io::Write;
             use std::os::unix::fs::PermissionsExt;
             let mut garde = self.dossier_script.lock().ok()?;
             if garde.is_none() {
@@ -788,8 +789,18 @@ impl LibrespotDaemon {
                 warn!(chemin = %texte, "librespot_onevent_chemin_avec_espace");
                 return None;
             }
-            std::fs::write(&chemin, script_onevent()).ok()?;
-            std::fs::set_permissions(&chemin, std::fs::Permissions::from_mode(0o700)).ok()?;
+            if !chemin.exists() {
+                // Fermer le seul descripteur en écriture avant de publier le
+                // nom que librespot exécute, y compris lors d’un redémarrage.
+                let mut fichier = tempfile::NamedTempFile::new_in(garde.as_ref()?.path()).ok()?;
+                fichier
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o700))
+                    .ok()?;
+                fichier.write_all(script_onevent().as_bytes()).ok()?;
+                let temporaire = fichier.into_temp_path();
+                temporaire.persist(&chemin).ok()?;
+            }
             Some(texte)
         }
         #[cfg(not(unix))]
@@ -1609,11 +1620,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn evenement_6018_le_script_relaie_les_variables_de_librespot() {
-        let dossier = tempfile::tempdir().unwrap();
-        let script = dossier.path().join("onevent.sh");
-        std::fs::write(&script, script_onevent()).unwrap();
-        let sortie = std::process::Command::new("/bin/sh")
-            .arg(&script)
+        let daemon = LibrespotDaemon::new("banc".into(), None, None);
+        let script = daemon.preparer_le_script().expect("script publié");
+        use std::os::unix::fs::MetadataExt;
+        let inode = std::fs::metadata(&script).unwrap().ino();
+        let ouvert = std::fs::File::open(&script).unwrap();
+        ouvert
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(
+            daemon.preparer_le_script().as_deref(),
+            Some(script.as_str())
+        );
+        assert_eq!(std::fs::metadata(&script).unwrap().ino(), inode);
+        assert_eq!(
+            ouvert.metadata().unwrap().modified().unwrap(),
+            std::time::SystemTime::UNIX_EPOCH
+        );
+        assert_eq!(ouvert.metadata().unwrap().mode() & 0o777, 0o700);
+        let sortie = std::process::Command::new(&script)
             .env("PLAYER_EVENT", "track_changed")
             .env("TRACK_ID", "4uLU6hMCjMI75M1A2tKUQC")
             .env("DURATION_MS", "213000")
@@ -1640,11 +1665,9 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn poser(dossier: &Path, texte: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+    fn poser(dossier: &Path, fixture: &str) -> PathBuf {
         let bin = dossier.join("librespot");
-        std::fs::write(&bin, texte).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_scratch::lier_executable(&bin, fixture);
         bin
     }
 
@@ -1655,7 +1678,7 @@ mod tests {
     fn binaire_6018_trouve_hors_du_path() {
         let vide = tempfile::tempdir().unwrap();
         let brew = tempfile::tempdir().unwrap();
-        let bin = poser(brew.path(), "#!/bin/sh\n");
+        let bin = poser(brew.path(), "shell-vide.sh");
         let path = std::ffi::OsString::from(vide.path());
         let systeme = |chemin: &PathBuf| {
             Some(BinaireLibrespot {
@@ -1692,11 +1715,8 @@ mod tests {
     fn binaire_6933_le_librespot_fourni_passe_avant_un_tiers_du_path() {
         let tune = tempfile::tempdir().unwrap();
         let usr_local = tempfile::tempdir().unwrap();
-        let fourni = poser(tune.path(), "\x7fELF faux binaire fourni");
-        let tiers = poser(
-            usr_local.path(),
-            "#!/bin/sh\nexec librespot-real --username \"VOTRE_EMAIL_SPOTIFY\" \"$@\"\n",
-        );
+        let fourni = poser(tune.path(), "en-tete-elf");
+        let tiers = poser(usr_local.path(), "librespot-tiers.sh");
         let path = std::ffi::OsString::from(usr_local.path());
         let retenu = chercher_librespot(
             None,
@@ -1749,7 +1769,7 @@ mod tests {
             None,
             "aucun librespot : rien"
         );
-        let place = poser(tune.path(), "");
+        let place = poser(tune.path(), "vide");
         assert_eq!(
             chercher_librespot(Some(&place), Some(tune.path()), Some(&path), &[]),
             None,
@@ -1762,7 +1782,7 @@ mod tests {
     #[tokio::test]
     async fn binaire_6933_version_lue_sans_executer_un_script() {
         let d = tempfile::tempdir().unwrap();
-        let script = poser(d.path(), "#!/bin/sh\necho librespot 9.9.9\n");
+        let script = poser(d.path(), "librespot-version.sh");
         assert_eq!(version_de_librespot(&script).await, None);
         // `/bin/echo` n'est pas un script : sa première ligne est relue
         // (« --version » en BSD, la version de coreutils en GNU).
@@ -1776,10 +1796,7 @@ mod tests {
     async fn nom_2778_le_nom_choisi_atteint_librespot() {
         let dossier = tempfile::tempdir().unwrap();
         // Un faux librespot qui relève ses arguments et reste en vie.
-        let bin = poser(
-            dossier.path(),
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/args\"\nexec sleep 30\n",
-        );
+        let bin = poser(dossier.path(), "librespot-arguments.sh");
         let args = dossier.path().join("args");
         let recepteur = SpotifyConnectManager::avec_binaire(
             NOM_PAR_DEFAUT.into(),

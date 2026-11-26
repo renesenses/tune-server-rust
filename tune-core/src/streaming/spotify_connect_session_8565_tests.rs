@@ -191,9 +191,7 @@ mod avec_un_faux_librespot {
     fn recepteur(dossier: &std::path::Path) -> Arc<SpotifyConnectManager> {
         let bin = dossier.join("librespot");
         // Chaque session a ses propres ordres. Le script exécuté reste en lecture seule.
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/spotify-connect/faux-librespot.sh");
-        std::os::unix::fs::symlink(script, &bin).unwrap();
+        crate::test_scratch::lier_executable(&bin, "spotify-session.sh");
         Arc::new(SpotifyConnectManager::avec_binaire(
             "Tune".into(),
             0,
@@ -679,15 +677,9 @@ mod avec_un_faux_librespot {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn premium_8565_un_compte_gratuit_est_dit_par_le_statut() {
-    use std::os::unix::fs::PermissionsExt;
     let dossier = tempfile::tempdir().unwrap();
     let bin = dossier.path().join("librespot");
-    std::fs::write(
-        &bin,
-        "#!/bin/sh\necho '[2026-11-12T12:00:00Z ERROR librespot] could not initialize spirc: Permission denied { PremiumAccountRequired }' >&2\nexec sleep 30\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_scratch::lier_executable(&bin, "spotify-session-premium.sh");
     let recepteur = SpotifyConnectManager::avec_binaire(
         "Tune".into(),
         0,

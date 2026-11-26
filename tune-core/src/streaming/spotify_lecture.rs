@@ -738,45 +738,13 @@ pub(crate) mod essais {
     //! Un faux librespot (script `sh`) et un faux pilote, partagés avec les
     //! témoins de l'orchestrateur. Aucun compte Spotify n'est touché.
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     /// Le faux librespot : relève ses arguments, puis attend qu'on lui
     /// demande de jouer (le fichier `jouer`, écrit par le faux pilote comme
     /// l'API Web le demanderait au vrai). Il écrit alors `N` octets 0x55 sur
     /// sa sortie standard, entourés des évènements `--onevent` d'un vrai.
-    const FAUX_LIBRESPOT: &str = r#"#!/bin/sh
-D=$(dirname "$0")
-printf '%s\n' "$*" > "$D/args"
-printf '%s' "$LIBRESPOT_ACCESS_TOKEN" > "$D/jeton"
-EV=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --onevent) EV="$2"; shift ;;
-  esac
-  shift
-done
-while :; do
-  if [ -f "$D/jouer" ]; then
-    read N P < "$D/jouer"
-    rm -f "$D/jouer"
-    case "$P" in
-      *cleRefusee*)
-        # #8565 : Spotify refuse la clé audio (librespot #1649).
-        [ -n "$EV" ] && PLAYER_EVENT=loading TRACK_ID="$P" $EV
-        echo "[2026-11-12T20:49:00Z ERROR librespot_core::audio_key] error audio key 0 1" >&2
-        echo "[2026-11-12T20:49:00Z ERROR librespot_playback::player] Skipping to next track, unable to load track <SpotifyUri>: ()" >&2
-        [ -n "$EV" ] && PLAYER_EVENT=unavailable TRACK_ID="$P" $EV
-        continue ;;
-    esac
-    [ -n "$EV" ] && PLAYER_EVENT=track_changed TRACK_ID="$P" NAME="Titre essai" $EV
-    [ -n "$EV" ] && PLAYER_EVENT=playing TRACK_ID="$P" POSITION_MS=0 $EV
-    head -c "$N" /dev/zero | tr '\000' '\125'
-    [ -n "$EV" ] && PLAYER_EVENT=end_of_track TRACK_ID="$P" $EV
-  fi
-  sleep 0.05
-done
-"#;
+    const FAUX_LIBRESPOT: &str = "spotify-lecture.sh";
 
     pub(crate) struct Banc {
         pub dossier: tempfile::TempDir,
@@ -818,8 +786,7 @@ done
     ) -> Banc {
         let dossier = tempfile::tempdir().unwrap();
         let bin = dossier.path().join("librespot");
-        std::fs::write(&bin, FAUX_LIBRESPOT).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_scratch::lier_executable(&bin, FAUX_LIBRESPOT);
         let cache = dossier.path().join("identifiants");
         if identifiants {
             std::fs::create_dir_all(&cache).unwrap();
@@ -1095,11 +1062,7 @@ done
 
     /// #6933 — le librespot 0.8.0 du testeur : Spotify refuse la connexion
     /// (`INVALID_CREDENTIALS`), librespot l'écrit sur stderr puis sort (1).
-    const LIBRESPOT_REFUSE: &str = r#"#!/bin/sh
-echo "[2026-10-20T18:02:11Z INFO  librespot] librespot 0.8.0 (Built on 2025-10-01)" >&2
-echo "[2026-10-20T18:02:12Z ERROR librespot] could not initialize spirc: Invalid state { Login request was denied: INVALID_CREDENTIALS }" >&2
-exit 1
-"#;
+    const LIBRESPOT_REFUSE: &str = "spotify-refus.sh";
 
     /// L'API Web accepte le jeton, mais l'appareil librespot n'apparaît pas.
     struct PiloteAppareilAbsent {
@@ -1128,8 +1091,7 @@ exit 1
     fn refus_6933(portee: Option<bool>) -> (String, String) {
         let dossier = tempfile::tempdir().unwrap();
         let bin = dossier.path().join("librespot");
-        std::fs::write(&bin, LIBRESPOT_REFUSE).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_scratch::lier_executable(&bin, LIBRESPOT_REFUSE);
         let binaire = bin.to_string_lossy().into_owned();
         let recepteur = Arc::new(SpotifyConnectManager::avec_binaire(
             "Tune".into(),
@@ -1249,11 +1211,7 @@ exit 1
 
     /// #8764 — librespot connecté qui refuse une commande Spotify Connect
     /// (`StateError::NoContext`, écrit par `handle_connect_state_request`).
-    const LIBRESPOT_SANS_CONTEXTE: &str = r#"#!/bin/sh
-echo "[2026-11-14T10:00:00Z INFO  librespot] librespot 0.8.0 (Built on 2025-10-01)" >&2
-echo "[2026-11-14T10:00:01Z ERROR librespot_connect::spirc] failed to handle request: Invalid state { context is not available. type: Default }" >&2
-exit 1
-"#;
+    const LIBRESPOT_SANS_CONTEXTE: &str = "spotify-sans-contexte.sh";
 
     /// #8764 — le `PUT /me/player/play` de Tune échoue (l'API Web répond).
     struct PiloteLectureRefusee;
@@ -1437,17 +1395,12 @@ exit 1
     /// Compte Spotify GRATUIT : le point d'accès refuse librespot 0.8.0
     /// (`login_error_message` : « Premium account required »), l'appareil
     /// n'apparaît jamais.
-    const LIBRESPOT_COMPTE_GRATUIT: &str = r#"#!/bin/sh
-echo "[2026-11-12T10:00:00Z INFO  librespot] librespot 0.8.0 (Built on 2025-10-01)" >&2
-echo "[2026-11-12T10:00:01Z ERROR librespot] could not initialize spirc: Login failed with reason: Premium account required" >&2
-exit 1
-"#;
+    const LIBRESPOT_COMPTE_GRATUIT: &str = "spotify-gratuit.sh";
 
     fn refus_avec(script: &str, pilote: Arc<dyn PiloteSpotify>) -> String {
         let dossier = tempfile::tempdir().unwrap();
         let bin = dossier.path().join("librespot");
-        std::fs::write(&bin, script).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_scratch::lier_executable(&bin, script);
         let recepteur = Arc::new(SpotifyConnectManager::avec_binaire(
             "Tune".into(),
             0,

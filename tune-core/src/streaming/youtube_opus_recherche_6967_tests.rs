@@ -336,16 +336,7 @@ fn la_sortie_de_yt_dlp_dit_quand_le_flux_est_servi() {
 /// Un faux yt-dlp : comme le vrai sans compte (client `TVHTML5`), il rend une
 /// URL que le serveur ne sert qu'à partir de `available_at`, deux secondes
 /// plus tard — s'il lui est demandé de le dire.
-const FAUX_YTDLP: &str = r#"#!/bin/sh
-DISPO=NA
-for a in "$@"; do
-  [ "$a" = 'tune-disponible=%(available_at)s' ] && DISPO=$(( $(date +%s) + 2 ))
-done
-echo "$TUNE_FAUX_FLUX/$DISPO"
-echo '{"User-Agent": "Mozilla/5.0"}'
-echo 'tune-format=251,opus,128.93'
-echo "tune-disponible=$DISPO"
-"#;
+const FAUX_YTDLP: &str = "yt-dlp-disponible.sh";
 
 /// Le flux du faux googlevideo : 403 avant l'instant inscrit dans l'URL, 206
 /// et le début d'un WebM ensuite (constaté le 27/10/2026 : 403 à la sortie de
@@ -365,7 +356,6 @@ async fn faux_flux(
 
 #[tokio::test]
 async fn le_flux_de_yt_dlp_n_est_demande_qu_une_fois_servi() {
-    use std::os::unix::fs::PermissionsExt;
     let app = Router::new().route("/flux/{dispo}", axum::routing::get(faux_flux));
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let adresse = ecoute.local_addr().unwrap();
@@ -374,9 +364,12 @@ async fn le_flux_de_yt_dlp_n_est_demande_qu_une_fois_servi() {
     let dossier = tempfile::tempdir().unwrap();
     let binaire = dossier.path().join("yt-dlp");
     // Le flux du faux serveur, lu par le script : `$TUNE_FAUX_FLUX/<instant>`.
-    let script = FAUX_YTDLP.replace("$TUNE_FAUX_FLUX", &format!("http://{adresse}/flux"));
-    std::fs::write(&binaire, script).unwrap();
-    std::fs::set_permissions(&binaire, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        dossier.path().join("flux-url"),
+        format!("http://{adresse}/flux"),
+    )
+    .unwrap();
+    crate::test_scratch::lier_executable(&binaire, FAUX_YTDLP);
 
     let flux = extraire_par_ytdlp(&binaire, "dQw4w9WgXcQ")
         .await
