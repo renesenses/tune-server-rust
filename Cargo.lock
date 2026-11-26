@@ -3608,6 +3608,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -6465,6 +6466,7 @@ version = "1.0.0"
 dependencies = [
  "async-trait",
  "axum",
+ "nix",
  "rand 0.8.7",
  "reqwest",
  "serde",
