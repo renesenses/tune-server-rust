@@ -3921,3 +3921,120 @@ async fn pg_916_suggestions_ecartees() {
     assert!(repo.lister(1).unwrap().is_empty());
     pool.close().await;
 }
+
+/// rc14 — la migration PG 124 : le profil 1 `default` / `Default` devient
+/// `admin` / `Admin`, sauf nom choisi par l'utilisateur ou `admin` déjà pris ;
+/// `default` reste l'alias du profil 1 à la connexion. Même règle que la
+/// SQLite 158 (`profil_administrateur`).
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_profil_admin_rc14() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::profil_administrateur as pa;
+
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool.clone()));
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("runner sur la base de test");
+    let migration_124 =
+        include_str!("../../migrations/postgres/124_profil_administrateur_admin.sql");
+    let jouer_la_124 = || async {
+        sqlx::raw_sql(migration_124)
+            .execute(&pool)
+            .await
+            .expect("migration 124");
+    };
+    let profil_1 = || -> (String, Option<String>) {
+        let r = db
+            .query_one(
+                "SELECT username, display_name FROM profiles WHERE id = 1",
+                &[],
+            )
+            .unwrap()
+            .expect("profil 1");
+        (
+            r[0].as_string().unwrap(),
+            r.get(1).and_then(|v| v.as_string()),
+        )
+    };
+    let poser = |nom: &str, affiche: &str| {
+        db.execute(
+            "UPDATE profiles SET username = ?, display_name = ? WHERE id = 1",
+            &[&nom as &dyn ToSqlValue, &affiche as &dyn ToSqlValue],
+        )
+        .unwrap();
+    };
+    let par_nom_saisi = |nom: &str| -> Option<i64> {
+        db.query_one(
+            &format!(
+                "SELECT id FROM profiles WHERE {}",
+                pa::SQL_PROFIL_PAR_NOM_DE_CONNEXION
+            ),
+            &[&nom as &dyn ToSqlValue, &nom as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+    };
+    let _ = db.execute(
+        "DELETE FROM profiles WHERE username IN ('admin', 'Admin') AND id <> 1",
+        &[],
+    );
+
+    // Base migrée : admin / Admin, `default` en est l'alias.
+    assert_eq!(profil_1().0, "admin");
+    assert_eq!(par_nom_saisi("admin"), Some(1));
+    assert_eq!(par_nom_saisi("default"), Some(1));
+    assert_eq!(par_nom_saisi("personne"), None);
+
+    // Base ancienne restée en `default` : renommée.
+    poser("default", "Default");
+    jouer_la_124().await;
+    assert_eq!(profil_1(), ("admin".into(), Some("Admin".into())));
+
+    // La constante fait la même chose que le fichier.
+    poser("default", "Default");
+    db.execute(pa::SQL_RENOMMER_LE_PROFIL_D_ORIGINE, &[])
+        .unwrap();
+    assert_eq!(profil_1(), ("admin".into(), Some("Admin".into())));
+
+    // Nom affiché choisi : gardé.
+    poser("default", "Bertrand");
+    jouer_la_124().await;
+    assert_eq!(profil_1(), ("admin".into(), Some("Bertrand".into())));
+
+    // Profil 1 renommé par l'utilisateur : inchangé, alias intact.
+    poser("bertrand", "Default");
+    jouer_la_124().await;
+    assert_eq!(profil_1(), ("bertrand".into(), Some("Default".into())));
+    assert_eq!(par_nom_saisi("default"), Some(1));
+
+    // Un autre profil déjà nommé `admin` : pas de collision.
+    poser("default", "Default");
+    let autre = db
+        .execute_returning_id(
+            "INSERT INTO profiles (username, display_name) VALUES ('admin', 'Admin du foyer')",
+            &[],
+        )
+        .unwrap();
+    jouer_la_124().await;
+    assert_eq!(profil_1(), ("default".into(), Some("Default".into())));
+    let pris: i64 = sqlx::query_scalar(pa::SQL_NOM_ADMIN_DEJA_PRIS)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(pris, 1);
+    assert_eq!(par_nom_saisi("default"), Some(1));
+    assert_eq!(par_nom_saisi("admin"), Some(autre));
+
+    // Remise en état.
+    db.execute(
+        "DELETE FROM profiles WHERE id = ?",
+        &[&autre as &dyn ToSqlValue],
+    )
+    .unwrap();
+    poser("admin", "Admin");
+}

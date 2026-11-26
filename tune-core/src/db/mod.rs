@@ -93,6 +93,8 @@ pub mod politique_parentale;
 pub mod postgres;
 #[cfg(all(test, feature = "postgres"))]
 mod postgres_e2e;
+/// rc14 — le profil administrateur d'origine `admin`, et l'alias `default`.
+pub mod profil_administrateur;
 pub mod profile_repo;
 /// #6682 — le temps d'écoute radio par station (« Mon écoute »).
 pub mod radio_ecoute;

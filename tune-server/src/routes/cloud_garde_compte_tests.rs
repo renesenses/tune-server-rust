@@ -53,7 +53,7 @@ fn activer_l_authentification(state: &AppState) -> (String, String) {
     reglages.set("jwt_secret", "secret-de-banc").unwrap();
     reglages.set("auth_enabled", "true").unwrap();
     let profils = ProfileRepo::with_backend(state.backend.clone());
-    let admin = profils.create("admin", Some("Admin"), None).unwrap();
+    let admin = profils.create("gerant", Some("Gérant"), None).unwrap();
     let invite = profils.create("invite", Some("Invité"), None).unwrap();
     (
         crate::auth::sign_jwt(admin, "admin", "secret-de-banc").unwrap(),
