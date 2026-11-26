@@ -584,11 +584,15 @@ en tâche de fond, en cache) :
   `modulator_failed`.
 - **Niveau** : 0 dBFS PCM = 50 % de modulation = 0 dB SACD (T11b), limiteur
   de sécurité à 60 %. L'étage de modulation a SA marge, −3 dB
-  (`MARGE_DU_MODULATEUR_DB`), indépendante du headroom automatique de la
-  chaîne PCM : appliquée en automatique, et plancher d'un headroom manuel
-  (un manuel plus fort, −6 dB, est gardé ; un plus faible, 0 dB, ne descend
-  pas sous −3 dB). Une crête intersample à +3 dB n'atteint jamais le
-  limiteur.
+  (`MARGE_DU_MODULATEUR_DB`), toujours AJOUTÉE une fois au headroom de la
+  chaîne (automatique ou manuel, lui-même appliqué une fois) : manuel à
+  −12 dB, −15 dB avant le modulateur. Une crête intersample à +3 dB
+  n'atteint jamais le limiteur. **Affichage (décision du 26/11)** : l'étage
+  `headroom` publie la marge de l'utilisateur telle quelle (`db` : −12) ; la
+  marge du modulateur est publiée à part, à l'étape `dsd_modulator`
+  (`params.modulator_margin_db` : −3), et le client l'affiche sur sa propre
+  ligne, « Marge du modulateur DSD : −3 dB », sans jamais la fondre dans un
+  total.
 - **`status`** : `unknown` tant que la sortie de la zone n'a jamais pu être
   lue (sortie occupée, nom du périphérique jamais vu) : `targets` est alors
   vide et le `PUT` ne refuse rien (la lecture décide et le dit).
@@ -632,8 +636,8 @@ en tâche de fond, en cache) :
   s'arrête et abandonne son relais plutôt que de rester bloqué.
 
 Sur le chemin résolu, une cible acceptée ajoute à l'étape `dsd_modulator`
-`order`, `rate_hz`, `transport`, `dop_rate_hz` et `zero_dbfs_modulation`
-(0,5) ; le chemin du signal (T16) de la piste qui joue y ajoute
+`order`, `rate_hz`, `transport`, `dop_rate_hz`, `zero_dbfs_modulation`
+(0,5) et `modulator_margin_db` (−3) ; le chemin du signal (T16) de la piste qui joue y ajoute
 `carrier_rate_hz`, `source_rate_hz`, `source_channels`, `channels`,
 `continued` et `reference_level` (« 0 dB SACD »).
 
