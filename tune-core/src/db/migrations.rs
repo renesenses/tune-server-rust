@@ -3003,6 +3003,18 @@ UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipnouveautes-hi
 UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipreggae-hifi.aac?id=radiofrance' WHERE url = 'https://icecast.radiofrance.fr/fipreggae-hifi.aac';
 UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac?id=radiofrance' WHERE url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac';
 ",
+    },    // rc14 — la session renouvelée tant qu'elle sert : les jetons de
+    // renouvellement (`POST /auth/refresh`). Seule l'empreinte SHA-256 du
+    // jeton est stockée, comme les clés Subsonic (139). Jumelle PG : 125.
+    // ⚠️ Numérotée 159 / PG 125 le 26/11 : la 158 / PG 124 est réservée par
+    // #9562 (profil administrateur « admin »), à fusionner AVANT celle-ci —
+    // sinon les gardes de contiguïté (`migration_count_matches`,
+    // `pg_migrations_are_contiguous_and_include_numeric_heals`) rougissent,
+    // et il faut renuméroter.
+    Migration {
+        version: 159,
+        name: "jetons_de_renouvellement",
+        up: include_str!("../../migrations/jetons_de_renouvellement.sql"),
     },
 ];
 
@@ -6502,6 +6514,12 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         123,
         "queue_items_format_streaming",
         include_str!("../../migrations/postgres/123_queue_items_format_streaming.sql"),
+    ),    // Jumelle de la SQLite 159 (rc14) : les jetons de renouvellement de
+    // session. 124 est réservée par #9562, à fusionner avant.
+    (
+        125,
+        "jetons_de_renouvellement",
+        include_str!("../../migrations/postgres/125_jetons_de_renouvellement.sql"),
     ),
 ];
 
@@ -10577,7 +10595,10 @@ mod tests {
         // SQLite 155. Migration de DONNÉES : annule la bascule de la 118
         // (neutralisée) là où elle a eu lieu, DEFAULT '0'.
         // 123 : format des pistes UPnP en file (#8788), SQLite 156.
-        assert_eq!(pg_latest_version(), 123, "latest PG migration must be 123");
+        // 124 : profil administrateur « admin » (#9562), SQLite 158.
+        // 125 : `jetons_de_renouvellement` (session renouvelée, rc14),
+        // jumelle de la SQLite 159. Crée la table que `/auth/refresh` NOMME.
+        assert_eq!(pg_latest_version(), 125, "latest PG migration must be 125");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

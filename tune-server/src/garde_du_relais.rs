@@ -161,7 +161,10 @@ fn route_d_api_relayable(m: &Method, api: &str, auth_active: bool) -> bool {
     if auth_active
         && matches!(
             (m.as_str(), api),
-            ("POST", "/auth/login") | ("POST", "/auth/logout") | ("GET", "/auth/me")
+            ("POST", "/auth/login")
+                | ("POST", "/auth/refresh")
+                | ("POST", "/auth/logout")
+                | ("GET", "/auth/me")
         )
     {
         return true;
@@ -464,6 +467,16 @@ mod tests {
         ));
         assert!(chemin_relayable(&Method::POST, "/api/v1/auth/login", true));
         assert!(chemin_relayable(&Method::GET, "/api/v1/auth/me", true));
+        // rc14 — le renouvellement de session passe par le relais comme la
+        // connexion (une app en 5G renouvelle par le pont), jamais sans
+        // authentification active.
+        assert!(chemin_relayable(&Method::POST, "/api/v1/auth/refresh", true));
+        assert!(!chemin_relayable(
+            &Method::POST,
+            "/api/v1/auth/refresh",
+            false
+        ));
+        assert!(!chemin_relayable(&Method::GET, "/api/v1/auth/refresh", true));
         // Même authentifié, l'administration reste locale.
         assert!(!chemin_relayable(&Method::POST, "/api/v1/auth/token", true));
         assert!(!chemin_relayable(

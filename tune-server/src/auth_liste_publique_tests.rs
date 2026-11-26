@@ -50,6 +50,7 @@ const TABLEAU_ATTENDU: &[&str] = &[
     "HEAD /api/v1/system/version",
     "POST /api/v1/auth/login",
     "POST /api/v1/auth/logout",
+    "POST /api/v1/auth/refresh",
 ];
 
 fn etat_sous_authentification() -> (tempfile::TempDir, AppState) {
@@ -204,6 +205,7 @@ async fn les_routes_publiques_voulues_repondent_sans_jeton() {
     // mais jamais le refus de la couche.
     for (methode, uri) in [
         (Method::POST, "/api/v1/auth/login"),
+        (Method::POST, "/api/v1/auth/refresh"),
         (Method::POST, "/api/v1/auth/logout"),
         (Method::GET, "/api/v1/cloud/sso/callback"),
         (Method::GET, "/api/v1/sources-reseau/essai-1/fichier"),

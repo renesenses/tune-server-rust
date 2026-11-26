@@ -296,6 +296,12 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
 #[cfg_attr(not(test), allow(dead_code))]
 const TABLES_NON_COPIEES: &[(&str, &str)] = &[
     (
+        "jetons_de_renouvellement",
+        "sessions renouvelables (rc14) : créées par le script PG 125 ; après une bascule \
+         de moteur, chaque appareil se reconnecte une fois, comme après un renouvellement \
+         des secrets",
+    ),
+    (
         "sync_releve_pistes_neuf",
         "état courant figé le temps d'une comparaison (#8239) : vide en dehors d'elle",
     ),

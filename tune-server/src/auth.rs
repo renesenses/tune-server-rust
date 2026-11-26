@@ -45,7 +45,10 @@ pub struct JwtClaims {
 
 /// Durée d'une session ordinaire : 24 h.
 pub const DUREE_SESSION: u64 = 86400;
-/// Durée d'une session « rester connecté » (`"remember": true`) : 30 jours.
+/// Durée d'une session « rester connecté » (`"remember": true`) : 30 jours,
+/// GLISSANTS (rc14) — le jeton d'accès, lui, dure 24 h ([`DUREE_SESSION`]) et
+/// se renouvelle par `POST /auth/refresh` ; chaque renouvellement reporte
+/// l'échéance de la session à 30 jours.
 pub const DUREE_SESSION_LONGUE: u64 = 30 * 86400;
 
 pub fn sign_jwt(user_id: i64, role: &str, secret: &str) -> Result<String, String> {
@@ -233,6 +236,18 @@ fn effacer_sessions_longues(settings: &SettingsRepo) {
     {
         settings.delete(&cle).ok();
     }
+    // rc14 — et leurs jetons de renouvellement.
+    crate::session_renouvelee::revoquer_tout(settings.backend());
+}
+
+/// Désinscrit UNE session : son inscription (ses jetons d'accès ne valent
+/// plus rien) et sa famille de jetons de renouvellement (rc14). Les
+/// WebSocket ouvertes avec elle se ferment.
+fn oublier_session(settings: &SettingsRepo, sid: &str) {
+    settings
+        .delete(&format!("{PREFIXE_SESSION_LONGUE}{sid}"))
+        .ok();
+    crate::session_renouvelee::revoquer_famille(settings.backend(), sid);
 }
 
 /// Vérifie un jeton de session : signature et échéance, puis, pour une
@@ -243,8 +258,20 @@ pub fn verifier_jeton(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
 ) -> Result<JwtClaims, String> {
     let claims = verify_jwt(token, secret)?;
+    verifier_session(&claims, backend)?;
+    Ok(claims)
+}
+
+/// La session d'un jeton (son `sid`) vit-elle encore : inscrite, non échue,
+/// même compte, même rôle, même mot de passe ? Un jeton sans `sid` (session
+/// ordinaire) n'a rien à vérifier ici. Sert aussi aux WebSocket ouvertes
+/// (rc14), dont le jeton peut avoir expiré depuis la poignée de main.
+pub fn verifier_session(
+    claims: &JwtClaims,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Result<(), String> {
     let Some(sid) = claims.sid.as_deref() else {
-        return Ok(claims);
+        return Ok(());
     };
     let settings = SettingsRepo::with_backend(backend.clone());
     let session = settings
@@ -253,6 +280,9 @@ pub fn verifier_jeton(
         .flatten()
         .and_then(|v| serde_json::from_str::<SessionLongue>(&v).ok())
         .ok_or_else(|| "session revoked".to_string())?;
+    if session.expires_at <= maintenant_unix() {
+        return Err("session expired".to_string());
+    }
     let user_id = claims.sub.parse::<i64>().unwrap_or(-1);
     if session.user_id != user_id || session.role != claims.role {
         return Err("session revoked".to_string());
@@ -262,7 +292,21 @@ pub fn verifier_jeton(
     if empreinte != session.empreinte || (claims.role == "admin" && !is_admin) {
         return Err("session revoked".to_string());
     }
-    Ok(claims)
+    Ok(())
+}
+
+/// La signature seule, sans l'échéance : pour retrouver, à la déconnexion, la
+/// session d'un jeton d'accès déjà expiré. Jamais pour autoriser.
+fn verify_jwt_signature_seule(token: &str, secret: &str) -> Option<JwtClaims> {
+    let mut validation = Validation::default();
+    validation.validate_exp = false;
+    jsonwebtoken::decode::<JwtClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .ok()
+    .map(|data| data.claims)
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +404,7 @@ const LECTURE: &[&str] = &["GET", "HEAD"];
 /// * `/cloud/sso/callback` (GET) : seul le retour du SSO est public (A5), le
 ///   navigateur y revient de mozaiklabs.fr ; `authorize`, `status` et
 ///   `disconnect` demandent une session ;
-/// * `/auth/login`, `/auth/logout` (POST), `/auth/config` et
+/// * `/auth/login`, `/auth/refresh`, `/auth/logout` (POST), `/auth/config` et
 ///   `/auth/activation` (GET, lecture de l'état seulement). Le reste de
 ///   `/auth/` — inscription (seul un administrateur crée des comptes une fois
 ///   l'authentification active), émission de jeton, clé d'API, écriture de la
@@ -381,6 +425,7 @@ pub(crate) const LISTE_PUBLIQUE: &[(&str, &[&str])] = &[
     ("/system/peer-info", &["GET"]),
     ("/cloud/sso/callback", &["GET"]),
     ("/auth/login", &["POST"]),
+    ("/auth/refresh", &["POST"]),
     ("/auth/logout", &["POST"]),
     ("/auth/config", &["GET"]),
     ("/auth/activation", &["GET"]),
@@ -720,16 +765,42 @@ pub fn ws_authorized(
     if !auth_enabled {
         return true;
     }
+    ws_session(state, headers, query_token).is_some()
+}
 
-    if extract_token_from_headers(headers)
-        .is_some_and(|tok| valider_jeton(&tok, &settings).is_some())
+/// La poignée de main d'une WebSocket, authentification active : `None` si
+/// elle est refusée, sinon les revendications du JWT de SESSION qui l'a
+/// ouverte (`Some(None)` : clé d'API, cookie ou jeton sans `sid`).
+///
+/// rc14 — une WebSocket ouverte n'est PAS coupée à l'expiration de son jeton
+/// d'accès (24 h) : la poignée de main l'a authentifiée. Elle se ferme
+/// seulement quand SA session cesse de valoir ([`verifier_session`]) :
+/// déconnexion, révocation, mot de passe changé, compte supprimé ou
+/// rétrogradé. Voir `routes/ws.rs`.
+pub fn ws_session(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    query_token: Option<&str>,
+) -> Option<Option<JwtClaims>> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let session = |tok: &str| -> Option<JwtClaims> {
+        let secret = settings.get("jwt_secret").ok().flatten()?;
+        verify_jwt(tok, &secret).ok().filter(|c| c.sid.is_some())
+    };
+    if let Some(tok) = extract_token_from_headers(headers)
+        && valider_jeton(&tok, &settings).is_some()
     {
-        return true;
+        return Some(if tok.starts_with("ApiKey:") {
+            None
+        } else {
+            session(&tok)
+        });
     }
     // Le paramètre du handshake accepte uniquement un JWT.
     query_token
         .filter(|tok| !tok.is_empty() && !tok.starts_with("ApiKey:"))
-        .is_some_and(|tok| valider_jeton(tok, &settings).is_some())
+        .filter(|tok| valider_jeton(tok, &settings).is_some())
+        .map(session)
 }
 
 // ---------------------------------------------------------------------------
@@ -1464,6 +1535,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/register", post(register))
         .route("/login", post(login))
+        .route("/refresh", post(refresh))
         .route("/logout", post(logout))
         .route("/me", get(me))
         .route("/token", post(create_token))
@@ -1841,11 +1913,10 @@ async fn login(
 
     let role = if is_admin { "admin" } else { "user" };
     let secret = get_or_create_jwt_secret(&settings);
-    let duree = if body.remember {
-        DUREE_SESSION_LONGUE
-    } else {
-        DUREE_SESSION
-    };
+    // rc14 — le jeton d'accès dure toujours 24 h. « Rester connecté » inscrit
+    // en plus une session de 30 jours glissants et rend son jeton de
+    // renouvellement (`POST /auth/refresh`).
+    let duree = DUREE_SESSION;
     let sid = if body.remember {
         let sid = uuid::Uuid::new_v4().simple().to_string();
         let empreinte = etat_du_compte(&state.backend, profile_id)
@@ -1879,9 +1950,7 @@ async fn login(
         du_compte.sort_by_key(|(_, s)| (s.created_at, s.ordre));
         let en_trop = (du_compte.len() + 1).saturating_sub(MAX_SESSIONS_LONGUES_PAR_COMPTE);
         for (ancien, _) in du_compte.iter().take(en_trop) {
-            settings
-                .delete(&format!("{PREFIXE_SESSION_LONGUE}{ancien}"))
-                .ok();
+            oublier_session(&settings, ancien);
         }
         if let Err(e) = inscrire_session_longue(&settings, &sid, &session) {
             return (
@@ -1907,15 +1976,31 @@ async fn login(
 
     let cookie = session_cookie_pour(&token, &headers, duree);
 
-    let mut response = Json(json!({
+    let mut corps = json!({
         "token": token,
         "token_type": "Bearer",
         "expires_in": duree,
         "username": body.username,
         "user_id": profile_id,
         "role": role,
-    }))
-    .into_response();
+    });
+    // rc14 — la famille de renouvellement de la session, même identifiant.
+    if let Some(sid) = sid.as_deref() {
+        let client = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok());
+        match tune_core::db::jetons_de_renouvellement::JetonsDeRenouvellementRepo::with_backend(
+            state.backend.clone(),
+        )
+        .ouvrir_famille(sid, profile_id, client, crate::session_renouvelee::maintenant())
+        {
+            Ok(emis) => ajouter_le_renouvellement(&mut corps, &emis),
+            // Sans jeton de renouvellement, la session vaut 24 h : le client
+            // se reconnectera, comme avant.
+            Err(e) => tracing::warn!(error = %e, "session_sans_jeton_de_renouvellement"),
+        }
+    }
+    let mut response = Json(corps).into_response();
 
     response
         .headers_mut()
@@ -1925,16 +2010,179 @@ async fn login(
 }
 
 // ---------------------------------------------------------------------------
+// POST /auth/refresh — rc14, la session renouvelée tant qu'elle sert
+// ---------------------------------------------------------------------------
+
+/// Ajoute `refresh_token` et `refresh_expires_in` à une réponse de session.
+/// Les anciens clients ignorent ces deux champs.
+fn ajouter_le_renouvellement(
+    corps: &mut Value,
+    emis: &tune_core::db::jetons_de_renouvellement::Emis,
+) {
+    if let Some(obj) = corps.as_object_mut() {
+        obj.insert("refresh_token".into(), json!(emis.jeton));
+        obj.insert(
+            "refresh_expires_in".into(),
+            json!(tune_core::db::jetons_de_renouvellement::DUREE_RENOUVELLEMENT),
+        );
+    }
+}
+
+#[derive(Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+/// `POST /auth/refresh {refresh_token}` — rend un nouveau jeton d'accès de
+/// 24 h (même session `sid`) et un NOUVEAU jeton de renouvellement
+/// (rotation) ; l'ancien ne sert plus. L'échéance de la session est reportée
+/// à 30 jours. Publique (le jeton d'accès peut être expiré), relayée par le
+/// pont comme `/auth/login`.
+///
+/// Refus (`code`) :
+/// - 401 `refresh_token_invalid` : inconnu ;
+/// - 401 `refresh_token_expired` : 30 jours sans usage ;
+/// - 401 `refresh_token_revoked` : session désinscrite (déconnexion,
+///   révocation par l'administrateur, plafond, secrets renouvelés), mot de
+///   passe changé, compte supprimé ;
+/// - 401 `refresh_token_reused` : jeton déjà consommé qui revient au-delà de
+///   30 s — vol présumé, la session entière est révoquée ;
+/// - 409 `refresh_token_already_rotated` : consommé il y a moins de 30 s
+///   (deux onglets, deux tâches) ; rien n'est révoqué, le client relit le
+///   jeton qu'il a rangé et réessaie une fois.
+///
+/// Tous les 401 veulent dire : retour à l'écran de connexion.
+async fn refresh(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RefreshRequest>,
+) -> Response {
+    use tune_core::db::jetons_de_renouvellement::{JetonsDeRenouvellementRepo, Refus};
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let refus = |statut: StatusCode, code: &str| {
+        (statut, Json(json!({"error": code, "code": code}))).into_response()
+    };
+    let maintenant = crate::session_renouvelee::maintenant();
+    let emis = match JetonsDeRenouvellementRepo::with_backend(state.backend.clone())
+        .renouveler(body.refresh_token.trim(), maintenant)
+    {
+        Ok(e) => e,
+        Err(r) => {
+            return match r {
+                Refus::Inconnu => refus(StatusCode::UNAUTHORIZED, "refresh_token_invalid"),
+                Refus::Expire | Refus::Revoque | Refus::Reutilise => {
+                    // La famille vient d'être révoquée par le dépôt : la
+                    // session qui porte le même identifiant part avec elle.
+                    if let Some((sid, _)) =
+                        JetonsDeRenouvellementRepo::with_backend(state.backend.clone())
+                            .session_du_jeton(body.refresh_token.trim())
+                    {
+                        oublier_session(&settings, &sid);
+                    }
+                    let code = match r {
+                        Refus::Expire => "refresh_token_expired",
+                        Refus::Reutilise => "refresh_token_reused",
+                        _ => "refresh_token_revoked",
+                    };
+                    refus(StatusCode::UNAUTHORIZED, code)
+                }
+                Refus::DejaTourne => refus(StatusCode::CONFLICT, "refresh_token_already_rotated"),
+                Refus::Base => refus(StatusCode::SERVICE_UNAVAILABLE, "database_unavailable"),
+            };
+        }
+    };
+    let sid = emis.famille.clone();
+    let cle = format!("{PREFIXE_SESSION_LONGUE}{sid}");
+    // L'inscription de la session est l'autorité (#9445) : sans elle, ou
+    // échue, ou pour un autre compte, pas de renouvellement.
+    let session = settings
+        .get(&cle)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str::<SessionLongue>(&v).ok())
+        .filter(|s| s.user_id == emis.profile_id && s.expires_at > maintenant as u64);
+    // Le rôle se relit à chaque renouvellement : un compte rétrogradé perd
+    // l'administration au plus tard au renouvellement suivant.
+    let compte = etat_du_compte(&state.backend, emis.profile_id);
+    let (Some(mut session), Some((is_admin, empreinte))) = (session, compte) else {
+        oublier_session(&settings, &sid);
+        return refus(StatusCode::UNAUTHORIZED, "refresh_token_revoked");
+    };
+    if empreinte != session.empreinte {
+        oublier_session(&settings, &sid);
+        return refus(StatusCode::UNAUTHORIZED, "refresh_token_revoked");
+    }
+    let role = if is_admin { "admin" } else { "user" };
+    session.role = role.to_string();
+    session.expires_at = emis.expire_le as u64;
+    if let Err(e) = inscrire_session_longue(&settings, &sid, &session) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("session registration failed: {e}")})),
+        )
+            .into_response();
+    }
+    let secret = get_or_create_jwt_secret(&settings);
+    let token = match signer_session(emis.profile_id, role, &secret, DUREE_SESSION, Some(&sid)) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("token generation failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let mut corps = json!({
+        "token": token,
+        "token_type": "Bearer",
+        "expires_in": DUREE_SESSION,
+        "username": session.username,
+        "user_id": emis.profile_id,
+        "role": role,
+    });
+    ajouter_le_renouvellement(&mut corps, &emis);
+    let mut response = Json(corps).into_response();
+    if let Ok(cookie) = session_cookie(&token, &headers).parse() {
+        response
+            .headers_mut()
+            .insert(axum::http::header::SET_COOKIE, cookie);
+    }
+    response
+}
+
+// ---------------------------------------------------------------------------
 // POST /auth/logout
 // ---------------------------------------------------------------------------
+
+/// Corps FACULTATIF de `POST /auth/logout` (rc14). Un client qui n'envoie
+/// rien garde le comportement de #9445.
+#[derive(Deserialize, Default)]
+struct LogoutRequest {
+    /// Le jeton de renouvellement de cet appareil : sa session est
+    /// désinscrite, même si le jeton d'accès est expiré ou absent.
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
 
 async fn logout(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    corps: axum::body::Bytes,
 ) -> impl IntoResponse {
     // La session longue présentée (en-tête ou cookie) est désinscrite : son
     // jeton ne vaut plus rien après la déconnexion.
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    let demande: LogoutRequest = serde_json::from_slice(&corps).unwrap_or_default();
+    if let Some(rt) = demande.refresh_token.as_deref()
+        && let Some((sid, _)) =
+            tune_core::db::jetons_de_renouvellement::JetonsDeRenouvellementRepo::with_backend(
+                state.backend.clone(),
+            )
+            .session_du_jeton(rt)
+    {
+        oublier_session(&settings, &sid);
+    }
     if let Some(secret) = settings
         .get("jwt_secret")
         .ok()
@@ -1961,12 +2209,12 @@ async fn logout(
             );
         }
         for jeton in presentes {
-            if let Ok(claims) = verify_jwt(&jeton, &secret)
+            // rc14 — signature seule : un jeton d'accès de 24 h déjà échu
+            // désigne encore sa session de 30 jours.
+            if let Some(claims) = verify_jwt_signature_seule(&jeton, &secret)
                 && let Some(sid) = claims.sid
             {
-                settings
-                    .delete(&format!("{PREFIXE_SESSION_LONGUE}{sid}"))
-                    .ok();
+                oublier_session(&settings, &sid);
             }
         }
     }
@@ -2092,6 +2340,7 @@ async fn revoquer_session(
     if let Err(e) = settings.delete(&cle) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
     }
+    oublier_session(&settings, &id);
     tracing::info!(session = %id, "session_longue_revoquee");
     Json(json!({ "revoked": id })).into_response()
 }
@@ -2202,6 +2451,9 @@ async fn set_auth_config(
         && !secret.is_empty()
     {
         settings.set("jwt_secret", secret).ok();
+        // rc14 — un secret posé à la main coupe tous les jetons d'accès : les
+        // sessions et leurs jetons de renouvellement ne les font pas renaître.
+        effacer_sessions_longues(&settings);
     }
 
     let enabled = settings
@@ -2817,6 +3069,9 @@ mod tests {
         // Public: login, logout, and the read-only config status (GET).
         assert!(est_route_publique(&Method::POST, "/api/v1/auth/login"));
         assert!(est_route_publique(&Method::POST, "/api/v1/auth/logout"));
+        // rc14 — le renouvellement : le jeton d'accès peut être expiré.
+        assert!(est_route_publique(&Method::POST, "/api/v1/auth/refresh"));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/refresh"));
         assert!(est_route_publique(&Method::GET, "/api/v1/auth/config"));
         // Nesting may strip the /api/v1 prefix — both spellings must hold.
         assert!(est_route_publique(&Method::POST, "/auth/login"));
