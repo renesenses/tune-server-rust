@@ -363,7 +363,11 @@ async fn alias_default_du_profil_admin(state: &AppState, lan: &str) {
             .as_string()
             .unwrap()
     };
-    assert_eq!(nom_du_profil_1(state), "admin", "base migrée : profil 1 = admin");
+    assert_eq!(
+        nom_du_profil_1(state),
+        "admin",
+        "base migrée : profil 1 = admin"
+    );
     assert_eq!(hachages(state), (None, None));
 
     // Première connexion sous `admin`, sur cette machine : revendiquée.
@@ -402,7 +406,10 @@ async fn alias_default_du_profil_admin(state: &AppState, lan: &str) {
     // son alias (mot de passe exigé)…
     state
         .backend
-        .execute("UPDATE profiles SET username = 'bertrand' WHERE id = 1", &[])
+        .execute(
+            "UPDATE profiles SET username = 'bertrand' WHERE id = 1",
+            &[],
+        )
         .unwrap();
     let (st, v) = connexion(state, lan, "default", "premier-1234").await;
     assert_eq!(st, StatusCode::OK, "{v}");

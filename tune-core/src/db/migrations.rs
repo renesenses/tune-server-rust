@@ -10637,7 +10637,8 @@ mod tests {
         // SQLite 155. Migration de DONNÉES : annule la bascule de la 118
         // (neutralisée) là où elle a eu lieu, DEFAULT '0'.
         // 123 : format des pistes UPnP en file (#8788), SQLite 156.
-        assert_eq!(pg_latest_version(), 123, "latest PG migration must be 123");
+        // 124 : profil administrateur d'origine `admin` (rc14), SQLite 158.
+        assert_eq!(pg_latest_version(), 124, "latest PG migration must be 124");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

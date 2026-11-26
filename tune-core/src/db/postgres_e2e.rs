@@ -3940,7 +3940,8 @@ async fn pg_profil_admin_rc14() {
     crate::db::migrations::run_pg_migrations(&pool)
         .await
         .expect("runner sur la base de test");
-    let migration_124 = include_str!("../../migrations/postgres/124_profil_administrateur_admin.sql");
+    let migration_124 =
+        include_str!("../../migrations/postgres/124_profil_administrateur_admin.sql");
     let jouer_la_124 = || async {
         sqlx::raw_sql(migration_124)
             .execute(&pool)
@@ -3949,10 +3950,16 @@ async fn pg_profil_admin_rc14() {
     };
     let profil_1 = || -> (String, Option<String>) {
         let r = db
-            .query_one("SELECT username, display_name FROM profiles WHERE id = 1", &[])
+            .query_one(
+                "SELECT username, display_name FROM profiles WHERE id = 1",
+                &[],
+            )
             .unwrap()
             .expect("profil 1");
-        (r[0].as_string().unwrap(), r.get(1).and_then(|v| v.as_string()))
+        (
+            r[0].as_string().unwrap(),
+            r.get(1).and_then(|v| v.as_string()),
+        )
     };
     let poser = |nom: &str, affiche: &str| {
         db.execute(
@@ -3963,13 +3970,19 @@ async fn pg_profil_admin_rc14() {
     };
     let par_nom_saisi = |nom: &str| -> Option<i64> {
         db.query_one(
-            &format!("SELECT id FROM profiles WHERE {}", pa::SQL_PROFIL_PAR_NOM_DE_CONNEXION),
+            &format!(
+                "SELECT id FROM profiles WHERE {}",
+                pa::SQL_PROFIL_PAR_NOM_DE_CONNEXION
+            ),
             &[&nom as &dyn ToSqlValue, &nom as &dyn ToSqlValue],
         )
         .unwrap()
         .and_then(|r| r.first().and_then(|v| v.as_i64()))
     };
-    let _ = db.execute("DELETE FROM profiles WHERE username IN ('admin', 'Admin') AND id <> 1", &[]);
+    let _ = db.execute(
+        "DELETE FROM profiles WHERE username IN ('admin', 'Admin') AND id <> 1",
+        &[],
+    );
 
     // Base migrée : admin / Admin, `default` en est l'alias.
     assert_eq!(profil_1().0, "admin");
@@ -3984,7 +3997,8 @@ async fn pg_profil_admin_rc14() {
 
     // La constante fait la même chose que le fichier.
     poser("default", "Default");
-    db.execute(pa::SQL_RENOMMER_LE_PROFIL_D_ORIGINE, &[]).unwrap();
+    db.execute(pa::SQL_RENOMMER_LE_PROFIL_D_ORIGINE, &[])
+        .unwrap();
     assert_eq!(profil_1(), ("admin".into(), Some("Admin".into())));
 
     // Nom affiché choisi : gardé.
@@ -4017,7 +4031,10 @@ async fn pg_profil_admin_rc14() {
     assert_eq!(par_nom_saisi("admin"), Some(autre));
 
     // Remise en état.
-    db.execute("DELETE FROM profiles WHERE id = ?", &[&autre as &dyn ToSqlValue])
-        .unwrap();
+    db.execute(
+        "DELETE FROM profiles WHERE id = ?",
+        &[&autre as &dyn ToSqlValue],
+    )
+    .unwrap();
     poser("admin", "Admin");
 }

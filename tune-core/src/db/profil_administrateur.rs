@@ -64,7 +64,8 @@ pub const SQL_PROFIL_PAR_NOM_DE_CONNEXION: &str = "(username = ? \
 /// Les noms réservés au profil administrateur d'origine : jamais donnés à un
 /// profil créé par la liaison au compte Mozaiklabs.
 pub fn nom_reserve(nom: &str) -> bool {
-    nom.eq_ignore_ascii_case(NOM_ADMINISTRATEUR) || nom.eq_ignore_ascii_case(ANCIEN_NOM_ADMINISTRATEUR)
+    nom.eq_ignore_ascii_case(NOM_ADMINISTRATEUR)
+        || nom.eq_ignore_ascii_case(ANCIEN_NOM_ADMINISTRATEUR)
 }
 
 #[cfg(test)]
@@ -85,7 +86,10 @@ mod tests {
 
     fn profil_1(db: &Arc<dyn DbBackend>) -> (String, Option<String>) {
         let r = db
-            .query_one("SELECT username, display_name FROM profiles WHERE id = 1", &[])
+            .query_one(
+                "SELECT username, display_name FROM profiles WHERE id = 1",
+                &[],
+            )
             .unwrap()
             .unwrap();
         (
@@ -114,7 +118,11 @@ mod tests {
         let db = base_migree();
         assert_eq!(id_par_nom_saisi(&db, "admin"), Some(1));
         assert_eq!(id_par_nom_saisi(&db, "default"), Some(1));
-        assert_eq!(id_par_nom_saisi(&db, "Default"), None, "alias exact, comme le nom");
+        assert_eq!(
+            id_par_nom_saisi(&db, "Default"),
+            None,
+            "alias exact, comme le nom"
+        );
         assert_eq!(id_par_nom_saisi(&db, "inconnu"), None);
     }
 
@@ -133,8 +141,11 @@ mod tests {
     #[test]
     fn un_profil_1_renomme_par_l_utilisateur_garde_son_nom_et_l_alias() {
         let db = base_migree();
-        db.execute("UPDATE profiles SET username = 'bertrand' WHERE id = 1", &[])
-            .unwrap();
+        db.execute(
+            "UPDATE profiles SET username = 'bertrand' WHERE id = 1",
+            &[],
+        )
+        .unwrap();
         assert_eq!(id_par_nom_saisi(&db, "default"), Some(1));
         assert_eq!(id_par_nom_saisi(&db, "admin"), None);
     }
@@ -179,7 +190,11 @@ mod tests {
             .connection()
             .lock()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM _migrations WHERE version = 158", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM _migrations WHERE version = 158",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(marquee, 1, "la 158 est notée");
     }
@@ -187,25 +202,43 @@ mod tests {
     #[test]
     fn une_base_ancienne_restee_en_default_passe_en_admin() {
         let db = base_sqlite_migree();
-        sql(&db, "UPDATE profiles SET username = 'default', display_name = 'Default' WHERE id = 1");
+        sql(
+            &db,
+            "UPDATE profiles SET username = 'default', display_name = 'Default' WHERE id = 1",
+        );
         rejouer_la_158(&db);
-        assert_eq!(profils(&db), vec![(1, "admin".into(), Some("Admin".into()))]);
+        assert_eq!(
+            profils(&db),
+            vec![(1, "admin".into(), Some("Admin".into()))]
+        );
     }
 
     #[test]
     fn un_nom_affiche_choisi_est_garde() {
         let db = base_sqlite_migree();
-        sql(&db, "UPDATE profiles SET username = 'default', display_name = 'Bertrand' WHERE id = 1");
+        sql(
+            &db,
+            "UPDATE profiles SET username = 'default', display_name = 'Bertrand' WHERE id = 1",
+        );
         rejouer_la_158(&db);
-        assert_eq!(profils(&db), vec![(1, "admin".into(), Some("Bertrand".into()))]);
+        assert_eq!(
+            profils(&db),
+            vec![(1, "admin".into(), Some("Bertrand".into()))]
+        );
     }
 
     #[test]
     fn un_profil_1_renomme_par_l_utilisateur_est_inchange() {
         let db = base_sqlite_migree();
-        sql(&db, "UPDATE profiles SET username = 'bertrand', display_name = 'Default' WHERE id = 1");
+        sql(
+            &db,
+            "UPDATE profiles SET username = 'bertrand', display_name = 'Default' WHERE id = 1",
+        );
         rejouer_la_158(&db);
-        assert_eq!(profils(&db), vec![(1, "bertrand".into(), Some("Default".into()))]);
+        assert_eq!(
+            profils(&db),
+            vec![(1, "bertrand".into(), Some("Default".into()))]
+        );
     }
 
     #[test]
@@ -241,10 +274,16 @@ mod tests {
     #[test]
     fn la_158_rejouee_ne_change_plus_rien() {
         let db = base_sqlite_migree();
-        sql(&db, "UPDATE profiles SET display_name = 'Bertrand' WHERE id = 1");
+        sql(
+            &db,
+            "UPDATE profiles SET display_name = 'Bertrand' WHERE id = 1",
+        );
         rejouer_la_158(&db);
         rejouer_la_158(&db);
-        assert_eq!(profils(&db), vec![(1, "admin".into(), Some("Bertrand".into()))]);
+        assert_eq!(
+            profils(&db),
+            vec![(1, "admin".into(), Some("Bertrand".into()))]
+        );
     }
 
     /// Le fichier PG 124 porte la même règle que la constante (même texte à
