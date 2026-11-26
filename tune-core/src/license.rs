@@ -1292,16 +1292,15 @@ fn format_utc(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// Whether an ISO-8601 (`%Y-%m-%dT%H:%M:%SZ`) timestamp lies in the past.
+/// Whether a timestamp lies in the past. Reads the same shapes as
+/// [`parse_timestamp`]: RFC 3339 with an offset (`+01:00`, `+02:00`, `Z`), as
+/// the licence server writes them, and the naive shapes, read as UTC.
 /// Unlike `is_expired` (which fails *closed*: malformed → expired), this fails
 /// *open*: unparseable input returns `false` so malformed server data never
 /// triggers a license revocation. Used by the heartbeat to tell a genuine past
 /// expiry from a transient `license_valid:false` verdict.
 pub fn is_timestamp_past(timestamp: &str) -> bool {
-    match chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%SZ") {
-        Ok(parsed) => parsed.and_utc() < chrono::Utc::now(),
-        Err(_) => false,
-    }
+    parse_timestamp(timestamp).is_some_and(|dt| dt < chrono::Utc::now())
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,8 +1339,9 @@ pub enum VerdictLicence {
     /// Garder le palier en cache ; la grace hors ligne expire d'elle-meme si
     /// le refus persiste.
     RefusTransitoire,
-    /// `license_valid:false` **avec** une `license_expires_at` deja passee :
-    /// la seule revocation autoritaire.
+    /// `license_valid:false` **avec** une date d'expiration deja passee
+    /// (`license_expires_at`, ou `expired_at` que porte le refus
+    /// « License expired » du site) : la seule revocation autoritaire.
     Expiree,
 }
 
@@ -1358,11 +1358,12 @@ pub fn verdict_licence(body: &serde_json::Value) -> VerdictLicence {
     };
 
     if !valide {
-        let expiree = body
-            .get("license_expires_at")
-            .and_then(|v| v.as_str())
-            .map(is_timestamp_past)
-            .unwrap_or(false);
+        // Le battement porte `license_expires_at` ; le refus « License
+        // expired » de `/license/validate` porte `expired_at`.
+        let expiree = ["license_expires_at", "expired_at"]
+            .iter()
+            .find_map(|champ| body.get(*champ).and_then(|v| v.as_str()))
+            .is_some_and(is_timestamp_past);
         return if expiree {
             VerdictLicence::Expiree
         } else {
@@ -1644,10 +1645,16 @@ fn parse_timestamp(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(timestamp) {
         return Some(dt.with_timezone(&chrono::Utc));
     }
-    // Naive `...Z`, the shape we persist in settings ourselves.
-    chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%SZ")
-        .ok()
-        .map(|n| n.and_utc())
+    // Naive `...Z`, the shape we persist in settings ourselves, then the naive
+    // shapes without any zone, read as UTC.
+    [
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    .iter()
+    .find_map(|f| chrono::NaiveDateTime::parse_from_str(timestamp, f).ok())
+    .map(|n| n.and_utc())
 }
 
 fn is_expired(timestamp: &str, days: i64) -> bool {
@@ -2834,6 +2841,136 @@ mod tests {
                 tier: Tier::Free,
                 expires_at: None,
             }
+        );
+    }
+
+    // --- Dates d'expiration : formes ecrites par le site -------------------
+
+    #[test]
+    fn date_passee_en_zulu() {
+        assert!(is_timestamp_past("2000-01-01T00:00:00Z"));
+        assert!(!is_timestamp_past("2099-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn date_passee_avec_decalage_plus_une_heure() {
+        assert!(is_timestamp_past("2026-01-01T00:00:00+01:00"));
+        assert!(!is_timestamp_past("2099-01-01T00:00:00+01:00"));
+    }
+
+    #[test]
+    fn date_passee_avec_decalage_plus_deux_heures() {
+        assert!(is_timestamp_past("2026-09-01T00:00:00+02:00"));
+        assert!(!is_timestamp_past("2099-09-01T00:00:00+02:00"));
+    }
+
+    #[test]
+    fn date_sans_fuseau_lue_en_utc() {
+        assert!(is_timestamp_past("2000-01-01T00:00:00"));
+        assert!(is_timestamp_past("2000-01-01 00:00:00"));
+        assert!(!is_timestamp_past("2099-01-01T00:00:00"));
+    }
+
+    #[test]
+    fn date_illisible_ne_revoque_pas() {
+        for illisible in [
+            "pas-une-date",
+            "",
+            "01/09/2026",
+            "2026-13-45T99:00:00+02:00",
+        ] {
+            assert!(!is_timestamp_past(illisible), "{illisible:?}");
+            for champ in ["license_expires_at", "expired_at"] {
+                assert_eq!(
+                    verdict_licence(&corps(&[
+                        (&champ_verdict(), serde_json::json!(false)),
+                        (champ, serde_json::json!(illisible)),
+                    ])),
+                    VerdictLicence::RefusTransitoire,
+                    "{champ} = {illisible:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn date_future_garde_le_palier() {
+        for champ in ["license_expires_at", "expired_at"] {
+            assert_eq!(
+                verdict_licence(&corps(&[
+                    (&champ_verdict(), serde_json::json!(false)),
+                    (champ, serde_json::json!("2099-01-01T00:00:00+01:00")),
+                ])),
+                VerdictLicence::RefusTransitoire,
+                "{champ}"
+            );
+        }
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(true)),
+                ("license_tier", serde_json::json!("premium")),
+                (
+                    "license_expires_at",
+                    serde_json::json!("2099-01-01T00:00:00+01:00")
+                ),
+            ])),
+            VerdictLicence::Confirmee {
+                tier: Tier::Premium,
+                expires_at: Some("2099-01-01T00:00:00+01:00".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn refus_avec_date_passee_est_une_expiration() {
+        // Battement : `license_expires_at` avec decalage.
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(false)),
+                (
+                    "license_expires_at",
+                    serde_json::json!("2026-09-01T00:00:00+01:00")
+                ),
+            ])),
+            VerdictLicence::Expiree
+        );
+        // `/license/validate` : refus « License expired » avec `expired_at`.
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(false)),
+                ("license_tier", serde_json::json!("free")),
+                ("message", serde_json::json!("License expired")),
+                ("expired_at", serde_json::json!("2026-09-01T00:00:00+02:00")),
+            ])),
+            VerdictLicence::Expiree
+        );
+        // `license_expires_at` nul : `expired_at` est lu a sa place.
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(false)),
+                ("license_expires_at", serde_json::Value::Null),
+                ("expired_at", serde_json::json!("2026-09-01T00:00:00Z")),
+            ])),
+            VerdictLicence::Expiree
+        );
+    }
+
+    #[test]
+    fn refus_sans_date_reste_transitoire() {
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(false)),
+                ("license_tier", serde_json::json!("free")),
+            ])),
+            VerdictLicence::RefusTransitoire
+        );
+        assert_eq!(
+            verdict_licence(&corps(&[
+                (&champ_verdict(), serde_json::json!(false)),
+                ("license_expires_at", serde_json::Value::Null),
+                ("expired_at", serde_json::Value::Null),
+            ])),
+            VerdictLicence::RefusTransitoire
         );
     }
 }

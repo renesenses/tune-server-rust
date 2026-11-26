@@ -2067,6 +2067,12 @@ path = "tests/sso_modules_du_compte.rs"
 name = "licence_par_le_compte_7419"
 path = "tests/licence_par_le_compte_7419.rs"
 
+# #1279 — une clé valide collée débloque le Premium du premier appel.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "licence_activation_immediate"
+path = "tests/licence_activation_immediate.rs"
+
 # #5682 — les gardes du montage SMB (#1834, #1916) et l'ordre « remonter les
 # partages, PUIS scanner » de `bootstrap.rs`. Le fichier existait sans cible :
 # `autotests = false` ne l'avait jamais compilé (relevé pendant #5682).
