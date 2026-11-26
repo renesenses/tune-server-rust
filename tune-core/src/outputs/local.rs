@@ -2249,7 +2249,7 @@ impl LocalOutput {
         // « Bypass all » ne saute plus d'un bloc au signal sec (toute la
         // marge d'une série, jusqu'à +24 dB) : l'égaliseur en place devient
         // un égaliseur coupé qui efface sa courbe par le fondu de #5215 et
-        // rejoint le niveau d'avant l'égaliseur en `TRANSITION_PURE_MS`,
+        // rejoint le niveau d'avant l'égaliseur en `REMONTEE_RAPIDE_TESS_MS`,
         // jamais au-delà (#6741). Seul cet étage joue pendant la transition
         // (`executeur_tess`) ; revenu à 0 dB il se retire et PURE redevient
         // bit-perfect. Volume monté : le surplus reste gardé, avec le voyant
@@ -2280,7 +2280,7 @@ impl LocalOutput {
             super::super::audio::eq::EqProcessor::prendre_la_releve(None, precedent);
         self.borner_la_remontee(&mut transition);
         if let Some(t) = transition.as_mut() {
-            t.rendre_le_niveau_d_avant_en(super::super::audio::eq::TRANSITION_PURE_MS);
+            t.rendre_le_niveau_d_avant_en();
         }
         *emplacement = transition;
     }

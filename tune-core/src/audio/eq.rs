@@ -31,13 +31,6 @@ pub const RAMPE_DE_BASCULE_MS: u32 = 300;
 /// biquad hérite de l'historique et ne claque pas.
 pub const SEUIL_DE_RAMPE_DB: f64 = 1.0;
 
-/// rc14 (sécurité auditive, décision de Bertrand du 25/11) — durée du fondu
-/// d'ENTRÉE en PURE ou en « Bypass all » : la chaîne n'est plus contournée
-/// d'un bloc à l'autre (jusqu'à +24 dB d'une série) ; l'égaliseur s'efface
-/// et le niveau rejoint celui d'avant l'égaliseur en ce temps, jamais
-/// au-delà (voir [`EqProcessor::rendre_le_niveau_d_avant_en`]).
-pub const TRANSITION_PURE_MS: u32 = 450;
-
 /// #6211 — durée du fondu qui éteint le préampli GARDÉ d'un égaliseur coupé
 /// sur un flux SANS FIN (radio).
 ///
@@ -83,6 +76,12 @@ pub const REMONTEE_DB_PAR_SECONDE: f64 = 2.0;
 /// geste sert une comparaison A/B, le signal sec revient en moins d'une
 /// demi-seconde, par la même rampe linéaire en dB (aucune marche). Hors de
 /// TESS, la règle du 10/10 et [`REMONTEE_DB_PAR_SECONDE`] restent.
+///
+/// rc14 (sécurité auditive, décision de Bertrand du 25/11) — même durée pour
+/// le fondu d'ENTRÉE en PURE ou en « Bypass all » : la chaîne n'est plus
+/// contournée d'un bloc à l'autre (jusqu'à +24 dB d'une série) ; l'égaliseur
+/// s'efface et le niveau rejoint celui d'avant l'égaliseur, jamais au-delà
+/// (voir [`EqProcessor::rendre_le_niveau_d_avant_en`]).
 ///
 /// rc14 (sécurité auditive, série TESS #9520) — même durée pour la remontée
 /// d'une hausse de préampli RETENUE entre deux égaliseurs ACTIFS (voir
@@ -674,15 +673,14 @@ impl EqProcessor {
     /// (identité exacte) ; volume monté, le surplus reste gardé, avec le
     /// voyant et « Rendre le niveau » (#6524). `libere` n'est pas posé. Sans
     /// effet hors d'un égaliseur coupé.
-    pub fn rendre_le_niveau_d_avant_en(&mut self, ms: u32) {
-        if !self.est_neutre() {
-            return;
-        }
-        self.relancer_depuis_le_gain_atteint();
-        let total = (u64::from(self.sample_rate) * u64::from(ms) / 1000).max(1) as usize;
-        if let Some(ext) = self.extinction.as_mut() {
-            ext.total = total;
-        }
+    ///
+    /// La durée, [`REMONTEE_RAPIDE_TESS_MS`], est portée par `rampe_rapide`
+    /// (relecture du 26/11) et non posée sur la rampe en cours : une rampe
+    /// RELANCÉE (geste de volume, piste suivante par
+    /// [`Self::reporter_le_preampli_garde`]) la garde, au lieu de retomber
+    /// sur [`REMONTEE_DB_PAR_SECONDE`] (3 s et plus).
+    pub fn rendre_le_niveau_d_avant_en(&mut self) {
+        self.rendre_le_sec_vite();
     }
 
     /// rc14 (série TESS) — « Rendre le niveau » sur un égaliseur ACTIF qui

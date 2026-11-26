@@ -280,3 +280,54 @@ fn le_dop_reste_intact_pendant_la_transition() {
     );
     assert!(matches!(banc.etat(true), OutputDspState::BypassedDop));
 }
+
+/// Relecture du 26/11 : une rampe RELANCÉE pendant la transition d'entrée en
+/// PURE (geste de volume, ou piste suivante par
+/// `EqProcessor::reporter_le_preampli_garde`) garde sa durée d'environ
+/// 450 ms, au lieu de retomber sur 2 dB/s (3 s et plus).
+#[test]
+fn relance_de_rampe_pendant_la_remontee_reste_en_450_ms() {
+    for relance in ["volume", "piste_suivante"] {
+        let mut banc = Banc::new();
+        banc.jouer(50, false);
+        banc.sortie.set_pure_bypass(true);
+        banc.sortie.replace_eq_live(None);
+        let entree = banc.gains_db.len();
+        banc.jouer(10, false);
+        let cible_db = match relance {
+            "volume" => {
+                // +1,6 dB de volume : la borne passe à 500 / 600.
+                banc.sortie.user_volume.store(600, Ordering::SeqCst);
+                banc.sortie.reborner_le_preampli_garde();
+                20.0 * (500.0_f64 / 600.0).log10()
+            }
+            _ => {
+                let mut eq = banc.sortie.eq.lock().unwrap();
+                let reporte = eq
+                    .as_ref()
+                    .and_then(EqProcessor::reporter_le_preampli_garde)
+                    .expect("l'égaliseur coupé de la transition garde un gain");
+                *eq = Some(reporte);
+                0.0
+            }
+        };
+        let geste = banc.gains_db.len();
+        assert!(
+            banc.gains_db[geste - 1] < cible_db - 3.0,
+            "{relance} : la remontée devait être en cours ({:.2} dB)",
+            banc.gains_db[geste - 1]
+        );
+        // 50 blocs (0,5 s) après la relance : la cible est atteinte.
+        banc.jouer(50, false);
+        let fin = *banc.gains_db.last().unwrap();
+        assert!(
+            (fin - cible_db).abs() < 0.1,
+            "{relance} : {fin:.2} dB 0,5 s après la relance, attendu {cible_db:.2} dB"
+        );
+        let pire = banc.max_db_depuis(entree);
+        assert!(
+            pire <= cible_db.max(0.0) + 0.1,
+            "{relance} : dépassement {pire:.2} dB"
+        );
+    }
+}
