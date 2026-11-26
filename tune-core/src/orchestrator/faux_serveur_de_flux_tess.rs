@@ -204,6 +204,7 @@ pub(crate) fn armer_pure(orch: &super::PlaybackOrchestrator, zone_id: i64) {
 /// reçue) face à la source 16 bits.
 #[derive(Debug)]
 pub(crate) struct Constat {
+    /// Trames COMPARÉES (reçues, dans la fenêtre de la source).
     pub trames: usize,
     /// |droite| maximale reçue, ramenée à l'échelle 16 bits.
     pub droite_max: i64,
@@ -212,6 +213,10 @@ pub(crate) struct Constat {
     pub identique: bool,
     /// Écart maximal de la gauche à `facteur × source` (16 bits).
     pub ecart_gauche: f64,
+    /// Trames de la fenêtre que le transport n'a pas livrées (paquets UDP
+    /// perdus, repérés par leur position) : ni comparées, ni comptées dans
+    /// `trames`. Toujours 0 pour une capture sans position ([`constater`]).
+    pub trous: usize,
 }
 
 /// Compare une capture `recu` (entiers sur `bits` bits) à la `source`,
@@ -223,17 +228,45 @@ pub(crate) fn constater(
     source: &[[i16; 2]],
     facteur: f64,
 ) -> Constat {
+    let recu: Vec<Option<[i32; 2]>> = recu.iter().copied().map(Some).collect();
+    constater_par_position(&recu, bits, source, facteur)
+}
+
+/// [`constater`] sur une capture PLACÉE par position (`recu[i]` est la trame
+/// de position `i` du flux, `None` si le transport ne l'a pas livrée).
+///
+/// Un paquet UDP perdu sur la boucle locale (banc chargé : la tâche du faux
+/// récepteur n'est pas servie à temps et le tampon de la prise déborde) ne
+/// DÉCALE plus la comparaison : avant, les trames reçues étaient mises bout à
+/// bout, et toute trame après le trou était comparée à la mauvaise trame de
+/// la source (CI de #9576 : 3 paquets de 480 trames perdus, écart 14 527).
+/// Chaque trame reçue est comparée à SA trame de la source ; les trous sont
+/// comptés à part (`trous`). Si le début de la piste tombe juste après un
+/// trou, l'alignement est inconnu : rien n'est comparé (`trames` = 0).
+pub(crate) fn constater_par_position(
+    recu: &[Option<[i32; 2]>],
+    bits: u32,
+    source: &[[i16; 2]],
+    facteur: f64,
+) -> Constat {
     let decalage = bits.saturating_sub(16);
     let ramener = |v: i32| -> i64 { i64::from(v) >> decalage };
-    let debut_recu = recu.iter().position(|f| f[0] != 0).unwrap_or(recu.len());
+    let debut_recu = recu
+        .iter()
+        .position(|f| f.is_some_and(|f| f[0] != 0))
+        .unwrap_or(recu.len());
     let debut_source = source.iter().position(|f| f[0] != 0).unwrap_or(0);
-    let recu = &recu[debut_recu..];
+    let aligne = debut_recu == 0 || recu[debut_recu - 1].is_some();
+    let recu = if aligne { &recu[debut_recu..] } else { &[][..] };
     let source = &source[debut_source..];
     let n = recu.len().min(source.len());
-    let mut identique = n > source.len() / 2;
+    let trous = recu.iter().take(n).filter(|f| f.is_none()).count();
+    let trames = n - trous;
+    let mut identique = trames > source.len() / 2;
     let mut droite_max = 0i64;
     let mut ecart_gauche = 0f64;
     for (r, s) in recu.iter().zip(source.iter()).take(n) {
+        let Some(r) = r else { continue };
         let (g, d) = (ramener(r[0]), ramener(r[1]));
         droite_max = droite_max.max(d.abs());
         ecart_gauche = ecart_gauche.max((g as f64 - facteur * f64::from(s[0])).abs());
@@ -242,13 +275,14 @@ pub(crate) fn constater(
         }
     }
     // La droite au-delà de la fenêtre compte aussi (queue d'un étage).
-    for r in recu.iter().skip(n) {
+    for r in recu.iter().skip(n).flatten() {
         droite_max = droite_max.max(ramener(r[1]).abs());
     }
     Constat {
-        trames: n,
+        trames,
         droite_max,
         identique,
         ecart_gauche,
+        trous,
     }
 }

@@ -11,7 +11,8 @@
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// Plafond de l'intervalle adaptatif : après des `503` répétés, deux requêtes
 /// d'une même clé ne s'espacent jamais de plus de 5 s (idée : MetaRust).
@@ -102,8 +103,8 @@ impl RateLimiter {
     /// Prochain départ permis. Une doublure séquentielle peut ainsi observer
     /// l'espacement des autorisations sans y mêler le temps de transport HTTP.
     #[cfg(feature = "services-factices")]
-    pub fn prochain_creneau(&self, key: &str) -> Option<Instant> {
-        self.etats().get(key).map(|etat| etat.prochain)
+    pub fn prochain_creneau(&self, key: &str) -> Option<std::time::Instant> {
+        self.etats().get(key).map(|etat| etat.prochain.into_std())
     }
 
     /// L'intervalle courant de `key` — l'intervalle de base tant qu'aucun

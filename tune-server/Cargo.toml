@@ -305,6 +305,18 @@ path = "tests/pont_administration.rs"
 name = "relais_routes_relayables"
 path = "tests/relais_routes_relayables.rs"
 
+# Session « rester connecté » (remember) des remotes : 30 jours, révocable.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "session_longue_remember"
+path = "tests/session_longue_remember.rs"
+
+# rc14 — la session renouvelée tant qu'elle sert (`POST /auth/refresh`) :
+# rotation, réutilisation, expiration, révocations, relais, WebSocket.
+[[test]]
+name = "session_renouvelee_rc14"
+path = "tests/session_renouvelee_rc14.rs"
+
 # #9174 — la provenance du lecteur d'une zone navigateur (relais ou local).
 # `autotests = false` plus haut : sans cette cible, jamais compilé.
 [[test]]
@@ -1593,6 +1605,11 @@ path = "tests/import_convolution_t09a.rs"
 name = "tess_prereglages_routes_t17"
 path = "tests/tess_prereglages_routes_t17.rs"
 
+# rc14 (Rémi) — « Enregistrer » écrase le préréglage d'origine, « Recharger ».
+[[test]]
+name = "tess_prereglage_ecraser_rc14"
+path = "tests/tess_prereglage_ecraser_rc14.rs"
+
 # #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
 # et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans
 # cette cible, le fichier ne serait jamais compilé.
@@ -2062,6 +2079,12 @@ path = "tests/sso_modules_du_compte.rs"
 name = "licence_par_le_compte_7419"
 path = "tests/licence_par_le_compte_7419.rs"
 
+# #1279 — une clé valide collée débloque le Premium du premier appel.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "licence_activation_immediate"
+path = "tests/licence_activation_immediate.rs"
+
 # #5682 — les gardes du montage SMB (#1834, #1916) et l'ordre « remonter les
 # partages, PUIS scanner » de `bootstrap.rs`. Le fichier existait sans cible :
 # `autotests = false` ne l'avait jamais compilé (relevé pendant #5682).
@@ -2277,6 +2300,12 @@ path = "tests/raccourcis_windows_sans_console_7637.rs"
 name = "licence_retrait_libere_la_machine_7726"
 path = "tests/licence_retrait_libere_la_machine_7726.rs"
 
+# rc14 — dire pourquoi le palier est gratuit : une raison par réponse du site
+# de licences, contre un faux serveur local.
+[[test]]
+name = "licence_raison_du_palier"
+path = "tests/licence_raison_du_palier.rs"
+
 # Durcissement de la configuration : écritures génériques de `settings` et
 # contrôle d'origine, par le vrai routeur. `autotests = false` plus haut : sans
 # cette cible, le banc ne serait JAMAIS compilé.
@@ -2326,6 +2355,12 @@ path = "tests/premiere_configuration_environnement.rs"
 [[test]]
 name = "administration_reseau_local_rc14"
 path = "tests/administration_reseau_local_rc14.rs"
+
+# rc14 : mot de passe administrateur perdu, réinitialisé depuis la machine
+# du serveur (`--reinitialiser-admin`, `POST /auth/admin/reinitialiser`).
+[[test]]
+name = "recuperation_admin_rc14"
+path = "tests/recuperation_admin_rc14.rs"
 
 # rc13.2 : connexion de `default` sur cette machine et depuis le réseau local,
 # après l'activation et sur une base rc12 (ancien hachage). SQLite, et

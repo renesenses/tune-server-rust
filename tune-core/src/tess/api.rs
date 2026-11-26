@@ -39,6 +39,15 @@ pub struct ReponseTessZone {
     pub chain: ChaineTess,
     /// Le préréglage chargé sur CETTE zone (« ACTIVE »), s'il y en a un.
     pub active_preset: Option<String>,
+    /// rc14 (Rémi) — le préréglage dont la chaîne de la zone est PARTIE (le
+    /// dernier chargé, enregistré ou écrasé depuis cette zone), même après
+    /// une retouche. Absent s'il n'y en a pas ou s'il a été supprimé.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_preset: Option<String>,
+    /// rc14 (Rémi) — la chaîne ne décrit plus `base_preset` : l'écran propose
+    /// « Enregistrer » (écraser) et « Recharger ». Absent quand faux.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preset_modified: bool,
     /// Headroom réellement appliqué, en dB (0 hors TESS ou sans traitement).
     pub headroom_db: f64,
     pub volume: EtatVolume,
@@ -101,6 +110,8 @@ impl ReponseTessZone {
             applicability: ctx.transport.applicabilite(),
             chain,
             active_preset,
+            base_preset: None,
+            preset_modified: false,
             headroom_db: r.headroom_db,
             volume: r.volume,
             badge: r.badge,
@@ -548,6 +559,11 @@ pub fn schema_json() -> Value {
             }
         }
     });
+    // Facultatifs (rc14, Rémi) : le préréglage d'origine et sa retouche.
+    // Posés hors de `json!` : la macro est à sa limite de récursion.
+    schema["$defs"]["zone_response"]["properties"]["base_preset"] = json!({ "type": "string" });
+    schema["$defs"]["zone_response"]["properties"]["preset_modified"] =
+        json!({ "type": "boolean" });
     schema["$defs"]["delivery"] = delivery;
     schema["$defs"]["zone_response"]["properties"]["delivery"] =
         json!({ "$ref": "#/$defs/delivery" });

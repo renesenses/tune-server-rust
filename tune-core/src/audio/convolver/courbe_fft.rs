@@ -90,21 +90,13 @@ fn replier_deg(x: f64) -> f64 {
     if r == -180.0 { 180.0 } else { r }
 }
 
-/// La courbe d'un canal (`taps`) à la cadence `sample_rate`, sur `points`
-/// points logarithmiques. `None` pour une RI vide ou une cadence nulle.
-pub fn courbe_du_canal(taps: &[f32], sample_rate: u32, points: usize) -> Option<CourbeCanal> {
+/// Le spectre d'un canal sur la grille FINE de la FFT : `(n, H[0..=n/2])`,
+/// `n` choisi par [`taille_fft`]. Une seule FFT réelle, hors temps réel.
+fn spectre_du_canal(taps: &[f32], sample_rate: u32) -> Option<(usize, Vec<Complex<f64>>)> {
     if taps.is_empty() || sample_rate == 0 {
         return None;
     }
-    let fs = f64::from(sample_rate);
     let n = taille_fft(taps.len(), sample_rate);
-    let retard = taps
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-
     let mut planificateur = RealFftPlanner::<f64>::new();
     let fft = planificateur.plan_fft_forward(n);
     let mut entree = fft.make_input_vec();
@@ -113,6 +105,45 @@ pub fn courbe_du_canal(taps: &[f32], sample_rate: u32, points: usize) -> Option<
     }
     let mut spectre = fft.make_output_vec();
     fft.process(&mut entree, &mut spectre).ok()?;
+    Some((n, spectre))
+}
+
+/// rc14 (Didier) — le gain MAXIMAL de la réponse en fréquence d'un filtre,
+/// `max |H(f)|` en dB, pris au PIRE canal, de 0 Hz à Nyquist, sur la grille
+/// fine de la FFT (une case ≤ 2 Hz, voir [`taille_fft`]) : c'est ce dont un
+/// sinus pleine échelle peut monter à la traversée du filtre.
+///
+/// La même FFT que la courbe ([`courbe_du_canal`]) ; calculée UNE fois par
+/// filtre et par cadence (l'appelant la met en cache), jamais dans le fil
+/// audio. `None` pour une RI vide, une cadence nulle ou un spectre nul.
+pub fn gain_max_db(ri: &[Vec<f32>], sample_rate: u32) -> Option<f64> {
+    let mut pire: Option<f64> = None;
+    for canal in ri {
+        let (_, spectre) = spectre_du_canal(canal, sample_rate)?;
+        let max = spectre.iter().map(|h| h.norm()).fold(0.0f64, f64::max);
+        if max > 0.0 && max.is_finite() {
+            let db = 20.0 * max.log10();
+            pire = Some(pire.map_or(db, |p: f64| p.max(db)));
+        }
+    }
+    pire
+}
+
+/// La courbe d'un canal (`taps`) à la cadence `sample_rate`, sur `points`
+/// points logarithmiques. `None` pour une RI vide ou une cadence nulle.
+pub fn courbe_du_canal(taps: &[f32], sample_rate: u32, points: usize) -> Option<CourbeCanal> {
+    if taps.is_empty() || sample_rate == 0 {
+        return None;
+    }
+    let fs = f64::from(sample_rate);
+    let retard = taps
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    let (n, mut spectre) = spectre_du_canal(taps, sample_rate)?;
 
     // Retrait exact du retard principal.
     let pas = 2.0 * std::f64::consts::PI * retard as f64 / n as f64;

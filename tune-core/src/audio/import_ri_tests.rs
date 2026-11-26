@@ -519,3 +519,29 @@ fn trop_de_cfg_sont_refuses() {
         "too_many_entries"
     );
 }
+
+/// rc14 (Didier) — un filtre qui amplifie est importé TEL QUEL, avec un
+/// avertissement (clé i18n et paramètres bruts) ; un filtre plat n'en a pas.
+#[test]
+fn un_filtre_qui_amplifie_est_signale_sans_etre_modifie() {
+    // `ri(n, a)` : a · 0,5^i, gain continu 2a. 0,9 → +5,1 dB ; 0,5 → 0 dB.
+    let j = importer(
+        &wav(&[ri(64, 0.9), ri(64, 0.5)], 48_000, 32),
+        "room_48k.wav",
+    )
+    .unwrap();
+    let av = avertissements_de_gain(&j);
+    assert_eq!(av.len(), 1, "{av:?}");
+    assert_eq!(av[0].code, "filter_gain_positive");
+    assert_eq!(av[0].message_key, CLE_GAIN_POSITIF);
+    assert_eq!(av[0].name, "room_48k.wav");
+    assert_eq!(av[0].sample_rate, 48_000);
+    assert!((av[0].gain_max_db - 5.11).abs() < 0.02, "{av:?}");
+    assert!((av[0].headroom_db - -5.61).abs() < 0.02, "{av:?}");
+    // Le filtre de l'utilisateur n'est pas touché.
+    assert_eq!(j.reponses[0].taps[0], ri(64, 0.9));
+    assert_eq!(j.reponses[0].taps[1], ri(64, 0.5));
+
+    let plat = importer(&wav(&[ri(64, 0.5)], 48_000, 32), "plat.wav").unwrap();
+    assert!(avertissements_de_gain(&plat).is_empty());
+}

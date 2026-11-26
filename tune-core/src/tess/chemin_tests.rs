@@ -833,3 +833,99 @@ fn rc14_modulateur_en_service_ou_repli_dit() {
     assert_eq!(codes[i + 1], CodeEtape::Quantization);
     assert_eq!(c.volume.placement, None);
 }
+
+/// rc14 (fil 3103) — la cible DSD passe à DSD256 pendant une piste modulée
+/// en DSD128 (zone en pause, relance pas encore faite) : le chemin dit ce
+/// qui JOUE (DSD128) et annonce DSD256 à la piste suivante. Contre-épreuve :
+/// même cadence, aucune annonce.
+#[test]
+fn rc14_cible_dsd_changee_en_cours_de_piste_le_chemin_dit_la_cadence_jouee() {
+    use crate::tess::modulation_dsd::{EtatModulation, ModulationEnService, TransportModulation};
+    let vers = |rate| ChaineTess {
+        fixed: EtagesFixes {
+            upsampling: Upsampling::Dsd {
+                rate,
+                filter: "polyvalent".into(),
+            },
+            ..EtagesFixes::default()
+        },
+        ..ChaineTess::default()
+    };
+    let mut s = service(&[], None, false);
+    s.modulation_dsd = Some(EtatModulation::EnService(ModulationEnService {
+        rate: TauxDsd::Dsd128,
+        rate_hz: 5_644_800,
+        transport: TransportModulation::Dop,
+        order: 7,
+        carrier_rate_hz: 352_800,
+        source_rate_hz: 44_100,
+        source_channels: 2,
+        channels: 2,
+        plugins_in_stream: false,
+        headroom_db: -3.0,
+        modulator_margin_db: -3.0,
+        continued: false,
+    }));
+    let c = chemin(
+        &vers(TauxDsd::Dsd256),
+        &ctx(TransportZone::Local, false, 0.0),
+        &s,
+        None,
+    );
+    for code in [CodeEtape::Upsampling, CodeEtape::DsdModulator] {
+        let e = etape(&c, code);
+        assert!(e.etape.effective, "{code:?}");
+        let p = e.etape.params.as_ref().unwrap();
+        assert_eq!(p["rate"], "dsd128", "{code:?} {p}");
+        assert_eq!(p["pending_rate"], "dsd256", "{code:?} {p}");
+        assert_eq!(
+            e.etape.detail.as_deref(),
+            Some("DSD256 at the next track"),
+            "{code:?}"
+        );
+    }
+    assert_eq!(
+        etape(&c, CodeEtape::DsdModulator)
+            .etape
+            .params
+            .as_ref()
+            .unwrap()["rate_hz"],
+        5_644_800
+    );
+
+    let c = chemin(
+        &vers(TauxDsd::Dsd128),
+        &ctx(TransportZone::Local, false, 0.0),
+        &s,
+        None,
+    );
+    for code in [CodeEtape::Upsampling, CodeEtape::DsdModulator] {
+        let e = etape(&c, code);
+        let p = e.etape.params.as_ref().unwrap();
+        assert_eq!(p["rate"], "dsd128");
+        assert!(p.get("pending_rate").is_none(), "{p}");
+        assert_eq!(e.etape.detail, None, "{code:?}");
+    }
+
+    // La chaîne ne va plus vers le DSD (relance écartée : elle repartirait en
+    // PCM) : le modulateur qui joue reste au chemin, la suite est annoncée.
+    let c = chemin(
+        &ChaineTess::default(),
+        &ctx(TransportZone::Local, false, 0.0),
+        &s,
+        None,
+    );
+    let m = etape(&c, CodeEtape::DsdModulator);
+    assert!(m.etape.effective);
+    assert_eq!(m.etape.detail.as_deref(), Some("Off at the next track"));
+    assert_eq!(m.etape.params.as_ref().unwrap()["rate"], "dsd128");
+    let up = etape(&c, CodeEtape::Upsampling);
+    assert!(up.etape.effective);
+    assert_eq!(up.etape.detail.as_deref(), Some("Off at the next track"));
+    assert_eq!(up.etape.params.as_ref().unwrap()["pending_target"], "off");
+    assert!(
+        c.steps
+            .iter()
+            .all(|e| e.etape.code != CodeEtape::Quantization)
+    );
+}

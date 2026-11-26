@@ -73,6 +73,14 @@ pub fn cle_prereglage_actif(zone_id: i64) -> String {
     format!("zone_{zone_id}_tess_active_preset")
 }
 
+/// rc14 (Rémi) — le préréglage d'ORIGINE de la chaîne de la zone : posé avec
+/// le marqueur « ACTIVE » (chargement, enregistrement, écrasement), il n'est
+/// pas effacé par une retouche. « ACTIVE » absent et origine présente : la
+/// chaîne a été modifiée depuis (`preset_modified`).
+pub fn cle_prereglage_de_base(zone_id: i64) -> String {
+    format!("zone_{zone_id}_tess_base_preset")
+}
+
 // ── Catalogue ───────────────────────────────────────────────────────
 
 const SCHEMA_EGALISEUR: &str =
@@ -463,6 +471,19 @@ pub(super) async fn reponse_de_zone(
                 .map(|l| l.get(p).is_some())
                 .unwrap_or(true)
         });
+    // rc14 (Rémi) — l'origine de la chaîne, si ce préréglage existe encore.
+    let base = settings
+        .get(&cle_prereglage_de_base(zone_id))
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty())
+        .filter(|p| {
+            tune_core::tess::prereglages::lire(&settings)
+                .map(|l| l.get(p).is_some())
+                .unwrap_or(false)
+        })
+        .or_else(|| actif.clone());
+    let modifie = base.is_some() && actif.is_none();
     let mut reponse = ReponseTessZone::depuis_avec_le_lecteur(
         zone_id,
         lecture.chaine,
@@ -474,6 +495,9 @@ pub(super) async fn reponse_de_zone(
     // rc14 — ce que la sortie fait de chaque cible DSD (sans sonder le
     // pilote), reporté sur le chemin résolu.
     .avec_capacites_dsd(capacites_dsd);
+    // rc14 (Rémi) — l'origine de la chaîne et sa retouche éventuelle.
+    reponse.base_preset = base;
+    reponse.preset_modified = modifie;
     preciser_les_paquets_a_installer(&mut reponse, &settings);
 
     // rc14 (rc13.91) — la sortie locale a refusé de suréchantillonner la
@@ -851,6 +875,37 @@ pub(super) fn cle_mode_pure(zone_id: i64) -> String {
 /// Chaque ancienne clé réécrite atteint la sortie vivante, comme par son
 /// ancienne route (`REGLAGES_A_RAFRAICHIR`).
 pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
+    rafraichir_avec(state, zone, cles, true).await;
+}
+
+/// Les relances d'un flux modulé vers le DSD que TESS a DEMANDÉES pour la
+/// zone (banc et diagnostic) : une demande, pas une relance (l'orchestrateur
+/// décide encore : piste modulée, relance qui resterait modulée, plancher).
+pub fn relances_dsd_demandees(zone_id: i64) -> usize {
+    relances_dsd()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&zone_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn relances_dsd() -> &'static std::sync::Mutex<std::collections::HashMap<i64, usize>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i64, usize>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// [`rafraichir`], en disant si un flux modulé vers le DSD peut être relancé.
+/// Non au DÉMARRAGE d'une piste (mode `at_next_playback`, `started`) : la
+/// piste vient d'être décidée avec la chaîne écrite, la relancer rouvrirait
+/// le DAC une demi-seconde après son début (relecture de #9575).
+pub(super) async fn rafraichir_avec(
+    state: &AppState,
+    zone: &Zone,
+    cles: &[String],
+    relance_dsd: bool,
+) {
     let id = zone.id.unwrap_or_default();
     let est = |p: Partie| cles.contains(&p.cle(id));
     let natif = cles
@@ -876,7 +931,14 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
         state.orchestrator.refresh_zone_upsampler(id).await;
     }
     if est(Partie::Convolution) {
-        rafraichir_le_convolueur(state, zone).await;
+        rafraichir_le_convolueur(state, zone, false).await;
+    } else if est(Partie::Egaliseur) {
+        // Revue de #9561 — le headroom (Auto ↔ manuel, marge manuelle) et
+        // l'égaliseur qui porte la marge manuelle changent la marge du filtre
+        // (`Partie::Egaliseur` suit la signature des égaliseurs ET du
+        // headroom) : le moteur la reprend, sans refaire le filtre si elle ne
+        // bouge pas.
+        rafraichir_le_convolueur(state, zone, true).await;
     }
     // rc14 — l'ordre des greffons cochés a changé : la sortie locale suit.
     if cles.contains(&tune_core::tess::egaliseurs_en_serie::cle_ordre_tess(id)) {
@@ -893,21 +955,36 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     // cadence fixe ; une cadence fixe réglée relance le flux (v2). Aucune voie
     // réseau n'applique le suréchantillonneur, le repli mono ni la
     // réaffectation.
-    if bypass && !est(Partie::Surechantillonnage) {
+    // Relecture de #9575 — la clé du suréchantillonneur (rendue aussi pour un
+    // changement de la seule cible DSD) n'annule plus la bascule : elle ne
+    // fait que reposer le choix (`refresh_zone_upsampler`, que la bascule
+    // refait elle-même).
+    if bypass {
         let _ = state.orchestrator.apply_bypass_all_portee(id).await;
     }
     // rc14 — piste modulée vers le DSD : les greffons et l'étage fixe vivent
     // dans le flux du producteur, pas dans la sortie. Tout changement de la
     // chaîne relance la piste à sa position (anti-rebond partagé avec
     // l'égaliseur).
-    if !cles.is_empty() {
+    if relance_dsd && !cles.is_empty() {
+        *relances_dsd()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id)
+            .or_default() += 1;
         state.orchestrator.relancer_si_flux_dsd_module(id).await;
     }
 }
 
 /// La convolution d'une sortie locale : posée ou retirée à chaud, comme par
 /// `POST /room-correction/ir/…` (le transcodage réseau relit la clé).
-async fn rafraichir_le_convolueur(state: &AppState, zone: &Zone) {
+///
+/// Revue de #9561 — le JEU de la zone (`JeuDeZone::charger`) : fichiers par
+/// cadence, repli, et surtout le headroom de la chaîne, dont dépend la marge
+/// du filtre (un `from_wav` la calculait toujours en Auto : en manuel, elle
+/// s'ajoutait à M). `marge_seule` : seule la marge a pu changer (headroom,
+/// égaliseur) ; le filtre n'est reconstruit que si elle bouge.
+async fn rafraichir_le_convolueur(state: &AppState, zone: &Zone, marge_seule: bool) {
     #[cfg(feature = "local-audio")]
     {
         let Some(device_id) = zone.output_device_id.as_deref() else {
@@ -917,11 +994,21 @@ async fn rafraichir_le_convolueur(state: &AppState, zone: &Zone) {
             return;
         }
         let id = zone.id.unwrap_or_default();
-        let chemin = SettingsRepo::with_backend(state.backend.clone())
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let chemin = settings
             .get(&Partie::Convolution.cle(id))
             .ok()
             .flatten()
             .filter(|c| !c.trim().is_empty());
+        if marge_seule && chemin.is_none() {
+            return;
+        }
+        // Lu hors du verrou des sorties (réglages, FFT du gain mise en cache).
+        let jeu = chemin.map(|c| {
+            let jeu = tune_core::audio::convolver::JeuDeZone::avec_principal(&settings, id, c);
+            let principal = jeu.principal.clone();
+            (principal, jeu.charger())
+        });
         let outputs = state.outputs.lock().await;
         if let Some(output) = outputs.get(device_id) {
             let output = output.lock().await;
@@ -929,11 +1016,19 @@ async fn rafraichir_le_convolueur(state: &AppState, zone: &Zone) {
                 .as_any()
                 .downcast_ref::<tune_core::outputs::local::LocalOutput>()
             {
-                match chemin {
-                    Some(c) => {
-                        if let Err(e) = local.set_convolver_ir(&c) {
-                            warn!(zone_id = id, error = %e, "tess_convolueur_non_pose");
+                match jeu {
+                    Some((c, Ok(config))) => {
+                        let pose = if marge_seule {
+                            local.reposer_la_convolution_si_la_marge_change(config)
+                        } else {
+                            local.set_convolver_config(config).map(|()| true)
+                        };
+                        if let Err(e) = pose {
+                            warn!(zone_id = id, chemin = %c, error = %e, "tess_convolueur_non_pose");
                         }
+                    }
+                    Some((c, Err(e))) => {
+                        warn!(zone_id = id, chemin = %c, error = %e, "tess_convolueur_non_pose");
                     }
                     None => local.clear_convolver(),
                 }
@@ -941,7 +1036,7 @@ async fn rafraichir_le_convolueur(state: &AppState, zone: &Zone) {
         }
     }
     #[cfg(not(feature = "local-audio"))]
-    let _ = (state, zone);
+    let _ = (state, zone, marge_seule);
 }
 
 /// `PUT /zones/{id}/tess`
@@ -988,6 +1083,11 @@ pub async fn put_zone_tess(
     reponse.warnings.extend(avertissement);
     Json(reponse).into_response()
 }
+
+// Revue de #9561 — la convolution posée par TESS suit le headroom.
+#[cfg(all(test, feature = "local-audio"))]
+#[path = "tess_convolueur_9561_tests.rs"]
+mod tess_convolueur_9561_tests;
 
 #[cfg(test)]
 mod tests_t14 {

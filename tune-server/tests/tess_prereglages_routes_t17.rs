@@ -1333,3 +1333,51 @@ async fn un_prereglage_par_son_corps_suit_les_bornes_de_gain_9520() {
         .await;
     assert_eq!(s, StatusCode::CREATED, "{v}");
 }
+
+/// rc14 (fil 3103) — un préréglage qui ne change QUE la cible DSD (DSD128 →
+/// DSD256) rend la clé de l'étage fixe : elle rejoint la file du mode
+/// `at_next_playback` (et, en mode immédiat, `rafraichir` relance le flux
+/// modulé à sa position). Avant : `cles=[]`, rien ne suivait.
+#[tokio::test]
+async fn un_prereglage_qui_change_la_seule_cible_dsd_rend_la_cle_de_l_etage_fixe() {
+    let b = Banc::avec_sortie(true, "local", "local:SMSL SU-9", 80).await;
+    ZoneRepo::with_backend(b.state.backend.clone())
+        .update_dsd_mode(b.zone, "dop")
+        .unwrap();
+    tune_core::tess::modulation_dsd::retenir_mesure_de_la_machine([50.0, 25.0, 12.0]);
+    let dsd =
+        |rate: &str| json!({"version": 1, "fixed": {"upsampling": {"mode": "dsd", "rate": rate}}});
+    let cle = format!("zone_{}_upsampler", b.zone);
+
+    let (s, v) = b.put_chaine(dsd("dsd256")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, p) = b.enregistrer("DSD256 upsampling").await;
+    assert_eq!(s, StatusCode::CREATED, "{p}");
+    let id = p["id"].as_str().unwrap().to_owned();
+    let (s, v) = b.put_chaine(dsd("dsd128")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    mode(&b, "at_next_playback").await;
+    assert!(cles_en_attente(b.zone).is_empty());
+
+    let (s, v) = b.appliquer(&id).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["apply_mode"], json!("at_next_playback"));
+    let attente = cles_en_attente(b.zone);
+    assert!(attente.contains(&cle), "{attente:?}");
+    // Le panneau (même `PUT`) aussi : DSD256 → DSD128.
+    appliquer_a_la_lecture(&b.state, b.zone).await;
+    let (s, v) = b.put_chaine(dsd("dsd128")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(cles_en_attente(b.zone).contains(&cle));
+    appliquer_a_la_lecture(&b.state, b.zone).await;
+
+    // Contre-épreuve : la même cible renvoyée ne rend rien.
+    let (s, v) = b.put_chaine(dsd("dsd128")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(
+        cles_en_attente(b.zone).is_empty(),
+        "{:?}",
+        cles_en_attente(b.zone)
+    );
+    mode(&b, "immediately").await;
+}

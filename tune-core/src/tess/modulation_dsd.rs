@@ -789,10 +789,14 @@ pub fn ouvrir_le_relais(zone_id: i64, session: &str, plan: PlanModulation) {
 
 /// Le producteur de `session` vient d'envoyer un bloc : il avance.
 pub fn signaler_l_avance(session: &str) {
+    signaler_l_avance_a(session, Instant::now);
+}
+
+fn signaler_l_avance_a(session: &str, maintenant: impl FnOnce() -> Instant) {
     let (m, _) = relais();
     let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(x) = r.par_session.get_mut(session) {
-        x.avance = Instant::now();
+        x.avance = maintenant();
     }
 }
 
@@ -875,9 +879,28 @@ pub fn attendre_le_relais_lue(
     annule: &dyn Fn() -> bool,
     lue: &dyn Fn() -> bool,
 ) -> Option<ProducteurDsd> {
-    let (m, c) = relais();
-    let debut = Instant::now();
-    let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
+    attendre_le_relais_avec(session, plan, delai, annule, lue, Instant::now, |r| {
+        relais()
+            .1
+            .wait_timeout(r, Duration::from_millis(50))
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+    })
+}
+
+type GardeRelais = std::sync::MutexGuard<'static, TableDesRelais>;
+
+fn attendre_le_relais_avec(
+    session: &str,
+    plan: PlanModulation,
+    delai: Duration,
+    annule: &dyn Fn() -> bool,
+    lue: &dyn Fn() -> bool,
+    maintenant: impl Fn() -> Instant,
+    mut attendre: impl FnMut(GardeRelais) -> GardeRelais,
+) -> Option<ProducteurDsd> {
+    let debut = maintenant();
+    let mut r = relais().0.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         let avance = match r.par_session.get(session).map(|x| (&x.etat, x.avance)) {
             None | Some((EtatDuRelais::Abandonne, _)) => return None,
@@ -892,16 +915,14 @@ pub fn attendre_le_relais_lue(
             }
             Some((EtatDuRelais::EnCours, avance)) => avance,
         };
+        let instant = maintenant();
         if annule()
-            || debut.elapsed() >= ATTENTE_MAX
-            || (avance.elapsed() >= delai && debut.elapsed() >= delai && lue())
+            || instant - debut >= ATTENTE_MAX
+            || (instant - avance >= delai && instant - debut >= delai && lue())
         {
             return None;
         }
-        r = c
-            .wait_timeout(r, Duration::from_millis(50))
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+        r = attendre(r);
     }
 }
 

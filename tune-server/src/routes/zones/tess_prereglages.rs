@@ -6,6 +6,8 @@
 //! - `POST /tess/presets` ← `{ "name", "zone_id" }` (la chaîne courante de la
 //!   zone) ou `{ "name", "chain" }` → 201, le préréglage créé ;
 //! - `PATCH /tess/presets/{preset_id}` ← `{ "name" }` → le préréglage renommé ;
+//! - `PUT /tess/presets/{preset_id}` ← `{ "zone_id" }` ou `{ "chain" }` → le
+//!   préréglage ÉCRASÉ (rc14 ; 409 `builtin_preset_read_only` sur « Pure ») ;
 //! - `DELETE /tess/presets/{preset_id}` → 204 ;
 //! - `PUT /tess/apply-mode` ← `{ "apply_mode": "immediately" | "at_next_playback" }` ;
 //! - `POST /zones/{id}/tess/presets/{preset_id}/apply` → la zone, le mode
@@ -54,8 +56,9 @@ use tune_core::tess::prereglages::{self, ModeApplication, PreReglage};
 use tune_core::tess::resolution::MotifEtape;
 
 use super::tess::{
-    appliquer_le_put, catalogue_du_serveur, cle_mode_pure, cle_prereglage_actif, erreur_migration,
-    rafraichir, refus, reponse_de_zone, verrou_des_put, zone_de,
+    appliquer_le_put, catalogue_du_serveur, cle_mode_pure, cle_prereglage_actif,
+    cle_prereglage_de_base, erreur_migration, rafraichir, refus, reponse_de_zone, verrou_des_put,
+    zone_de,
 };
 use super::*;
 
@@ -274,6 +277,11 @@ pub async fn enregistrer_prereglage(State(state): State<AppState>, corps: Bytes)
 /// l'ancien marqueur est effacé au mieux (aucun marqueur plutôt qu'un
 /// marqueur faux) et un avertissement est rendu, jamais une erreur.
 fn poser_le_marqueur(settings: &SettingsRepo, zone_id: i64, preset_id: &str) -> Option<String> {
+    // rc14 (Rémi) — l'origine de la chaîne suit le marqueur, au mieux : sans
+    // elle, l'écran ne propose simplement pas « Enregistrer » après retouche.
+    if let Err(e) = settings.set(&cle_prereglage_de_base(zone_id), preset_id) {
+        warn!(zone_id, preset_id, erreur = %e, "tess_origine_non_posee");
+    }
     let cle = cle_prereglage_actif(zone_id);
     let e = settings.set(&cle, preset_id).err()?;
     warn!(zone_id, preset_id, erreur = %e, "tess_marqueur_actif_non_pose");
@@ -420,6 +428,140 @@ pub async fn renommer_prereglage(
     Json(p).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorpsEcraser {
+    #[serde(default)]
+    pub zone_id: Option<i64>,
+    #[serde(default)]
+    pub chain: Option<Value>,
+}
+
+/// Refus d'écraser un préréglage livré avec Tune (« Pure ») : l'écran
+/// propose « Enregistrer sous… » (`POST /tess/presets`).
+pub const CODE_PREREGLAGE_LIVRE: &str = "builtin_preset_read_only";
+
+/// `PUT /tess/presets/{preset_id}` ← `{ "zone_id" }` ou `{ "chain" }` — rc14
+/// (Rémi) : « Enregistrer » ÉCRASE la chaîne du préréglage, sans recréer de
+/// ligne ; l'identifiant et le nom restent. La chaîne se lit comme à
+/// l'enregistrement (`POST`) : celle de la zone, ou la chaîne fournie, lue
+/// strictement. Un préréglage livré (`builtin`, « Pure ») est refusé (409
+/// [`CODE_PREREGLAGE_LIVRE`]). Écrasé depuis une zone, le préréglage y
+/// redevient « ACTIVE » ; les AUTRES zones qui le marquaient « ACTIVE » ne le
+/// décrivent plus : leur marqueur s'efface (elles le gardent comme origine,
+/// donc « modifié », avec « Recharger »).
+pub async fn ecraser_prereglage(
+    State(state): State<AppState>,
+    Path(preset_id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    let corps: CorpsEcraser = match serde_json::from_slice(&corps) {
+        Ok(c) => c,
+        Err(e) => return refus(&ErreurChaine::CorpsIllisible(e.to_string())),
+    };
+    let settings = settings_de(&state);
+    // Même ordre des verrous qu'à l'enregistrement : liste, puis zone.
+    let _liste = verrou_de_la_liste().lock().await;
+    let verrou_zone = corps.zone_id.map(verrou_des_put);
+    let _zone = match &verrou_zone {
+        Some(v) => Some(v.lock().await),
+        None => None,
+    };
+    let mut liste = match prereglages::lire(&settings) {
+        Ok(l) => l,
+        Err(e) => return stockage(e),
+    };
+    let Some(existant) = liste.get(&preset_id).cloned() else {
+        return introuvable(&preset_id);
+    };
+    if existant.builtin {
+        return erreur(
+            StatusCode::CONFLICT,
+            CODE_PREREGLAGE_LIVRE,
+            "This preset ships with Tune and cannot be overwritten. Save it under a new name.",
+            Some(&preset_id),
+        );
+    }
+    let chaine = match (corps.zone_id, corps.chain) {
+        (Some(zone_id), None) => {
+            if let Err(r) = zone_de(&state, zone_id) {
+                return r;
+            }
+            // La chaîne ENREGISTRÉE de la zone, neutre vis-à-vis du droit,
+            // comme à l'enregistrement.
+            match lire_zone(&settings, zone_id, true) {
+                Ok(l) => l.chaine,
+                Err(e) => return erreur_migration(&e),
+            }
+        }
+        (None, Some(chain)) => {
+            let c = match ChaineTess::depuis_corps(&chain.to_string()) {
+                Ok(c) => c,
+                Err(e) => return refus(&e),
+            };
+            if let Err(e) = c.valider(
+                &catalogue_du_serveur(),
+                tune_core::tess::ContexteValidation { premium: true },
+            ) {
+                return refus(&e);
+            }
+            c
+        }
+        _ => {
+            return erreur(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                "Give either zone_id (save the zone's current chain) or chain.",
+                Some(&preset_id),
+            );
+        }
+    };
+    if chaine.version > tune_core::tess::VERSION_CHAINE {
+        return refus(&ErreurChaine::VersionNonPriseEnCharge {
+            trouvee: chaine.version,
+            attendue: tune_core::tess::VERSION_CHAINE,
+        });
+    }
+    let Some(p) = liste.presets.iter_mut().find(|p| p.id == preset_id) else {
+        return introuvable(&preset_id);
+    };
+    p.chain = sans_champs_du_serveur(&chaine);
+    let p = p.clone();
+    if let Err(e) = prereglages::ecrire(&settings, &liste) {
+        return stockage(e);
+    }
+    // Le préréglage est écrasé : un échec d'un marqueur ne le défait pas.
+    let mut avertissements = Vec::new();
+    for zone in ZoneRepo::with_backend(state.backend.clone())
+        .list()
+        .unwrap_or_default()
+    {
+        let Some(id) = zone.id else { continue };
+        if Some(id) == corps.zone_id {
+            continue;
+        }
+        let cle = cle_prereglage_actif(id);
+        if settings.get(&cle).ok().flatten().as_deref() == Some(preset_id.as_str())
+            && !effacer_le_marqueur(&settings, id)
+        {
+            warn!(zone_id = id, preset_id = %preset_id, "tess_marqueur_actif_perime");
+        }
+    }
+    if let Some(zone_id) = corps.zone_id
+        && let Some(a) = poser_le_marqueur(&settings, zone_id, &p.id)
+    {
+        avertissements.push(a);
+    }
+    info!(preset_id = %p.id, zone_id = ?corps.zone_id, "tess_prereglage_ecrase");
+    let mut v = serde_json::to_value(&p).unwrap_or_else(|_| json!({}));
+    if !avertissements.is_empty()
+        && let Some(o) = v.as_object_mut()
+    {
+        o.insert("warnings".into(), json!(avertissements));
+    }
+    Json(v).into_response()
+}
+
 /// `DELETE /tess/presets/{preset_id}` — supprime (Pure compris : la croix de
 /// la maquette A2). Les zones qui l'avaient chargé gardent leur chaîne et ne
 /// le marquent plus « ACTIVE ».
@@ -513,7 +655,7 @@ async fn appliquer_toute_l_attente(state: &AppState) {
         // `PUT` en mode immédiat : sur une zone réseau qui joue, l'égaliseur
         // relance le flux à la position ; le crossfeed réseau attend la piste
         // suivante ; le reste n'agit qu'en local.
-        servir_l_attente(state, zone_id, true).await;
+        servir_l_attente(state, zone_id, true, true).await;
     }
 }
 
@@ -782,7 +924,21 @@ pub(super) async fn appliquer_selon_le_mode(
 /// réseau, lui, vient d'être fabriqué avec les clés déjà écrites : rien à
 /// relancer (jamais de relance juste après un démarrage).
 pub async fn appliquer_a_la_lecture(state: &AppState, zone_id: i64) {
-    servir_l_attente(state, zone_id, false).await;
+    servir_l_attente(state, zone_id, false, false).await;
+}
+
+/// À la REPRISE après pause (`resumed`) : comme au démarrage, et un flux
+/// modulé vers le DSD peut être relancé (il joue encore avec l'ancienne
+/// chaîne). Au démarrage (`started`), jamais : la piste vient d'être décidée
+/// avec la chaîne écrite (relecture de #9575).
+pub async fn appliquer_a_la_reprise(state: &AppState, zone_id: i64) {
+    servir_l_attente(state, zone_id, false, true).await;
+}
+
+/// L'événement de lecture permet-il de relancer un flux modulé vers le DSD ?
+/// Seulement la reprise : au démarrage, la piste porte déjà la chaîne.
+pub fn relance_dsd_permise(evenement: &str) -> bool {
+    evenement == "resumed"
 }
 
 /// Combien de rafraîchissements de la sortie vivante la file d'attente a
@@ -806,7 +962,7 @@ fn rafraichis() -> &'static Mutex<HashMap<i64, usize>> {
 /// Sert la file d'une zone. `toutes_sorties` : rafraîchit aussi une sortie
 /// réseau (passage en immédiat) ; sinon, au démarrage d'une lecture, seule
 /// une sortie locale l'est (le flux réseau vient d'être fabriqué).
-async fn servir_l_attente(state: &AppState, zone_id: i64, toutes_sorties: bool) {
+async fn servir_l_attente(state: &AppState, zone_id: i64, toutes_sorties: bool, relance_dsd: bool) {
     // Sous le verrou des `PUT` de la zone : un `PUT` (ou un chargement) en
     // cours écrit ses clés et décide de leur sort avant que la file soit lue.
     let verrou = verrou_des_put(zone_id);
@@ -825,10 +981,10 @@ async fn servir_l_attente(state: &AppState, zone_id: i64, toutes_sorties: bool) 
             .unwrap_or_else(|e| e.into_inner())
             .entry(zone_id)
             .or_default() += 1;
-        rafraichir(state, &zone, &cles).await;
+        super::tess::rafraichir_avec(state, &zone, &cles, relance_dsd).await;
         apres_le_rafraichissement(state, zone_id, &cles).await;
     }
-    info!(zone_id, cles = ?cles, locale, "tess_applique_au_demarrage");
+    info!(zone_id, cles = ?cles, locale, relance_dsd, "tess_applique_au_demarrage");
 }
 
 /// rc14 (retour de Rémi sur la rc13.90) — ce que la chaîne réécrite doit
@@ -892,7 +1048,11 @@ pub fn spawn_application_au_demarrage(state: &AppState) {
                 Err(RecvError::Closed) => break,
             };
             if est_une_prochaine_lecture(&ev.event) && !cles_en_attente(ev.zone_id).is_empty() {
-                appliquer_a_la_lecture(&state, ev.zone_id).await;
+                if relance_dsd_permise(&ev.event) {
+                    appliquer_a_la_reprise(&state, ev.zone_id).await;
+                } else {
+                    appliquer_a_la_lecture(&state, ev.zone_id).await;
+                }
             }
         }
     });
@@ -914,6 +1074,44 @@ mod reprise_rc14_tests {
         // Contre-épreuve : une pause n'applique rien.
         assert!(!est_une_prochaine_lecture("paused"));
         assert!(!est_une_prochaine_lecture("stopped"));
+    }
+
+    /// Relecture de #9575 — au démarrage d'une piste (`started`), la file est
+    /// servie SANS relance du flux modulé vers le DSD (la piste vient d'être
+    /// décidée avec la chaîne écrite) ; à la reprise (`resumed`), la relance
+    /// est demandée.
+    #[tokio::test]
+    async fn le_demarrage_ne_relance_pas_le_dsd_la_reprise_si() {
+        assert!(relance_dsd_permise("resumed"));
+        assert!(!relance_dsd_permise("started"));
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        // Numéro de zone propre au test : la file est commune au processus.
+        for i in 0..140 {
+            repo.create(&format!("Avant {i}"), Some("local"), None)
+                .unwrap();
+        }
+        let zone = repo
+            .create("Salon", Some("local"), Some("local:Realtek HD"))
+            .unwrap();
+        let cle = tune_core::tess::migration::Partie::Surechantillonnage.cle(zone);
+        let avant = super::super::tess::relances_dsd_demandees(zone);
+        ajouter_en_attente(zone, vec![cle.clone()]);
+        appliquer_a_la_lecture(&state, zone).await;
+        assert!(
+            cles_en_attente(zone).is_empty(),
+            "le démarrage sert la file"
+        );
+        assert_eq!(
+            super::super::tess::relances_dsd_demandees(zone),
+            avant,
+            "aucune relance DSD au démarrage"
+        );
+        // Contre-épreuve : la reprise demande la relance.
+        ajouter_en_attente(zone, vec![cle]);
+        appliquer_a_la_reprise(&state, zone).await;
+        assert!(cles_en_attente(zone).is_empty());
+        assert_eq!(super::super::tess::relances_dsd_demandees(zone), avant + 1);
     }
 
     #[tokio::test]

@@ -165,4 +165,43 @@ Only Tune endpoints grouped through **OAAT** share a clock and receive presentat
 - **GitHub**: https://github.com/renesenses/tune-server-rust
 - **CLI**: `cargo install tune-cli` to control from the terminal
 
+---
+
+## 9. Lost administrator password
+
+Authentication is on and the administrator password (`default`, or `admin`)
+is lost: recovery happens **on the server machine**, with a command that does
+not start the server and never prints a password. It must see the same
+database as the service: same user, same `TUNE_DATA_DIR` / `TUNE_DB_PATH`.
+With no database there, it says so and creates nothing.
+
+Two ways to finish:
+
+- **with a browser on the machine**: `tune-server --reset-admin` (or
+  `--reinitialiser-admin`) writes a one-time code (15 min, 5 attempts) to the
+  console and to `tune-server.log`. Open `http://localhost:8888` **on that
+  machine**, click "Forgot password?", enter the code and the new password.
+  From another device, behind a proxy or through the remote relay, it is
+  refused;
+- **with no browser on the machine**: add `--password-stdin` (or
+  `--mot-de-passe-stdin`) and type the new password twice; it is not echoed
+  (or pipe it in: the first line is read).
+
+Either way, in a single operation: existing sessions are revoked (sign in
+again everywhere; the running server closes its WebSockets within seconds)
+and the **API key is erased** (generate a new one for scripts that used it).
+The **bridge token** (remote listening) does not change: paired apps stay
+paired. If the write fails, nothing is changed and the command says so.
+
+| System | Command |
+|---|---|
+| Windows | Start menu → *Tune Server* → **Mot de passe administrateur oublié** (runs `reinitialiser-admin.bat` next to `tune-server.exe`) |
+| macOS | in Terminal, as your own user: `tune-server --reset-admin` (Homebrew) |
+| Debian / Ubuntu | `sudo -u tune sh -c 'cd /var/lib/tune && set -a && . /etc/default/tune-server && exec /opt/tune/tune-server --reset-admin'` |
+| Docker (`tune-server` container from docker-compose) | `docker exec -it -u tune tune-server /app/tune-server --reset-admin --password-stdin` (the host's browser is not "this machine" for the container) |
+| Tune OS | over SSH: `sudo sh -c 'cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server --reset-admin --password-stdin'` |
+
+> The password of the Tune OS **system account** `tune` (SSH, console) is a
+> different matter: see the image's console helper.
+
 Enjoy the music!

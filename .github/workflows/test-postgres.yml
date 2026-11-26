@@ -282,6 +282,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_profil_admin_rc14 -- --nocapture --test-threads=1
 
+      # [rc14] Session renouvelée : les épreuves des jetons de renouvellement
+      # jouées sur SQLite, rejouées sur PostgreSQL. Sans cette étape,
+      # l'épreuve prendrait son saut annoncé (garde `derive_des_garde_fous_2816`).
+      - name: Jetons de renouvellement de session sur PostgreSQL (rc14)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres epreuves_communes_postgres -- --nocapture --test-threads=1
+
       - name: Schema-drift regression (#1706)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test

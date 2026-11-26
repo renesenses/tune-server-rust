@@ -196,7 +196,10 @@ mod tests {
     }
 
     fn rejouer_la_158(db: &SqliteDb) {
-        sql(db, "DELETE FROM _migrations WHERE version = 158");
+        // `run_migrations` reprend après la plus haute version notée : les
+        // suivantes (159, jetons de renouvellement, idempotente) sont
+        // oubliées aussi pour que la 158 rejoue.
+        sql(db, "DELETE FROM _migrations WHERE version >= 158");
         migrations::run_migrations(db).unwrap();
         let marquee: i64 = db
             .connection()

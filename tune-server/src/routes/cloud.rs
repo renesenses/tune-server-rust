@@ -2004,8 +2004,17 @@ async fn license_status(
     // un champ de clé vide, et l'auditeur allait recopier une clé inutile.
     let premium_source = state.license.source_du_premium().await;
 
+    // Pourquoi ce palier : raison normalisée tirée de la dernière réponse du
+    // site (`session_conflict`, `key_expired`, `key_invalid`,
+    // `server_unreachable`, `rate_limited`, `grace_period`), `null` quand il
+    // n'y a rien à dire. Affichage seulement : le palier ci-dessus ne dépend
+    // pas de ce champ.
+    let (reason, reason_detail) = raison_du_palier_json(&state).await;
+
     Json(json!({
         "tier": ls.tier,
+        "reason": reason,
+        "reason_detail": reason_detail,
         "premium_source": premium_source,
         "license_key": license_key,
         "expires_at": ls.expires_at,
@@ -2073,11 +2082,15 @@ async fn license_activate(
             json!({"tier": ls.tier, "expires_at": ls.expires_at}),
         );
     }
+    // `pending` ne disait pas pourquoi : la raison normalisée l'accompagne.
+    let (reason, reason_detail) = raison_du_palier_json(&state).await;
     Json(json!({
         "status": if premium { "activated" } else { "pending" },
         "tier": ls.tier,
         "expires_at": ls.expires_at,
         "license_key": key,
+        "reason": reason,
+        "reason_detail": reason_detail,
     }))
     .into_response()
 }
@@ -2194,6 +2207,30 @@ fn mozaik_base(settings: &SettingsRepo) -> String {
     base.trim_end_matches('/').to_string()
 }
 
+/// La raison normalisée du palier, pour les réponses de licence : le code
+/// (`reason`) et son détail (`reason_detail` : minutes restantes, date de fin,
+/// fin de la grâce, statut amont). `(null, null)` quand il n'y a rien à dire.
+pub(crate) async fn raison_du_palier_json(state: &AppState) -> (Value, Value) {
+    match state.license.raison_du_palier().await {
+        Some(e) => (
+            json!(e.reason.code()),
+            serde_json::to_value(&e).unwrap_or(Value::Null),
+        ),
+        None => (Value::Null, Value::Null),
+    }
+}
+
+/// Retient la réponse du site de licences (sans la clé) pour en dire la
+/// raison, et la journalise : `license_validation_result reason=…`.
+fn noter_reponse_licence(state: &AppState, upstream_status: Option<u16>, body: Option<&Value>) {
+    state
+        .license
+        .noter_reponse(tune_core::license::lire_reponse_licence(
+            upstream_status,
+            body,
+        ));
+}
+
 /// Validate the currently-stored license key against mozaiklabs.fr and apply
 /// the authoritative tier via `update_from_server`. Returns the effective tier
 /// afterwards. On an unreachable/erroring server it leaves the cached tier
@@ -2224,14 +2261,19 @@ pub(crate) async fn validate_stored_license(state: &AppState) -> tune_core::lice
         .send()
         .await;
     let Ok(resp) = resp else {
+        noter_reponse_licence(state, None, None);
         return state.license.tier().await;
     };
+    let statut = resp.status().as_u16();
     if !resp.status().is_success() {
+        noter_reponse_licence(state, Some(statut), None);
         return state.license.tier().await;
     }
     let Ok(body) = resp.json::<Value>().await else {
+        noter_reponse_licence(state, Some(statut), None);
         return state.license.tier().await;
     };
+    noter_reponse_licence(state, Some(statut), Some(&body));
 
     // Lecture unique du verdict (`tune_core::license::verdict_licence`) : ce
     // corps etait interprete a quatre endroits, avec des defauts opposes sur le
@@ -2373,8 +2415,19 @@ fn corps_validation(motif: MotifValidation, corps: Value) -> Value {
 }
 
 /// La réponse HTTP. **200 dans les neuf cas** — voir [`MotifValidation`].
-fn reponse_validation(motif: MotifValidation, corps: Value) -> axum::response::Response {
-    Json(corps_validation(motif, corps)).into_response()
+///
+/// `reason` garde son sens de #3906 (la sortie de la route, un code par
+/// sortie) ; la raison normalisée du PALIER voyage à côté, dans
+/// `reason_detail.reason`, la même que `GET /cloud/license/status`.
+async fn reponse_validation(
+    state: &AppState,
+    motif: MotifValidation,
+    corps: Value,
+) -> axum::response::Response {
+    let mut corps = corps_validation(motif, corps);
+    let (_, detail) = raison_du_palier_json(state).await;
+    corps["reason_detail"] = detail;
+    Json(corps).into_response()
 }
 
 /// Le message du cas « statut distant », mot pour mot.
@@ -2405,12 +2458,14 @@ async fn license_validate(
     let ls = state.license.license_state().await;
     let Some(ref key) = ls.license_key else {
         return reponse_validation(
+            &state,
             MotifValidation::AucuneCle,
             json!({
                 "tier": "free",
                 "message": "No license key configured",
             }),
-        );
+        )
+        .await;
     };
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -2434,21 +2489,27 @@ async fn license_validate(
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "license_validate_request_failed");
+            noter_reponse_licence(&state, None, None);
             return reponse_validation(
+                &state,
                 MotifValidation::RequeteEchouee,
                 json!({
                     "tier": ls.tier,
                     "message": format!("Validation request failed: {e}"),
                     "cached": true,
                 }),
-            );
+            )
+            .await;
         }
     };
 
     // 404 means the server endpoint doesn't exist yet — keep cached state.
+    let statut_amont = resp.status().as_u16();
     if resp.status() == StatusCode::NOT_FOUND {
+        noter_reponse_licence(&state, Some(statut_amont), None);
         info!("license_validate_endpoint_not_found, keeping cached state");
         return reponse_validation(
+            &state,
             MotifValidation::PointAccesAbsent,
             json!({
                 "tier": ls.tier,
@@ -2456,13 +2517,16 @@ async fn license_validate(
                 "cached": true,
                 "upstream_status": StatusCode::NOT_FOUND.as_u16(),
             }),
-        );
+        )
+        .await;
     }
 
     if !resp.status().is_success() {
         let status = resp.status();
+        noter_reponse_licence(&state, Some(statut_amont), None);
         warn!(status = %status, "license_validate_server_error");
         return reponse_validation(
+            &state,
             MotifValidation::StatutDistant,
             json!({
                 "tier": ls.tier,
@@ -2470,22 +2534,26 @@ async fn license_validate(
                 "cached": true,
                 "upstream_status": status.as_u16(),
             }),
-        );
+        )
+        .await;
     }
 
     // Parse the server's authoritative response.
     let body: Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
+            noter_reponse_licence(&state, Some(statut_amont), None);
             warn!(error = %e, "license_validate_parse_failed");
             return reponse_validation(
+                &state,
                 MotifValidation::ReponseIllisible,
                 json!({
                     "tier": ls.tier,
                     "message": format!("Failed to parse response: {e}"),
                     "cached": true,
                 }),
-            );
+            )
+            .await;
         }
     };
 
@@ -2498,18 +2566,21 @@ async fn license_validate(
     // `status:"validated"`. Le bouton « Valider » du panneau retrogradait donc
     // un payeur en annoncant un succes. Un verdict absent ne persiste plus
     // rien : le palier en cache est rendu tel quel, sous `status:"cached"`.
+    noter_reponse_licence(&state, Some(statut_amont), Some(&body));
     let verdict = tune_core::license::verdict_licence(&body);
     let (tier, expires_at) = match verdict {
         tune_core::license::VerdictLicence::Absent => {
             warn!("license_validate_sans_verdict_palier_conserve");
             return reponse_validation(
+                &state,
                 MotifValidation::SansVerdict,
                 json!({
                     "tier": ls.tier,
                     "message": "The licence server returned no verdict; the cached tier is kept.",
                     "cached": true,
                 }),
-            );
+            )
+            .await;
         }
         tune_core::license::VerdictLicence::Expiree => {
             info!("license_invalidated_by_server_validate (authoritative expiry)");
@@ -2522,25 +2593,28 @@ async fn license_validate(
                 json!({"tier": "free", "expires_at": null}),
             );
             return reponse_validation(
+                &state,
                 MotifValidation::Expiree,
                 json!({
                     "tier": "free",
                     "message": "License key is not valid",
                 }),
-            );
+            )
+            .await;
         }
         tune_core::license::VerdictLicence::RefusTransitoire => {
             // Un refus nu n'est pas une revocation : Premium survit dans la
             // fenetre de grace au lieu d'etre detruit sur un hoquet.
             warn!("license_validate_rejected_keeping_cached_tier");
             return reponse_validation(
+                &state,
                 MotifValidation::RefusTransitoire,
                 json!({
                     "tier": ls.tier,
                     "message": "Server could not confirm the license right now; Premium is retained (grace period).",
                     "cached": true,
                 }),
-            );
+            ).await;
         }
         tune_core::license::VerdictLicence::Confirmee { tier, expires_at } => (tier, expires_at),
     };
@@ -2557,6 +2631,7 @@ async fn license_validate(
 
     let updated = state.license.license_state().await;
     reponse_validation(
+        &state,
         MotifValidation::Confirmee,
         json!({
             "tier": updated.tier,
@@ -2564,6 +2639,7 @@ async fn license_validate(
             "last_validated": updated.last_validated,
         }),
     )
+    .await
 }
 
 /// #3906 — les neuf sorties de `POST /cloud/license/validate` doivent être

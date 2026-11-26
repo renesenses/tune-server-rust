@@ -12,9 +12,10 @@
 //!   réaffectation) ; une RI que le convolueur a retirée est connue éteinte.
 //!   Tant que l'exécuteur TESS (T03, T04) n'est pas branché, c'est une
 //!   [`GreffonsEnService::Sonde`] ; il publiera la liste exacte ;
-//! - **headroom** : l'étage de T07 n'est pas encore branché dans la lecture,
-//!   donc rien n'est en service (le headroom automatique s'affiche « not in
-//!   service » plutôt qu'appliqué) ;
+//! - **headroom** : l'étage de T07 n'est pas branché dans la lecture ; la
+//!   marge MANUELLE l'est par l'étage des égaliseurs (#9520), et se lit en
+//!   service quand l'étape « DSP » altère le signal
+//!   ([`marge_manuelle_en_service`], rc14) ;
 //! - **upsampling** : `upsampling.active` du chemin historique ;
 //! - **volume** : la sonde locale (`OutputVolumeState::Applied`), sinon un
 //!   gain logiciel de zone différent de l'unité, sortie locale seulement.
@@ -101,6 +102,60 @@ pub(crate) fn en_service_d_apres_le_chemin(sp: &Value, volume_logiciel: bool) ->
         latences: Vec::new(),
         modulation_dsd: None,
     }
+}
+
+/// rc14 (Rémi) — la marge MANUELLE que la lecture applique RÉELLEMENT :
+/// depuis #9520, elle est posée par l'étage des égaliseurs, qui applique
+/// `min(M, L1)` (la réserve « Sûre » de la série n'est jamais perdue), ou un
+/// gain fixe M sur la sortie locale sans égaliseur. La valeur publiée est
+/// donc la réserve que l'étage applique (`eq_headroom.reserve_db` du chemin
+/// historique, `EqProfile::reserve_db_at`, la plus forte des deux voies),
+/// jamais la consigne M seule. Rien n'est annoncé sans étape « DSP » qui
+/// altère le signal (PURE, « Bypass all », sortie qui ne l'exécute pas) ni
+/// sans étage d'égaliseur en service (une étape DSP due au seul crossfeed ne
+/// porte pas la marge). L'automatique (0 dB depuis #9520) n'est jamais un
+/// gain à part : sa réserve se lit dans l'étape DSP.
+pub(crate) fn marge_manuelle_en_service(
+    chaine: &tune_core::tess::ChaineTess,
+    sp: &Value,
+) -> Option<f64> {
+    let tune_core::tess::Headroom::Manual { db } = chaine.fixed.headroom else {
+        return None;
+    };
+    if !(db.is_finite() && db < 0.0) {
+        return None;
+    }
+    let dsp_actif = etapes(sp).iter().any(|e| a_le_nom(e, "DSP") && altere(e));
+    if dsp_actif && let Some(r) = reserve_de_l_etage_eq(sp) {
+        return (r < 0.0).then_some(r);
+    }
+    // Revue de #9561 — sans étage d'égaliseur (sortie réseau), c'est le
+    // convolueur qui porte M : la marge qu'il applique, telle qu'il la publie.
+    marge_portee_par_la_convolution(sp)
+}
+
+/// La marge que le convolueur applique au filtre en service (dB, < 0),
+/// `headroom_db` de l'étape `room_correction` appliquée.
+fn marge_portee_par_la_convolution(sp: &Value) -> Option<f64> {
+    etapes(sp)
+        .iter()
+        .find(|e| a_le_code(e, "room_correction") && e.get("applied") == Some(&Value::Bool(true)))
+        .and_then(|e| e.get("headroom_db"))
+        .and_then(Value::as_f64)
+        .filter(|r| r.is_finite() && *r < 0.0)
+}
+
+/// La réserve que l'étage des égaliseurs applique (dB, ≤ 0), la plus forte
+/// des voies : `eq_headroom.reserve_db` du chemin historique. `None` sans
+/// égaliseur construit.
+fn reserve_de_l_etage_eq(sp: &Value) -> Option<f64> {
+    sp.get("eq_headroom")?
+        .get("reserve_db")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_f64)
+        .filter(|x| x.is_finite())
+        .reduce(f64::min)
 }
 
 /// rc14 — la modulation DSD de la piste qui joue (sortie locale), retenue par
@@ -292,6 +347,16 @@ pub(crate) fn chemin_tess_de_la_zone(
         ),
         &ctx.volume,
     );
+    // Une valeur déjà constatée (modulation DSD de #9518) prime : le
+    // producteur applique alors lui-même le headroom.
+    if !matches!(
+        en_service.modulation_dsd,
+        Some(EtatModulation::EnService(_))
+    ) {
+        en_service.headroom_db = en_service
+            .headroom_db
+            .or_else(|| marge_manuelle_en_service(&lecture.chaine, sp));
+    }
     let intact = sp.get("bit_perfect").and_then(Value::as_bool);
     let chemin = chemin_du_signal(
         &lecture.chaine,

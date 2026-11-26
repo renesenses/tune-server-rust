@@ -375,6 +375,128 @@ struct CanalDuFiltre {
 /// Réglage : le nom du dernier dépôt d'un jeu (`.zip` ou `.wav`) de la zone.
 const CLE_NOM_DU_JEU: &str = "ir_set_name_";
 
+/// Réglage (Rémi, rc14) : le nom d'ORIGINE de chaque fichier du jeu, par nom
+/// interne de stockage — `{"zone_4.wav": "HAF_44_HL.wav"}`. Tune range les
+/// réponses sous `zone_{id}.wav` / `zone_{id}_sr{N}.wav` ; sans ce réglage,
+/// « Filters in this set » n'affichait que ce nom interne. Une installation
+/// d'avant n'a pas ce réglage : `display_name` y reste le nom interne.
+const CLE_NOMS_D_ORIGINE: &str = "ir_original_names_";
+
+/// Le nom interne (sans dossier) d'un fichier du jeu.
+fn nom_interne(chemin: &str) -> String {
+    std::path::Path::new(chemin)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| chemin.to_string())
+}
+
+/// Les noms d'origine connus de la zone (vide si le réglage manque ou ne se
+/// lit pas).
+fn lire_noms_d_origine(
+    settings: &dyn ReglagesImport,
+    zone_id: i64,
+) -> serde_json::Map<String, serde_json::Value> {
+    settings
+        .lire(&format!("{CLE_NOMS_D_ORIGINE}{zone_id}"))
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn ecrire_noms_d_origine(
+    settings: &dyn ReglagesImport,
+    zone_id: i64,
+    noms: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let cle = format!("{CLE_NOMS_D_ORIGINE}{zone_id}");
+    if noms.is_empty() {
+        settings.effacer(&cle)
+    } else {
+        settings.ecrire(&cle, &serde_json::Value::Object(noms.clone()).to_string())
+    }
+}
+
+/// Pose (ou retire, `None`) le nom d'origine du fichier rangé à `chemin` :
+/// chaque écriture d'un fichier du jeu dit le sien, et un dépôt sans nom
+/// efface celui d'un ancien fichier rangé au même endroit.
+fn poser_nom_d_origine(
+    settings: &dyn ReglagesImport,
+    zone_id: i64,
+    chemin: &str,
+    nom: Option<&str>,
+) {
+    let mut noms = lire_noms_d_origine(settings, zone_id);
+    let interne = nom_interne(chemin);
+    match nom_de_depot(nom) {
+        Some(n) => noms.insert(interne, json!(n)),
+        None => noms.remove(&interne),
+    };
+    if let Err(e) = ecrire_noms_d_origine(settings, zone_id, &noms) {
+        tracing::warn!(zone_id, error = %e, "convolver_nom_d_origine_non_ecrit");
+    }
+}
+
+/// Les noms des entrées d'une archive, par chemin normalisé en minuscules
+/// (la clé sous laquelle `import_ri` les range) : de quoi rendre à chaque
+/// filtre la casse de son nom dans l'archive. Vide hors archive.
+fn casse_des_entrees(corps: &[u8]) -> std::collections::HashMap<String, String> {
+    let mut casse = std::collections::HashMap::new();
+    if !tune_core::audio::import_ri::est_une_archive_zip(corps) {
+        return casse;
+    }
+    let Ok(zip) = ::zip::ZipArchive::new(std::io::Cursor::new(corps)) else {
+        return casse;
+    };
+    for nom in zip.file_names().flatten() {
+        let normalise: Vec<&str> = nom
+            .split(['/', '\\'])
+            .filter(|p| !p.is_empty() && *p != ".")
+            .collect();
+        let normalise = normalise.join("/");
+        casse.insert(normalise.to_ascii_lowercase(), normalise);
+    }
+    casse
+}
+
+/// Le nom d'une réponse importée avec la casse de l'archive, sans dossier
+/// (`a + b` pour deux mono réunis) ; tel quel s'il n'y est pas.
+fn retrouver_la_casse(casse: &std::collections::HashMap<String, String>, nom: &str) -> String {
+    nom.split(" + ")
+        .map(|p| {
+            let p = casse
+                .get(&p.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| p.to_string());
+            p.rsplit(['/', '\\']).next().unwrap_or(&p).to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// Ajoute à chaque fichier décrit `name` (nom interne), `original_name` (nom
+/// à l'import, `null` s'il n'est pas connu) et `display_name` (le nom
+/// d'origine, sinon le nom interne : l'affichage d'avant).
+fn nommer_les_fichiers(
+    fichiers: &mut [serde_json::Value],
+    noms: &serde_json::Map<String, serde_json::Value>,
+) {
+    for f in fichiers {
+        let Some(chemin) = f.get("path").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let interne = nom_interne(chemin);
+        let origine = noms
+            .get(&interne)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        f["display_name"] = json!(origine.clone().unwrap_or_else(|| interne.clone()));
+        f["original_name"] = json!(origine);
+        f["name"] = json!(interne);
+    }
+}
+
 /// Un nom de dépôt affichable : sans chemin, sans caractère de contrôle,
 /// 128 caractères au plus.
 fn nom_de_depot(nom: Option<&str>) -> Option<String> {
@@ -421,6 +543,8 @@ fn balayer_les_depots_provisoires(ir_dir: &std::path::Path) {
 struct JeuPose {
     jeu: tune_core::audio::import_ri::JeuImporte,
     chemin_principal: String,
+    /// rc14 (Didier) — les filtres du jeu qui amplifient (importés tels quels).
+    avertissements_de_gain: Vec<tune_core::audio::import_ri::AvertissementDeGain>,
 }
 
 /// Refus d'un import, au format de l'API.
@@ -552,10 +676,11 @@ fn importer_bloquant(
         tune_core::audio::convolver::par_cadence::CLE_JEU
     );
     let cle_nom = format!("{CLE_NOM_DU_JEU}{zone_id}");
+    let cle_noms = format!("{CLE_NOMS_D_ORIGINE}{zone_id}");
     // (0) Les réglages d'avant. Une lecture qui échoue n'est pas une clé
     // absente : rien n'est touché.
     let mut reglages_avant: Vec<(String, Option<String>)> = Vec::new();
-    for cle in [&cle_principal, &cle_jeu, &cle_nom] {
+    for cle in [&cle_principal, &cle_jeu, &cle_nom, &cle_noms] {
         let valeur = settings.lire(cle).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -630,6 +755,20 @@ fn importer_bloquant(
         .map(|(_, f)| f.to_str().unwrap_or("").to_string())
         .collect();
     let chemin_principal = chemins[principal].clone();
+    // Le nom d'origine de chaque réponse : son nom dans l'archive, ou le
+    // nom du `.wav` déposé. Sans nom de dépôt, un `.wav` seul n'a que le nom
+    // par défaut d'`importer` : il n'est pas retenu.
+    let mut noms_d_origine = serde_json::Map::new();
+    let casse = casse_des_entrees(corps);
+    for (r, chemin) in jeu.reponses.iter().zip(&chemins) {
+        if nom.is_none() && r.nom == nom_lu {
+            continue;
+        }
+        let nom_lu_r = retrouver_la_casse(&casse, &r.nom);
+        if let Some(n) = nom_de_depot(Some(&nom_lu_r)) {
+            noms_d_origine.insert(nom_interne(chemin), json!(n));
+        }
+    }
     let supplementaires: Vec<String> = chemins
         .iter()
         .enumerate()
@@ -652,7 +791,8 @@ fn importer_bloquant(
         .and_then(|_| match &nom {
             Some(n) => settings.ecrire(&cle_nom, n),
             None => settings.effacer(&cle_nom),
-        });
+        })
+        .and_then(|_| ecrire_noms_d_origine(settings, zone_id, &noms_d_origine));
     if let Err(e) = ecrits {
         let mut non_remis = Vec::new();
         for (cle, valeur) in &reglages_avant {
@@ -692,9 +832,20 @@ fn importer_bloquant(
     for cote in ["L", "R"] {
         std::fs::remove_file(ir_dir.join(format!("zone_{zone_id}_{cote}.wav"))).ok();
     }
+    let avertissements_de_gain = import_ri::avertissements_de_gain(&jeu);
+    for a in &avertissements_de_gain {
+        tracing::info!(
+            zone_id,
+            nom = %a.name,
+            sample_rate = a.sample_rate,
+            gain_max_db = a.gain_max_db,
+            "convolver_import_filtre_qui_amplifie"
+        );
+    }
     Ok(JeuPose {
         jeu,
         chemin_principal,
+        avertissements_de_gain,
     })
 }
 
@@ -728,6 +879,7 @@ async fn importer_le_jeu(
     let JeuPose {
         jeu,
         chemin_principal,
+        avertissements_de_gain,
     } = match pose {
         Ok(Ok(p)) => p,
         Ok(Err(reponse)) => return reponse,
@@ -766,6 +918,18 @@ async fn importer_le_jeu(
         "ignored": jeu.ecartes.iter().map(|(n, r)| json!({"name": n, "reason": r})).collect::<Vec<_>>(),
         "active": true,
         "warning": avertissement,
+        // rc14 (Didier) — un filtre qui amplifie : clé i18n et paramètres
+        // bruts (nom, cadence, gain maximal, marge automatique).
+        "gain_warnings": avertissements_de_gain.iter().map(|a| json!({
+            "code": a.code,
+            "message_key": a.message_key,
+            "params": {
+                "name": a.name,
+                "sample_rate": a.sample_rate,
+                "gain_db": a.gain_max_db,
+                "headroom_db": a.headroom_db,
+            },
+        })).collect::<Vec<_>>(),
         "applies_to": if is_local { "local" } else { "network (transcode)" },
     }))
     .into_response()
@@ -832,7 +996,8 @@ fn decrire_le_jeu(settings: &SettingsRepo, zone_id: i64) -> Vec<serde_json::Valu
     let Some(jeu) = tune_core::audio::convolver::JeuDeZone::lire(settings, zone_id) else {
         return Vec::new();
     };
-    jeu.chemins()
+    let mut fichiers: Vec<serde_json::Value> = jeu
+        .chemins()
         .into_iter()
         .enumerate()
         .map(
@@ -847,7 +1012,9 @@ fn decrire_le_jeu(settings: &SettingsRepo, zone_id: i64) -> Vec<serde_json::Valu
                 Err(e) => json!({"path": chemin, "main": i == 0, "error": e}),
             },
         )
-        .collect()
+        .collect();
+    nommer_les_fichiers(&mut fichiers, &lire_noms_d_origine(settings, zone_id));
+    fichiers
 }
 
 /// Cadence d'un fichier de reponse impulsionnelle, `None` s'il est illisible.
@@ -904,6 +1071,7 @@ async fn ajouter_au_jeu(
     device_id: &str,
     is_local: bool,
     body: &[u8],
+    nom: Option<&str>,
 ) -> axum::response::Response {
     let ir_dir = dossier_ir();
     std::fs::create_dir_all(&ir_dir).ok();
@@ -932,6 +1100,7 @@ async fn ajouter_au_jeu(
     }
     let chemin = chemin.to_str().unwrap_or("").to_string();
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    poser_nom_d_origine(&settings, zone_id, &chemin, nom);
     let principal = settings
         .get(&format!("ir_path_{zone_id}"))
         .ok()
@@ -1036,7 +1205,15 @@ async fn upload_ir_handler(
     let _zone_verrouillee = verrou.lock().await;
 
     if vrai(canal.per_rate.as_deref()) && canal.channel.as_deref().is_none_or(str::is_empty) {
-        return ajouter_au_jeu(&state, zone_id, &device_id, is_local, &body).await;
+        return ajouter_au_jeu(
+            &state,
+            zone_id,
+            &device_id,
+            is_local,
+            &body,
+            canal.name.as_deref(),
+        )
+        .await;
     }
 
     // Persist the IR to disk.
@@ -1136,6 +1313,14 @@ async fn upload_ir_handler(
         Some(n) => settings.set(&format!("{CLE_NOM_DU_JEU}{zone_id}"), &n).ok(),
         None => settings.delete(&format!("{CLE_NOM_DU_JEU}{zone_id}")).ok(),
     };
+    // Rémi (rc14) — le nom d'origine du fichier. Deux canaux réunis n'ont
+    // pas de nom unique : l'interne reste affiché.
+    poser_nom_d_origine(
+        &settings,
+        zone_id,
+        &ir_path_str,
+        canal.name.as_deref().filter(|_| cote.is_none()),
+    );
     // #8761 — un fichier par cadence de MEME cadence que le nouveau principal
     // l'emporterait sur lui (le dernier du jeu gagne) : il est retire.
     if let Some(cadence) = cadence_du_fichier(&ir_path_str) {
@@ -1268,6 +1453,9 @@ async fn clear_ir_handler(
     // Drop the stored path (network/transcode) + the file for any zone.
     settings.delete(&format!("ir_path_{zone_id}")).ok();
     settings.delete(&format!("{CLE_NOM_DU_JEU}{zone_id}")).ok();
+    settings
+        .delete(&format!("{CLE_NOMS_D_ORIGINE}{zone_id}"))
+        .ok();
     std::fs::remove_file(&principal_par_defaut).ok();
     // Et les deux depots par canal, sinon un « effacer » suivi d'un depot d'un
     // seul cote ressusciterait l'ancien filtre de l'autre.
@@ -1604,6 +1792,86 @@ mod import_t09a_tests {
             .expect("restore_incomplete");
         assert_eq!(non_remis.len(), 1, "{v}");
         assert!(cote.exists(), "la copie de côté n'est pas effacée");
+    }
+
+    /// Le même `.wav` mono flottant, à la cadence `sr`.
+    fn wav_a(sr: u32) -> Vec<u8> {
+        let mut w = wav();
+        w[24..28].copy_from_slice(&sr.to_le_bytes());
+        w[28..32].copy_from_slice(&(sr * 4).to_le_bytes());
+        w
+    }
+
+    fn zip(fichiers: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut tampon = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = ::zip::ZipWriter::new(&mut tampon);
+            let o = ::zip::write::SimpleFileOptions::default();
+            for (nom, contenu) in fichiers {
+                z.start_file(*nom, o).unwrap();
+                z.write_all(contenu).unwrap();
+            }
+            z.finish().unwrap();
+        }
+        tampon.into_inner()
+    }
+
+    /// Les fichiers décrits comme `decrire_le_jeu` les rend, avec leurs noms.
+    fn decrits(chemins: &[String], reglages: &FauxReglages) -> Vec<serde_json::Value> {
+        let mut v: Vec<serde_json::Value> = chemins.iter().map(|c| json!({"path": c})).collect();
+        nommer_les_fichiers(&mut v, &lire_noms_d_origine(reglages, 7));
+        v
+    }
+
+    /// Rémi (rc14) — `HAF_44_HL.wav` importé s'affichait `zone_7.wav` dans
+    /// « Filters in this set ». Le nom d'origine est gardé à l'import, le nom
+    /// interne reste celui du stockage ; une archive garde le nom de chaque
+    /// filtre ; une installation sans ce réglage garde l'affichage d'avant.
+    #[test]
+    fn le_nom_d_origine_du_filtre_est_garde_a_l_import() {
+        let d = tune_core::test_scratch::scratch_dir("rc14-nom-d-origine");
+        let reglages = FauxReglages::default();
+        let pose = importer_bloquant(&wav(), Some("HAF_44_HL.wav".into()), d.path(), 7, &reglages)
+            .expect("import du .wav");
+        assert_eq!(nom_interne(&pose.chemin_principal), "zone_7.wav");
+        let f = &decrits(std::slice::from_ref(&pose.chemin_principal), &reglages)[0];
+        assert_eq!(f["name"], "zone_7.wav", "{f}");
+        assert_eq!(f["original_name"], "HAF_44_HL.wav", "{f}");
+        assert_eq!(f["display_name"], "HAF_44_HL.wav", "{f}");
+
+        // Une archive : chaque filtre garde SON nom dans l'archive, et
+        // l'ancien nom du `.wav` précédent disparaît avec lui.
+        let corps = zip(&[
+            ("salon/HAF_44_HL.wav", wav_a(44_100)),
+            ("salon/HAF_96_HL.wav", wav_a(96_000)),
+        ]);
+        importer_bloquant(&corps, Some("salon.zip".into()), d.path(), 7, &reglages)
+            .expect("import de l'archive");
+        let noms = lire_noms_d_origine(&reglages, 7);
+        assert_eq!(noms.len(), 2, "{noms:?}");
+        let mut affiches: Vec<(String, String)> = noms
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+            .collect();
+        affiches.sort();
+        assert!(
+            affiches.iter().all(|(k, _)| k.starts_with("zone_7")),
+            "{affiches:?}"
+        );
+        let mut originaux: Vec<&str> = affiches.iter().map(|(_, v)| v.as_str()).collect();
+        originaux.sort();
+        assert_eq!(originaux, ["HAF_44_HL.wav", "HAF_96_HL.wav"]);
+
+        // Contre-épreuve : une installation d'avant, sans le réglage, garde
+        // le nom interne à l'affichage.
+        let ancienne = FauxReglages::default();
+        let f = &decrits(&["/d/ir/zone_4.wav".to_string()], &ancienne)[0];
+        assert_eq!(f["display_name"], "zone_4.wav", "{f}");
+        assert!(f["original_name"].is_null(), "{f}");
+        // Et un `.wav` déposé sans nom ne se donne pas le nom par défaut.
+        importer_bloquant(&wav(), None, d.path(), 7, &reglages).expect("import sans nom");
+        assert!(lire_noms_d_origine(&reglages, 7).is_empty());
     }
 
     #[tokio::test]

@@ -261,6 +261,29 @@ pub fn scratch_dir_in(racine: impl AsRef<Path>, etiquette: &str) -> ScratchDir {
     ScratchDir { chemin }
 }
 
+/// Exécute le cas libtest courant seul lorsque son état est global au processus.
+/// Le parent contrôle le résultat de l'enfant, qui exécute les assertions.
+pub fn dans_un_processus_isole() -> bool {
+    let thread = std::thread::current();
+    let nom = thread.name().expect("nom du test libtest");
+    const CAS: &str = "TUNE_CAS_LIBTEST_ISOLE";
+    if std::env::var(CAS).as_deref() == Ok(nom) {
+        return true;
+    }
+    let sortie = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", nom, "--nocapture"])
+        .env(CAS, nom)
+        .output()
+        .expect("lancer le test isolé");
+    let stdout = String::from_utf8_lossy(&sortie.stdout);
+    assert!(
+        sortie.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "{nom} : {stdout}\n{}",
+        String::from_utf8_lossy(&sortie.stderr)
+    );
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

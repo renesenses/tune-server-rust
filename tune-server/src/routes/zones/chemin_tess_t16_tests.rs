@@ -606,3 +606,63 @@ fn la_marge_du_modulateur_dsd_est_publiee_a_part() {
     let p = tune_core::tess::chemin::params_du_modulateur(&m(-12.0));
     assert_eq!(p["modulator_margin_db"], -3.0);
 }
+
+/// rc14 (Rémi) — le chemin du signal affiche la marge MANUELLE quand l'étage
+/// des égaliseurs tourne, et rien sous PURE (étape DSP contournée).
+///
+/// Revue de #9546 — la valeur affichée est celle que l'étage APPLIQUE,
+/// `min(M, L1)` (`eq_headroom.reserve_db`), pas la consigne M : M = −7,5 dB
+/// avec une série dont la réserve L1 est de −9,2 dB applique −9,2 dB.
+#[test]
+fn la_marge_manuelle_est_en_service_quand_l_etage_dsp_tourne_rc14() {
+    use super::chemin_tess_t16::marge_manuelle_en_service;
+    use tune_core::tess::{ChaineTess, Headroom};
+    let mut c = ChaineTess::default();
+    c.fixed.headroom = Headroom::Manual { db: -7.5 };
+    let dsp = |reserve: Option<[f64; 2]>, intact: bool| {
+        let mut sp = json!({"steps": [{"name": "DSP", "bit_perfect": intact}]});
+        if let Some(r) = reserve {
+            sp["eq_headroom"] = json!({"mode": "safe", "reserve_db": r});
+        }
+        sp
+    };
+    // M plus forte que la réserve de la série : M, telle quelle.
+    assert_eq!(
+        marge_manuelle_en_service(&c, &dsp(Some([-7.5, -7.5]), false)),
+        Some(-7.5)
+    );
+    // La réserve L1 de la série est plus forte : c'est ELLE qui est appliquée
+    // (min(M, L1)), et c'est elle qui s'affiche — pas M.
+    assert_eq!(
+        marge_manuelle_en_service(&c, &dsp(Some([-9.2, -8.1]), false)),
+        Some(-9.2),
+        "min(M, L1), la plus forte des deux voies"
+    );
+    // Une étape DSP sans étage d'égaliseur (crossfeed seul, sortie réseau
+    // sans égaliseur) ne porte pas la marge.
+    assert_eq!(marge_manuelle_en_service(&c, &dsp(None, false)), None);
+    assert_eq!(
+        marge_manuelle_en_service(&c, &dsp(Some([-7.5, -7.5]), true)),
+        None,
+        "PURE la contourne"
+    );
+    assert_eq!(marge_manuelle_en_service(&c, &json!({"steps": []})), None);
+    // Revue de #9561 — sortie réseau sans égaliseur : le convolueur porte M,
+    // c'est sa marge appliquée qui s'affiche.
+    let reseau = json!({"steps": [
+        {"name": "DSP", "bit_perfect": false},
+        {"code": "room_correction", "applied": true, "headroom_db": -7.5},
+    ]});
+    assert_eq!(marge_manuelle_en_service(&c, &reseau), Some(-7.5));
+    // Automatique, ou 0 dB : jamais un gain à part.
+    c.fixed.headroom = Headroom::Manual { db: 0.0 };
+    assert_eq!(
+        marge_manuelle_en_service(&c, &dsp(Some([-3.0, -3.0]), false)),
+        None
+    );
+    c.fixed.headroom = Headroom::Auto {};
+    assert_eq!(
+        marge_manuelle_en_service(&c, &dsp(Some([-3.0, -3.0]), false)),
+        None
+    );
+}

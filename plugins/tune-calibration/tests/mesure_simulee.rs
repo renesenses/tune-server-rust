@@ -7,11 +7,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tune_calibration::mic_cal::MicCalibration;
 use tune_calibration::sim::RoomSim;
 use tune_calibration_greffon::fournisseur::FournisseurBalayage;
 use tune_calibration_greffon::generateur::Consigne;
 use tune_calibration_greffon::hote::TraitementsDeZone;
 use tune_calibration_greffon::mesure::{Controleur, Demande, Etat, FREQUENCE_MESURE};
+use tune_calibration_greffon::niveau::SPL_MAX_DB;
 use tune_calibration_greffon::simulation::{
     Boucle, CheminDeLecture, HoteSimule, MicroSimule, PieceEnDirect,
 };
@@ -375,6 +377,79 @@ fn un_micro_fige_arrete_la_mesure_tot_en_le_disant_9066() {
     let json = serde_json::to_value(&av).unwrap();
     assert_eq!(json["code"], "micro_fige", "{json}");
     assert_eq!(json["etat"], "erreur", "{json}");
+}
+
+/// rc14, version prudente (26/11) — les SALVES de la mesure se bornent sur la
+/// plus haute des deux conversions SPL. Étalonnage choisi pour que la
+/// première salve donne ≈ 95 dB SPL par l'ancienne conversion
+/// (`dBFS + 112 − Sens`) et ≈ 77 par la nouvelle (`dBFS + 94 − Sens − gain`,
+/// gain 0). La montée doit s'arrêter à la PREMIÈRE salve, refusée sur la
+/// pression. Avec la nouvelle conversion seule, elle monterait encore de
+/// deux pas (≈ 107 dB réels si l'ancienne dit vrai).
+#[test]
+fn les_salves_se_bornent_sur_la_plus_haute_des_deux_conversions() {
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let b = banc(&sim, 1.0, Some(50.0), "salves-prudentes");
+    // Un RSB visé inatteignable : chaque salve veut monter, seul un plafond
+    // l'arrête.
+    let demande_haute = |etalonnage: &str| {
+        let mut d = demande(12);
+        d.politique.target_snr_db = 200.0;
+        d.etalonnage = Some(etalonnage.into());
+        d.gain_relatif_db = Some(0.0);
+        d
+    };
+    // 1. Repérer la crête captée de la première salve, micro très peu
+    //    sensible (aucun plafond SPL en jeu).
+    b.controleur
+        .deposer_etalonnage(
+            "sourd",
+            "\"Sens Factor =80.0dB, SERNO: 1\"\n10 0.0\n20000 0.0\n",
+        )
+        .unwrap();
+    let id = b.controleur.lancer(demande_haute("sourd")).unwrap();
+    attendre_fin(&b.controleur, &id, Duration::from_secs(180));
+    let reperage = b.controleur.mesure(&id).unwrap().avancement().salves;
+    assert!(reperage.len() >= 3, "{reperage:?}");
+    let crete = reperage[0].crete_captee_dbfs;
+    let premier_niveau = reperage[0].niveau_joue_dbfs;
+
+    // 2. L'étalonnage piège : ancienne ≈ 95, nouvelle ≈ 77 à la 1re salve.
+    let sens = crete + 112.0 - 95.0;
+    let texte = format!("\"Sens Factor ={sens:.3}dB, SERNO: 2\"\n10 0.0\n20000 0.0\n");
+    let cal = MicCalibration::parse(&texte).unwrap();
+    assert!(cal.crete_spl(crete, Some(0.0)).unwrap() < 80.0);
+    assert!(cal.crete_spl_prudente(crete, Some(0.0)).unwrap() > SPL_MAX_DB);
+    b.controleur.deposer_etalonnage("piege", &texte).unwrap();
+    let id = b.controleur.lancer(demande_haute("piege")).unwrap();
+    let etat = attendre_fin(&b.controleur, &id, Duration::from_secs(180));
+    let salves = b.controleur.mesure(&id).unwrap().avancement().salves;
+    match &etat {
+        Etat::Refusee { motif } => assert!(motif.contains("pression acoustique"), "{motif}"),
+        autre => panic!("attendu un refus sur la pression, obtenu {autre:?} ; {salves:?}"),
+    }
+    // Coupée : une seule salve, refusée, au premier niveau.
+    assert_eq!(
+        salves.len(),
+        1,
+        "la montée doit s'arrêter sur la plus haute des deux conversions : {salves:?}"
+    );
+    assert!(
+        salves[0].spl_db.is_some_and(|s| s > SPL_MAX_DB),
+        "{salves:?}"
+    );
+    assert!(
+        salves[0].decision.contains("pression acoustique"),
+        "{salves:?}"
+    );
+    // Bornée : rien n'a été joué au-dessus du premier niveau.
+    let emissions = b.controleur.mesure(&id).unwrap().deroule.emissions();
+    assert!(
+        emissions
+            .iter()
+            .all(|e| e.niveau_dbfs <= premier_niveau + 1e-9),
+        "{emissions:?}"
+    );
 }
 
 /// Garde-fou du niveau joué : une pièce trop sourde (enceinte presque

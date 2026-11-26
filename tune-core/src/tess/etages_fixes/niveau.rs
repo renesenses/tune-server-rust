@@ -39,7 +39,84 @@
 //!   la [`super::ConsigneVolume`].
 
 use super::rampe::{decibels, lineaire};
-use crate::tess::chaine::Headroom;
+use crate::tess::chaine::{HEADROOM_AUTO_DB, HEADROOM_MANUEL_MIN_DB, Headroom};
+
+/// rc14 (Didier) — la marge de sécurité ajoutée au gain maximal d'un filtre
+/// de convolution : `max |H(f)|` est lu sur la grille de la FFT, et un pic
+/// étroit peut tomber entre deux cases.
+pub const MARGE_DE_SECURITE_CONVOLUTION_DB: f64 = 0.5;
+/// Sous ce gain maximal, un filtre est tenu pour « à 0 dB » : un Dirac
+/// exporté en 24 bits ou en `f32` ne pèse pas exactement 1.
+pub const TOLERANCE_GAIN_CONVOLUTION_DB: f64 = 0.01;
+
+/// rc14 (Didier) — ce que la convolution demande à la marge, et ce qui est
+/// appliqué. Voir [`marge_de_convolution`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MargeDeConvolution {
+    /// Le gain maximal du filtre, au pire canal, à la cadence du flux (dB).
+    pub gain_max_db: f64,
+    /// La marge qu'il faudrait pour qu'un sinus pleine échelle ne dépasse
+    /// pas 0 dBFS : `−(gain_max + 0,5)`, bornée à [`HEADROOM_MANUEL_MIN_DB`] ;
+    /// 0 pour un filtre qui n'amplifie pas.
+    pub requise_db: f64,
+    /// La marge que le CONVOLUEUR applique (≤ 0) : la requise en Auto ; en
+    /// manuel, M quand aucun étage d'égaliseur ne la porte (sortie réseau
+    /// sans égaliseur : personne d'autre ne l'appliquerait), 0 sinon (l'étage
+    /// des égaliseurs pose déjà `min(M, L1)`, #9520 : jamais deux fois).
+    pub appliquee_db: f64,
+    /// Marge MANUELLE plus faible que la requise : le chemin du signal le
+    /// dit, rien n'est changé. Avec un égaliseur empilé, c'est ce que sa
+    /// réserve L1 laisse de M au filtre qui compte (`min(M, L1) − L1`).
+    pub insuffisante: bool,
+}
+
+/// rc14 (Didier) — la marge d'un filtre de convolution, depuis le gain que
+/// le convolueur DÉCLARE (`max |H(f)|`, comme le crossfeed déclare son gain
+/// moyen). La SEULE règle : le convolueur l'applique, le chemin du signal la
+/// publie, [`BilanDeNiveau`] la compte.
+///
+/// - Auto : `min(HEADROOM_AUTO_DB, −(gain_max + 0,5))`, bornée à −24 dB ;
+///   un filtre qui n'amplifie pas (gain ≤ 0 dB) ne change rien.
+/// - Manuel M, UNE seule autorité (#9546) : `laissee_par_l_egaliseur_db` est
+///   ce que l'étage des égaliseurs, quand il tourne, laisse de M au filtre
+///   (`min(M, L1) − L1`, ≤ 0 ; le gain fixe M sans bande laisse M). `None` :
+///   aucun étage d'égaliseur ne tourne (sortie réseau sans égaliseur), et
+///   c'est le convolueur qui porte M — sans quoi le filtre jouerait à 0 dB,
+///   sans aucune protection. `insuffisante` si la marge qui reste au filtre
+///   est au-dessus de la requise.
+pub fn marge_de_convolution(
+    headroom: &Headroom,
+    gain_max_db: f64,
+    laissee_par_l_egaliseur_db: Option<f64>,
+) -> MargeDeConvolution {
+    let gain = fini(gain_max_db);
+    let requise_db = if gain > TOLERANCE_GAIN_CONVOLUTION_DB {
+        (-(gain + MARGE_DE_SECURITE_CONVOLUTION_DB)).max(HEADROOM_MANUEL_MIN_DB)
+    } else {
+        0.0
+    };
+    match headroom {
+        Headroom::Manual { db } => {
+            let manuelle = fini(*db).min(0.0);
+            let (appliquee_db, laissee) = match laissee_par_l_egaliseur_db {
+                Some(l) => (0.0, fini(l).min(0.0)),
+                None => (manuelle, manuelle),
+            };
+            MargeDeConvolution {
+                gain_max_db: gain,
+                requise_db,
+                appliquee_db,
+                insuffisante: requise_db < 0.0 && laissee > requise_db + 1e-9,
+            }
+        }
+        Headroom::Auto {} | Headroom::Unknown => MargeDeConvolution {
+            gain_max_db: gain,
+            requise_db,
+            appliquee_db: HEADROOM_AUTO_DB.min(requise_db).min(0.0),
+            insuffisante: false,
+        },
+    }
+}
 
 /// Ce que le bilan prend en entrée (lu par l'hôte à chaque installation de
 /// chaîne, de piste ou d'interrupteur ; jamais par bloc).
@@ -59,6 +136,10 @@ pub struct EntreesNiveau {
     pub gain_moyen_greffons_db: f64,
     /// `zone_{id}_level_compensation` (vrai par défaut).
     pub compensation_active: bool,
+    /// rc14 (Didier) — le gain MAXIMAL déclaré par le convolueur effectif
+    /// (`max |H(f)|`, dB, pire canal, à la cadence du flux) ; 0 sans
+    /// convolution. Voir [`marge_de_convolution`].
+    pub gain_max_convolution_db: f64,
 }
 
 /// Le bilan. Voir le module.
@@ -94,13 +175,20 @@ impl BilanDeNiveau {
     pub fn calculer(e: &EntreesNiveau) -> Self {
         let reserve = fini(e.gain_moyen_greffons_db).min(0.0);
         let resolu = fini(e.headroom_resolu_db).min(0.0);
+        // rc14 (Didier) — la marge du filtre de convolution (comptée en Auto
+        // seulement ; en manuel, le headroom résolu porte déjà M) : elle
+        // protège un gain que la réserve des égaliseurs ne voit pas, elle
+        // s'ajoute donc à la leur.
+        let convolution =
+            marge_de_convolution(&e.headroom, e.gain_max_convolution_db, None).appliquee_db;
         let (headroom_db, absorbe) = match e.headroom {
             Headroom::Auto {} if resolu < 0.0 => {
                 // `resolu` vaut `HEADROOM_AUTO_DB` : la part que la réserve des
                 // greffons ne couvre pas déjà.
                 let reste = (resolu - reserve).min(0.0);
-                (reste, reste - resolu)
+                (reste + convolution, reste - resolu)
             }
+            Headroom::Auto {} => (resolu + convolution, 0.0),
             _ => (resolu, 0.0),
         };
         let niveau = fini(e.replaygain_db) + fini(e.gain_de_zone_db);

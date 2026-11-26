@@ -163,21 +163,15 @@ async fn silence_pendant(passe: Passe, visee: Visee) -> (Duration, usize) {
 }
 
 async fn exiger_un_executeur_vivant(nom: &str, passe: Passe, visee: Visee) {
-    // L'état des campagnes est global au processus : un témoin voisin peut
-    // en rouvrir une entre la remise au repos et le comptage, qui est alors
-    // sauté. On rejoue, au plus trois fois ; jamais un vert sans lecture.
-    for _ in 0..3 {
-        let (silence, ralenties) = silence_pendant(passe, visee).await;
-        if ralenties == 0 {
-            continue;
-        }
-        assert!(
-            silence < SILENCE_MAX,
-            "{nom} : l'exécuteur s'est tu {silence:?} pendant une lecture de {LENTEUR:?}"
-        );
+    if !crate::test_scratch::dans_un_processus_isole() {
         return;
     }
-    panic!("{nom} : la lecture visée n'a pas eu lieu");
+    let (silence, ralenties) = silence_pendant(passe, visee).await;
+    assert!(ralenties > 0, "{nom} : la lecture visée n'a pas eu lieu");
+    assert!(
+        silence < SILENCE_MAX,
+        "{nom} : l'exécuteur s'est tu {silence:?} pendant une lecture de {LENTEUR:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

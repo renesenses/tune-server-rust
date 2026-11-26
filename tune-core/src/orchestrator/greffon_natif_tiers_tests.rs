@@ -255,6 +255,9 @@ async fn pure_contourne_le_greffon_sur_la_sortie_locale(orch: &PlaybackOrchestra
         .as_any()
         .downcast_ref::<crate::outputs::local::LocalOutput>()
         .unwrap();
+    // rc14 (sécurité auditive) — l'étage casque retiré par PURE est fondu
+    // vers le sec en ~0,75 s : le verdict se lit une fois PURE au sec.
+    local.jouer_du_pcm_pour_test(1.0);
     local.publier_le_contrat_pour_test();
     assert_eq!(
         local.signal_path_status().unwrap().dsp,
