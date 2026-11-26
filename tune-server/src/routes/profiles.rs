@@ -368,6 +368,18 @@ async fn get_profile(State(state): State<AppState>, Path(id): Path<i64>) -> impl
     }
 }
 
+/// rc14 : `admin` / `default` demandés pour un autre profil que le 1.
+fn refus_nom_reserve() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "reserved_username",
+            "message": "This name is reserved for the administrator profile.",
+        })),
+    )
+        .into_response()
+}
+
 /// Créer un profil : l'administrateur quand l'authentification est active
 /// (un profil y est un compte).
 async fn create_profile(
@@ -377,6 +389,11 @@ async fn create_profile(
 ) -> Response {
     if !foyer {
         return refus_profil_d_autrui();
+    }
+    // rc14 : `admin` / `default` n'appartiennent qu'au profil 1 — un autre
+    // profil qui les porterait capterait l'alias `default`.
+    if tune_core::db::profil_administrateur::nom_refuse_pour(None, &body.name) {
+        return refus_nom_reserve();
     }
     let repo = ProfileRepo::with_backend(state.backend.clone());
 
@@ -420,6 +437,13 @@ async fn update_profile(
 ) -> Response {
     if id != moi && !foyer {
         return refus_profil_d_autrui();
+    }
+    if body
+        .name
+        .as_deref()
+        .is_some_and(|n| tune_core::db::profil_administrateur::nom_refuse_pour(Some(id), n))
+    {
+        return refus_nom_reserve();
     }
     let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.update(id, body.name.as_deref(), body.avatar_color.as_deref()) {

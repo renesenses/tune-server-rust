@@ -204,6 +204,10 @@ impl ProfileRepo {
         display_name: Option<&str>,
         avatar_path: Option<&str>,
     ) -> Result<i64, String> {
+        // rc14 : `admin` / `default` n'appartiennent qu'au profil 1.
+        if crate::db::profil_administrateur::nom_refuse_pour(None, username) {
+            return Err(crate::db::profil_administrateur::ERREUR_NOM_RESERVE.into());
+        }
         let sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 3] = [&username, &display_name, &avatar_path];
         self.db.execute_returning_id(&sql, &params)
@@ -215,6 +219,12 @@ impl ProfileRepo {
         display_name: Option<&str>,
         avatar_path: Option<&str>,
     ) -> Result<(), String> {
+        // rc14 : `admin` / `default` n'appartiennent qu'au profil 1.
+        if display_name
+            .is_some_and(|n| crate::db::profil_administrateur::nom_refuse_pour(Some(id), n))
+        {
+            return Err(crate::db::profil_administrateur::ERREUR_NOM_RESERVE.into());
+        }
         let sql = self.dialect_sql(sql::update, sql::update);
         // Pass display_name twice: once for username, once for display_name column
         let params: [&dyn ToSqlValue; 4] = [&display_name, &display_name, &avatar_path, &id];
@@ -761,7 +771,7 @@ mod tests {
 
         let profiles = repo.list().unwrap();
         assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].name, "default");
+        assert_eq!(profiles[0].name, "admin");
 
         let id = repo.create("bertrand", Some("Bertrand"), None).unwrap();
         assert!(id > 1);
@@ -797,6 +807,31 @@ mod tests {
         assert_eq!(p.avatar_path.as_deref(), Some("/avatars/alice.png"));
     }
 
+    /// rc14 : aucun autre profil ne prend `admin` ni `default` (il capterait
+    /// l'alias du profil 1), casse ignorée ; le profil 1 garde ses noms.
+    #[test]
+    fn les_noms_du_profil_1_sont_reserves() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let repo = ProfileRepo::new(db);
+        for nom in ["default", "Default", "DEFAULT", "admin", "Admin", " admin "] {
+            assert!(repo.create(nom, None, None).is_err(), "création {nom:?}");
+        }
+        let id = repo.create("salon", None, None).unwrap();
+        for nom in ["default", "Default", "Admin"] {
+            assert!(
+                repo.update(id, Some(nom), None).is_err(),
+                "renommage {nom:?}"
+            );
+        }
+        assert_eq!(repo.get(id).unwrap().unwrap().name, "salon");
+        repo.update(1, Some("default"), None).unwrap();
+        assert_eq!(repo.get(1).unwrap().unwrap().name, "default");
+        repo.update(1, Some("admin"), None).unwrap();
+        assert_eq!(repo.get(1).unwrap().unwrap().name, "admin");
+    }
+
     #[test]
     fn profile_get_default() {
         let db = SqliteDb::open_in_memory().unwrap();
@@ -804,9 +839,11 @@ mod tests {
         migrations::run_migrations(&db).unwrap();
 
         let repo = ProfileRepo::new(db);
-        let default = repo.get(1).unwrap().unwrap();
-        assert_eq!(default.name, "default");
-        assert!(default.is_admin);
+        // rc14 : le profil d'origine s'appelle `admin` / `Admin`.
+        let admin = repo.get(1).unwrap().unwrap();
+        assert_eq!(admin.name, "admin");
+        assert_eq!(admin.display_name.as_deref(), Some("Admin"));
+        assert!(admin.is_admin);
     }
 
     #[test]

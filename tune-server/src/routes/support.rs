@@ -80,7 +80,7 @@ struct ReplyBody {
 }
 
 async fn list(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
@@ -99,7 +99,7 @@ async fn list(
 /// (sans pièce jointe, chemin historique) ou `multipart/form-data` (avec
 /// `attachments[]`). Le format est choisi d'après le `Content-Type` entrant.
 async fn create(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     req: Request,
 ) -> Response {
@@ -361,7 +361,7 @@ fn ext_allowed(ext: &str) -> bool {
 }
 
 async fn detail(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
@@ -391,7 +391,7 @@ async fn detail(
 /// **forum**. Le miroir (`MirrorTicketToForum`) n'est branché qu'à la création
 /// du ticket, côté Laravel ; aucune ligne d'ici ne peut l'y brancher.
 async fn reply(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     Path(id): Path<i64>,
     req: Request,
@@ -489,7 +489,7 @@ async fn reply_multipart(
 /// Marque un fil comme lu. Aucun corps attendu : l'identité vient d'`auth()`,
 /// jamais d'une clé de licence fournie par la page.
 async fn mark_read(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<i64>,

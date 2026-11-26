@@ -17,6 +17,9 @@ use std::sync::Arc;
 /// #8761 — jeu de RI par cadence et rééchantillonnage en repli.
 pub mod par_cadence;
 pub use par_cadence::{ChoixRi, JeuDeZone};
+/// rc14 (Rémi) — la courbe d'un filtre par FFT, phase déroulée comprise.
+#[path = "convolver/courbe_fft.rs"]
+pub mod courbe_fft;
 
 #[cfg(test)]
 #[path = "convolver/banc_f64_tests.rs"]

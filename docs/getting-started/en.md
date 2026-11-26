@@ -73,6 +73,21 @@ The onboarding wizard guides you through the first steps:
 
 ---
 
+## 2b. Administration without a password
+
+As long as authentication is off, administration actions (restart, update, plugins…) are accepted from this machine and from devices on the local network. Never considered local: remote access (relay, reverse proxy), public addresses, the shared address space `100.64.0.0/10`, the `fc00::/8` and `fd7a:115c:a1e0::/48` ranges, and the machine's default gateway (a virtual machine behind NAT, or a router that rewrites the source address, makes every connection appear to come from it).
+
+The account, the licence and the remote-access token stay reserved to this machine (or to the administrator).
+
+Turn on **Settings → Administration from this machine only** (or enable authentication) if:
+
+- a TCP relay (port forwarding) runs on another machine of the network in front of Tune: it cannot be detected;
+- an overlay network uses private addresses that Tune cannot tell apart from the home network. You can also remove its ranges with `TUNE_ADMIN_LAN_EXCLUDED_RANGES=fd12:3456:789a::/48,10.8.0.0/24`.
+
+In a container, administration from the local network is only enabled with `TUNE_ADMIN_LAN_IN_CONTAINER=1`, to be set only with the host network (`--network host`). With rootless Podman, every connection seems to come from `10.0.2.100`: do not set this variable.
+
+---
+
 ## 3. Add your library
 
 **Settings → Music folders → Add**
