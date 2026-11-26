@@ -300,6 +300,20 @@ pub(crate) fn chemin_tess_de_la_zone(
     if !chemin.discrepancies.is_empty() {
         debug!(zone_id = zid, ecarts = ?chemin.discrepancies, "tess_chemin_ecarts");
     }
+    // rc14 (rc13.91) — « pas en service » dit pourquoi (refus de la sortie).
+    let mut chemin = chemin;
+    super::refus_surechantillonnage_tess::avec_le_refus_du_surechantillonneur(
+        chemin.steps.iter_mut().map(|n| &mut n.etape),
+        &lecture.chaine,
+        super::refus_surechantillonnage_tess::refus_du_chemin_historique(sp),
+    );
+    // Rémi (fil 3097) — la convolution sautée à cette cadence, de même.
+    let convolution = super::refus_surechantillonnage_tess::raison_de_la_convolution_du_chemin(sp);
+    super::refus_surechantillonnage_tess::avec_la_raison_de_la_convolution(
+        chemin.steps.iter_mut().map(|n| &mut n.etape),
+        &lecture.chaine,
+        convolution.as_ref().map(|(c, t)| (c.as_str(), t.as_str())),
+    );
     serde_json::to_value(chemin).ok()
 }
 
