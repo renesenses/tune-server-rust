@@ -443,12 +443,17 @@ fn un_changement_de_format_gapless_rebat_ou_desactive_le_convolveur() {
         assert_eq!(moteur.channels(), 2);
         // Un Dirac stéréo à travers le moteur actif rend l'IR qu'il porte :
         // c'est bien l'IR rééchantillonnée, dupliquée sur les deux canaux.
+        // rc14 (Didier) — [1 ; 0,5] amplifie (+3,5 dB) : le moteur la rend
+        // atténuée de sa marge, calculée sur l'IR à 96 kHz.
+        assert!(moteur.reserve_db() < 0.0, "{}", moteur.reserve_db());
+        let marge = 10f32.powf(moteur.reserve_db() as f32 / 20.0);
         let n = taps_96k[0].len();
         let mut dirac = vec![0.0f32; n * 2];
         dirac[0] = 1.0;
         dirac[1] = 1.0;
         moteur.process_offline(&mut dirac);
         for (i, attendu) in taps_96k[0].iter().enumerate() {
+            let attendu = attendu * marge;
             for c in 0..2 {
                 let obtenu = dirac[i * 2 + c];
                 assert!(

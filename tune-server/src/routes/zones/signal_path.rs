@@ -143,6 +143,10 @@ pub(super) struct CorrectionPiece {
     pub resampled_to: Option<u32>,
     /// #8761 — les cadences des fichiers du jeu de la zone.
     pub ir_files: Vec<u32>,
+    /// rc14 (Didier) — la marge du filtre à la cadence du flux : gain
+    /// maximal, marge appliquée par le convolueur, et marge manuelle
+    /// insuffisante. `None` : filtre non appliqué ou cadence inconnue.
+    pub marge: Option<tune_core::tess::etages_fixes::MargeDeConvolution>,
 }
 
 impl CorrectionPiece {
@@ -157,6 +161,10 @@ impl CorrectionPiece {
             "taps": self.taps,
             "resampled_to": self.resampled_to,
             "ir_files": self.ir_files,
+            "headroom_db": self.marge.map(|m| m.appliquee_db),
+            "filter_gain_max_db": self.marge.map(|m| m.gain_max_db),
+            "headroom_required_db": self.marge.map(|m| m.requise_db),
+            "headroom_insufficient": self.marge.is_some_and(|m| m.insuffisante),
         })
     }
 }
@@ -209,6 +217,7 @@ pub(super) fn zone_correction_piece_lang(
                 taps: None,
                 resampled_to: None,
                 ir_files: Vec::new(),
+                marge: None,
             });
         }
     };
@@ -223,6 +232,7 @@ pub(super) fn zone_correction_piece_lang(
             taps,
             resampled_to: None,
             ir_files: Vec::new(),
+            marge: None,
         });
     }
     // #8761 — le jeu par cadence : un fichier à la cadence du fil, ou le plus
@@ -238,7 +248,11 @@ pub(super) fn zone_correction_piece_lang(
         && let Ok(choix) = jeu.choix_pour(fil)
     {
         let taps = jeu.prises_pour(fil).or(taps);
-        let description = if choix.reechantillonne {
+        // rc14 (Didier) — la marge que le convolueur applique à ce flux, la
+        // même règle que `ConvolverConfig::build_for` (gain maximal du filtre
+        // rééchantillonné, mis en cache).
+        let marge = jeu.marge_pour(fil).ok();
+        let mut description = if choix.reechantillonne {
             fs(
                 lang,
                 "correction_piece_reechantillonnee",
@@ -260,6 +274,32 @@ pub(super) fn zone_correction_piece_lang(
                 ],
             )
         };
+        if let Some(m) = marge {
+            let db = |x: f64| format!("{x:.1}");
+            let note = if m.insuffisante {
+                let manuel = match jeu_headroom_manuel(backend, zone_id) {
+                    Some(v) => db(v),
+                    None => "?".into(),
+                };
+                Some(fs(
+                    lang,
+                    "correction_piece_marge_insuffisante",
+                    &[&manuel, &db(m.gain_max_db), &db(m.requise_db)],
+                ))
+            } else if m.appliquee_db < 0.0 {
+                Some(fs(
+                    lang,
+                    "correction_piece_marge",
+                    &[&db(m.appliquee_db), &db(m.gain_max_db)],
+                ))
+            } else {
+                None
+            };
+            if let Some(note) = note {
+                description.push_str(" \u{b7} ");
+                description.push_str(&note);
+            }
+        }
         return Some(CorrectionPiece {
             kind: "ir",
             status: "applied",
@@ -270,6 +310,7 @@ pub(super) fn zone_correction_piece_lang(
             taps,
             resampled_to: choix.reechantillonne.then_some(fil),
             ir_files,
+            marge,
         });
     }
     if let (Some(fil), Some(ir)) = (wire_sample_rate, ir_sr)
@@ -290,6 +331,7 @@ pub(super) fn zone_correction_piece_lang(
             taps,
             resampled_to: None,
             ir_files: Vec::new(),
+            marge: None,
         });
     }
     let cadence = wire_sample_rate.or(ir_sr).unwrap_or(48_000);
@@ -311,7 +353,21 @@ pub(super) fn zone_correction_piece_lang(
         taps,
         resampled_to: None,
         ir_files: Vec::new(),
+        marge: None,
     })
+}
+
+/// rc14 (Didier) — le headroom MANUEL de la chaîne de la zone (dB), `None`
+/// en Auto.
+fn jeu_headroom_manuel(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> Option<f64> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    match tune_core::tess::egaliseurs_en_serie::headroom_de_zone(&settings, zone_id) {
+        tune_core::tess::chaine::Headroom::Manual { db } => Some(db),
+        _ => None,
+    }
 }
 
 /// #7632 (C2) — la correction de pièce faite par l'ÉGALISEUR : le profil de
@@ -383,6 +439,7 @@ fn correction_piece_egaliseur_lang(
         taps: None,
         resampled_to: None,
         ir_files: Vec::new(),
+        marge: None,
     })
 }
 
@@ -2942,6 +2999,10 @@ fn assembler_les_etapes_lang(
             "reason": cp.reason,
             "ir_sample_rate": cp.ir_sample_rate,
             "taps": cp.taps,
+            // rc14 (Didier) — la marge réellement appliquée au filtre.
+            "headroom_db": cp.marge.map(|m| m.appliquee_db),
+            "filter_gain_max_db": cp.marge.map(|m| m.gain_max_db),
+            "headroom_insufficient": cp.marge.is_some_and(|m| m.insuffisante),
         }));
     }
 

@@ -628,9 +628,10 @@ impl ChaineTess {
                 && ctx.transport != TransportZone::Local
                 && !greffons.iter().any(|e| {
                     e.effective
-                        && e.plugin_id
-                            .as_deref()
-                            .is_some_and(|id| super::migration::FACADES_EQ.contains(&id))
+                        && e.plugin_id.as_deref().is_some_and(|id| {
+                            super::migration::FACADES_EQ.contains(&id)
+                                || id == super::migration::ID_CONVOLUTION
+                        })
                 })
             {
                 // rc14 (Rémi) — une marge manuelle passe par l'étage des
@@ -638,6 +639,9 @@ impl ChaineTess {
                 // remplace sa réserve, sur toute sortie ; sans égaliseur,
                 // c'est un gain fixe qui ne vit que sur la sortie LOCALE (un
                 // flux réseau bit-perfect ne se transcode pas pour lui).
+                // Revue de #9561 — sans égaliseur, une convolution effective
+                // la porte elle-même (`marge_de_convolution`) : le flux est
+                // déjà traité, et le filtre n'est jamais laissé sans marge.
                 headroom.eteindre(MotifEtape::NotAppliedOnTransport, None);
             }
         }
@@ -1481,6 +1485,15 @@ mod tests {
             &ctx(TransportZone::AirPlay),
         );
         assert_eq!(r.headroom_db, -6.5);
+        // Revue de #9561 — réseau sans égaliseur, avec une convolution : le
+        // convolueur porte M, elle est appliquée.
+        let r = resoudre(
+            &manuelle(-6.5, vec![maillon("convolution", true)]),
+            &ctx(TransportZone::AirPlay),
+        );
+        assert_eq!(r.headroom_db, -6.5);
+        let h = marge(&r);
+        assert!(h.effective && h.reason.is_none(), "{h:?}");
         // 0 dB manuel : rien n'est demandé.
         let r = resoudre(&manuelle(0.0, vec![]), &ctx(TransportZone::Local));
         assert!(!marge(&r).requested);

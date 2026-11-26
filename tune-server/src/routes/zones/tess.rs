@@ -876,7 +876,14 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
         state.orchestrator.refresh_zone_upsampler(id).await;
     }
     if est(Partie::Convolution) {
-        rafraichir_le_convolueur(state, zone).await;
+        rafraichir_le_convolueur(state, zone, false).await;
+    } else if est(Partie::Egaliseur) {
+        // Revue de #9561 — le headroom (Auto ↔ manuel, marge manuelle) et
+        // l'égaliseur qui porte la marge manuelle changent la marge du filtre
+        // (`Partie::Egaliseur` suit la signature des égaliseurs ET du
+        // headroom) : le moteur la reprend, sans refaire le filtre si elle ne
+        // bouge pas.
+        rafraichir_le_convolueur(state, zone, true).await;
     }
     // rc14 — l'ordre des greffons cochés a changé : la sortie locale suit.
     if cles.contains(&tune_core::tess::egaliseurs_en_serie::cle_ordre_tess(id)) {
@@ -907,7 +914,13 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
 
 /// La convolution d'une sortie locale : posée ou retirée à chaud, comme par
 /// `POST /room-correction/ir/…` (le transcodage réseau relit la clé).
-async fn rafraichir_le_convolueur(state: &AppState, zone: &Zone) {
+///
+/// Revue de #9561 — le JEU de la zone (`JeuDeZone::charger`) : fichiers par
+/// cadence, repli, et surtout le headroom de la chaîne, dont dépend la marge
+/// du filtre (un `from_wav` la calculait toujours en Auto : en manuel, elle
+/// s'ajoutait à M). `marge_seule` : seule la marge a pu changer (headroom,
+/// égaliseur) ; le filtre n'est reconstruit que si elle bouge.
+async fn rafraichir_le_convolueur(state: &AppState, zone: &Zone, marge_seule: bool) {
     #[cfg(feature = "local-audio")]
     {
         let Some(device_id) = zone.output_device_id.as_deref() else {
@@ -917,11 +930,21 @@ async fn rafraichir_le_convolueur(state: &AppState, zone: &Zone) {
             return;
         }
         let id = zone.id.unwrap_or_default();
-        let chemin = SettingsRepo::with_backend(state.backend.clone())
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let chemin = settings
             .get(&Partie::Convolution.cle(id))
             .ok()
             .flatten()
             .filter(|c| !c.trim().is_empty());
+        if marge_seule && chemin.is_none() {
+            return;
+        }
+        // Lu hors du verrou des sorties (réglages, FFT du gain mise en cache).
+        let jeu = chemin.map(|c| {
+            let jeu = tune_core::audio::convolver::JeuDeZone::avec_principal(&settings, id, c);
+            let principal = jeu.principal.clone();
+            (principal, jeu.charger())
+        });
         let outputs = state.outputs.lock().await;
         if let Some(output) = outputs.get(device_id) {
             let output = output.lock().await;
@@ -929,11 +952,19 @@ async fn rafraichir_le_convolueur(state: &AppState, zone: &Zone) {
                 .as_any()
                 .downcast_ref::<tune_core::outputs::local::LocalOutput>()
             {
-                match chemin {
-                    Some(c) => {
-                        if let Err(e) = local.set_convolver_ir(&c) {
-                            warn!(zone_id = id, error = %e, "tess_convolueur_non_pose");
+                match jeu {
+                    Some((c, Ok(config))) => {
+                        let pose = if marge_seule {
+                            local.reposer_la_convolution_si_la_marge_change(config)
+                        } else {
+                            local.set_convolver_config(config).map(|()| true)
+                        };
+                        if let Err(e) = pose {
+                            warn!(zone_id = id, chemin = %c, error = %e, "tess_convolueur_non_pose");
                         }
+                    }
+                    Some((c, Err(e))) => {
+                        warn!(zone_id = id, chemin = %c, error = %e, "tess_convolueur_non_pose");
                     }
                     None => local.clear_convolver(),
                 }
@@ -941,7 +972,7 @@ async fn rafraichir_le_convolueur(state: &AppState, zone: &Zone) {
         }
     }
     #[cfg(not(feature = "local-audio"))]
-    let _ = (state, zone);
+    let _ = (state, zone, marge_seule);
 }
 
 /// `PUT /zones/{id}/tess`
@@ -988,6 +1019,11 @@ pub async fn put_zone_tess(
     reponse.warnings.extend(avertissement);
     Json(reponse).into_response()
 }
+
+// Revue de #9561 — la convolution posée par TESS suit le headroom.
+#[cfg(all(test, feature = "local-audio"))]
+#[path = "tess_convolueur_9561_tests.rs"]
+mod tess_convolueur_9561_tests;
 
 #[cfg(test)]
 mod tests_t14 {
