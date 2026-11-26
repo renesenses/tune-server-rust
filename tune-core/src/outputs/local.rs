@@ -1714,7 +1714,16 @@ impl LocalOutput {
         if self.pure_bypass.load(Ordering::Relaxed) {
             return;
         }
-        let actif = self.convolver_config.lock().is_ok_and(|c| c.is_some())
+        // Relecture de #9576 : un filtre retiré dont la marge gardée remonte
+        // encore (#9561) baisse toujours le niveau. Chaque verrou est pris et
+        // rendu dans son propre `let` : jamais deux tenus à la fois.
+        let filtre_configure = self.convolver_config.lock().is_ok_and(|c| c.is_some());
+        let marge_gardee = self
+            .convolver
+            .lock()
+            .is_ok_and(|c| c.as_ref().is_some_and(|m| m.porte_une_marge()));
+        let actif = filtre_configure
+            || marge_gardee
             || self.crossfeed.lock().is_ok_and(|c| c.is_some())
             || self.mono_downmix.load(Ordering::Relaxed)
             || self.replaygain_seul.load(Ordering::SeqCst) < 1000
@@ -2565,7 +2574,12 @@ impl LocalOutput {
                 let convolution = self
                     .convolver
                     .lock()
-                    .is_ok_and(|c| c.as_ref().is_some_and(|m| !m.est_eteint()));
+                    // Relecture de #9576 : éteint mais portant encore la
+                    // marge gardée d un filtre retiré (#9561), à fondre aussi.
+                    .is_ok_and(|c| {
+                        c.as_ref()
+                            .is_some_and(|m| !m.est_eteint() || m.porte_une_marge())
+                    });
                 let mono = stereo && self.mono_downmix.load(Ordering::Relaxed);
                 let crossfeed = if stereo {
                     self.crossfeed.lock().ok().and_then(|mut c| c.take())
@@ -10700,6 +10714,8 @@ mod convolution_sous_licence_7632;
 // Revue de #9561 — la marge du filtre suit le headroom, flux en cours.
 #[cfg(test)]
 mod marge_convolution_9561;
+#[cfg(test)]
+mod interaction_pure_marge_9576;
 
 #[cfg(test)]
 mod open_failure_tests;
