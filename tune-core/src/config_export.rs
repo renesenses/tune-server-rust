@@ -51,6 +51,11 @@
 //!   avec les réglages ; à l'import, une liste illisible ou incohérente est
 //!   écartée avec un avertissement. Le préréglage actif de chaque zone
 //!   (`zone_{id}_tess_active_preset`) voyage dans sa zone.
+//! - rc14 : le profil d'égaliseur de chaque zone, les préréglages d'égaliseur
+//!   et la chaîne TESS suivent la règle de leurs routes dédiées
+//!   ([`egaliseurs`]) : sans le Premium, un égaliseur paramétrique ou une
+//!   correction de pièce mesurée revient en égaliseur graphique au plus
+//!   près, et le rapport le dit.
 //!
 //! # Aperçu
 //!
@@ -549,7 +554,7 @@ fn volume_restaurable(zone: &Map<String, Value>) -> bool {
 /// TESS D1 : un gabarit de réglage de zone que seul le serveur écrit (profil
 /// de pièce, chaîne TESS et son ombre) ; l'import l'ignore.
 fn gabarit_tenu_par_le_serveur(gabarit: &str) -> bool {
-    crate::tess::migration::cle_tenue_par_le_serveur(&gabarit.replace("{id}", "0"))
+    crate::tess::migration::cle_jamais_importee(&gabarit.replace("{id}", "0"))
 }
 
 fn cle_de_zone_valide(gabarit: &str, id: i64) -> Option<String> {
@@ -562,7 +567,7 @@ fn cle_de_zone_valide(gabarit: &str, id: i64) -> Option<String> {
                 && g == gabarit
                 && !est_secret(&cle)
                 && !crate::playback::radio_fin_de_file::cle_de_marques(&cle)
-                && !crate::tess::migration::cle_tenue_par_le_serveur(&cle) =>
+                && !crate::tess::migration::cle_jamais_importee(&cle) =>
         {
             Some(cle)
         }
@@ -670,7 +675,15 @@ fn piece_pour(
 }
 
 /// Calcule ce que l'import du fichier ferait, SANS RIEN ÉCRIRE.
-pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan, String> {
+///
+/// `premium` : le compte a-t-il le droit Premium ? Sans lui, les profils
+/// d'égaliseur, les préréglages et les chaînes TESS du fichier suivent la
+/// règle de leurs routes ([`egaliseurs`]).
+pub fn planifier(
+    backend: &Arc<dyn DbBackend>,
+    fichier: &Fichier,
+    premium: bool,
+) -> Result<Plan, String> {
     let settings = SettingsRepo::with_backend(backend.clone());
     let repo = ZoneRepo::with_backend(backend.clone());
     let reglages_actuels = settings.all()?;
@@ -971,7 +984,9 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
         }
         let brute = corrigee.as_ref().unwrap_or(brute);
         // TESS D1 : mêmes clés que celles que `PATCH /system/config` refuse.
-        if crate::tess::migration::cle_tenue_par_le_serveur(cle) {
+        // Les profils d'égaliseur passent, et suivent la règle de
+        // [`egaliseurs`] à la fin de la planification.
+        if crate::tess::migration::cle_jamais_importee(cle) {
             tenus_par_le_serveur.push(cle);
             continue;
         }
@@ -1031,12 +1046,14 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
         ));
     }
 
-    Ok(Plan {
+    let mut plan = Plan {
         format_version: fichier.format_version,
         reglages,
         zones,
         avertissements,
-    })
+    };
+    egaliseurs::retenir(&settings, &mut plan, premium);
+    Ok(plan)
 }
 
 // ── Application ─────────────────────────────────────────────────────
@@ -1354,6 +1371,8 @@ pub fn rapport(plan: &Plan) -> Value {
     })
 }
 
+pub mod egaliseurs;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1420,3 +1439,7 @@ mod volume_6774_tests;
 #[cfg(test)]
 #[path = "config_export/tess_export_tests.rs"]
 mod tess_export_tests;
+
+#[cfg(test)]
+#[path = "config_export/egaliseurs_tests.rs"]
+mod egaliseurs_tests;

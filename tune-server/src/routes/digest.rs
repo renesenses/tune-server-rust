@@ -49,7 +49,7 @@ async fn preview(State(state): State<AppState>) -> Result<Json<Value>, AppError>
 // ---------------------------------------------------------------------------
 
 async fn send(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
     if !state.license.check_feature(Feature::WeeklyDigest).await {
@@ -191,7 +191,7 @@ struct DigestSettings {
 }
 
 async fn save_settings(
-    _garde: crate::auth::AdminOuCetteMachine,
+    _garde: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
     Json(body): Json<DigestSettings>,
 ) -> Result<Json<Value>, AppError> {
