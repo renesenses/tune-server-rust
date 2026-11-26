@@ -77,6 +77,12 @@ pub const REMONTEE_DB_PAR_SECONDE: f64 = 2.0;
 /// demi-seconde, par la même rampe linéaire en dB (aucune marche). Hors de
 /// TESS, la règle du 10/10 et [`REMONTEE_DB_PAR_SECONDE`] restent.
 ///
+/// rc14 (sécurité auditive, décision de Bertrand du 25/11) — même durée pour
+/// le fondu d'ENTRÉE en PURE ou en « Bypass all » : la chaîne n'est plus
+/// contournée d'un bloc à l'autre (jusqu'à +24 dB d'une série) ; l'égaliseur
+/// s'efface et le niveau rejoint celui d'avant l'égaliseur, jamais au-delà
+/// (voir [`EqProcessor::rendre_le_niveau_d_avant_en`]).
+///
 /// rc14 (sécurité auditive, série TESS #9520) — même durée pour la remontée
 /// d'une hausse de préampli RETENUE entre deux égaliseurs ACTIFS (voir
 /// [`EqProcessor::retenir_la_hausse_de`]) : décocher un maillon d'une série,
@@ -658,6 +664,23 @@ impl EqProcessor {
             self.relancer_depuis_le_gain_atteint();
         }
         true
+    }
+
+    /// rc14 (PURE, « Bypass all ») — un égaliseur COUPÉ rejoint le niveau
+    /// d'avant l'égaliseur en `ms`, tout de suite, même pendant le fondu de
+    /// la courbe (les deux se recouvrent, sans marche), vers
+    /// `min(1, borne de volume)` (#6741) : à volume inchangé il se retire
+    /// (identité exacte) ; volume monté, le surplus reste gardé, avec le
+    /// voyant et « Rendre le niveau » (#6524). `libere` n'est pas posé. Sans
+    /// effet hors d'un égaliseur coupé.
+    ///
+    /// La durée, [`REMONTEE_RAPIDE_TESS_MS`], est portée par `rampe_rapide`
+    /// (relecture du 26/11) et non posée sur la rampe en cours : une rampe
+    /// RELANCÉE (geste de volume, piste suivante par
+    /// [`Self::reporter_le_preampli_garde`]) la garde, au lieu de retomber
+    /// sur [`REMONTEE_DB_PAR_SECONDE`] (3 s et plus).
+    pub fn rendre_le_niveau_d_avant_en(&mut self) {
+        self.rendre_le_sec_vite();
     }
 
     /// rc14 (série TESS) — « Rendre le niveau » sur un égaliseur ACTIF qui
