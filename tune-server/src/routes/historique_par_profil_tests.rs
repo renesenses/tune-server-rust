@@ -47,7 +47,7 @@ fn banc(authentification: bool) -> Banc {
     let base = dossier.path().join("tune.db");
     let state = AppState::new(base.to_str().unwrap(), 0, Default::default()).unwrap();
     let profils = ProfileRepo::with_backend(state.backend.clone());
-    let admin = profils.create("admin", Some("Admin"), None).unwrap();
+    let admin = profils.create("gerant", Some("Gérant"), None).unwrap();
     let moi = profils.create("moi", Some("Moi"), None).unwrap();
     let autre = profils.create("autre", Some("Autre"), None).unwrap();
     let (jeton_admin, jeton_moi) = if authentification {

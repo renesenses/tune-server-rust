@@ -643,7 +643,7 @@ impl PlaybackOrchestrator {
         // moteur installé, PURE, « Bypass all ») et donne le headroom à
         // appliquer avant le modulateur. Les fermetures (non `Send`) vivent
         // dans ce bloc, hors des `await`.
-        let (effective, headroom_db) = {
+        let (effective, headroom_de_la_chaine_db) = {
             let disponible = |id: &str| {
                 id != ID_UPSAMPLING
                     || crate::audio::premium_plugins::enabled(
@@ -677,13 +677,10 @@ impl PlaybackOrchestrator {
                 .etapes
                 .iter()
                 .any(|e| e.code == CodeEtape::Upsampling && e.effective);
-            // La marge propre du modulateur (−3 dB), indépendante du
-            // headroom automatique de la chaîne PCM ; un manuel plus fort
-            // l'emporte, jamais un plus faible.
-            (
-                effective,
-                modulation::headroom_avant_le_modulateur(r.headroom_db),
-            )
+            // Le headroom de la chaîne (manuel ; 0 en automatique) : la marge
+            // propre du modulateur s'y ajoutera une fois, et le manuel n'est
+            // appliqué qu'une fois (`servir_la_modulation_dsd`).
+            (effective, r.headroom_db)
         };
         if !effective {
             modulation::oublier(zone_id, piste);
@@ -742,7 +739,14 @@ impl PlaybackOrchestrator {
             }
         }
         match self
-            .servir_la_modulation_dsd(req, track, file_path, plan, headroom_db, tranche)
+            .servir_la_modulation_dsd(
+                req,
+                track,
+                file_path,
+                plan,
+                headroom_de_la_chaine_db,
+                tranche,
+            )
             .await
         {
             Ok(resolu) => Ok(Some(resolu)),
@@ -757,7 +761,7 @@ impl PlaybackOrchestrator {
         track: &crate::db::models::Track,
         file_path: &str,
         plan: PlanModulation,
-        headroom_db: f64,
+        headroom_de_la_chaine_db: f64,
         tranche: Option<&super::resolve_local::TrancheCue>,
     ) -> Result<ResolvedStream, MotifDsdRefuse> {
         let zone_id = req.zone_id;
@@ -778,10 +782,26 @@ impl PlaybackOrchestrator {
                 warn!(zone_id, error = %e, "tess_dsd_modulateur_non_construit");
                 MotifDsdRefuse::ModulatorFailed
             })?;
+        // Les greffons de la zone (égaliseur, convolution, crossfeed et
+        // ReplayGain) passent DANS le flux : la sortie ne touche pas un
+        // porteur DSD.
+        let dsp = self.load_streaming_dsp(zone_id, req.piste_rg(), plan.cadence_pcm, plan.voies);
+        let greffons_dans_le_flux = dsp.is_active();
+        // Revue rc14 (#9518 × #9520) — un headroom manuel est déjà appliqué
+        // par l'égaliseur du flux (`reserve_imposee_db`, ou le gain fixe de
+        // la sortie locale) : le modulateur n'y ajoute que sa propre marge,
+        // une fois. Sans étage qui le porte, il l'applique lui-même.
+        let manuel_dans_le_flux = dsp.eq.is_some()
+            && self
+                .load_eq_profile(zone_id)
+                .is_some_and(|p| p.reserve_imposee_db.is_some());
+        let headroom_db = modulation::headroom_avant_le_modulateur(headroom_de_la_chaine_db);
+        let gain_du_modulateur_db =
+            modulation::gain_fixe_du_modulateur_db(headroom_de_la_chaine_db, manuel_dans_le_flux);
         let preampli_db = self
             .preampli_garde_db(req.output_device_id.as_deref())
             .await;
-        neuf.definir_gain_fixe(10f64.powf((headroom_db + preampli_db) / 20.0));
+        neuf.definir_gain_fixe(10f64.powf((gain_du_modulateur_db + preampli_db) / 20.0));
         // Le volume : publié tel qu'il est maintenant, puis suivi sans verrou.
         // Publiés sous le verrou des zones (une sourdine concurrente n'est
         // jamais écrasée) ; trim et verrou PURE relus, puis tenus à jour par
@@ -824,11 +844,6 @@ impl PlaybackOrchestrator {
         // Le relais de CETTE piste, ouvert avant toute résolution de la
         // suivante.
         modulation::ouvrir_le_relais(zone_id, &session_id, plan);
-        // Les greffons de la zone (égaliseur, convolution, crossfeed et
-        // ReplayGain) passent DANS le flux : la sortie ne touche pas un
-        // porteur DSD.
-        let dsp = self.load_streaming_dsp(zone_id, req.piste_rg(), plan.cadence_pcm, plan.voies);
-        let greffons_dans_le_flux = dsp.is_active();
         let mono = self.zone_mono_downmix(zone_id);
         info!(
             zone_id,
@@ -839,6 +854,8 @@ impl PlaybackOrchestrator {
             voies_source = plan.voies_source,
             transport = ?plan.transport,
             headroom_db,
+            gain_du_modulateur_db,
+            manuel_dans_le_flux,
             preampli_db,
             lien = ?lien,
             greffons_dans_le_flux,
@@ -856,6 +873,7 @@ impl PlaybackOrchestrator {
             channels: plan.voies,
             plugins_in_stream: greffons_dans_le_flux || mono,
             headroom_db,
+            modulator_margin_db: modulation::MARGE_DU_MODULATEUR_DB,
             continued: false,
         };
         let cle = CleFlux {

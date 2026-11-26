@@ -105,7 +105,7 @@ async fn l_etat_dit_si_un_code_est_necessaire() {
     assert_eq!(v["auth_enabled"], false);
     assert_eq!(v["from_this_machine"], false);
     assert_eq!(v["code_required"], true);
-    assert_eq!(v["admin_username"], "default");
+    assert_eq!(v["admin_username"], "admin");
     let (_, v) = appel(
         &state,
         CETTE_MACHINE,
@@ -501,8 +501,8 @@ async fn l_activation_supprime_les_comptes_non_reconnus_et_garde_l_admin() {
         .iter()
         .filter_map(|c| c["username"].as_str())
         .collect();
-    assert_eq!(noms, ["default", "etranger", "famille"], "{v}");
-    let admin = comptes.iter().find(|c| c["username"] == "default").unwrap();
+    assert_eq!(noms, ["admin", "etranger", "famille"], "{v}");
+    let admin = comptes.iter().find(|c| c["username"] == "admin").unwrap();
     assert_eq!(admin["role"], "admin");
     assert_eq!(admin["deletable"], false);
     assert!(comptes.iter().all(|c| c.get("created_at").is_some()));
@@ -528,7 +528,7 @@ async fn l_activation_supprime_les_comptes_non_reconnus_et_garde_l_admin() {
     assert!(active(&state));
     assert!(!existe(&state, "etranger"));
     assert!(existe(&state, "famille"));
-    assert!(existe(&state, "default"));
+    assert!(existe(&state, "admin"));
     assert!(existe(&state, "salon"));
     let (st, _) = appel(
         &state,
