@@ -17,7 +17,7 @@ fn base() -> Arc<dyn DbBackend> {
 
 fn importer(db: &Arc<dyn DbBackend>, corps: &Value) -> (Plan, Bilan) {
     let fichier = lire(corps.as_object().unwrap().clone()).unwrap();
-    let plan = planifier(db, &fichier).unwrap();
+    let plan = planifier(db, &fichier, true).unwrap();
     let bilan = appliquer(db, &plan).unwrap();
     (plan, bilan)
 }
