@@ -67,7 +67,8 @@ pub const SQL_PROFIL_PAR_NOM_DE_CONNEXION: &str = "(username = ? \
 /// au compte Mozaiklabs —, sinon il capterait l'alias `default`.
 pub fn nom_reserve(nom: &str) -> bool {
     let nom = nom.trim();
-    nom.eq_ignore_ascii_case(NOM_ADMINISTRATEUR) || nom.eq_ignore_ascii_case(ANCIEN_NOM_ADMINISTRATEUR)
+    nom.eq_ignore_ascii_case(NOM_ADMINISTRATEUR)
+        || nom.eq_ignore_ascii_case(ANCIEN_NOM_ADMINISTRATEUR)
 }
 
 /// Le nom `nom` est-il refusé pour le profil `id` (`None` : profil à créer) ?

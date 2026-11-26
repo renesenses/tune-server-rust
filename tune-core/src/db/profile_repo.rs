@@ -820,7 +820,10 @@ mod tests {
         }
         let id = repo.create("salon", None, None).unwrap();
         for nom in ["default", "Default", "Admin"] {
-            assert!(repo.update(id, Some(nom), None).is_err(), "renommage {nom:?}");
+            assert!(
+                repo.update(id, Some(nom), None).is_err(),
+                "renommage {nom:?}"
+            );
         }
         assert_eq!(repo.get(id).unwrap().unwrap().name, "salon");
         repo.update(1, Some("default"), None).unwrap();

@@ -524,7 +524,10 @@ async fn noms_reserves_au_profil_1(state: &AppState, lan: &str) {
     assert_eq!(hachage_de_l_autre, None, "rien n'est enregistré");
     state
         .backend
-        .execute("DELETE FROM profiles WHERE id = ?", &[&autre as &dyn ToSqlValue])
+        .execute(
+            "DELETE FROM profiles WHERE id = ?",
+            &[&autre as &dyn ToSqlValue],
+        )
         .unwrap();
 }
 
