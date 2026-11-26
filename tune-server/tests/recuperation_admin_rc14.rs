@@ -118,6 +118,13 @@ async fn reinitialiser(
     .await
 }
 
+/// Adresse de la connexion, en-têtes ajoutés, et ce que le cas éprouve.
+type CasHorsMachine = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static str,
+);
+
 /// Un code faux de la même forme que les vrais.
 fn code_faux(vrai: &str) -> String {
     let mut faux: Vec<char> = vrai.chars().collect();
@@ -286,7 +293,7 @@ async fn hors_machine_proxy_et_relais_refuses() {
     let _env = ENVIRONNEMENT.lock().await;
     let state = etat(":memory:");
     let code = ra::emettre_un_code(&settings(&state)).unwrap();
-    let cas: [(&str, &[(&str, &str)], &str); 4] = [
+    let cas: [CasHorsMachine; 4] = [
         (AUTRE_HOTE_DU_LAN, &[], "autre hôte du réseau local"),
         (
             CETTE_MACHINE,
