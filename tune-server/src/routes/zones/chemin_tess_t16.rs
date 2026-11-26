@@ -104,13 +104,17 @@ pub(crate) fn en_service_d_apres_le_chemin(sp: &Value, volume_logiciel: bool) ->
     }
 }
 
-/// rc14 (Rémi) — la marge MANUELLE que la lecture applique : depuis #9520,
-/// elle est posée par l'étage des égaliseurs (elle remplace leur réserve, ou
-/// devient un gain fixe sur la sortie locale). Elle est donc en service quand
-/// le chemin historique dit cet étage actif (« DSP » qui altère le signal).
-/// PURE, « Bypass all » et une sortie qui ne l'exécute pas ne montrent pas
-/// d'étape DSP active : rien n'est annoncé. L'automatique (0 dB depuis
-/// #9520) n'est jamais un gain à part : sa réserve se lit dans l'étape DSP.
+/// rc14 (Rémi) — la marge MANUELLE que la lecture applique RÉELLEMENT :
+/// depuis #9520, elle est posée par l'étage des égaliseurs, qui applique
+/// `min(M, L1)` (la réserve « Sûre » de la série n'est jamais perdue), ou un
+/// gain fixe M sur la sortie locale sans égaliseur. La valeur publiée est
+/// donc la réserve que l'étage applique (`eq_headroom.reserve_db` du chemin
+/// historique, `EqProfile::reserve_db_at`, la plus forte des deux voies),
+/// jamais la consigne M seule. Rien n'est annoncé sans étape « DSP » qui
+/// altère le signal (PURE, « Bypass all », sortie qui ne l'exécute pas) ni
+/// sans étage d'égaliseur en service (une étape DSP due au seul crossfeed ne
+/// porte pas la marge). L'automatique (0 dB depuis #9520) n'est jamais un
+/// gain à part : sa réserve se lit dans l'étape DSP.
 pub(crate) fn marge_manuelle_en_service(
     chaine: &tune_core::tess::ChaineTess,
     sp: &Value,
@@ -118,8 +122,27 @@ pub(crate) fn marge_manuelle_en_service(
     let tune_core::tess::Headroom::Manual { db } = chaine.fixed.headroom else {
         return None;
     };
+    if !(db.is_finite() && db < 0.0) {
+        return None;
+    }
     let dsp_actif = etapes(sp).iter().any(|e| a_le_nom(e, "DSP") && altere(e));
-    (db.is_finite() && db < 0.0 && dsp_actif).then_some(db)
+    if !dsp_actif {
+        return None;
+    }
+    reserve_de_l_etage_eq(sp).filter(|r| *r < 0.0)
+}
+
+/// La réserve que l'étage des égaliseurs applique (dB, ≤ 0), la plus forte
+/// des voies : `eq_headroom.reserve_db` du chemin historique. `None` sans
+/// égaliseur construit.
+fn reserve_de_l_etage_eq(sp: &Value) -> Option<f64> {
+    sp.get("eq_headroom")?
+        .get("reserve_db")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_f64)
+        .filter(|x| x.is_finite())
+        .reduce(f64::min)
 }
 
 /// rc14 — la modulation DSD de la piste qui joue (sortie locale), retenue par
