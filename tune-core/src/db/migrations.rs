@@ -6514,7 +6514,7 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         123,
         "queue_items_format_streaming",
         include_str!("../../migrations/postgres/123_queue_items_format_streaming.sql"),
-    ),    // Jumelle de la SQLite 159 (rc14) : les jetons de renouvellement de
+    ), // Jumelle de la SQLite 159 (rc14) : les jetons de renouvellement de
     // session. 124 est réservée par #9562, à fusionner avant.
     (
         125,

@@ -20,6 +20,10 @@
 //! - **Stockage** : seule l'empreinte SHA-256 du jeton est en base, comme les
 //!   clés Subsonic ([`super::cles_clients`]). Le jeton ne se relit jamais.
 //!
+//! La clé s'appelle `jeton_id`, pas `id` : sous PostgreSQL, le moteur ajoute
+//! `RETURNING id` aux INSERT des tables qui ont une colonne `id` et la lit en
+//! entier — un identifiant TEXTE y échouerait après coup.
+//!
 //! Les horodatages sont des secondes Unix (BIGINT dans les deux moteurs).
 //! Chaque fonction reçoit `maintenant` : les épreuves avancent l'horloge.
 
@@ -68,7 +72,10 @@ pub fn empreinte_du_mot_de_passe(db: &Arc<dyn DbBackend>, profile_id: i64) -> Op
         )
         .ok()
         .flatten()?;
-    let v2 = ligne.first().and_then(|v| v.as_string()).unwrap_or_default();
+    let v2 = ligne
+        .first()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
     let ancien = ligne.get(1).and_then(|v| v.as_string()).unwrap_or_default();
     Some(hex(&Sha256::digest(format!("{v2}\n{ancien}").as_bytes()))[..32].to_string())
 }
@@ -143,7 +150,7 @@ impl JetonsDeRenouvellementRepo {
         let client: Option<String> = client.map(|c| c.chars().take(120).collect());
         self.db.execute(
             "INSERT INTO jetons_de_renouvellement \
-             (id, famille, profile_id, empreinte_sha256, empreinte_mot_de_passe, client, cree_le, expire_le) \
+             (jeton_id, famille, profile_id, empreinte_sha256, empreinte_mot_de_passe, client, cree_le, expire_le) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 &uuid::Uuid::new_v4().to_string() as &dyn ToSqlValue,
@@ -175,7 +182,7 @@ impl JetonsDeRenouvellementRepo {
         let ligne = self
             .db
             .query_one_strong(
-                "SELECT id, famille, profile_id, empreinte_mot_de_passe, client, expire_le, \
+                "SELECT jeton_id, famille, profile_id, empreinte_mot_de_passe, client, expire_le, \
                  remplace_le, revoque_le, empreinte_sha256 \
                  FROM jetons_de_renouvellement WHERE empreinte_sha256 = ?",
                 &[&attendue as &dyn ToSqlValue],
@@ -186,7 +193,10 @@ impl JetonsDeRenouvellementRepo {
         if !bool::from(stockee.as_bytes().ct_eq(attendue.as_bytes())) {
             return Err(Refus::Inconnu);
         }
-        let id = ligne.first().and_then(|v| v.as_string()).unwrap_or_default();
+        let id = ligne
+            .first()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
         let famille = ligne.get(1).and_then(|v| v.as_string()).unwrap_or_default();
         let profile_id = ligne.get(2).and_then(|v| v.as_i64()).unwrap_or(-1);
         let empreinte_mdp = ligne.get(3).and_then(|v| v.as_string()).unwrap_or_default();
@@ -211,7 +221,8 @@ impl JetonsDeRenouvellementRepo {
             return Err(Refus::Expire);
         }
         // Le mot de passe a changé, ou le profil n'existe plus.
-        if empreinte_du_mot_de_passe(&self.db, profile_id).as_deref() != Some(empreinte_mdp.as_str())
+        if empreinte_du_mot_de_passe(&self.db, profile_id).as_deref()
+            != Some(empreinte_mdp.as_str())
         {
             self.revoquer_famille(&famille, maintenant);
             return Err(Refus::Revoque);
@@ -228,7 +239,7 @@ impl JetonsDeRenouvellementRepo {
                 // même jeton, un seul le consomme.
                 let n = tx.execute(
                     "UPDATE jetons_de_renouvellement SET remplace_le = ? \
-                     WHERE id = ? AND remplace_le IS NULL AND revoque_le IS NULL",
+                     WHERE jeton_id = ? AND remplace_le IS NULL AND revoque_le IS NULL",
                     &[&maintenant as &dyn ToSqlValue, &id],
                 )?;
                 pris = n == 1;
@@ -237,7 +248,7 @@ impl JetonsDeRenouvellementRepo {
                 }
                 tx.execute(
                     "INSERT INTO jetons_de_renouvellement \
-                     (id, famille, profile_id, empreinte_sha256, empreinte_mot_de_passe, client, cree_le, expire_le) \
+                     (jeton_id, famille, profile_id, empreinte_sha256, empreinte_mot_de_passe, client, cree_le, expire_le) \
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     &[
                         &nouvel_id as &dyn ToSqlValue,

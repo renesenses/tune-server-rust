@@ -129,7 +129,9 @@ async fn renouveler(app: &Router, jeton: &str) -> (StatusCode, Value) {
 }
 
 async fn moi(app: &Router, jeton: &str) -> StatusCode {
-    appel(app, "GET", "/api/v1/auth/me", Some(jeton), None).await.0
+    appel(app, "GET", "/api/v1/auth/me", Some(jeton), None)
+        .await
+        .0
 }
 
 /// Recule l'horloge des jetons de renouvellement en base (consommation et
@@ -166,7 +168,11 @@ async fn la_connexion_rend_un_jeton_de_renouvellement_sans_rien_changer_d_autre(
     assert_eq!(v["token_type"], "Bearer");
     assert_eq!(v["expires_in"], 86400);
     assert_eq!(v["role"], "user");
-    assert!(v["token"].as_str().is_some_and(|t| t.split('.').count() == 3));
+    assert!(
+        v["token"]
+            .as_str()
+            .is_some_and(|t| t.split('.').count() == 3)
+    );
     // Le nouveau : jeton opaque et sa durée.
     assert!(
         v["refresh_token"]
@@ -174,7 +180,10 @@ async fn la_connexion_rend_un_jeton_de_renouvellement_sans_rien_changer_d_autre(
             .is_some_and(|t| t.starts_with("tune_rt_"))
     );
     assert_eq!(v["refresh_expires_in"], 30 * 86400);
-    assert_eq!(moi(&app, v["token"].as_str().unwrap()).await, StatusCode::OK);
+    assert_eq!(
+        moi(&app, v["token"].as_str().unwrap()).await,
+        StatusCode::OK
+    );
 
     // Sans `remember` (ancien client) : 24 h, pas de renouvellement.
     let (st, v) = appel(
@@ -315,7 +324,10 @@ async fn la_deconnexion_revoque_la_session_et_seulement_elle() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    assert_eq!(renouveler(&app, &rt_telephone).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        renouveler(&app, &rt_telephone).await.0,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(moi(&app, &acces_telephone).await, StatusCode::UNAUTHORIZED);
     // Le navigateur reste connecté.
     assert_eq!(moi(&app, &acces_web).await, StatusCode::OK);
@@ -403,7 +415,12 @@ async fn jamais_de_jeton_en_clair_en_base() {
         .query_many("SELECT * FROM jetons_de_renouvellement", &[])
         .unwrap();
     assert_eq!(lignes.len(), 2);
-    lignes.extend(state.backend.query_many("SELECT * FROM settings", &[]).unwrap());
+    lignes.extend(
+        state
+            .backend
+            .query_many("SELECT * FROM settings", &[])
+            .unwrap(),
+    );
     for ligne in &lignes {
         for valeur in ligne {
             if let Some(texte) = valeur.as_string() {

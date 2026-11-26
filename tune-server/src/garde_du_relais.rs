@@ -470,13 +470,21 @@ mod tests {
         // rc14 — le renouvellement de session passe par le relais comme la
         // connexion (une app en 5G renouvelle par le pont), jamais sans
         // authentification active.
-        assert!(chemin_relayable(&Method::POST, "/api/v1/auth/refresh", true));
+        assert!(chemin_relayable(
+            &Method::POST,
+            "/api/v1/auth/refresh",
+            true
+        ));
         assert!(!chemin_relayable(
             &Method::POST,
             "/api/v1/auth/refresh",
             false
         ));
-        assert!(!chemin_relayable(&Method::GET, "/api/v1/auth/refresh", true));
+        assert!(!chemin_relayable(
+            &Method::GET,
+            "/api/v1/auth/refresh",
+            true
+        ));
         // Même authentifié, l'administration reste locale.
         assert!(!chemin_relayable(&Method::POST, "/api/v1/auth/token", true));
         assert!(!chemin_relayable(

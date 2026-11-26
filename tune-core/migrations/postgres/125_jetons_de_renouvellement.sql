@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS jetons_de_renouvellement (
- id TEXT PRIMARY KEY,
+ jeton_id TEXT PRIMARY KEY,
  famille TEXT NOT NULL,
  profile_id BIGINT NOT NULL,
  empreinte_sha256 TEXT NOT NULL UNIQUE,

@@ -1992,8 +1992,12 @@ async fn login(
         match tune_core::db::jetons_de_renouvellement::JetonsDeRenouvellementRepo::with_backend(
             state.backend.clone(),
         )
-        .ouvrir_famille(sid, profile_id, client, crate::session_renouvelee::maintenant())
-        {
+        .ouvrir_famille(
+            sid,
+            profile_id,
+            client,
+            crate::session_renouvelee::maintenant(),
+        ) {
             Ok(emis) => ajouter_le_renouvellement(&mut corps, &emis),
             // Sans jeton de renouvellement, la session vaut 24 h : le client
             // se reconnectera, comme avant.

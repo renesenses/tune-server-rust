@@ -86,7 +86,8 @@ fn course_dans_le_delai_de_grace(db: &Arc<dyn DbBackend>, id: i64) {
     let a = repo.ouvrir(id, None, T0).unwrap();
     let b = repo.renouveler(&a.jeton, T0 + 5).unwrap();
     assert_eq!(
-        repo.renouveler(&a.jeton, T0 + 5 + DELAI_DE_GRACE).unwrap_err(),
+        repo.renouveler(&a.jeton, T0 + 5 + DELAI_DE_GRACE)
+            .unwrap_err(),
         Refus::DejaTourne
     );
     // Rien n'est révoqué : le jeton tourné sert toujours.
@@ -139,10 +140,19 @@ fn revocations(db: &Arc<dyn DbBackend>, id: i64) {
     // Déconnexion : la famille du jeton présenté.
     let a = repo.ouvrir(id, None, T0).unwrap();
     let autre = repo.ouvrir(id, None, T0).unwrap();
-    assert_eq!(repo.session_du_jeton(&a.jeton), Some((a.famille.clone(), id)));
+    assert_eq!(
+        repo.session_du_jeton(&a.jeton),
+        Some((a.famille.clone(), id))
+    );
     assert!(repo.revoquer_famille(&a.famille, T0 + 1) >= 1);
-    assert_eq!(repo.renouveler(&a.jeton, T0 + 2).unwrap_err(), Refus::Revoque);
-    assert!(repo.famille_active(&autre.famille, T0 + 2), "l'autre appareil reste");
+    assert_eq!(
+        repo.renouveler(&a.jeton, T0 + 2).unwrap_err(),
+        Refus::Revoque
+    );
+    assert!(
+        repo.famille_active(&autre.famille, T0 + 2),
+        "l'autre appareil reste"
+    );
     // Se déconnecter partout.
     repo.revoquer_profil(id, T0 + 3);
     assert_eq!(
@@ -152,7 +162,10 @@ fn revocations(db: &Arc<dyn DbBackend>, id: i64) {
     // Secrets renouvelés : tout le monde.
     let c = repo.ouvrir(id, None, T0 + 5).unwrap();
     repo.revoquer_tout(T0 + 6);
-    assert_eq!(repo.renouveler(&c.jeton, T0 + 7).unwrap_err(), Refus::Revoque);
+    assert_eq!(
+        repo.renouveler(&c.jeton, T0 + 7).unwrap_err(),
+        Refus::Revoque
+    );
     // Jeton inconnu ou mal formé.
     assert_eq!(
         repo.renouveler("tune_rt_0000", T0).unwrap_err(),
@@ -226,6 +239,9 @@ async fn epreuves_communes_postgres() {
         &[&id as &dyn ToSqlValue],
     )
     .unwrap();
-    db.execute("DELETE FROM profiles WHERE id = ?", &[&id as &dyn ToSqlValue])
-        .unwrap();
+    db.execute(
+        "DELETE FROM profiles WHERE id = ?",
+        &[&id as &dyn ToSqlValue],
+    )
+    .unwrap();
 }

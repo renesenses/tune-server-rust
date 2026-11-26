@@ -45,7 +45,8 @@ pub fn signaler_revocation() {
 /// Révoque la famille de renouvellement `sid` (sa session vient d'être
 /// désinscrite).
 pub fn revoquer_famille(db: &Arc<dyn DbBackend>, sid: &str) {
-    let n = JetonsDeRenouvellementRepo::with_backend(db.clone()).revoquer_famille(sid, maintenant());
+    let n =
+        JetonsDeRenouvellementRepo::with_backend(db.clone()).revoquer_famille(sid, maintenant());
     tracing::info!(session = %sid, jetons = n, "session_revoquee");
     signaler_revocation();
 }
