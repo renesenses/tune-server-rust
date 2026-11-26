@@ -76,6 +76,15 @@ pub const VOIES_MAX: usize = 16;
 /// Durée du fondu enchaîné d'un changement de réglage à chaud.
 pub const RAMPE_MS: f64 = 20.0;
 
+/// rc14 (sécurité auditive, relecture de #9556) — fondu d'ENTRÉE en PURE :
+/// du signal réglé au signal sec tenu au niveau de chaque voie, comme le
+/// fondu de l'égaliseur (`audio::eq::RAMPE_DE_BASCULE_MS`).
+pub const FONDU_ENTREE_PURE_MS: f64 = crate::audio::eq::RAMPE_DE_BASCULE_MS as f64;
+
+/// rc14 — puis la remontée du niveau tenu vers le niveau d'avant le
+/// réglage, bornée par le volume (`audio::eq::REMONTEE_RAPIDE_TESS_MS`).
+pub const REMONTEE_PURE_MS: f64 = crate::audio::eq::REMONTEE_RAPIDE_TESS_MS as f64;
+
 /// Le réglage d'une voie.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -317,6 +326,42 @@ impl Echantillon for f64 {
     }
 }
 
+/// rc14 (sécurité auditive, relecture de #9556) — l'entrée en PURE d'un
+/// réglage qui agit. Le couper d'un bloc à l'autre rendait d'un coup la
+/// RÉSERVE ([`ReglagesEnceintes::reserve_db`], jusqu'à +10 dB) aux voies
+/// baissées. Même règle que l'égaliseur : un fondu du signal réglé au
+/// signal sec TENU au niveau de chaque voie (`|facteur|`, sans délai ni
+/// inversion), puis une remontée vers le niveau d'avant le réglage, bornée
+/// par le volume (#6741) : `borne` est le rapport `volume d'avant / volume
+/// courant` que pose la sortie, jamais au-delà de 1, jamais sous le niveau
+/// tenu. Volume inchangé : le sec au bit près au bout, puis le contournement
+/// habituel. Volume monté : le surplus reste tenu (voyant « niveau réduit »)
+/// jusqu'à « Rendre le niveau » ([`ProcesseurEnceintes::liberer_en_pure`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PhasePure {
+    /// Armée par la sortie, avant son drapeau : le fondu part au premier
+    /// bloc joué SOUS PURE (un bloc joué entre les deux reste réglé).
+    Armee,
+    /// Du réglé au sec tenu ([`FONDU_ENTREE_PURE_MS`]).
+    Fondu,
+    /// Du niveau tenu vers la cible ([`REMONTEE_PURE_MS`]).
+    Remontee,
+    /// Niveau tenu, en attente d'une borne plus haute.
+    Tenu,
+}
+
+#[derive(Debug, Clone)]
+struct TransitionPure {
+    phase: PhasePure,
+    borne: f64,
+    libre: bool,
+    /// rc14 (suite de la relecture de #9556) — une COUPURE hors PURE
+    /// (« Bypass all », greffon décoché, réglage retiré) : même fondu, même
+    /// remontée bornée, mais au bout le réglage neutre continue d'être
+    /// joué (pas de contournement), et seule une nouvelle pose la quitte.
+    coupure: bool,
+}
+
 /// Les paramètres effectifs pour un format : délai et facteur par voie.
 #[derive(Debug, Clone, PartialEq)]
 struct Parametres {
@@ -393,6 +438,11 @@ pub struct ProcesseurEnceintes {
     /// Le dernier bloc a été contourné (PURE) : la sortie était le signal
     /// sec, le retour se fait en fondu depuis le neutre.
     contourne: bool,
+    /// rc14 — entrée en PURE en cours ([`PhasePure`]).
+    transition: Option<TransitionPure>,
+    /// rc14 — la borne de volume de la prochaine coupure
+    /// ([`Self::definir_borne`]).
+    borne_de_coupure: f64,
 }
 
 impl ProcesseurEnceintes {
@@ -413,6 +463,8 @@ impl ProcesseurEnceintes {
             position: 0,
             historique: 0,
             contourne: false,
+            transition: None,
+            borne_de_coupure: 1.0,
         }
     }
 
@@ -455,17 +507,43 @@ impl ProcesseurEnceintes {
     /// fondu de [`RAMPE_MS`] dès le bloc suivant (après un fondu en cours, et
     /// dès que l'historique couvre les délais demandés).
     pub fn definir(&mut self, reglages: ReglagesEnceintes) {
-        if self.canaux == 0 && self.en_attente.is_none() {
+        self.definir_borne(reglages, 1.0);
+    }
+
+    /// [`Self::definir`], avec la borne de volume (#6741) d'une COUPURE :
+    /// rc14 (sécurité auditive, suite de la relecture de #9556) — un réglage
+    /// qui agit et qu'on coupe pendant la lecture (« Bypass all », greffon
+    /// décoché) rendait sa réserve en [`RAMPE_MS`] (20 ms), jusqu'à +10 dB.
+    /// Il passe désormais comme l'entrée en PURE : fondu vers le sec tenu
+    /// au niveau de chaque voie, puis remontée en [`REMONTEE_PURE_MS`] vers
+    /// `borne`, jamais au-delà (voyant, « Rendre le niveau »). Une nouvelle
+    /// pose qui agit pendant ce temps repart du point atteint.
+    pub fn definir_borne(&mut self, reglages: ReglagesEnceintes, borne: f64) {
+        if self.canaux == 0 && self.en_attente.is_none() && self.transition.is_none() {
             self.reglages = reglages;
             return;
         }
+        let coupe = Parametres::de(&reglages, self.canaux, self.cadence).neutre();
+        let coupure_en_cours = self.transition.as_ref().is_some_and(|t| t.coupure);
+        if coupure_en_cours && !coupe {
+            // Le réglage revient (ou un autre) : depuis le point atteint.
+            self.reglages = reglages.clone();
+            self.en_attente = Some(reglages);
+            self.sortir_de_pure();
+            return;
+        }
+        self.borne_de_coupure = Self::borne_lisible(borne);
         self.en_attente = Some(reglages);
         self.demarrer_si_possible();
     }
 
     /// Démarre le fondu vers le réglage en attente si rien ne l'empêche.
     fn demarrer_si_possible(&mut self) {
-        if self.canaux == 0 || self.precedent.is_some() || self.contourne {
+        if self.canaux == 0
+            || self.precedent.is_some()
+            || self.contourne
+            || self.transition.is_some()
+        {
             return;
         }
         let Some(r) = self.en_attente.as_ref() else {
@@ -481,6 +559,21 @@ impl ProcesseurEnceintes {
         if nouveaux == self.actuel {
             return;
         }
+        // rc14 (suite de la relecture de #9556) — une COUPURE d'un réglage
+        // qui agit (« Bypass all », greffon décoché) ne rend plus sa réserve
+        // en 20 ms : fondu vers le sec tenu, puis remontée bornée. Sans
+        // voie baissée (délais, inversions seuls), rien ne monte : le fondu
+        // habituel suffit.
+        if nouveaux.neutre() && self.actuel.facteurs.iter().any(|f| f.abs() < 1.0) {
+            self.transition = Some(TransitionPure {
+                phase: PhasePure::Armee,
+                borne: self.borne_de_coupure,
+                libre: false,
+                coupure: true,
+            });
+            self.commencer_le_fondu_vers_le_sec();
+            return;
+        }
         let ancien = std::mem::replace(&mut self.actuel, nouveaux);
         self.precedent = Some(ancien);
         self.rampe_totale = ((RAMPE_MS / 1000.0) * f64::from(self.cadence))
@@ -492,10 +585,14 @@ impl ProcesseurEnceintes {
     /// Un nouveau flux commence (nouvelle lecture) : historique vidé, fondu
     /// abandonné, `reglages` appliqué dès le premier bloc.
     pub fn nouveau_flux(&mut self, reglages: ReglagesEnceintes) {
+        // rc14 — une entrée en PURE en cours : le nouveau flux garde le
+        // niveau tenu (jamais au-dessus de ce qui sortait), sans délai.
+        let tenu = self.niveau_tenu();
         self.en_attente = None;
         self.reglages = reglages;
         self.contourne = false;
         self.reinitialiser();
+        self.reprendre_le_niveau_tenu(tenu);
     }
 
     /// Vide l'historique (nouveau flux indépendant du précédent).
@@ -514,6 +611,11 @@ impl ProcesseurEnceintes {
     }
 
     fn preparer(&mut self, canaux: usize, cadence: u32) {
+        // rc14 — format changé pendant une entrée en PURE : le niveau tenu
+        // (le plus bas des voies, les voies ont pu changer) est repris.
+        let tenu = self
+            .niveau_tenu()
+            .map(|t| vec![t.iter().copied().fold(1.0_f64, f64::min); canaux]);
         self.canaux = canaux;
         self.cadence = cadence;
         self.actuel = Parametres::de(&self.reglages, canaux, cadence);
@@ -526,6 +628,272 @@ impl ProcesseurEnceintes {
         self.anneau.resize(self.longueur * canaux, 0.0);
         self.position = 0;
         self.historique = 0;
+        self.reprendre_le_niveau_tenu(tenu);
+    }
+
+    /// rc14 — le niveau que tient une entrée en PURE en cours, par voie :
+    /// celui d'arrivée du fondu, ou celui de départ d'une remontée (jamais
+    /// au-dessus de ce qui sort). `None` hors d'une entrée en PURE.
+    fn niveau_tenu(&self) -> Option<Vec<f64>> {
+        let t = self.transition.as_ref()?;
+        if t.phase == PhasePure::Armee {
+            return None;
+        }
+        Some(match (t.phase, self.precedent.as_ref()) {
+            (PhasePure::Remontee, Some(p)) => p.facteurs.clone(),
+            _ => self.actuel.facteurs.clone(),
+        })
+    }
+
+    /// rc14 — après une remise à zéro (nouveau flux, nouveau format) : la
+    /// sortie tient `tenu`, sans délai, puis reprend sa remontée.
+    fn reprendre_le_niveau_tenu(&mut self, tenu: Option<Vec<f64>>) {
+        let (Some(tenu), Some(t)) = (tenu, self.transition.as_mut()) else {
+            return;
+        };
+        if self.canaux == 0 || tenu.len() != self.canaux {
+            return;
+        }
+        t.phase = PhasePure::Tenu;
+        self.precedent = None;
+        self.rampe_restante = 0;
+        self.actuel = Parametres {
+            retards: vec![0; self.canaux],
+            facteurs: tenu,
+        };
+        self.avancer_la_transition();
+    }
+
+    /// rc14 (sécurité auditive) — l'entrée en PURE (posée par la sortie
+    /// AVANT son drapeau) : au lieu d'un contournement d'un bloc à l'autre,
+    /// un fondu vers le sec tenu au niveau de chaque voie, puis la remontée
+    /// bornée (voir [`PhasePure`]). Sans effet sur un réglage neutre au
+    /// repos, avant le premier bloc, ou déjà contourné ; une entrée en cours
+    /// ne fait que suivre la nouvelle borne.
+    pub fn entrer_en_pure(&mut self, borne: f64) {
+        if self.transition.is_some() {
+            self.borner_en_pure(borne);
+            return;
+        }
+        if self.canaux == 0 || self.contourne || self.neutre_au_repos() {
+            return;
+        }
+        self.transition = Some(TransitionPure {
+            phase: PhasePure::Armee,
+            borne: Self::borne_lisible(borne),
+            libre: false,
+            coupure: false,
+        });
+    }
+
+    /// rc14 — un bloc SOUS PURE pendant l'entrée : le fondu part au
+    /// premier, puis la transition suit son cours ([`Self::traiter`]).
+    pub fn traiter_en_pure<T: Echantillon>(
+        &mut self,
+        tampon: &mut [T],
+        canaux: u16,
+        cadence: u32,
+    ) -> bool {
+        if self
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.phase == PhasePure::Armee)
+            && self.au_format(canaux, cadence)
+        {
+            self.commencer_le_fondu_vers_le_sec();
+        }
+        self.traiter(tampon, canaux, cadence)
+    }
+
+    /// rc14 — du réglé au sec tenu au niveau de chaque voie. Un fondu de
+    /// réglage en cours : on part du réglage visé (au plus [`RAMPE_MS`]
+    /// d'écart avec ce qui sort).
+    fn commencer_le_fondu_vers_le_sec(&mut self) {
+        let Some(t) = self.transition.as_mut() else {
+            return;
+        };
+        t.phase = PhasePure::Fondu;
+        let tenu: Vec<f64> = (0..self.canaux)
+            .map(|c| {
+                let a = self.actuel.facteurs[c].abs();
+                let p = self.precedent.as_ref().map_or(a, |p| p.facteurs[c].abs());
+                a.min(p).min(1.0)
+            })
+            .collect();
+        let cible = Parametres {
+            retards: vec![0; self.canaux],
+            facteurs: tenu,
+        };
+        self.precedent = Some(std::mem::replace(&mut self.actuel, cible));
+        self.rampe_totale = ((FONDU_ENTREE_PURE_MS / 1000.0) * f64::from(self.cadence))
+            .round()
+            .max(1.0) as usize;
+        self.rampe_restante = self.rampe_totale;
+    }
+
+    fn borne_lisible(borne: f64) -> f64 {
+        if borne.is_finite() && borne > 0.0 {
+            borne.min(1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// rc14 — un geste de volume pendant une entrée en PURE : la borne
+    /// suit (#6741). Une remontée repart du niveau tenu à la fin de sa
+    /// phase ; un niveau tenu remonte tout de suite si la borne le permet.
+    pub fn borner_en_pure(&mut self, borne: f64) {
+        let Some(t) = self.transition.as_mut() else {
+            return;
+        };
+        t.borne = Self::borne_lisible(borne);
+        if t.phase == PhasePure::Tenu {
+            self.avancer_la_transition();
+        }
+    }
+
+    /// rc14 — « Rendre le niveau » (#6524) pendant une entrée en PURE : la
+    /// remontée va jusqu'au sec, sans la borne de volume.
+    pub fn liberer_en_pure(&mut self) {
+        let Some(t) = self.transition.as_mut() else {
+            return;
+        };
+        t.libre = true;
+        if t.phase == PhasePure::Tenu {
+            self.avancer_la_transition();
+        }
+    }
+
+    /// rc14 — une entrée en PURE est-elle en cours (le réglage touche
+    /// encore le signal sous PURE) ?
+    pub fn en_transition_pure(&self) -> bool {
+        self.transition.is_some()
+    }
+
+    /// rc14 — l'entrée en PURE a-t-elle commencé (au moins un bloc joué
+    /// sous PURE) ?
+    pub fn transition_commencee(&self) -> bool {
+        self.transition
+            .as_ref()
+            .is_some_and(|t| t.phase != PhasePure::Armee && !t.coupure)
+    }
+
+    /// rc14 — le niveau tenu par l'entrée en PURE (le plus bas des voies,
+    /// en dB) et s'il remonte ; `None` s'il ne tient rien sous l'unité.
+    pub fn garde_en_pure(&self) -> Option<(f64, bool)> {
+        let t = self.transition.as_ref()?;
+        let bas = self.niveau_tenu()?.into_iter().fold(1.0_f64, f64::min);
+        (bas < 1.0 - 1e-9).then(|| (20.0 * bas.max(1e-6).log10(), t.phase != PhasePure::Tenu))
+    }
+
+    /// rc14 — fin d'une phase de l'entrée en PURE (rampe finie, ou borne
+    /// relevée sur un niveau tenu) : remonter vers `max(tenu, min(1,
+    /// borne))`, tenir, ou, tout revenu à l'unité, finir : le contournement
+    /// prend la suite (historique remis à zéro, comme une entrée sans
+    /// fondu).
+    fn avancer_la_transition(&mut self) {
+        let Some(t) = self.transition.as_mut() else {
+            return;
+        };
+        if self.precedent.is_some() || t.phase == PhasePure::Armee {
+            return;
+        }
+        let plafond = if t.libre { 1.0 } else { t.borne };
+        let cible: Vec<f64> = self
+            .actuel
+            .facteurs
+            .iter()
+            .map(|f| f.max(plafond).min(1.0))
+            .collect();
+        if self.actuel.retards.iter().all(|d| *d == 0)
+            && self.actuel.facteurs.iter().all(|f| *f == 1.0)
+        {
+            let coupure = t.coupure;
+            self.transition = None;
+            if coupure {
+                // Coupure finie : le réglage neutre joue, à l'identité.
+                if let Some(r) = self.en_attente.take() {
+                    self.reglages = r;
+                }
+                return;
+            }
+            self.contourne = true;
+            self.anneau.fill(0.0);
+            self.historique = 0;
+            return;
+        }
+        if cible == self.actuel.facteurs {
+            t.phase = PhasePure::Tenu;
+            return;
+        }
+        t.phase = PhasePure::Remontee;
+        let vers = Parametres {
+            retards: vec![0; self.canaux],
+            facteurs: cible,
+        };
+        self.precedent = Some(std::mem::replace(&mut self.actuel, vers));
+        self.rampe_totale = ((REMONTEE_PURE_MS / 1000.0) * f64::from(self.cadence))
+            .round()
+            .max(1.0) as usize;
+        self.rampe_restante = self.rampe_totale;
+    }
+
+    /// rc14 — on QUITTE PURE pendant son entrée. Un fondu en cours repart
+    /// à rebours depuis le point atteint (aucun saut) ; un niveau tenu
+    /// rejoint le réglage par le fondu habituel ([`RAMPE_MS`]). La cible est
+    /// le réglage d'avant PURE : celui que l'orchestrateur a posé SOUS PURE
+    /// (le neutre, « coupé ») reste en attente et ne passe qu'ensuite, le
+    /// temps que le réglage de la sortie de PURE le remplace.
+    pub fn sortir_de_pure(&mut self) {
+        let Some(t) = self.transition.take() else {
+            return;
+        };
+        if t.phase == PhasePure::Armee {
+            // Rien n'a encore changé dans le signal.
+            return;
+        }
+        let fait = self.rampe_totale - self.rampe_restante;
+        match (t.phase, self.precedent.take()) {
+            (PhasePure::Fondu, Some(depart)) => {
+                // Le fondu repart à rebours vers le réglé.
+                let atteint = std::mem::replace(&mut self.actuel, depart);
+                self.precedent = Some(atteint);
+                self.rampe_restante = (fait + 1).min(self.rampe_totale).max(1);
+                return;
+            }
+            (_, Some(depart)) => {
+                // Remontée (sans délai de part et d'autre) : le point atteint
+                // est un simple facteur par voie.
+                let a = fait as f64 / self.rampe_totale.max(1) as f64;
+                for (f, d) in self.actuel.facteurs.iter_mut().zip(&depart.facteurs) {
+                    *f = d + a * (*f - d);
+                }
+            }
+            (_, None) => {}
+        }
+        let vers = Parametres::de(&self.reglages, self.canaux, self.cadence);
+        if vers == self.actuel {
+            return;
+        }
+        // rc14 (suite de la relecture de #9556) — vers un réglage NEUTRE
+        // (le seul que connaisse une piste lancée sous PURE) : la sortie
+        // ferait REMONTER les voies tenues en 20 ms. Elle devient une
+        // coupure : remontée bornée depuis le point atteint.
+        if vers.neutre() && self.actuel.facteurs.iter().any(|f| f.abs() < 1.0) {
+            self.transition = Some(TransitionPure {
+                phase: PhasePure::Tenu,
+                coupure: true,
+                ..t
+            });
+            self.avancer_la_transition();
+            return;
+        }
+        let depuis = std::mem::replace(&mut self.actuel, vers);
+        self.precedent = Some(depuis);
+        self.rampe_totale = ((RAMPE_MS / 1000.0) * f64::from(self.cadence))
+            .round()
+            .max(1.0) as usize;
+        self.rampe_restante = self.rampe_totale;
     }
 
     /// Prépare le format si besoin ; `false` si le bloc n'a pas de format.
@@ -572,6 +940,9 @@ impl ProcesseurEnceintes {
         if !self.au_format(canaux, cadence) {
             return;
         }
+        // rc14 — un contournement direct (drapeau posé sans `entrer_en_pure`)
+        // abandonne une entrée en cours.
+        self.transition = None;
         if !self.contourne {
             self.contourne = true;
             self.anneau.fill(0.0);
@@ -641,7 +1012,11 @@ impl ProcesseurEnceintes {
                 self.rampe_restante -= 1;
                 if self.rampe_restante == 0 {
                     self.precedent = None;
-                    self.demarrer_si_possible();
+                    if self.transition.is_some() {
+                        self.avancer_la_transition();
+                    } else {
+                        self.demarrer_si_possible();
+                    }
                 }
             }
         }

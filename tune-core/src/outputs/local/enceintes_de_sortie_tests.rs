@@ -212,7 +212,10 @@ fn retrait_et_changement_a_chaud_sans_saut() {
     poser(&s.cle, true, Some(deux_voies(1000.0, 0.0, 2.0)));
     s.jouer(0.5);
     poser(&s.cle, true, None);
-    s.jouer(0.5);
+    // rc14 (suite de la relecture de #9556) — le retrait d'un réglage qui
+    // baisse une voie passe par le fondu de 300 ms puis la remontée de
+    // 450 ms : l'identité au bout de 0,75 s.
+    s.jouer(1.0);
     let saut = s.saut_max(0, 1).max(s.saut_max(1, 1));
     eprintln!("saut_mesure retrait et 3 m -> 10 m : {saut:.5}");
     assert!(saut <= 3.0 * pas_naturel(CADENCE), "saut {saut}");
@@ -350,4 +353,269 @@ fn une_nouvelle_lecture_ne_rejoue_rien_de_la_precedente() {
             "son de l'écoute précédente rejoué (arrêt : {vider_par_arret})"
         );
     }
+}
+
+/// Niveau (RMS relatif au sinus d'entrée) de la voie `voie`, fenêtre de
+/// 20 ms (une période de 50 Hz) commençant à la trame `debut`.
+fn niveau(s: &Sortie, voie: usize, debut: usize) -> f64 {
+    let n = (CADENCE / 50) as usize;
+    let e: f64 = (debut..debut + n)
+        .map(|t| s.sortie[t * 2 + voie].powi(2))
+        .sum::<f64>()
+        / n as f64;
+    e.sqrt() / (0.8 / std::f64::consts::SQRT_2)
+}
+
+/// rc14 (sécurité auditive, relecture de #9556, M) — ENTRÉE en PURE d'un
+/// réglage qui agit (voie 1 à +6 dB, d'où une réserve de −6 dB sur la voie
+/// 0 ; voie 1 retardée), volume inchangé : la voie baissée ne remonte pas
+/// d'un coup (+6 dB d'un bloc à l'autre avant) ; elle TIENT son niveau le
+/// temps du fondu, puis rejoint le sec en ~450 ms, sans marche ; aucune
+/// voie ne dépasse son niveau d'avant ; aucun saut d'échantillon ; puis
+/// PURE est bit-perfect et le réglage n'agit plus.
+#[test]
+fn entree_en_pure_fondu_puis_niveau_d_avant_sans_hausse_rc14() {
+    let mut s = Sortie::new();
+    poser(&s.cle, true, Some(deux_voies(300.0, 0.0, 6.0)));
+    s.jouer(0.5);
+    let fenetre = (CADENCE / 50) as usize;
+    let avant_0 = niveau(&s, 0, s.trames() - fenetre);
+    let avant_1 = niveau(&s, 1, s.trames() - fenetre);
+    assert!(
+        (avant_0 - 0.5).abs() < 0.01,
+        "prémisse : voie 0 à {avant_0:.3}"
+    );
+    assert!(
+        (avant_1 - 1.0).abs() < 0.01,
+        "prémisse : voie 1 à {avant_1:.3}"
+    );
+    // Comme `LocalOutput::set_pure_bypass(true)` puis l'orchestrateur.
+    entrer_en_pure(&s.cle, 1.0);
+    s.cle.store(true, Ordering::Relaxed);
+    poser(&s.cle, true, None);
+    assert!(
+        agit(&s.cle, false),
+        "l'entrée en PURE touche encore le signal"
+    );
+    let entree = s.trames();
+    s.jouer(1.2);
+    let mut precedent = avant_0;
+    for k in 0..50 {
+        let debut = entree + k * fenetre;
+        let v0 = niveau(&s, 0, debut);
+        let v1 = niveau(&s, 1, debut);
+        assert!(v1 <= avant_1 * 1.01, "voie 1 à {v1:.3} (fenêtre {k})");
+        if k < 15 {
+            assert!(
+                v0 <= avant_0 * 1.02,
+                "voie 0 à {v0:.3} pendant le fondu (fenêtre {k}) : la réserve revient d'un coup"
+            );
+        }
+        let marche = 20.0 * (v0 / precedent).log10();
+        assert!(
+            marche < 1.0,
+            "marche de {marche:.2} dB sur la voie 0 (fenêtre {k})"
+        );
+        precedent = v0;
+    }
+    let saut = s.saut_max(0, entree).max(s.saut_max(1, entree));
+    assert!(saut <= 3.0 * pas_naturel(CADENCE), "saut {saut}");
+    let fin = s.trames();
+    for n in (fin - 4_800) * 2..fin * 2 {
+        assert_eq!(
+            s.sortie[n].to_bits(),
+            s.entree[n].to_bits(),
+            "PURE : intact"
+        );
+    }
+    assert!(!agit(&s.cle, false));
+    assert!(garde_en_pure(&s.cle).is_none());
+}
+
+/// rc14 (relecture de #9556, M) — volume MONTÉ depuis le réglage (borne
+/// 0,5 : le niveau d'avant le réglage est à −6 dB au volume courant) : la
+/// voie baissée reste tenue, le voyant le dit ; une borne relevée la fait
+/// remonter jusqu'à elle, pas au-delà ; « Rendre le niveau » rend le sec.
+#[test]
+fn entree_en_pure_volume_monte_tient_puis_rend_le_niveau_rc14() {
+    let mut s = Sortie::new();
+    poser(&s.cle, true, Some(deux_voies(300.0, 0.0, 6.0)));
+    s.jouer(0.5);
+    entrer_en_pure(&s.cle, 0.5);
+    s.cle.store(true, Ordering::Relaxed);
+    poser(&s.cle, true, None);
+    s.jouer(1.0);
+    let fenetre = (CADENCE / 50) as usize;
+    let v0 = niveau(&s, 0, s.trames() - fenetre);
+    assert!((v0 - 0.5).abs() < 0.01, "tenu à {v0:.3}");
+    let (db, en_retour) = garde_en_pure(&s.cle).expect("voyant « niveau réduit »");
+    assert!((db + 6.02).abs() < 0.1 && !en_retour, "{db:.2} dB");
+    borner_en_pure(&s.cle, 0.75);
+    let releve = s.trames();
+    s.jouer(1.0);
+    for k in 0..45 {
+        let v = niveau(&s, 0, releve + k * fenetre);
+        assert!(v <= 0.75 * 1.01, "au-dessus de la borne : {v:.3}");
+    }
+    let v0 = niveau(&s, 0, s.trames() - fenetre);
+    assert!((v0 - 0.75).abs() < 0.01, "tenu à la borne : {v0:.3}");
+    liberer_en_pure(&s.cle);
+    s.jouer(1.0);
+    let fin = s.trames();
+    for n in (fin - 4_800) * 2..fin * 2 {
+        assert_eq!(
+            s.sortie[n].to_bits(),
+            s.entree[n].to_bits(),
+            "rendu : intact"
+        );
+    }
+    assert!(!agit(&s.cle, false));
+}
+
+/// rc14 (relecture de #9556) — on QUITTE PURE pendant son entrée : le
+/// réglage revient par le fondu habituel, sans saut ni dépassement.
+#[test]
+fn quitter_pure_pendant_l_entree_sans_saut_rc14() {
+    let mut s = Sortie::new();
+    let r = deux_voies(300.0, 0.0, 6.0);
+    poser(&s.cle, true, Some(r.clone()));
+    s.jouer(0.5);
+    entrer_en_pure(&s.cle, 1.0);
+    s.cle.store(true, Ordering::Relaxed);
+    poser(&s.cle, true, None);
+    s.jouer(0.1);
+    s.cle.store(false, Ordering::Relaxed);
+    poser(&s.cle, true, Some(r));
+    let retour = s.trames();
+    s.jouer(0.5);
+    let saut = s.saut_max(0, retour).max(s.saut_max(1, retour));
+    assert!(saut <= 3.0 * pas_naturel(CADENCE), "saut au retour {saut}");
+    let fenetre = (CADENCE / 50) as usize;
+    let v0 = niveau(&s, 0, s.trames() - fenetre);
+    assert!((v0 - 0.5).abs() < 0.01, "réglage revenu : {v0:.3}");
+}
+
+/// rc14 (suite de la relecture de #9556) — « Bypass all » (ou greffon
+/// décoché) pendant la lecture, volume inchangé : le réglage n'est plus
+/// coupé par le fondu de 20 ms, qui rendait la réserve d'un coup (+6 dB
+/// sur la voie 0). La voie baissée tient son niveau le temps du fondu, puis
+/// rejoint le sec en ~450 ms, sans marche ; aucune voie au-dessus de son
+/// niveau d'avant ; aucun saut ; puis l'identité, au bit près.
+#[test]
+fn bypass_all_fondu_puis_niveau_d_avant_sans_hausse_rc14() {
+    let mut s = Sortie::new();
+    poser(&s.cle, true, Some(deux_voies(300.0, 0.0, 6.0)));
+    s.jouer(0.5);
+    let fenetre = (CADENCE / 50) as usize;
+    let avant_0 = niveau(&s, 0, s.trames() - fenetre);
+    let avant_1 = niveau(&s, 1, s.trames() - fenetre);
+    // Comme l'orchestrateur sous « Bypass all » : le réglage est retiré.
+    poser_borne(&s.cle, true, None, 1.0);
+    let coupe = s.trames();
+    s.jouer(1.2);
+    let mut precedent = avant_0;
+    for k in 0..50 {
+        let debut = coupe + k * fenetre;
+        let v0 = niveau(&s, 0, debut);
+        let v1 = niveau(&s, 1, debut);
+        assert!(v1 <= avant_1 * 1.01, "voie 1 à {v1:.3} (fenêtre {k})");
+        if k < 15 {
+            assert!(
+                v0 <= avant_0 * 1.02,
+                "voie 0 à {v0:.3} pendant le fondu (fenêtre {k}) : la réserve revient d'un coup"
+            );
+        }
+        let marche = 20.0 * (v0 / precedent).log10();
+        assert!(marche < 1.0, "marche de {marche:.2} dB (fenêtre {k})");
+        precedent = v0;
+    }
+    let saut = s.saut_max(0, coupe).max(s.saut_max(1, coupe));
+    assert!(saut <= 3.0 * pas_naturel(CADENCE), "saut {saut}");
+    let fin = s.trames();
+    for n in (fin - 4_800) * 2..fin * 2 {
+        assert_eq!(
+            s.sortie[n].to_bits(),
+            s.entree[n].to_bits(),
+            "coupé : intact"
+        );
+    }
+    assert!(!agit(&s.cle, false));
+}
+
+/// rc14 (suite de la relecture de #9556) — « Bypass all » avec le volume
+/// MONTÉ depuis le réglage (borne 0,5) : la voie baissée reste tenue, le
+/// voyant le dit ; « Rendre le niveau » rend le sec ; le réglage revient
+/// ensuite par son fondu, sans saut.
+#[test]
+fn bypass_all_volume_monte_tient_puis_rend_le_niveau_rc14() {
+    let mut s = Sortie::new();
+    let r = deux_voies(300.0, 0.0, 6.0);
+    poser(&s.cle, true, Some(r.clone()));
+    s.jouer(0.5);
+    poser_borne(&s.cle, true, None, 0.5);
+    s.jouer(1.0);
+    let fenetre = (CADENCE / 50) as usize;
+    let v0 = niveau(&s, 0, s.trames() - fenetre);
+    assert!((v0 - 0.5).abs() < 0.01, "tenu à {v0:.3}");
+    let (db, _) = garde_en_pure(&s.cle).expect("voyant « niveau réduit »");
+    assert!((db + 6.02).abs() < 0.1, "{db:.2} dB");
+    assert!(agit(&s.cle, false));
+    // Le réglage revient (« Bypass all » décoché) : depuis le niveau tenu.
+    poser_borne(&s.cle, true, Some(r.clone()), 0.5);
+    let retour = s.trames();
+    s.jouer(0.5);
+    let saut = s.saut_max(0, retour).max(s.saut_max(1, retour));
+    assert!(saut <= 3.0 * pas_naturel(CADENCE), "saut au retour {saut}");
+    let v0 = niveau(&s, 0, s.trames() - fenetre);
+    assert!((v0 - 0.5).abs() < 0.01, "réglage revenu : {v0:.3}");
+    // Nouvelle coupure, puis « Rendre le niveau ».
+    poser_borne(&s.cle, true, None, 0.5);
+    s.jouer(1.0);
+    liberer_en_pure(&s.cle);
+    s.jouer(1.0);
+    let fin = s.trames();
+    for n in (fin - 4_800) * 2..fin * 2 {
+        assert_eq!(
+            s.sortie[n].to_bits(),
+            s.entree[n].to_bits(),
+            "rendu : intact"
+        );
+    }
+    assert!(garde_en_pure(&s.cle).is_none());
+}
+
+/// rc14 (suite de la relecture de #9556) — piste NOUVELLE sous PURE pendant
+/// l'entrée (l'orchestrateur ne connaît alors que le neutre), puis sortie
+/// de PURE : la sortie ne fait plus remonter les voies tenues en 20 ms vers
+/// le neutre ; elle reprend la remontée bornée, sans marche.
+#[test]
+fn piste_sous_pure_puis_sortie_sans_hausse_rc14() {
+    let mut s = Sortie::new();
+    poser(&s.cle, true, Some(deux_voies(300.0, 0.0, 6.0)));
+    s.jouer(0.5);
+    entrer_en_pure(&s.cle, 1.0);
+    s.cle.store(true, Ordering::Relaxed);
+    poser(&s.cle, true, None);
+    s.jouer(0.2);
+    nouvelle_lecture(&s.cle, true, None);
+    s.jouer(0.04);
+    let fenetre = (CADENCE / 50) as usize;
+    let tenu = niveau(&s, 0, s.trames() - fenetre);
+    assert!(tenu < 0.6, "prémisse : voie 0 tenue ({tenu:.3})");
+    s.cle.store(false, Ordering::Relaxed);
+    poser(&s.cle, true, None);
+    let sortie = s.trames();
+    s.jouer(1.0);
+    let mut precedent = tenu;
+    for k in 0..45 {
+        let v0 = niveau(&s, 0, sortie + k * fenetre);
+        let marche = 20.0 * (v0 / precedent).log10();
+        assert!(
+            marche < 1.0,
+            "marche de {marche:.2} dB sur la voie 0 à la sortie de PURE (fenêtre {k})"
+        );
+        precedent = v0;
+    }
+    let saut = s.saut_max(0, sortie);
+    assert!(saut <= 3.0 * pas_naturel(CADENCE), "saut {saut}");
 }
