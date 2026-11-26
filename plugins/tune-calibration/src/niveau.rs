@@ -1689,7 +1689,7 @@ impl Controleur {
             && !coupe
             && matches!(verdict.jugement, Jugement::Bon | Jugement::Faible)
             && let Some(cal) = etalonnage
-            && d.gain_relatif_db.is_some()
+            && cal.reference_spl(d.gain_relatif_db).is_some()
         {
             // Le plateau de référence dure 3,5 s après la rampe. Chercher
             // 3 s contiguës pour écarter la latence et conserver le spectre.
@@ -1721,7 +1721,13 @@ impl Controleur {
             rsb = verdict.rsb_db,
             "calibration_niveau_verdict"
         );
-        test.verrou().verdict = Some(verdict);
+        let mut etat = test.verrou();
+        if etalonnage.and_then(|c| c.sens_factor_db).is_none() {
+            etat.avertissements.push("Niveau en dB(C) indisponible : sélectionnez un fichier micro avec une sensibilité étalonnée.".into());
+        } else if d.gain_relatif_db.is_none() {
+            etat.avertissements.push("Niveau en dB(C) indisponible : indiquez le gain de capture par rapport au gain d’étalonnage.".into());
+        }
+        etat.verdict = Some(verdict);
         Ok(())
     }
 }

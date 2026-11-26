@@ -247,6 +247,11 @@ fn le_verdict_annonce_la_mesure() {
     let a = b.controleur.test_niveau(&id).unwrap().avancement();
     let v = a.verdict.clone().expect("verdict");
     assert_eq!(v.niveau_dbc, None);
+    assert!(
+        a.avertissements
+            .iter()
+            .any(|m| m.contains("sensibilité étalonnée"))
+    );
     assert_eq!(v.jugement, Jugement::Bon, "{v:?}");
     assert!(v.rsb_db >= RSB_MIN_DB, "{v:?}");
     let bruit = a.bruit.expect("bruit de fond");
