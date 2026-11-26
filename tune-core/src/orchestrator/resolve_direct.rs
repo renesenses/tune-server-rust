@@ -2440,7 +2440,34 @@ impl PlaybackOrchestrator {
         // interdisent le passage direct comme l'égaliseur : les octets
         // compressés de la station les contourneraient tous.
         let chaine = self.preparer_la_chaine_radio(req.zone_id);
-        let needs_proxy = proxy_sans_egaliseur || radio_eq_profile.is_some() || chaine.is_some();
+        // rc14 — le suréchantillonnage PCM vers un lecteur de la famille
+        // UPnP : la radio est décodée et servie en WAV progressif à la cible.
+        let zone_radio = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .get(req.zone_id)
+            .ok()
+            .flatten();
+        let zone_output_type = zone_radio.as_ref().and_then(|z| z.output_type.clone());
+        let device_id_radio = req
+            .output_device_id
+            .clone()
+            .or_else(|| zone_radio.as_ref().and_then(|z| z.output_device_id.clone()))
+            .unwrap_or_default();
+        let surech_radio = if crate::tess::reseau_upnp::famille_upnp(
+            crate::tess::TransportZone::depuis_type_de_sortie(zone_output_type.as_deref()),
+        ) {
+            self.preparer_le_surechantillonnage_radio(
+                req.zone_id,
+                zone_output_type.as_deref(),
+                &device_id_radio,
+            )
+            .await
+        } else {
+            None
+        };
+        let needs_proxy = proxy_sans_egaliseur
+            || radio_eq_profile.is_some()
+            || chaine.is_some()
+            || surech_radio.is_some();
 
         if needs_proxy {
             let wav_info = StreamInfo {
@@ -2459,6 +2486,10 @@ impl PlaybackOrchestrator {
             let (session_id, tx, data_ready, session) =
                 self.streamer.create_radio_session(wav_info, 256).await;
             retenir_le_codec_de_la_station(&self.db, &session, req.source_id.as_deref());
+            let surech_radio = surech_radio.map(|c| {
+                let _ = session.surechantillonnage_radio.set(c);
+                self.noteur_surech(req.zone_id)
+            });
             info!(
                 hote = %hote_pour_le_journal(audio_url),
                 source = "radio",
@@ -2474,11 +2505,15 @@ impl PlaybackOrchestrator {
                 None => super::eq_en_vol::EqEnVol::pour_la_radio_servie(proxy_sans_egaliseur),
             };
             self.noter_eq_en_vol(req.zone_id, &session_id, en_vol.clone());
-            let tx = match chaine {
-                Some(c) => {
-                    super::chaine_radio_9346::relayer_par_la_chaine_radio(c, session.clone(), tx)
-                }
-                None => tx,
+            let tx = match (chaine, surech_radio) {
+                (None, None) => tx,
+                (chaine, noteur) => super::chaine_radio_9346::relayer_la_radio(
+                    chaine,
+                    req.zone_id,
+                    noteur,
+                    session.clone(),
+                    tx,
+                ),
             };
             let radio_url = audio_url.to_string();
             // VU-mètres sur radio (DLNA) : forwarder de niveaux alimenté

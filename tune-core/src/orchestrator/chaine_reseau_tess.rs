@@ -534,6 +534,10 @@ pub(super) struct SurechReseau {
     mots: Vec<i32>,
     /// Les octets PCM quantifiés, à la cadence de sortie.
     pub(super) sortie: Vec<u8>,
+    /// Relais progressif : la fin d'un tampon qui n'est pas une trame
+    /// entière, reportée en tête du suivant (jamais servie à la cadence de
+    /// la source au milieu d'un flux suréchantillonné).
+    reste: Vec<u8>,
 }
 
 impl SurechReseau {
@@ -545,6 +549,7 @@ impl SurechReseau {
             rendu: Vec::new(),
             mots: Vec::new(),
             sortie: Vec::new(),
+            reste: Vec::new(),
         }
     }
 
@@ -595,7 +600,76 @@ impl SurechReseau {
     }
 }
 
+/// rc14 — l'en-tête WAV d'un flux suréchantillonné : la cadence et le débit
+/// portés à la cible, la taille des données multipliée par le rapport (sauf
+/// une taille « inconnue », gardée telle quelle). Un tampon qui n'est pas un
+/// en-tête RIFF/WAVE canonique de 44 octets n'est pas touché.
+pub(super) fn reecrire_l_en_tete_wav(entete: &mut [u8], vers: u32, rapport: u32) {
+    if entete.len() < 44 || &entete[0..4] != b"RIFF" || &entete[8..12] != b"WAVE" {
+        return;
+    }
+    let lire = |e: &[u8], i: usize| u32::from_le_bytes([e[i], e[i + 1], e[i + 2], e[i + 3]]);
+    let debit = lire(entete, 28).saturating_mul(rapport);
+    entete[24..28].copy_from_slice(&vers.to_le_bytes());
+    entete[28..32].copy_from_slice(&debit.to_le_bytes());
+    if &entete[36..40] == b"data" {
+        let donnees = lire(entete, 40);
+        let inconnue = donnees == u32::MAX || donnees == crate::audio::wav::UNKNOWN_DATA_SIZE;
+        if !inconnue {
+            let neuve = u64::from(donnees) * u64::from(rapport);
+            let neuve = neuve.min(u64::from(crate::audio::wav::UNKNOWN_DATA_SIZE)) as u32;
+            entete[40..44].copy_from_slice(&neuve.to_le_bytes());
+            if lire(entete, 4) != u32::MAX {
+                entete[4..8].copy_from_slice(&neuve.saturating_add(36).to_le_bytes());
+            }
+        }
+    }
+}
+
 impl StreamingDsp {
+    /// rc14 — relais progressif : [`Self::process_flux`] quand l'étage de
+    /// suréchantillonnage est posé. Les trames entières passent par la
+    /// chaîne ; le reste attend le tampon suivant ; `pcm` reçoit la sortie
+    /// suréchantillonnée (L fois plus longue, latence du noyau retirée).
+    pub(super) fn process_flux_surechantillonne(&mut self, pcm: &mut Vec<u8>, bit_depth: u16) {
+        let trame = usize::from(bit_depth / 8) * self.canaux_du_flux();
+        let Some(s) = self.surechantillonneur.as_mut() else {
+            return;
+        };
+        let mut entree = std::mem::take(&mut s.reste);
+        entree.extend_from_slice(pcm);
+        let utiles = if trame == 0 {
+            0
+        } else {
+            entree.len() / trame * trame
+        };
+        s.reste = entree.split_off(utiles);
+        if !entree.is_empty() {
+            self.traiter_par_tess(&mut entree, bit_depth, Passage::Flux);
+        }
+        *pcm = self
+            .surechantillonneur
+            .as_mut()
+            .map(|s| std::mem::take(&mut s.sortie))
+            .unwrap_or_default();
+    }
+
+    /// rc14 — fin d'un flux suréchantillonné : la queue du convolveur (s'il
+    /// y en a un) puis celle du noyau, suréchantillonnées et quantifiées.
+    pub(super) fn terminer_flux_surechantillonne(&mut self, bit_depth: u16) -> Vec<u8> {
+        let trame = usize::from(bit_depth / 8) * self.canaux_du_flux();
+        let latence = self.convolver.as_ref().map_or(0, Convolver::latency_frames);
+        let mut queue = vec![0u8; latence * trame];
+        self.traiter_par_tess(&mut queue, bit_depth, Passage::Fin);
+        self.surechantillonneur
+            .as_mut()
+            .map(|s| {
+                s.reste.clear();
+                std::mem::take(&mut s.sortie)
+            })
+            .unwrap_or_default()
+    }
+
     /// rc14 — [`Self::process`] sur une piste ENTIÈRE, qui rend dans `pcm`
     /// les octets servis : suréchantillonnés quand l'étage est posé (`pcm`
     /// change alors de longueur, ×L), traités en place sinon.

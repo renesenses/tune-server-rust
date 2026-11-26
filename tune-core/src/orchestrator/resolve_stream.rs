@@ -601,6 +601,25 @@ impl PlaybackOrchestrator {
             .source_id
             .as_deref()
             .ok_or("source_id required for streaming")?;
+        // rc14 — un service vers un lecteur de la famille UPnP : sauf le bras
+        // HTTPS en WAV progressif (qui note l'étage posé), rien ne porte le
+        // suréchantillonnage. Le refus motivé est noté d'abord.
+        if crate::tess::reseau_upnp::famille_upnp(
+            crate::tess::TransportZone::depuis_type_de_sortie(
+                crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                    .get(req.zone_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|z| z.output_type)
+                    .as_deref(),
+            ),
+        ) {
+            super::surechantillonnage_reseau::noter_un_refus_si_demande(
+                self,
+                req.zone_id,
+                crate::audio::surechantillonnage::refus_reseau::SOURCE_NON_PORTEE,
+            );
+        }
 
         // Check for prefetched PCM data before downloading.
         // If the prefetch engine has already decoded this track, serve
@@ -3047,13 +3066,65 @@ impl PlaybackOrchestrator {
                     .await;
             }
 
+            // rc14 — le suréchantillonnage PCM vers un lecteur de la famille
+            // UPnP : porté par le WAV progressif (cadences LPCM annoncées),
+            // au fil de l'eau. Il vaut consentement au WAV progressif, comme
+            // l'étage casque seul. Sans voie progressive : refus motivé (le
+            // pré-transcodage d'une piste entière imposerait un long silence).
+            let surech_service = if depart_qobuz == 0
+                && cadence_plafonnee.is_none()
+                && crate::tess::reseau_upnp::famille_upnp(
+                    crate::tess::TransportZone::depuis_type_de_sortie(zone_output_type.as_deref()),
+                ) {
+                self.decider_le_surechantillonnage_reseau(
+                    super::surechantillonnage_reseau::DemandeSurechReseau {
+                        zone_id: req.zone_id,
+                        type_de_zone: zone_output_type.as_deref(),
+                        device_id,
+                        source_format: AudioFormat::from_extension(&codec_lower),
+                        source_hz: stream_data.quality.sample_rate,
+                        plafond_zone: None,
+                        flac: false,
+                    },
+                )
+                .await
+                .and_then(|p| {
+                    if p.flac {
+                        p.pour_la_famille(false).ok()
+                    } else {
+                        Some(p)
+                    }
+                })
+            } else {
+                super::surechantillonnage_reseau::noter_un_refus_si_demande(
+                    self,
+                    req.zone_id,
+                    crate::audio::surechantillonnage::refus_reseau::SOURCE_NON_PORTEE,
+                );
+                None
+            };
+            if let Some(p) = surech_service.as_ref() {
+                match crate::audio::surechantillonnage::SurechantillonneurF64::nouveau(
+                    &p.reglages,
+                    p.de,
+                    p.vers,
+                    2,
+                ) {
+                    Ok(e) => {
+                        https_dsp.surechantillonneur =
+                            Some(super::chaine_reseau_tess::SurechReseau::nouveau(e));
+                    }
+                    Err(error) => warn!(%error, "upsampler_network_build_failed"),
+                }
+            }
+
             // #5080 — traitement actif vers une zone réseau : WAV progressif,
             // le traitement au fil de l'eau, quand la bibliothèque y aurait
             // droit. Sans cela, le bras ci-dessous attend la piste ENTIÈRE —
             // téléchargée, décodée, traitée, ré-encodée — avant de rendre une
             // adresse : plus d'une minute de silence sur un Hi-Res long.
             if depart_qobuz == 0
-                && https_dsp_active
+                && (https_dsp_active || https_dsp.surechantillonneur.is_some())
                 && let Some(bd_servie) = self
                     .profondeur_du_wav_progressif_de_service(
                         service_name,
@@ -3067,6 +3138,12 @@ impl PlaybackOrchestrator {
                     )
                     .await
             {
+                if let Some(p) = surech_service.as_ref() {
+                    self.noter_le_surechantillonnage_reseau(
+                        req.zone_id,
+                        Some(super::surechantillonnage_reseau::etat_applique(p)),
+                    );
+                }
                 return Ok(self
                     .servir_le_service_en_wav_progressif(
                         req,
@@ -3078,6 +3155,18 @@ impl PlaybackOrchestrator {
                         https_dsp,
                     )
                     .await);
+            }
+            // Pas de voie progressive : l'étage n'est pas posé (jamais dans
+            // le pré-transcodage d'une piste entière ni dans le mandataire).
+            if https_dsp.surechantillonneur.take().is_some() {
+                let p = surech_service.as_ref();
+                self.noter_le_surechantillonnage_reseau(
+                    req.zone_id,
+                    Some(super::surechantillonnage_reseau::EtatSurechReseau::refuse(
+                        crate::audio::surechantillonnage::refus_reseau::VOIE_NON_PORTEE,
+                        p.map(|p| p.proposees.clone()).unwrap_or_default(),
+                    )),
+                );
             }
 
             if depart_qobuz > 0
@@ -3441,7 +3530,7 @@ impl PlaybackOrchestrator {
             opt_in,
             dsp.crossfeed.is_some(),
             autre_traitement,
-        );
+        ) || dsp.surechantillonneur.is_some();
         let actif = dsp.is_active();
         // La sonde SOAP n'est consultée que si tout le reste est réuni.
         if !service_en_wav_progressif(actif, sortie_reseau, consenti, decodable, true) {
@@ -3481,14 +3570,26 @@ impl PlaybackOrchestrator {
             bit_depth = bd,
             "streaming_dsp_progressif_wav_target"
         );
+        // rc14 — suréchantillonné, le flux est SERVI à la cible (le relais
+        // réécrit l'en-tête WAV du décodeur) ; le décodeur reste à `sr`.
+        let surech = dsp
+            .surechantillonneur
+            .as_ref()
+            .map(|s| crate::http::streamer::SurechDuFlux {
+                de_hz: s.etage.cadence_entree(),
+                vers_hz: s.etage.cadence_sortie(),
+                filtre: s.etage.filtre().to_owned(),
+                reserve_db: s.etage.reserve_db(),
+            });
         let wav_info = StreamInfo {
             format: "wav".into(),
             mime_type: "audio/wav".into(),
-            sample_rate: sr,
+            sample_rate: surech.as_ref().map_or(sr, |s| s.vers_hz),
             bit_depth: bd,
             channels: 2,
             file_size: None,
             duration_ms: None,
+            surechantillonnage: surech.clone(),
             ..Default::default()
         };
         let (session_id, tx, data_ready) = self
@@ -3511,14 +3612,16 @@ impl PlaybackOrchestrator {
         // fenêtres du forwarder (seek compris).
         let ecretages =
             Arc::new(crate::audio::ecretage_de_traitement::EcretagesDeTraitement::new());
-        let releve = crate::audio::ecretage_de_traitement::ReleveDEcretage::new(
-            ecretages.clone(),
-            req.seek_ms.unwrap_or(0) as f64,
-            sr,
-            2,
-            bd,
-        );
-        let tx = spawn_streaming_dsp_relay_releve(dsp, bd, true, tx, Some(releve));
+        let releve = surech.is_none().then(|| {
+            crate::audio::ecretage_de_traitement::ReleveDEcretage::new(
+                ecretages.clone(),
+                req.seek_ms.unwrap_or(0) as f64,
+                sr,
+                2,
+                bd,
+            )
+        });
+        let tx = spawn_streaming_dsp_relay_releve(dsp, bd, true, tx, releve);
         let mut tache = self.capturer_pour_le_transcodage(
             req,
             service_name,

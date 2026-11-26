@@ -276,22 +276,22 @@ pub fn acheminer(r: &Resolution, f: &FaitsUpnp) -> AcheminementUpnp {
 /// suréchantillonnage PCM (`surech` : celle de la dernière piste de la
 /// bibliothèque résolue vers ce lecteur, `None` : aucune encore).
 ///
-/// Un suréchantillonnage appliqué est un traitement qui impose le fichier
-/// refait (motif `upsampling_file_transcode`) ; refusé, il ne change pas la
-/// voie. Il ne vaut que pour une piste de la bibliothèque : un service ou une
-/// radio le refusent (`source_not_supported_on_network`).
+/// Un suréchantillonnage appliqué part en relais progressif LPCM vers un
+/// lecteur qui annonce le LPCM, par le fichier refait sinon (motif
+/// `upsampling_file_transcode`) ; refusé, il ne change pas la voie. Il ne vaut que pour une piste de la bibliothèque : un service ou une
+/// radio que la lecture n'a pas pu porter sont notés refusés
+/// (`source_not_supported_on_network`).
 pub fn acheminer_avec(
     r: &Resolution,
     f: &FaitsUpnp,
     surech: Option<&SurechantillonnageUpnp>,
 ) -> AcheminementUpnp {
-    let upsampling = surech_pcm_demande(r).then(|| match f.origine {
-        OrigineDuFlux::Service | OrigineDuFlux::Radio => {
-            SurechantillonnageUpnp::refuse(SURECH_SOURCE_NON_PORTEE, Vec::new())
-        }
-        _ => surech
+    // rc14 (PR 2) — la lecture note sa décision pour la bibliothèque, les
+    // services (bras WAV progressif) et les radios : la mémoire fait foi.
+    let upsampling = surech_pcm_demande(r).then(|| {
+        surech
             .cloned()
-            .unwrap_or_else(|| SurechantillonnageUpnp::refuse(SURECH_NON_EVALUE, Vec::new())),
+            .unwrap_or_else(|| SurechantillonnageUpnp::refuse(SURECH_NON_EVALUE, Vec::new()))
     });
     let surech_actif = upsampling.as_ref().is_some_and(|u| u.active);
     let mut a = acheminer_sans_surech(r, f, surech_actif);
@@ -301,6 +301,21 @@ pub fn acheminer_avec(
 
 fn acheminer_sans_surech(r: &Resolution, f: &FaitsUpnp, surech_actif: bool) -> AcheminementUpnp {
     if surech_actif && !source_dsd(r) {
+        // rc14 — un lecteur qui annonce le LPCM reçoit le WAV suréchantillonné
+        // au fil de l'eau (relais progressif, le suréchantillonnage vaut
+        // consentement) ; sinon le fichier refait.
+        // Un service ou une radio ne le portent QUE par le WAV progressif.
+        let progressif = f.lpcm == LpcmDuLecteur::Accepted || f.origine != OrigineDuFlux::Library;
+        if progressif {
+            return AcheminementUpnp {
+                route: VoieUpnp::ProgressiveLpcm,
+                reason: None,
+                detail: (f.origine == OrigineDuFlux::Radio).then(|| DETAIL_RADIO.into()),
+                renderer_lpcm: f.lpcm,
+                lpcm_bits: f.lpcm_bits,
+                upsampling: None,
+            };
+        }
         return AcheminementUpnp {
             route: VoieUpnp::FileTranscode,
             reason: Some(MotifDeVoie::UpsamplingFileTranscode),
@@ -414,7 +429,8 @@ fn source_dsd(r: &Resolution) -> bool {
     champ("kind") == Some("dsd") && champ("played_as") == Some("converted_to_pcm")
 }
 
-/// rc14 — détail de la voie d'une piste suréchantillonnée.
+/// rc14 — détail de la voie d'une piste suréchantillonnée vers un lecteur
+/// sans LPCM annoncé.
 pub const DETAIL_SURECH_FICHIER: &str =
     "Upsampled: the track is converted to the target rate before the first note";
 
@@ -1110,6 +1126,45 @@ mod tests {
         assert_eq!(v["upsampling"]["to_hz"], 176_400);
     }
 
+    /// PR 2 — vers un lecteur qui annonce le LPCM, l'étage part par le relais
+    /// progressif, toujours effectif et jamais « Bit-perfect ».
+    #[test]
+    fn le_surechantillonnage_part_au_relais_progressif_vers_un_lecteur_lpcm() {
+        let mut r = resoudre_chaine(&chaine_surech(), false);
+        let u = surech_applique();
+        let a = acheminer_avec(&r, &faits(Accepted, false, Library), Some(&u));
+        assert_eq!(a.route, VoieUpnp::ProgressiveLpcm);
+        assert_eq!(a.reason, None);
+        appliquer(&mut r, &a);
+        let e = r
+            .etapes
+            .iter()
+            .find(|e| e.code == CodeEtape::Upsampling)
+            .unwrap();
+        assert!(e.effective);
+        assert_eq!(r.badge, Badge::ProcessedByTess);
+    }
+
+    /// PR 2 — une radio et un service suréchantillonnés partent par le WAV
+    /// progressif, l'étage effectif.
+    #[test]
+    fn radio_et_service_surechantillonnes_partent_au_relais() {
+        for origine in [OrigineDuFlux::Radio, Service] {
+            let mut r = resoudre_chaine(&chaine_surech(), false);
+            let u = surech_applique();
+            let a = acheminer_avec(&r, &faits(Refused, false, origine), Some(&u));
+            assert_eq!(a.route, VoieUpnp::ProgressiveLpcm, "{origine:?}");
+            appliquer(&mut r, &a);
+            assert!(
+                r.etapes
+                    .iter()
+                    .any(|e| e.code == CodeEtape::Upsampling && e.effective),
+                "{origine:?}"
+            );
+            assert_ne!(r.badge, Badge::BitPerfect);
+        }
+    }
+
     /// PURE prime : l'étage n'est pas demandé, la voie reste intacte et le
     /// badge « Bit-perfect », même si la lecture se souvient d'un
     /// suréchantillonnage appliqué avant PURE.
@@ -1145,10 +1200,12 @@ mod tests {
                 "renderer_rate_unknown",
             ),
             (Library, None, SURECH_NON_EVALUE),
-            (Service, Some(surech_applique()), SURECH_SOURCE_NON_PORTEE),
             (
-                OrigineDuFlux::Radio,
-                Some(surech_applique()),
+                Service,
+                Some(SurechantillonnageUpnp::refuse(
+                    SURECH_SOURCE_NON_PORTEE,
+                    Vec::new(),
+                )),
                 SURECH_SOURCE_NON_PORTEE,
             ),
         ] {

@@ -2331,6 +2331,20 @@ impl PlaybackOrchestrator {
                 crossfeed_reseau,
                 eq_forces_transcode,
             );
+            // rc14 — le suréchantillonnage vaut consentement au WAV
+            // progressif, comme l'étage casque seul : la piste est refaite à
+            // la cible AU FIL DE L'EAU (première note en moins d'une
+            // seconde) au lieu du fichier entier. Sans lui, la règle d'avant
+            // (`progressif_sans_surech`, voie de repli si le lecteur
+            // n'annonce aucune cadence LPCM exploitable).
+            let opt_in_sans_surech = opt_in;
+            let opt_in = opt_in || surech_reseau.is_some();
+            let traitement_sans_surech = TraitementsDeZone {
+                surechantillonnage: false,
+                ..traitements_de_zone
+            }
+            .un_au_moins()
+                || crossfeed_reseau;
             let candidat =
                 cible_wav_pour_traitement(traitement, is_network_output, src_est_dsd, opt_in, true);
 
@@ -2343,16 +2357,54 @@ impl PlaybackOrchestrator {
             } else {
                 false
             };
-            // rc14 — une piste suréchantillonnée part par le fichier refait :
-            // le relais progressif ne porte pas encore l'étage.
-            surech_reseau.is_none()
-                && cible_wav_pour_traitement(
-                    traitement,
-                    is_network_output,
-                    src_est_dsd,
-                    opt_in,
-                    renderer_accepte_lpcm,
-                )
+            let progressif = cible_wav_pour_traitement(
+                traitement,
+                is_network_output,
+                src_est_dsd,
+                opt_in,
+                renderer_accepte_lpcm,
+            );
+            let progressif_sans_surech = cible_wav_pour_traitement(
+                traitement_sans_surech,
+                is_network_output,
+                src_est_dsd,
+                opt_in_sans_surech,
+                renderer_accepte_lpcm,
+            );
+            (progressif, progressif_sans_surech)
+        };
+        // rc14 — la cible du suréchantillonnage suit la VOIE : relais
+        // progressif WAV (cadences LPCM annoncées), sinon fichier refait
+        // (FLAC, ou WAV pour un lecteur sans FLAC).
+        let (dsp_progressif_wav, progressif_sans_surech) = dsp_progressif_wav;
+        let (surech_reseau, dsp_progressif_wav) = match surech_reseau {
+            None => (None, dsp_progressif_wav),
+            Some(p) => {
+                let progressif = dsp_progressif_wav
+                    .then(|| p.pour_la_famille(false).ok())
+                    .flatten();
+                match progressif {
+                    Some(q) => (Some(q), true),
+                    None => match p.pour_la_famille(!transcodage.dlna_needs_wav) {
+                        Ok(q) => (Some(q), progressif_sans_surech),
+                        Err((code, proposees)) => {
+                            info!(
+                                zone_id = req.zone_id,
+                                reason = code,
+                                rates = ?proposees,
+                                "upsampler_network_not_engaged"
+                            );
+                            self.noter_le_surechantillonnage_reseau(
+                                req.zone_id,
+                                Some(super::surechantillonnage_reseau::EtatSurechReseau::refuse(
+                                    code, proposees,
+                                )),
+                            );
+                            (None, progressif_sans_surech)
+                        }
+                    },
+                }
+            }
         };
         // #3311 — le décodeur `.ape` incrémental livré en v0.9.131 (#2505) est
         // branché sur le SEUL bras progressif. Sur une zone réseau la cible est
@@ -4052,7 +4104,13 @@ impl PlaybackOrchestrator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if let Some(p) = planifie.as_ref() {
+        // (Avec le relais progressif, une piste trop lourde pour le fichier
+        // part en WAV progressif #8558 : l'étage y est porté, rien à refuser
+        // ici quand le lecteur annonce le LPCM.)
+        if let Some(p) = planifie
+            .as_ref()
+            .filter(|p| !decision.dsp_progressif_wav && p.cadences_lpcm.is_empty())
+        {
             let src_fmt = decision.source_format.unwrap_or(AudioFormat::Flac);
             if super::bascule_progressive_8558::basculer_en_progressif(
                 decision.is_network_output,
@@ -4072,7 +4130,26 @@ impl PlaybackOrchestrator {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some(p) = planifie {
+            // rc14 — toute session WAV progressive (relais LPCM, mais aussi
+            // APE/WavPack ou piste trop lourde pour le fichier) porte l'étage
+            // au fil de l'eau : première note immédiate, aucun garde-fou de
+            // délai. La cible y est celle des cadences LPCM annoncées.
+            let session_wav = !format.use_file_transcode
+                && format.target_format_str == "wav"
+                && !format.l16
+                && !format.conteneur_natif;
+            let p = match (session_wav, p.flac) {
+                (true, true) => match p.pour_la_famille(false) {
+                    Ok(q) => q,
+                    Err((code, _)) => {
+                        self.ecarter_le_surechantillonnage(req, decision, code);
+                        return Ok(format);
+                    }
+                },
+                _ => p,
+            };
             let famille_attendue = if p.flac { "flac" } else { "wav" };
+            let progressif = session_wav;
             let porte = format.use_file_transcode
                 && !format.l16
                 && !format.conteneur_natif
@@ -4085,8 +4162,9 @@ impl PlaybackOrchestrator {
                         format.out_bd,
                     ));
             // Décision du 26/11 : jamais de long silence avant la première
-            // note. Tant que le relais progressif ne porte pas l'étage, une
-            // piste dont le fichier refait prendrait plus de
+            // note. Le relais progressif WAV part tout de suite ; par le
+            // fichier refait (lecteur sans LPCM annoncé), une piste qui
+            // prendrait plus de
             // `DELAI_MAX_AVANT_LA_PREMIERE_NOTE_S` sur CETTE machine n'est
             // pas suréchantillonnée — sauf si sa rendition est déjà en cache.
             let delai = crate::audio::surechantillonnage::delai_estime_du_fichier_s(
@@ -4096,6 +4174,7 @@ impl PlaybackOrchestrator {
                 decision.track_duration_ms.max(0) as f64 / 1000.0,
             );
             let trop_lent = porte
+                && !progressif
                 && delai.is_none_or(|d| {
                     d > crate::audio::surechantillonnage::DELAI_MAX_AVANT_LA_PREMIERE_NOTE_S
                 })
@@ -4128,15 +4207,20 @@ impl PlaybackOrchestrator {
                     decision,
                     refus_reseau::TROP_LENT_POUR_LE_FICHIER,
                 );
-            } else if porte {
+            } else if porte || progressif {
                 info!(
                     zone_id = req.zone_id,
                     de_hz = p.de,
                     vers_hz = p.vers,
                     cible = %format.target_format_str,
                     profondeur = format.out_bd,
+                    progressif,
                     delai_estime_s = ?delai,
-                    "upsampler_network_file_transcode"
+                    "upsampler_network_engaged_on_route"
+                );
+                self.noter_le_surechantillonnage_reseau(
+                    req.zone_id,
+                    Some(super::surechantillonnage_reseau::etat_applique(&p)),
                 );
                 format.out_sr = p.vers;
                 format.info.sample_rate = p.vers;
@@ -4869,8 +4953,15 @@ impl PlaybackOrchestrator {
             out_mime,
             out_ext,
             info,
+            surech,
             ..
         } = format;
+        // rc14 — le relais progressif porte le suréchantillonnage : le
+        // décodeur et les greffons travaillent à la cadence de la SOURCE,
+        // l'étage porte le flux à la cible (`out_sr`, celle de `StreamInfo`
+        // et donc du DIDL et du `Content-Length`), et le relais réécrit
+        // l'en-tête WAV à la cible.
+        let cadence_de_decodage = surech.as_ref().map_or(out_sr, |p| p.de);
         // #6630 — le décodeur part de `seek_ms` : la durée de la session est
         // celle qui RESTE à servir, comme celle du départ natif (#6059). Sans
         // quoi `Content-Length` annonçait la piste entière et le corps se
@@ -4886,9 +4977,30 @@ impl PlaybackOrchestrator {
             // Chargé AVANT la session (#5114) : le flux doit dire, dans son
             // `StreamInfo`, s'il porte le crossfeed — et seul le porteur
             // réellement posé sur le canal le sait.
-            let mut dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), out_sr, channels);
+            let mut dsp =
+                self.load_streaming_dsp(req.zone_id, req.piste_rg(), cadence_de_decodage, channels);
+            if let Some(p) = surech.as_ref() {
+                dsp.surechantillonneur = Some(super::chaine_reseau_tess::SurechReseau::nouveau(
+                    crate::audio::surechantillonnage::SurechantillonneurF64::nouveau(
+                        &p.reglages,
+                        p.de,
+                        p.vers,
+                        channels,
+                    )
+                    .map_err(|e| format!("upsampler_network_build_failed: {e}"))?,
+                ));
+            }
             let relais = relais_dsp_progressif(dsp.is_active(), is_local_output);
             let mut info = info;
+            info.surechantillonnage =
+                surech
+                    .as_ref()
+                    .map(|p| crate::http::streamer::SurechDuFlux {
+                        de_hz: p.de,
+                        vers_hz: p.vers,
+                        filtre: p.reglages.filter.clone(),
+                        reserve_db: p.reserve_db(),
+                    });
             info.crossfeed = relais && dsp.crossfeed_executable();
             info.compensation_db = dsp.compensation_cuite_db().filter(|_| relais);
             let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
@@ -4962,15 +5074,20 @@ impl PlaybackOrchestrator {
                     dsp.en_vol = Some(poste);
                 }
                 // #7100 — le relais relève où SA chaîne écrête ; le forwarder
-                // de la même session le lit pour allumer `over_*`.
-                let releve = crate::audio::ecretage_de_traitement::ReleveDEcretage::new(
-                    ecretages.clone(),
-                    req.seek_ms.unwrap_or(0) as f64,
-                    out_sr,
-                    channels,
-                    out_bd,
-                );
-                spawn_streaming_dsp_relay_releve(dsp, out_bd, true, tx, Some(releve))
+                // de la même session le lit pour allumer `over_*`. rc14 —
+                // pas sous suréchantillonnage : la sortie, L fois plus
+                // longue, ne se compare plus octet à octet à l'entrée (le
+                // limiteur du greffon garantit l'absence d'écrêtage).
+                let releve = surech.is_none().then(|| {
+                    crate::audio::ecretage_de_traitement::ReleveDEcretage::new(
+                        ecretages.clone(),
+                        req.seek_ms.unwrap_or(0) as f64,
+                        out_sr,
+                        channels,
+                        out_bd,
+                    )
+                });
+                spawn_streaming_dsp_relay_releve(dsp, out_bd, true, tx, releve)
             } else {
                 tx
             };
@@ -5047,7 +5164,7 @@ impl PlaybackOrchestrator {
                 let result = tokio::task::spawn_blocking(move || {
                     crate::audio::decode::decode_to_pcm_streaming_tranche(
                         &fp_clone,
-                        Some(out_sr),
+                        Some(cadence_de_decodage),
                         Some(channels as u32),
                         Some(out_bd),
                         tx_clone,

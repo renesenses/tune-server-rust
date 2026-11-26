@@ -444,8 +444,9 @@ pub fn cible_reseau(
 
 /// rc14 — le délai au-delà duquel une piste n'est pas suréchantillonnée par
 /// le fichier refait : la première note ne doit jamais attendre plus que
-/// cela (décision du 26/11, tant que le relais progressif ne porte pas
-/// l'étage).
+/// cela (décision du 26/11). Le relais progressif WAV, lui, part tout de
+/// suite : ce garde-fou ne vaut que pour un lecteur qui n'annonce pas le
+/// LPCM (fichier FLAC refait).
 pub const DELAI_MAX_AVANT_LA_PREMIERE_NOTE_S: f64 = 3.0;
 
 /// Ce que coûte le fichier refait autour de l'étage (décodage, encodage FLAC

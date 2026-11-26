@@ -1639,7 +1639,7 @@ pub struct PlaybackOrchestrator {
     dlna_lpcm_accepte: Mutex<HashMap<String, bool>>,
     /// rc14 — la décision de suréchantillonnage réseau de la dernière piste
     /// de la bibliothèque résolue, par zone (`surechantillonnage_reseau`).
-    surech_reseau: std::sync::Mutex<HashMap<i64, crate::tess::reseau_upnp::SurechantillonnageUpnp>>,
+    surech_reseau: surechantillonnage_reseau::MemoireSurech,
     /// #4573 — ce que le Sink du renderer ANNONCE en nombre de canaux, par
     /// `(device_id, mime)`. `Some(None)` veut dire « le Sink a été lu, il ne porte
     /// aucun `channels=` » : une ignorance MESURÉE, qui ne fait rien réduire
@@ -2223,6 +2223,11 @@ impl StreamingDsp {
         if !self.is_active() {
             return;
         }
+        // rc14 — l'étage de suréchantillonnage change la longueur du flux.
+        if self.surechantillonneur.is_some() {
+            self.process_flux_surechantillonne(pcm, bit_depth);
+            return;
+        }
         let lus = pcm.len();
         let ecrits = self.traiter_par_tess(pcm, bit_depth, chaine_reseau_tess::Passage::Flux);
         // Le reste qui n'est pas une trame entière suit la sortie.
@@ -2238,6 +2243,9 @@ impl StreamingDsp {
     /// latence du convolveur retenait encore, passées par les étages qui le
     /// suivent. Vide sans convolveur.
     fn terminer_flux(&mut self, bit_depth: u16) -> Vec<u8> {
+        if self.surechantillonneur.is_some() {
+            return self.terminer_flux_surechantillonne(bit_depth);
+        }
         let Some(conv) = self.convolver.as_ref() else {
             return Vec::new();
         };
@@ -2299,6 +2307,12 @@ fn spawn_streaming_dsp_relay_releve(
         while let Some(mut chunk) = up_rx.recv().await {
             if header_pending {
                 header_pending = false;
+                // rc14 — l'en-tête du décodeur dit la cadence de la SOURCE :
+                // le flux suréchantillonné est servi à la cible.
+                if let Some(s) = dsp.surechantillonneur.as_ref() {
+                    let (vers, rapport) = (s.etage.cadence_sortie(), s.etage.rapport() as u32);
+                    chaine_reseau_tess::reecrire_l_en_tete_wav(&mut chunk, vers, rapport);
+                }
             } else if let Some(r) = releve.as_mut() {
                 // #7100 × #7642 — le relevé passe, lui aussi, par
                 // `process_flux` : l'état du convolveur doit survivre d'un
@@ -2376,7 +2390,7 @@ impl PlaybackOrchestrator {
             appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
-            surech_reseau: std::sync::Mutex::new(HashMap::new()),
+            surech_reseau: Default::default(),
             dlna_canaux_max: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashMap::new()),
             transferts_en_pause: std::sync::Mutex::new(std::collections::HashSet::new()),
