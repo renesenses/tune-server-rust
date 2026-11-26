@@ -88,6 +88,8 @@ impl Formule {
 #[derive(Debug)]
 struct Interne {
     monotone: HorlogeMonotone,
+    #[cfg(feature = "banc-ptp")]
+    ecoule_simule: Option<Arc<AtomicU64>>,
     formule: Mutex<Formule>,
     sauts: AtomicU64,
     corrections: AtomicU64,
@@ -108,6 +110,8 @@ impl HorlogeVirtuelle {
         let m = monotone.ns();
         Self(Arc::new(Interne {
             monotone,
+            #[cfg(feature = "banc-ptp")]
+            ecoule_simule: None,
             formule: Mutex::new(Formule {
                 base_monotone: m,
                 base_virtuelle: i128::from(m),
@@ -120,13 +124,42 @@ impl HorlogeVirtuelle {
         }))
     }
 
+    #[cfg(feature = "banc-ptp")]
+    pub(super) fn simulee(generation: Arc<AtomicU64>, ecoule: Arc<AtomicU64>) -> Self {
+        let mut h = Self::new(generation);
+        let interne = Arc::get_mut(&mut h.0).unwrap();
+        interne.monotone.origine_ns = 0;
+        let formule = interne.formule.get_mut().unwrap();
+        formule.base_monotone = 0;
+        formule.base_virtuelle = 0;
+        interne.ecoule_simule = Some(ecoule);
+        h
+    }
+
+    pub(super) fn instant(&self) -> Instant {
+        #[cfg(feature = "banc-ptp")]
+        if let Some(ecoule) = &self.0.ecoule_simule {
+            return self.0.monotone.origine
+                + std::time::Duration::from_nanos(ecoule.load(Ordering::Relaxed));
+        }
+        Instant::now()
+    }
+
+    fn monotone_ns(&self) -> u64 {
+        #[cfg(feature = "banc-ptp")]
+        if let Some(ecoule) = &self.0.ecoule_simule {
+            return ecoule.load(Ordering::Relaxed);
+        }
+        self.0.monotone.ns()
+    }
+
     fn formule(&self) -> std::sync::MutexGuard<'_, Formule> {
         self.0.formule.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Le temps virtuel, en ns (0 si la formule tombait sous zéro).
     pub fn maintenant_ns(&self) -> u64 {
-        let m = self.0.monotone.ns();
+        let m = self.monotone_ns();
         u64::try_from(self.formule().virtuel(m).max(0)).unwrap_or(u64::MAX)
     }
 
@@ -189,7 +222,7 @@ impl HorlogeVirtuelle {
             .0
             .dernier_saut
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+            .unwrap_or_else(|p| p.into_inner()) = Some(self.instant());
         self.0.sauts.fetch_add(1, Ordering::AcqRel);
         self.0.corrections.fetch_add(1, Ordering::AcqRel);
         self.0.generation.fetch_add(1, Ordering::AcqRel);
@@ -209,12 +242,12 @@ impl Clock for HorlogeVirtuelle {
     }
 
     fn step_clock(&mut self, offset: DureePtp) -> Result<Time, Self::Error> {
-        let m = self.0.monotone.ns();
+        let m = self.monotone_ns();
         self.sauter_a(offset, m)
     }
 
     fn set_frequency(&mut self, ppm: f64) -> Result<Time, Self::Error> {
-        let m = self.0.monotone.ns();
+        let m = self.monotone_ns();
         Ok(self.regler_frequence_a(ppm, m))
     }
 
