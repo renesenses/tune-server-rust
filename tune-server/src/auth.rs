@@ -186,6 +186,10 @@ const LECTURE: &[&str] = &["GET", "HEAD"];
 /// * `/cloud/sso/callback` (GET) : seul le retour du SSO est public (A5), le
 ///   navigateur y revient de mozaiklabs.fr ; `authorize`, `status` et
 ///   `disconnect` demandent une session ;
+/// * `/auth/admin/reinitialiser` (POST) : le mot de passe administrateur
+///   perdu. Sans jeton par nature ; le gestionnaire n'accepte qu'un appel de
+///   CETTE machine portant le code de `tune-server --reinitialiser-admin`
+///   (voir [`crate::recuperation_admin`]) ;
 /// * `/auth/login`, `/auth/logout` (POST), `/auth/config` et
 ///   `/auth/activation` (GET, lecture de l'état seulement). Le reste de
 ///   `/auth/` — inscription (seul un administrateur crée des comptes une fois
@@ -210,6 +214,7 @@ pub(crate) const LISTE_PUBLIQUE: &[(&str, &[&str])] = &[
     ("/auth/logout", &["POST"]),
     ("/auth/config", &["GET"]),
     ("/auth/activation", &["GET"]),
+    ("/auth/admin/reinitialiser", &["POST"]),
 ];
 
 /// Le chemin tel que la liste publique l'écrit : sans le préfixe `/api/v1`.
@@ -1298,6 +1303,7 @@ pub fn router() -> Router<AppState> {
             get(etat_activation).post(activer_l_authentification),
         )
         .route("/activation/code", post(demander_un_code_d_activation))
+        .route("/admin/reinitialiser", post(reinitialiser_l_administrateur))
 }
 
 // ---------------------------------------------------------------------------
@@ -1938,7 +1944,7 @@ const ALPHABET_CODE: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 /// `getrandom`), en écartant les deux octets que la v4 fixe en partie
 /// (version, variante) et, par rejet, les valeurs au-delà du plus grand
 /// multiple de 31.
-fn nouveau_code_activation() -> String {
+pub(crate) fn nouveau_code_activation() -> String {
     let limite = (256 / ALPHABET_CODE.len() * ALPHABET_CODE.len()) as u8;
     let mut code = String::with_capacity(LONGUEUR_CODE);
     while code.len() < LONGUEUR_CODE {
@@ -1957,7 +1963,7 @@ fn nouveau_code_activation() -> String {
 }
 
 /// Normalise une saisie : majuscules, sans espaces ni tirets.
-fn normaliser_code(saisi: &str) -> String {
+pub(crate) fn normaliser_code(saisi: &str) -> String {
     saisi
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '-')
@@ -2107,7 +2113,7 @@ fn verifier_code_activation(
 /// Nouveau secret de signature, clé d'API effacée, connexion SSO en attente
 /// oubliée : rien de ce qui a été obtenu pendant que tout était ouvert ne
 /// survit à l'activation.
-fn renouveler_les_secrets(settings: &SettingsRepo) {
+pub(crate) fn renouveler_les_secrets(settings: &SettingsRepo) {
     settings
         .set("jwt_secret", &uuid::Uuid::new_v4().to_string())
         .ok();
@@ -2442,6 +2448,143 @@ async fn activer_l_authentification(
     response
         .headers_mut()
         .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+    response
+}
+
+// ---------------------------------------------------------------------------
+// Mot de passe administrateur perdu : réinitialisation depuis cette machine
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ReinitialisationAdmin {
+    code: String,
+    nouveau_mot_de_passe: String,
+}
+
+fn refus_reinitialisation(statut: StatusCode, erreur: &str, message: &str) -> Response {
+    (statut, Json(json!({ "error": erreur, "message": message }))).into_response()
+}
+
+/// `POST /auth/admin/reinitialiser` — `{code, nouveau_mot_de_passe}`.
+///
+/// Seulement depuis CETTE machine ([`DepuisCetteMachine`] : adresse réelle de
+/// la connexion en bouclage, aucun en-tête de mandataire, ni relais distant,
+/// ni relais du port 80 d'une appliance). Le code vient de
+/// `tune-server --reinitialiser-admin` ; la base n'en garde que l'empreinte.
+/// Succès : mot de passe du compte administrateur remplacé, code consommé,
+/// sessions révoquées (nouveau secret de signature, WebSocket fermées), et
+/// une session ouverte pour l'appelant. Les échecs sont journalisés sans le
+/// code.
+async fn reinitialiser_l_administrateur(
+    State(state): State<AppState>,
+    DepuisCetteMachine(cette_machine): DepuisCetteMachine,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ReinitialisationAdmin>,
+) -> Response {
+    use crate::recuperation_admin as ra;
+    if !cette_machine {
+        tracing::warn!(
+            relayee = crate::garde_du_relais::requete_relayee(&headers),
+            "reinitialisation_admin_refusee_hors_machine"
+        );
+        return refus_reinitialisation(
+            StatusCode::FORBIDDEN,
+            "reset_not_local",
+            "The administrator password can only be reset from the server machine itself \
+             (http://localhost), never through a proxy or the remote relay.",
+        );
+    }
+    if body.nouveau_mot_de_passe.chars().count() < ra::LONGUEUR_MIN_MOT_DE_PASSE {
+        return refus_reinitialisation(
+            StatusCode::BAD_REQUEST,
+            "password_too_short",
+            "password must be at least 8 characters",
+        );
+    }
+    let Some((id, nom)) = ra::compte_administrateur(&state.backend) else {
+        return refus_reinitialisation(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no_admin_profile",
+            "No administrator account in this database.",
+        );
+    };
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    // Argon2 : hors de l'exécuteur.
+    let verdict = {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let code = body.code.clone();
+        tokio::task::spawn_blocking(move || ra::verifier_et_consommer(&settings, &code))
+            .await
+            .unwrap_or(ra::Verdict::AucunOuExpire)
+    };
+    match verdict {
+        ra::Verdict::Juste => {}
+        ra::Verdict::Faux { restants } => {
+            tracing::warn!(restants, "reinitialisation_admin_code_faux");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "reset_code_invalid",
+                    "remaining_attempts": restants,
+                    "message": "Wrong reset code.",
+                })),
+            )
+                .into_response();
+        }
+        ra::Verdict::AucunOuExpire => {
+            tracing::warn!("reinitialisation_admin_code_absent_ou_expire");
+            return refus_reinitialisation(
+                StatusCode::GONE,
+                "reset_code_expired",
+                "No valid reset code: run `tune-server --reinitialiser-admin` again on the server machine.",
+            );
+        }
+        ra::Verdict::Bloque => {
+            tracing::warn!("reinitialisation_admin_code_bloque");
+            return refus_reinitialisation(
+                StatusCode::TOO_MANY_REQUESTS,
+                "reset_attempts_exceeded",
+                "Too many wrong codes: this code is destroyed. Run `tune-server --reinitialiser-admin` again.",
+            );
+        }
+    }
+    let mot_de_passe = body.nouveau_mot_de_passe.clone();
+    let backend = state.backend.clone();
+    let pose =
+        tokio::task::spawn_blocking(move || ra::poser_le_mot_de_passe(&backend, id, &mot_de_passe))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+    if let Err(e) = pose {
+        tracing::error!(error = %e, "reinitialisation_admin_echec");
+        return refus_reinitialisation(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reset_failed",
+            "The new password could not be saved.",
+        );
+    }
+    // Les WebSocket ouvertes avec l'ancien secret se ferment.
+    state.fermeture_websockets.send_modify(|n| *n += 1);
+    tracing::warn!(admin = %nom, "reinitialisation_admin_reussie");
+
+    let secret = get_or_create_jwt_secret(&settings);
+    let Ok(token) = sign_jwt(id, "admin", &secret) else {
+        return Json(json!({ "reset": true, "username": nom })).into_response();
+    };
+    let mut response = Json(json!({
+        "reset": true,
+        "username": nom,
+        "token": token,
+        "token_type": "Bearer",
+        "expires_in": 86400,
+        "role": "admin",
+    }))
+    .into_response();
+    let cookie = session_cookie(&token, &headers);
+    if let Ok(valeur) = cookie.parse() {
+        response
+            .headers_mut()
+            .insert(axum::http::header::SET_COOKIE, valeur);
+    }
     response
 }
 

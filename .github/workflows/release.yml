@@ -1050,6 +1050,18 @@ jobs:
             FileWrite `$0 'tune-server.exe --sans-console$\r$\n'
             FileClose `$0
 
+            ; rc14 - mot de passe administrateur oublie : la commande ecrit un
+            ; code a usage unique (console + tune-server.log), a saisir dans
+            ; l'ecran de connexion ouvert sur CETTE machine. Elle ne demarre
+            ; pas le serveur ; pause garde la fenetre ouverte pour lire le code.
+            FileOpen `$0 "`$INSTDIR\reinitialiser-admin.bat" w
+            FileWrite `$0 '@echo off$\r$\n'
+            FileWrite `$0 'cd /d "%~dp0"$\r$\n'
+            FileWrite `$0 'echo Tune : mot de passe administrateur oublie / forgotten administrator password$\r$\n'
+            FileWrite `$0 'tune-server.exe --reinitialiser-admin$\r$\n'
+            FileWrite `$0 'pause$\r$\n'
+            FileClose `$0
+
             ; Start menu
             ; #7637 - l'entree principale « Tune Server » et le raccourci du
             ; Bureau lancent le serveur SANS fenetre de terminal (l'interface
@@ -1062,6 +1074,8 @@ jobs:
             CreateShortcut "`$SMPROGRAMS\Tune Server\Quitter Tune Server.lnk" "`$SYSDIR\taskkill.exe" "/F /IM tune-server.exe" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
             ; Journal du serveur (pas de console a rouvrir une fois cache).
             CreateShortcut "`$SMPROGRAMS\Tune Server\Journal de Tune Server.lnk" "`$WINDIR\notepad.exe" '"`$LOCALAPPDATA\TuneServer\tune-server.log"'
+            ; rc14 - recuperer l'acces administrateur depuis cette machine.
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Mot de passe administrateur oublie.lnk" "`$INSTDIR\reinitialiser-admin.bat" "" "`$INSTDIR\tune-server.exe"
             ; Ancien raccourci de la rc7 a la rc9, devenu l'entree principale.
             Delete "`$SMPROGRAMS\Tune Server\Tune Server (sans console).lnk"
             CreateShortcut "`$DESKTOP\Tune Server.lnk" "`$INSTDIR\start-tune-server-sans-console.bat" "" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED

@@ -214,6 +214,14 @@ pub async fn run_with(opts: RunOptions) {
 
     let config = TuneConfig::load();
 
+    // rc14 — mot de passe administrateur perdu : `--reinitialiser-admin`
+    // (`--reset-admin`). Après le `.env` et la configuration, pour ouvrir la
+    // MÊME base que le service ; avant le journal, le port et `AppState` : la
+    // commande ne démarre pas le serveur.
+    if crate::recuperation_admin::demandee(std::env::args().skip(1)) {
+        std::process::exit(crate::recuperation_admin::executer(&config).await);
+    }
+
     let _chemin_du_journal = installer_le_journal(&config.log_level);
 
     // #5513 : pour `artwork_cache_dir()` et le rapport de scan, qui n'ont

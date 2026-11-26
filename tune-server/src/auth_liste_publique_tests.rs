@@ -48,6 +48,7 @@ const TABLEAU_ATTENDU: &[&str] = &[
     "HEAD /api/v1/sources-reseau/{id}/fichier",
     "HEAD /api/v1/system/health",
     "HEAD /api/v1/system/version",
+    "POST /api/v1/auth/admin/reinitialiser",
     "POST /api/v1/auth/login",
     "POST /api/v1/auth/logout",
 ];
