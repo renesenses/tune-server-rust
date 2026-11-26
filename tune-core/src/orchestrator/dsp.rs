@@ -63,10 +63,16 @@ impl RaisonDeRelance {
     }
 
     /// Trop tôt après la relance précédente : abandonner (le réglage prendra
-    /// effet à la piste suivante) ou attendre la fin du plancher ? Seul le
-    /// suréchantillonneur attend : sa réponse a dit « appliqué ».
+    /// effet à la piste suivante) ou attendre la fin du plancher ?
+    ///
+    /// rc14 (retour de Rémi sur la rc13.90, TESS) : un réglage ATTEND aussi.
+    /// L'abandon rendait la désactivation d'un greffon sans effet quand elle
+    /// suivait son activation de moins de 5 s (l'activation avait relancé le
+    /// flux, la désactivation tombait sous le plancher et se perdait) : la
+    /// dernière demande l'emporte toujours, au plus tard à la fin du
+    /// plancher. Seule la bascule PURE garde l'abandon.
     pub(crate) fn differe_sous_le_plancher(self) -> bool {
-        self == Self::Surechantillonnage
+        self != Self::BasculePure
     }
 }
 
@@ -1082,6 +1088,16 @@ impl PlaybackOrchestrator {
         self: &std::sync::Arc<Self>,
         zone_id: i64,
     ) -> PorteeDuReglage {
+        // rc14 — piste modulée vers le DSD : l'égaliseur est DANS le flux du
+        // producteur ; la sortie, qui reçoit un porteur DSD, n'en applique
+        // aucun. Relance à la même position avec le nouveau réglage.
+        if self.modulation_dsd_en_service(zone_id).await {
+            return if self.relancer_si_flux_dsd_module(zone_id).await {
+                PorteeDuReglage::Relance
+            } else {
+                PorteeDuReglage::PisteSuivante
+            };
+        }
         let debut = std::time::Instant::now();
         let rapport = self.refresh_zone_eq_detaille(zone_id).await;
         let applique_a_chaud = rapport.applique();
@@ -1189,7 +1205,18 @@ impl PlaybackOrchestrator {
         let eq = self
             .eq_profile_configure(zone_id)
             .filter(|p| crate::audio::eq::EqProcessor::new(p, 44100, 2).is_enabled())
-            .map(|p| serde_json::to_string(&p).unwrap_or_else(|_| format!("{p:?}")))
+            .map(|p| {
+                let mut e = serde_json::to_string(&p).unwrap_or_else(|_| format!("{p:?}"));
+                // Revue #9520 v2 — la marge manuelle de TESS et la réserve L1
+                // d'une série changent les octets sans être sérialisées.
+                if let Some(db) = p.reserve_imposee_db {
+                    e.push_str(&format!("|marge={}", db.to_bits()));
+                }
+                if p.reserve_l1_toujours {
+                    e.push_str("|l1");
+                }
+                e
+            })
             .unwrap_or_default();
         let ir = self
             .chemin_ir_configure(zone_id)
@@ -1473,6 +1500,200 @@ impl PlaybackOrchestrator {
             .get(&zone_id)
             .and_then(|notes| notes.iter().find(|(s, _)| s == sid).map(|(_, e)| e.clone()));
         servi.is_some_and(|e| e == self.empreinte_du_traitement(zone_id, np.piste_rg()))
+    }
+
+    /// rc14 (retour de Rémi sur la rc13.90, TESS) — le flux RÉSEAU que la
+    /// zone joue a-t-il été fabriqué avec un autre traitement que celui
+    /// qu'elle demande maintenant ?
+    ///
+    /// Vrai seulement quand on le SAIT : sortie réseau (une sortie locale
+    /// traite elle-même, à chaud), flux identifié, traitement noté à sa
+    /// résolution (ou à la dernière relève en vol), et empreinte différente.
+    /// Inconnu ⇒ `false` : rien n'est refabriqué sur une supposition (une
+    /// reprise ou une relance de trop couperait le son pour rien).
+    ///
+    /// Sert la reprise après pause (« appliquer à la prochaine lecture »
+    /// compte une reprise comme une lecture, radio comprise) et le
+    /// changement de chaîne TESS en mode immédiat (convolution, crossfeed,
+    /// greffons natifs : seul l'égaliseur savait relancer).
+    pub(crate) fn flux_reseau_perime(
+        &self,
+        zone_id: i64,
+        np: &crate::playback::NowPlaying,
+    ) -> bool {
+        let reseau = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .is_some_and(|z| match z.output_device_id.as_deref() {
+                Some(d) => !d.starts_with("local:"),
+                None => z.output_type.as_deref().is_some_and(|t| t != "local"),
+            });
+        if !reseau {
+            return false;
+        }
+        let Some(ref sid) = np.stream_id else {
+            return false;
+        };
+        let servi = self
+            .traitement_des_flux
+            .lock()
+            .unwrap()
+            .get(&zone_id)
+            .and_then(|notes| notes.iter().find(|(s, _)| s == sid).map(|(_, e)| e.clone()));
+        servi.is_some_and(|e| e != self.empreinte_du_traitement(zone_id, np.piste_rg()))
+    }
+
+    /// rc14 (TESS, mode « Appliquer : immédiatement ») — la chaîne de la zone
+    /// vient de changer : un flux réseau qui JOUE et ne la porte plus est
+    /// relancé à sa position (une radio : le direct est repris), par la même
+    /// relance anti-rebondie que l'égaliseur. Avant, seul l'égaliseur le
+    /// faisait : une convolution, un crossfeed ou un greffon natif changés
+    /// (activés comme désactivés) n'agissaient qu'à la piste suivante, donc
+    /// jamais sur une radio. Une zone en pause n'est pas relancée (#7556) :
+    /// sa reprise refabrique le flux ([`Self::flux_reseau_perime`]).
+    ///
+    /// Rend `true` quand une relance a été programmée.
+    pub async fn relancer_si_flux_reseau_perime(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        let etat = self.playback.get_state(zone_id).await;
+        if etat.state != crate::playback::PlayState::Playing {
+            return false;
+        }
+        let Some(np) = etat.now_playing.as_ref() else {
+            return false;
+        };
+        if !self.flux_reseau_perime(zone_id, np) {
+            return false;
+        }
+        // Relecture de #9540 (m2) — une station MONO ne porte ni crossfeed ni
+        // greffon natif (étages stéréo seulement, `chaine_radio_9346`) : si
+        // seuls ceux-là ont changé, relancer la radio couperait le son pour
+        // rien.
+        if np.source == "radio"
+            && let Some(sid) = np.stream_id.as_deref()
+            && self.streamer.canaux_detectes(sid).await == Some(1)
+            && self.seuls_des_etages_stereo_ont_change(zone_id, np)
+        {
+            info!(zone_id, "tess_radio_mono_crossfeed_inerte_pas_de_relance");
+            return false;
+        }
+        let programmee = self.schedule_replay_pour(zone_id, RaisonDeRelance::Reglage);
+        info!(zone_id, programmee, "tess_flux_reseau_perime_relance");
+        programmee
+    }
+
+    /// Relecture de #9540 (m2) — entre le traitement servi et celui demandé,
+    /// seuls le crossfeed (`cf=`), sa compensation (`lc=`) et les natifs
+    /// tiers (`tiers=`) diffèrent-ils ? Ces étages sont stéréo seulement.
+    pub(super) fn seuls_des_etages_stereo_ont_change(
+        &self,
+        zone_id: i64,
+        np: &crate::playback::NowPlaying,
+    ) -> bool {
+        let Some(sid) = np.stream_id.as_deref() else {
+            return false;
+        };
+        let servi = self
+            .traitement_des_flux
+            .lock()
+            .unwrap()
+            .get(&zone_id)
+            .and_then(|notes| notes.iter().find(|(s, _)| s == sid).map(|(_, e)| e.clone()));
+        let Some(servi) = servi else {
+            return false;
+        };
+        let sans = |e: &str| {
+            e.split('\u{1f}')
+                .filter(|c| {
+                    !(c.starts_with("cf=") || c.starts_with("lc=") || c.starts_with("tiers="))
+                })
+                .collect::<Vec<_>>()
+                .join("\u{1f}")
+        };
+        sans(&servi) == sans(&self.empreinte_du_traitement(zone_id, np.piste_rg()))
+    }
+
+    /// rc14 (retour de Rémi sur la rc13.90) — l'égaliseur vient d'être
+    /// DÉCOCHÉ dans TESS : le préampli que l'égaliseur coupé garde (décision
+    /// du 10/10) remonte en moins de 0,5 s (décision du 25/11, A/B), par
+    /// rampe, sans marche, vers le niveau d'avant l'égaliseur (#6741,
+    /// sécurité auditive) : à volume inchangé, la sortie redevient l'entrée au
+    /// bit près ; si le volume a monté entre-temps, le reste demeure gardé
+    /// (voyant, « Rendre le niveau » #6524).
+    ///
+    /// - sortie locale : `LocalOutput::rendre_le_sec_vite` ;
+    /// - flux réseau dont l'égaliseur vient d'être relevé en vol :
+    ///   `EqEnVol::poser_vers_le_sec_rapide` (même borne) ;
+    /// - flux refabriqué (relance réseau) : il repart sans égaliseur ni gain
+    ///   gardé, au niveau sec, après la coupure de la relance — comme avant ce
+    ///   correctif ; le volume d'un appareil réseau est le sien (matériel), la
+    ///   borne n'y est pas transposable (documenté dans #9540).
+    ///
+    /// Sans effet si l'égaliseur est actif, ou en PURE. Rend `true` quand un
+    /// retour a été demandé.
+    pub async fn rendre_le_sec_si_egaliseur_coupe(&self, zone_id: i64) -> bool {
+        if self.zone_audiophile(zone_id) || self.eq_profile_configure(zone_id).is_some() {
+            return false;
+        }
+        if self.rendre_le_sec_vite_en_local(zone_id).await {
+            info!(zone_id, "tess_egaliseur_coupe_niveau_rendu_local");
+            return true;
+        }
+        let np = self.playback.get_state(zone_id).await.now_playing;
+        let Some(np) = np else {
+            return false;
+        };
+        let Some(sid) = np.stream_id.as_deref() else {
+            return false;
+        };
+        // Le flux porte déjà « sans égaliseur » : la relève en vol vient
+        // d'avoir lieu (une relance, elle, laisse l'ancienne empreinte).
+        if !self.flux_porte_deja_ce_traitement(zone_id, &np) {
+            return false;
+        }
+        let Some(poste) = self.poste_eq_en_vol(zone_id, sid) else {
+            return false;
+        };
+        if std::sync::Arc::strong_count(&poste) < 2 {
+            return false;
+        }
+        poste.poser_vers_le_sec_rapide();
+        info!(
+            zone_id,
+            stream_id = sid,
+            "tess_egaliseur_coupe_niveau_rendu_en_vol"
+        );
+        true
+    }
+
+    /// rc14 (décision du 25/11) — la sortie locale de la zone porte un
+    /// égaliseur coupé qui garde un préampli : retour RAPIDE au sec
+    /// (`EqProcessor::rendre_le_sec_vite`). `false` sinon.
+    async fn rendre_le_sec_vite_en_local(&self, zone_id: i64) -> bool {
+        #[cfg(feature = "local-audio")]
+        {
+            let device = self.peripherique_de_la_zone(zone_id);
+            let Some(sortie) = ({ self.outputs.lock().await.get(&device) }) else {
+                return false;
+            };
+            let sortie = sortie.lock().await;
+            let Some(locale) = sortie
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            if locale.preampli_garde().is_none() {
+                return false;
+            }
+            locale.rendre_le_sec_vite();
+            true
+        }
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
     }
 
     /// LA trace qui tranche, à l'activation de l'égaliseur (#3479).
@@ -1998,6 +2219,47 @@ impl PlaybackOrchestrator {
     /// [`Self::refresh_zone_eq`], qui rend `true` si un égaliseur est actif :
     /// entrer en PURE éteint tout, donc un `false` de ce genre signifierait
     /// « rien reçu » alors que tout vient d'être appliqué.
+    /// rc14 — pose l'ordre de la chaîne TESS de la zone sur sa sortie locale
+    /// vivante (pris au bloc suivant, sans relance). Rend `true` si une
+    /// sortie locale l'a reçu ; sinon la prochaine lecture le posera.
+    pub async fn appliquer_ordre_tess(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+                .filter(|d| d.starts_with("local:"))
+            else {
+                return false;
+            };
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let chaine = crate::tess::egaliseurs_en_serie::chaine_de_zone(
+                &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+                zone_id,
+            );
+            let output = output_arc.lock().await;
+            match output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            {
+                Some(local) => {
+                    local.set_ordre_tess(&chaine);
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
     pub async fn refresh_zone_pure_dsp(&self, zone_id: i64) -> bool {
         #[cfg(not(feature = "local-audio"))]
         {
@@ -2049,6 +2311,9 @@ impl PlaybackOrchestrator {
                 if local_output.flux_en_demarrage() {
                     let pure = self.zone_audiophile(zone_id);
                     local_output.set_pure_bypass(pure);
+                    local_output.set_pure_ou_mesure(crate::audio::audiophile::pure_ou_mesure(
+                        &self.db, zone_id,
+                    ));
                     self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
                     info!(zone_id, pure, "zone_pure_reportee_au_flux_qui_demarre");
                     return true;
@@ -2058,6 +2323,8 @@ impl PlaybackOrchestrator {
 
             let pure = self.zone_audiophile(zone_id);
             local_output.set_pure_bypass(pure);
+            local_output
+                .set_pure_ou_mesure(crate::audio::audiophile::pure_ou_mesure(&self.db, zone_id));
             // #6522, #6524 — le verdict PURE suit les RÉGLAGES, que la bascule
             // ne change pas ; la chaîne, elle, va être vidée juste en dessous.
             self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
@@ -2085,6 +2352,11 @@ impl PlaybackOrchestrator {
             // quoi une zone qui sort de PURE resterait stéréo jusqu'à la piste
             // suivante alors que le panneau annonce déjà « Mono ».
             local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+            // rc14 — le réglage des enceintes aussi (coupé sous PURE).
+            local_output.set_reglage_enceintes(
+                self.zone_enceintes_dans_la_chaine(zone_id),
+                self.zone_reglage_enceintes(zone_id),
+            );
             // #6044 — la réaffectation est elle aussi gouvernée par PURE.
             local_output.set_reaffectation(self.reaffectation_de_la_piste(
                 zone_id,
@@ -2189,6 +2461,14 @@ impl PlaybackOrchestrator {
             crossfeed: self.load_crossfeed_processor(zone_id, sample_rate),
             channels,
             compensation: None,
+            // rc14 — le réglage des enceintes, s'il touche ce flux. Chaque
+            // flux part d'un historique VIDE : rien d'une autre piste n'est
+            // jamais rejoué (les voies retardées commencent par leur délai de
+            // silence, et leur queue s'arrête avec le flux : ≤ 58 ms).
+            enceintes: self
+                .zone_reglage_enceintes(zone_id)
+                .filter(|r| !r.est_neutre(usize::from(channels)))
+                .map(crate::audio::reglage_enceintes::ProcesseurEnceintes::new),
             sample_rate,
             en_vol: None,
             convolveur_reste_a_jeter: None,
@@ -2309,7 +2589,11 @@ impl PlaybackOrchestrator {
     /// réglage que PURE cache. `None` si la clé est absente, illisible ou si
     /// le profil est désactivé.
     pub(super) fn eq_profile_configure(&self, zone_id: i64) -> Option<crate::audio::eq::EqProfile> {
-        Self::eq_profile_configure_with(&self.db, zone_id)
+        let premium = self
+            .license
+            .as_ref()
+            .is_none_or(|license| license.premium_snapshot());
+        Self::eq_profile_configure_with(&self.db, zone_id, premium)
     }
 
     /// #4176 — le profil ENREGISTRÉ de la zone est-il à plat : aucune bande
@@ -2336,24 +2620,13 @@ impl PlaybackOrchestrator {
     fn eq_profile_configure_with(
         db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
         zone_id: i64,
+        premium: bool,
     ) -> Option<crate::audio::eq::EqProfile> {
-        if !crate::audio::premium_plugins::enabled(
+        crate::tess::egaliseurs_en_serie::profil_du_moteur(
             &crate::db::settings_repo::SettingsRepo::with_backend(db.clone()),
-            "equalizer",
-        ) {
-            return None;
-        }
-        let settings = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
-        let key = format!("zone_{zone_id}_eq_profile");
-        let profile: crate::audio::eq::EqProfile = settings
-            .get(&key)
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str(&s).ok())?;
-        if !profile.enabled {
-            return None;
-        }
-        Some(profile)
+            zone_id,
+            premium,
+        )
     }
 
     /// Quel traitement, parmi ceux que le mode PURE gouverne sur un flux
@@ -2442,6 +2715,7 @@ impl PlaybackOrchestrator {
         self.traitement_que_pure_gouverne(zone_id, crate::audio::replaygain::PisteRg::AUCUNE)
             .is_some()
             || Self::zone_mono_downmix_configure_with(&self.db, zone_id)
+            || Self::zone_enceintes_configure_with(&self.db, zone_id)
             || Self::reaffectation_de_zone_armee_with(&self.db, zone_id)
             || track_id.is_some_and(|tid| Self::reaffectation_d_album_armee_with(&self.db, tid))
     }
@@ -2742,6 +3016,60 @@ impl PlaybackOrchestrator {
     ///   remettrait en lecture, #7556) ou position inconnue (#2595) ;
     /// - [`PorteeDuReglage::RienNeJoue`] : la prochaine lecture partira avec
     ///   ce réglage.
+    /// Revue #9520 — « Bypass all » basculé : le suréchantillonneur et la
+    /// cadence fixe suivent. Relance seulement si le choix du
+    /// suréchantillonneur change, ou si la cadence fixe s'applique hors
+    /// « Bypass all » (`demandee_active_hors_bypass` : jamais sous PURE, en
+    /// strict ou en AirPlay, où la bascule n'y change rien).
+    ///
+    /// La relance part comme une bascule PURE (`RaisonDeRelance::BasculePure`,
+    /// annonce #8422 comprise) avec la règle de plancher du suréchantillonneur.
+    /// Même anti-rebond que toute relance de réglage (`schedule_replay_pour`,
+    /// une génération par zone) : avec la relance de la bascule PURE réseau
+    /// (`apply_audiophile_change_portee`), une bascule ne rejoue qu'UNE fois, et
+    /// l'annonce PURE n'est pas perdue.
+    pub async fn apply_bypass_all_portee(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+    ) -> PorteeDuReglage {
+        self.refresh_zone_upsampler(zone_id).await;
+        let choix_change = match self.surechantillonneur_du_flux_et_choix(zone_id).await {
+            Some((du_flux, choix)) => du_flux != choix,
+            None => false,
+        };
+        let cadence_change =
+            crate::audio::frequence_fixe::demandee_active_hors_bypass(&self.db, zone_id).is_some();
+        let etat = self.playback.get_state(zone_id).await;
+        let portee =
+            if etat.now_playing.is_none() || etat.state == crate::playback::PlayState::Stopped {
+                PorteeDuReglage::RienNeJoue
+            } else if !(choix_change || cadence_change) {
+                PorteeDuReglage::Immediate
+            } else if etat.state != crate::playback::PlayState::Playing {
+                PorteeDuReglage::PisteSuivante
+            } else {
+                if choix_change {
+                    self.surech_replay_en_attente
+                        .lock()
+                        .unwrap()
+                        .insert(zone_id);
+                }
+                if self.schedule_replay_pour(zone_id, RaisonDeRelance::BasculePure) {
+                    PorteeDuReglage::Relance
+                } else {
+                    PorteeDuReglage::PisteSuivante
+                }
+            };
+        info!(
+            zone_id,
+            choix_change,
+            cadence_change,
+            portee = ?portee,
+            "tess_bypass_all_portee"
+        );
+        portee
+    }
+
     pub async fn apply_upsampler_change_portee(
         self: &std::sync::Arc<Self>,
         zone_id: i64,
@@ -3258,6 +3586,97 @@ impl PlaybackOrchestrator {
             .flatten()
             .as_deref()
             == Some("true")
+    }
+
+    /// rc14 — le réglage des enceintes (greffon TESS `speaker-setup`) que la
+    /// lecture APPLIQUE : armé, hors PURE (et mesure de pièce), hors « Bypass
+    /// all ». `None` : le greffon ne tourne pas.
+    pub fn zone_reglage_enceintes(
+        &self,
+        zone_id: i64,
+    ) -> Option<crate::audio::reglage_enceintes::ReglagesEnceintes> {
+        crate::audio::reglage_enceintes::reglages_appliques(&self.db, zone_id)
+    }
+
+    /// rc14 — le greffon `speaker-setup` est-il dans la chaîne TESS de la
+    /// zone (coché ou non, neutre compris) ? Sinon, la sortie locale n'a pas
+    /// de créneau (coût nul).
+    pub fn zone_enceintes_dans_la_chaine(&self, zone_id: i64) -> bool {
+        crate::audio::reglage_enceintes::dans_la_chaine(
+            &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+            zone_id,
+        )
+    }
+
+    /// rc14 — le réglage des enceintes CONFIGURÉ et non neutre, sans regarder
+    /// PURE (le bouclier PURE le compte parmi ce qu'il contourne).
+    pub(super) fn zone_enceintes_configure_with(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: i64,
+    ) -> bool {
+        crate::audio::reglage_enceintes::reglages_configures(
+            &crate::db::settings_repo::SettingsRepo::with_backend(db.clone()),
+            zone_id,
+        )
+        .is_some_and(|r| !r.est_neutre_partout())
+    }
+
+    /// rc14 — la zone a-t-elle un réglage des enceintes qui touche le signal
+    /// (hors PURE et « Bypass all ») ? Même usage que
+    /// [`Self::zone_has_active_crossfeed`] : décider du flux traité avant de
+    /// connaître le nombre de voies.
+    pub(super) fn zone_has_active_enceintes(&self, zone_id: i64) -> bool {
+        self.zone_reglage_enceintes(zone_id)
+            .is_some_and(|r| !r.est_neutre_partout())
+    }
+
+    /// rc14 — reposer le réglage des enceintes sur la sortie locale qui joue,
+    /// sans attendre la piste suivante : le processeur passe au nouveau
+    /// réglage par un fondu (pas de clic). Rend `true` si une sortie locale
+    /// vivante l'a reçu.
+    pub async fn refresh_zone_enceintes(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let track_id = self.piste_en_cours(zone_id).await;
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            let reglages = self.zone_reglage_enceintes(zone_id);
+            let arme = reglages.is_some();
+            local_output
+                .set_reglage_enceintes(self.zone_enceintes_dans_la_chaine(zone_id), reglages);
+            self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
+            info!(
+                zone_id,
+                device_id = %device_id,
+                arme,
+                "zone_speaker_setup_refreshed_live"
+            );
+            true
+        }
     }
 
     /// Réappliquer le repli mono d'une zone à la sortie locale qui joue, sans

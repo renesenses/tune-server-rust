@@ -44,6 +44,8 @@ pub mod facet_filter;
 pub mod facettes_classiques;
 pub mod favorite_facets_repo;
 pub mod favorites_reconcile;
+/// Fil 3094 — les lignes de file techniques (balayage de calibration).
+pub mod file_technique_3094;
 /// #5314 — le genre posé sur un album vaut pour ses pistes.
 pub mod genre_album_pistes;
 /// Albums masqués (#1391) — marqueurs réconciliés, sur le modèle des favoris.
@@ -140,6 +142,8 @@ pub mod zone_repo;
 
 #[cfg(test)]
 mod album_dr_provenance_tests;
+#[cfg(test)]
+mod code_barres_si_vide_tests;
 #[cfg(test)]
 mod consentements_redemarrage_8521_tests;
 #[cfg(test)]

@@ -30,10 +30,14 @@ pub mod api;
 pub mod chaine;
 /// Chemin du signal TESS, rapproché du réel (lot T16).
 pub mod chemin;
+/// rc14 — égaliseurs combinables en série, « Bypass all » complet, bornes de gain.
+pub mod egaliseurs_en_serie;
 pub mod etage;
 pub mod executeur;
 pub mod greffon;
 pub mod migration;
+/// rc14 — suréchantillonnage vers le DSD sur la sortie locale (modulateur T11b).
+pub mod modulation_dsd;
 pub mod prereglages;
 pub mod quantification;
 /// TESS sur la famille UPnP : voie, réserves par lecteur, motifs (lot T12b).

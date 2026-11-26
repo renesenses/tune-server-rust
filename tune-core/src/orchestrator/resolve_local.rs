@@ -1231,6 +1231,30 @@ impl PlaybackOrchestrator {
         {
             return Ok(DecisionOuResolu::Resolu(resolu));
         }
+        // rc14 — TESS vers le DSD sur la sortie locale : une piste PCM est
+        // modulée (T11b) et servie comme un DSD de fichier, en DoP ou en
+        // natif. `None` : la chaîne ne le demande pas, ou la piste repart en
+        // PCM par le chemin d'avant, inchangé (motif au chemin du signal).
+        if let Some(resolu) = self
+            .decider_la_modulation_dsd(
+                req,
+                track,
+                &file_path,
+                source_format.is_some_and(|f| f != AudioFormat::Dsd),
+                sorties.is_local_output && !sorties.is_oaat_output,
+                source.sample_rate,
+                // Voies inconnues en base (0) : la stéréo, imposée au décodeur.
+                if source.channels == 0 {
+                    2
+                } else {
+                    source.channels
+                },
+                tranche_cue.as_ref(),
+            )
+            .await?
+        {
+            return Ok(DecisionOuResolu::Resolu(resolu));
+        }
         let forcages = self
             .decider_les_forcages_reseau(
                 req,
@@ -2192,7 +2216,8 @@ impl PlaybackOrchestrator {
                 // le relais progressif (`load_streaming_dsp`) les porte déjà.
                 etage_casque: super::regles::sortie_tess_qui_tire_le_flux(
                     zone_output_type.as_deref(),
-                ) && self.zone_has_active_crossfeed(req.zone_id),
+                ) && (self.zone_has_active_crossfeed(req.zone_id)
+                    || self.zone_has_active_enceintes(req.zone_id)),
             }
         } else {
             TraitementsDeZone::default()
@@ -2230,7 +2255,11 @@ impl PlaybackOrchestrator {
             // `is_network_output &&` d'abord : sans lui, une zone LOCALE
             // paierait une lecture de réglages par piste pour un drapeau que
             // `cible_wav_pour_traitement` va de toute façon annuler.
-            let crossfeed_reseau = is_network_output && self.zone_has_active_crossfeed(req.zone_id);
+            // rc14 — le réglage des enceintes vit au même étage du relais
+            // progressif (dernier de `StreamingDsp`) : même règle.
+            let crossfeed_reseau = is_network_output
+                && (self.zone_has_active_crossfeed(req.zone_id)
+                    || self.zone_has_active_enceintes(req.zone_id));
             let traitement = eq_forces_transcode || crossfeed_reseau;
             // #2742 (24/09) — un crossfeed SEUL vaut consentement au WAV
             // progressif : `crossfeed_bibliotheque_reseau`, cas 2.
@@ -2298,7 +2327,7 @@ impl PlaybackOrchestrator {
     /// à `cadence_dop` (WASAPI partagé ou exclusif). La sonde est bloquante
     /// (COM) : elle part sur un fil de `spawn_blocking`. `Inconnu` partout
     /// ailleurs, et alors rien ne change.
-    async fn accueil_du_dop_local(
+    pub(super) async fn accueil_du_dop_local(
         &self,
         device_id: Option<&str>,
         cadence_dop: u32,
@@ -2408,7 +2437,7 @@ impl PlaybackOrchestrator {
     /// `capacite_dsd_natif` ; absente, elle est sondée UNE fois, hors du fil
     /// asynchrone, et seulement si le verrou de périphérique ASIO est libre —
     /// jamais pendant qu'un autre flux tient le pilote.
-    async fn sortie_dsd_locale(&self, device_id: Option<&str>) -> SortieDsdLocale {
+    pub(super) async fn sortie_dsd_locale(&self, device_id: Option<&str>) -> SortieDsdLocale {
         #[cfg(feature = "local-audio")]
         {
             use crate::outputs::capacite_dsd_natif::{self as capacite, CapaciteConnue};

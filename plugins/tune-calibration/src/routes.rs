@@ -3,6 +3,11 @@
 //! * `GET  /microphones` — les entrées audio (micros) et les étalonnages déposés ;
 //! * `POST /microphones/etalonnages` — déposer un fichier d'étalonnage
 //!   (`{ "nom", "texte" }`, texte miniDSP ou REW `.cal`) ;
+//! * `POST /niveaux` — test de niveau du micro avant la mesure (rc14) :
+//!   `{ "mode": "signal" | "ecoute", "entree", "voie_micro", "zone_id",
+//!   "volume", "voies", "duree_s" }` (202, `{ "id" }`) ; `GET /niveaux/{id}`
+//!   — vumètre, bruit de fond, verdict ; `DELETE /niveaux/{id}` — annuler
+//!   (voir `niveau.rs`) ;
 //! * `POST /zones/{zone}/mesures` — lancer une mesure (202, `{ "id" }`) ;
 //! * `GET  /mesures` — toutes les mesures connues (avancement) ;
 //! * `GET  /mesures/{id}` — l'avancement d'une mesure ;
@@ -127,6 +132,11 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
     Router::new()
         .route("/microphones", get(microphones))
         .route("/microphones/etalonnages", post(deposer_etalonnage))
+        .route("/niveaux", post(crate::niveau::http::lancer))
+        .route(
+            "/niveaux/{id}",
+            get(crate::niveau::http::avancement).delete(crate::niveau::http::annuler),
+        )
         .route("/zones/{zone}/mesures", post(lancer))
         .route("/mesures", get(mesures))
         .route("/mesures/{id}", get(avancement).delete(annuler))
@@ -167,6 +177,28 @@ fn refus(code: StatusCode, motif: &str, message: String) -> Response {
     (code, Json(json!({ "error": motif, "message": message }))).into_response()
 }
 
+/// Fil 3094 — la zone n'a pas de sortie active (deux zones sur le même
+/// appareil, celle-ci orpheline) : 409, motif stable, et la zone à utiliser.
+pub fn refus_sortie_inactive(inactive: &crate::hote::SortieInactive) -> Response {
+    let (porteuse_id, porteuse_nom) = match &inactive.porteuse {
+        Some((id, nom)) => (Some(*id), Some(nom.clone())),
+        None => (None, None),
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": crate::hote::SortieInactive::MOTIF,
+            "message": inactive.message(),
+            "params": {
+                "device": inactive.appareil(),
+                "holder_zone_id": porteuse_id,
+                "holder_zone_name": porteuse_nom,
+            },
+        })),
+    )
+        .into_response()
+}
+
 async fn microphones(State(etat): State<EtatRoutes>) -> Response {
     let c = etat.controleur.clone();
     let (entrees, pile) =
@@ -188,7 +220,8 @@ async fn microphones(State(etat): State<EtatRoutes>) -> Response {
                     "frequences": e.frequences,
                     "bits_servis": e.bits_servis,
                     "virtuelle": e.virtuelle,
-                    "mesurable": e.frequence_courante == Some(crate::mesure::FREQUENCE_MESURE),
+                    // rc14 — toute fréquence de `cadence::FREQUENCES_ACCEPTEES`.
+                    "mesurable": e.frequence_courante.is_some_and(crate::cadence::acceptee),
                 })
             })
             .collect(),
@@ -198,7 +231,9 @@ async fn microphones(State(etat): State<EtatRoutes>) -> Response {
     };
     Json(json!({
         "pile": pile,
+        // Gardée pour les clients d'avant la rc14 ; la liste fait foi.
         "frequence_requise": crate::mesure::FREQUENCE_MESURE,
+        "frequences_acceptees": crate::cadence::FREQUENCES_ACCEPTEES,
         "entrees": entrees,
         "etalonnages": etat.controleur.etalonnages(),
     }))
@@ -254,6 +289,9 @@ struct DemandeMesure {
     /// Plafonds plus stricts seulement ; les valeurs par défaut sont des maxima.
     max_spl_db: Option<f64>,
     max_play_dbfs: Option<f64>,
+    /// Mesure de vérification : la zone joue avec sa correction.
+    #[serde(default)]
+    avec_correction: bool,
 }
 
 // Le refus est la réponse HTTP prête, comme `proposition_pour`.
@@ -295,6 +333,7 @@ fn demande_de(zone: i64, d: DemandeMesure) -> Result<Demande, Response> {
         demande.politique.max_play_dbfs = p;
     }
     demande.voies = voies;
+    demande.avec_correction = d.avec_correction;
     Ok(demande)
 }
 
@@ -308,9 +347,19 @@ async fn lancer(
         Err(r) => return r,
     };
     let c = etat.controleur.clone();
-    let r = tokio::task::spawn_blocking(move || c.lancer(demande))
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()));
+    let r = tokio::task::spawn_blocking(move || match c.hote.sortie_inactive(zone) {
+        // Fil 3094 — refus structuré : motif stable, appareil et zone
+        // porteuse en paramètres, pour que le client le dise dans sa langue.
+        Some(inactive) => Err(Err(inactive)),
+        None => c.lancer(demande).map_err(Ok),
+    })
+    .await
+    .unwrap_or_else(|e| Err(Ok(e.to_string())));
+    let r = match r {
+        Err(Err(inactive)) => return refus_sortie_inactive(&inactive),
+        Err(Ok(e)) => Err(e),
+        Ok(id) => Ok(id),
+    };
     match r {
         Ok(id) => (
             StatusCode::ACCEPTED,

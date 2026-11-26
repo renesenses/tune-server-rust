@@ -254,6 +254,7 @@ impl Banc {
                 db: 0.0,
             },
             replaygain_actif: false,
+            voies_de_sortie: None,
         };
         ReponseTessZone::depuis_avec_le_lecteur(
             self.zone_id,
@@ -493,6 +494,7 @@ async fn la_voie_publiee_est_celle_de_la_lecture_case_par_case() {
                     db: 0.0,
                 },
                 replaygain_actif: false,
+                voies_de_sortie: None,
             };
             // Upsampling et headroom manuel : la lecture réseau ne les lit pas
             // (`TraitementsDeZone`) ; ils varient ici, et la voie attendue de
@@ -947,6 +949,7 @@ async fn upsampling_et_headroom_ne_sont_pas_annonces_quand_la_lecture_sert_la_so
             db: 0.0,
         },
         replaygain_actif: false,
+        voies_de_sortie: None,
     };
     let etat = ReponseTessZone::depuis_avec_le_lecteur(
         b.zone_id,
@@ -1068,6 +1071,7 @@ async fn un_service_converti_pour_le_lecteur_n_est_jamais_dit_bit_perfect() {
                 db: 0.0,
             },
             replaygain_actif: false,
+            voies_de_sortie: None,
         };
         let etat = ReponseTessZone::depuis_avec_le_lecteur(
             zone,
@@ -1157,6 +1161,7 @@ async fn dash_tidal(egaliseur: bool) -> (&'static str, ReponseTessZone) {
             db: 0.0,
         },
         replaygain_actif: false,
+        voies_de_sortie: None,
     };
     let etat = ReponseTessZone::depuis_avec_le_lecteur(
         zone,

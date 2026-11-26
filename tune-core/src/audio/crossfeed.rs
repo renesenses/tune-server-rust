@@ -1556,12 +1556,13 @@ mod tests {
         );
         // TESS T04 — l'étage est exécuté par la chaîne réseau en `f64` : son
         // adaptateur reçoit le crossfeed du porteur ET figure parmi les étages
-        // que l'exécuteur appelle.
+        // que l'exécuteur appelle (rc14 : suivi du réglage des enceintes,
+        // dernier étage).
         const CHAINE_RESEAU: &str = include_str!("../orchestrator/chaine_reseau_tess.rs");
         assert!(
             CHAINE_RESEAU.contains("moteur: crossfeed,")
                 && CHAINE_RESEAU.contains(
-                    "let mut etages: [&mut dyn EtageTess; 3] = [&mut a_eq, &mut a_conv, &mut a_cf];"
+                    "let mut etages: [&mut dyn EtageTess; 4] = [&mut a_eq, &mut a_conv, &mut a_cf, &mut a_enc];"
                 )
                 && CHAINE_RESEAU.contains("c.process_interleaved_f64(&mut t[..trames * 2]);"),
             "`StreamingDsp::process` n'applique plus le crossfeed : il est \

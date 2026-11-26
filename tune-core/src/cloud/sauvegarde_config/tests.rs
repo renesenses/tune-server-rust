@@ -236,7 +236,7 @@ fn une_machine_neuve_retrouve_son_jeton_discogs() {
 
     let cible = base_neuve();
     let (contenu, _) = dechiffrer(&blob, None, Some(PHRASE)).unwrap();
-    let r = restaurer(&cible, &contenu, Mode::Merge).unwrap();
+    let r = restaurer(&cible, &contenu, Mode::Merge, true).unwrap();
     assert_eq!(
         reglages(&cible).get("discogs_token").unwrap().as_deref(),
         Some("VOYAGE-discogs"),
@@ -259,13 +259,13 @@ fn fusionner_garde_le_jeton_discogs_de_la_machine() {
     let cible = base_neuve();
     let sc = reglages(&cible);
     sc.set("discogs_token", "jeton-d-ici").unwrap();
-    let r = restaurer(&cible, &contenu, Mode::Merge).unwrap();
+    let r = restaurer(&cible, &contenu, Mode::Merge, true).unwrap();
     assert_eq!(
         sc.get("discogs_token").unwrap().as_deref(),
         Some("jeton-d-ici")
     );
     assert!(r.service_tokens_restored.is_empty());
-    restaurer(&cible, &contenu, Mode::Replace).unwrap();
+    restaurer(&cible, &contenu, Mode::Replace, true).unwrap();
     assert_eq!(
         sc.get("discogs_token").unwrap().as_deref(),
         Some("VOYAGE-discogs")
@@ -282,7 +282,7 @@ fn la_section_des_jetons_n_ecrit_que_la_liste_fermee() {
     let cible = base_neuve();
     let sc = reglages(&cible);
     sc.set("jwt_secret", "le-vrai").unwrap();
-    restaurer(&cible, &contenu, Mode::Replace).unwrap();
+    restaurer(&cible, &contenu, Mode::Replace, true).unwrap();
     assert_eq!(sc.get("jwt_secret").unwrap().as_deref(), Some("le-vrai"));
     assert!(sc.get("auth_tokens_qobuz").unwrap().is_none());
     assert!(sc.get(CLE_SECRETE).unwrap().is_none());
@@ -487,7 +487,7 @@ fn une_restauration_ne_touche_pas_la_bibliotheque() {
     sc.set("library_scan_on_startup", "true").unwrap();
     let avant = empreinte_bibliotheque(&cible);
 
-    restaurer(&cible, &contenu, Mode::Replace).unwrap();
+    restaurer(&cible, &contenu, Mode::Replace, true).unwrap();
 
     assert_eq!(
         empreinte_bibliotheque(&cible),
@@ -518,7 +518,7 @@ fn une_restauration_n_ecrit_aucun_secret() {
     let cible = base_neuve();
     let sc = reglages(&cible);
     sc.set("jwt_secret", "le-vrai").unwrap();
-    restaurer(&cible, &contenu, Mode::Replace).unwrap();
+    restaurer(&cible, &contenu, Mode::Replace, true).unwrap();
     assert_eq!(sc.get("jwt_secret").unwrap().as_deref(), Some("le-vrai"));
     assert!(sc.get("mozaik_access_token").unwrap().is_none());
     assert!(sc.get(CLE_SECRETE).unwrap().is_none());
@@ -548,7 +548,7 @@ fn une_machine_neuve_reprend_ses_personnalisations() {
     bibliotheque(&cible, "");
     // Un profil intermédiaire : « ana » n'aura pas le même numéro ici.
     exec(&cible, "INSERT INTO profiles (username) VALUES ('zoe')");
-    let r = restaurer(&cible, &contenu, Mode::Replace).unwrap();
+    let r = restaurer(&cible, &contenu, Mode::Replace, true).unwrap();
     let sc = reglages(&cible);
 
     assert_eq!(sc.get("theme").unwrap().as_deref(), Some("sombre"));
@@ -618,7 +618,7 @@ fn fusionner_garde_l_existant_remplacer_le_remplace() {
     exec(&cible, "INSERT INTO playlists (name) VALUES ('Du soir')");
     let pl = un_entier(&cible, "SELECT id FROM playlists WHERE name = 'Du soir'");
 
-    let r = restaurer(&cible, &contenu, Mode::Merge).unwrap();
+    let r = restaurer(&cible, &contenu, Mode::Merge, true).unwrap();
     assert_eq!(sc.get("theme").unwrap().as_deref(), Some("clair"));
     assert!(
         sc.get("eq_presets").unwrap().is_some(),
@@ -626,7 +626,7 @@ fn fusionner_garde_l_existant_remplacer_le_remplace() {
     );
     assert_eq!(r.playlists_replaced, 0);
 
-    restaurer(&cible, &contenu, Mode::Replace).unwrap();
+    restaurer(&cible, &contenu, Mode::Replace, true).unwrap();
     assert_eq!(sc.get("theme").unwrap().as_deref(), Some("sombre"));
     assert_eq!(sc.get("reglage_local").unwrap().as_deref(), Some("garde"));
     assert_eq!(
@@ -853,7 +853,7 @@ async fn bout_en_bout_depot_rotation_et_reprise() {
         Some(ErreurOuverture::SecretRequis)
     );
     let (contenu, retrouvee) = dechiffrer(&blob, None, Some(PHRASE)).unwrap();
-    restaurer(&neuve, &contenu, Mode::Replace).unwrap();
+    restaurer(&neuve, &contenu, Mode::Replace, true).unwrap();
     assert!(adopter(&sn, &retrouvee.unwrap()).unwrap());
     assert_eq!(sn.get("theme").unwrap().as_deref(), Some("clair"));
     // Sa propre sauvegarde manuelle s'ouvre avec la même phrase.
@@ -1192,7 +1192,7 @@ fn un_profil_nomme_par_son_adresse_se_retrouve_par_email() {
          VALUES ('Léa', 'Léa', 'lea@exemple.test', 0)",
     );
     let avant = un_entier(&cible, "SELECT COUNT(*) FROM profiles");
-    let r = restaurer(&cible, &contenu, Mode::Merge).unwrap();
+    let r = restaurer(&cible, &contenu, Mode::Merge, true).unwrap();
     assert_eq!(r.profiles_created, 1, "seul Tom est recréé");
     assert_eq!(
         un_entier(&cible, "SELECT COUNT(*) FROM profiles"),

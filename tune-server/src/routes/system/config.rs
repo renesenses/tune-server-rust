@@ -1868,7 +1868,7 @@ fn refus_des_cles_tenues_par_le_serveur<'a>(
             StatusCode::FORBIDDEN,
             Json(json!({
                 "error": "server_managed_settings",
-                "message": "Room correction profiles and TESS chains are written by their own routes only.",
+                "message": "Equalizer profiles and presets, room correction profiles and TESS chains are written by their own routes only.",
                 "refused_keys": refusees,
             })),
         )
@@ -2011,7 +2011,9 @@ pub(super) async fn update_config(
     }
     // TESS D1 : le profil de pièce (dont l'origine décide du droit Premium)
     // et la chaîne TESS de chaque zone ne s'écrivent que par leurs routes,
-    // jamais par l'écriture générique, admin compris.
+    // jamais par l'écriture générique, admin compris. rc14 : de même pour le
+    // profil d'égaliseur de chaque zone et les préréglages, que leurs routes
+    // valident.
     if let Some(refus) = refus_des_cles_tenues_par_le_serveur(values.keys().map(String::as_str)) {
         return Ok(refus);
     }
@@ -3271,7 +3273,14 @@ async fn importer_la_configuration(
         &mut fichier.settings,
         dirs_depuis_valeur,
     ));
-    let mut plan = ce::planifier(&state.backend, &fichier).map_err(AppError::internal)?;
+    // rc14 — le profil d'égaliseur, les préréglages et la chaîne TESS de
+    // chaque zone suivent la règle de leurs routes : ce que la licence couvre
+    // (`config_export::egaliseurs`).
+    let premium = state
+        .license
+        .check_feature(tune_core::license::Feature::ParametricEq)
+        .await;
+    let mut plan = ce::planifier(&state.backend, &fichier, premium).map_err(AppError::internal)?;
     plan.avertissements.extend(ecartees.iter().cloned());
     let mut reponse = ce::rapport(&plan);
     if q.dry_run {

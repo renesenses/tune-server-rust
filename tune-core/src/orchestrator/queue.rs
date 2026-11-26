@@ -907,6 +907,14 @@ impl PlaybackOrchestrator {
     ) -> Result<PlayResult, String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
+        // Fil 3094 — un balayage de calibration périmé resté dans la file est
+        // écarté AVANT de lire la ligne : la position demandée désigne alors
+        // la ligne qui a pris sa place (la suivante).
+        let position = self
+            .ecarter_les_balayages_perimes(zone_id)
+            .await
+            .position_apres(position);
+
         let output_device_id = ZoneRepo::with_backend(self.db.clone())
             .get(zone_id)
             .ok()
@@ -1616,6 +1624,20 @@ impl PlaybackOrchestrator {
                 disc_number: None,
                 album_ref: None,
             };
+            // rc14 — lien EXPLICITE pour la modulation DSD de TESS : cette
+            // piste est la suivante de la file de celle qui joue ; son
+            // producteur pourra reprendre l'état du modulateur en cours.
+            {
+                let etat = self.playback.get_state(zone_id).await;
+                if etat.queue_position + 1 == position
+                    && let Some(session) = etat
+                        .now_playing
+                        .as_ref()
+                        .and_then(|np| np.stream_id.clone())
+                {
+                    crate::tess::modulation_dsd::annoncer_la_suivante(zone_id, track_id, &session);
+                }
+            }
             let resolved = Box::pin(self.resolve_stream(&req)).await?;
             if let Some(ref sid) = resolved.stream_id {
                 self.gapless_sessions

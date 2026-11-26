@@ -719,7 +719,7 @@ impl Controleur {
         let (avant, _) = self.reponse_de(&d.avant)?;
         let (apres, _) = self.reponse_de(&d.apres)?;
         let f_lo = d.f_min_hz.unwrap_or(crate::correction::F_MIN_HZ);
-        let f_hi = d.f_max_hz.unwrap_or(crate::correction::F_MAX_HZ);
+        let f_hi = d.f_max_hz.unwrap_or(crate::correction::F_MAX_SPATIALE_HZ);
         let cible = match &d.cible {
             Some(c) => {
                 let t = c.courbe()?;

@@ -28,8 +28,9 @@
 //!   APRÈS, à la place de la frontière `f32` du producteur.
 
 use std::cell::RefCell;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use tracing::warn;
 
@@ -58,10 +59,6 @@ pub(crate) struct OrdreLocal {
     bypass_all: bool,
 }
 
-// `depuis_ids`, `depuis_chaine` et les lecteurs servent à la lecture de
-// l'ordre par zone (T02, branchement dans la PR suivante de T03) ; d'ici là,
-// seuls les témoins les appellent.
-#[cfg_attr(not(test), allow(dead_code))]
 impl OrdreLocal {
     /// L'ordre d'avant TESS : égaliseur, convolveur, crossfeed, repli mono.
     pub(crate) const HISTORIQUE: Self = Self {
@@ -97,10 +94,13 @@ impl OrdreLocal {
         };
         for id in ids {
             let e = match id {
-                "equalizer-graphic" | "equalizer-parametric" | "equalizer-headphone" => {
-                    EtageLocal::Egaliseur
-                }
-                "convolution" | "room-correction" => EtageLocal::Convolution,
+                // rc14 — la correction de pièce est une façade de l'égaliseur
+                // (`zone_{id}_eq_profile`, D1) : elle vit dans son moteur.
+                "equalizer-graphic"
+                | "equalizer-parametric"
+                | "equalizer-headphone"
+                | "room-correction" => EtageLocal::Egaliseur,
+                "convolution" => EtageLocal::Convolution,
                 "crossfeed" | "crosstalk" => EtageLocal::Crossfeed,
                 _ if id.starts_with("crossfeed-") => EtageLocal::Crossfeed,
                 // TESS T14 — un natif tiers (absent du catalogue de
@@ -118,21 +118,87 @@ impl OrdreLocal {
         Self { etages, bypass_all }
     }
 
-    /// L'ordre réel d'une chaîne TESS de zone.
+    /// L'ordre réel d'une chaîne TESS de zone : celui des greffons COCHÉS
+    /// (un maillon décoché ne traite rien et ne place aucun étage).
+    ///
+    /// rc14 — une chaîne que l'utilisateur n'a jamais réordonnée donne
+    /// [`Self::HISTORIQUE`] : la migration range les greffons au rang de la
+    /// lecture d'avant (`migration::rang` : égaliseurs, convolution,
+    /// crossfeed, natifs, repli mono, réaffectation), le même ordre.
+    ///
+    /// Les égaliseurs cochés forment UN étage (un seul moteur, leurs bandes
+    /// en série, `tess::egaliseurs_en_serie`), placé au rang du premier.
     pub(crate) fn depuis_chaine(chaine: &ChaineTess) -> Self {
         Self::depuis_ids(
-            chaine.plugins.iter().map(|m| m.id.as_str()),
+            chaine
+                .plugins
+                .iter()
+                .filter(|m| m.enabled)
+                .map(|m| m.id.as_str()),
             chaine.bypass_all,
         )
     }
 
+    /// rc14 — l'ordre posé pour la sortie locale dont `cle` est le drapeau
+    /// PURE (`LocalOutput::pure_bypass`, propre à chaque sortie) ;
+    /// [`Self::HISTORIQUE`] si aucun ne l'a été. « Bypass all » n'est pas
+    /// porté ici : il passe par `pure_bypass` (`traitements_contournes`).
+    pub(crate) fn de_la_sortie(cle: &AtomicBool) -> Self {
+        if ORDRES_POSES.load(Ordering::Acquire) == 0 {
+            return Self::HISTORIQUE;
+        }
+        ordres()
+            .read()
+            .ok()
+            .and_then(|t| t.get(&adresse(cle)).copied())
+            .unwrap_or(Self::HISTORIQUE)
+    }
+
+    /// rc14 — pose l'ordre de la chaîne TESS de la zone sur cette sortie
+    /// (voir [`Self::de_la_sortie`]). L'ordre historique n'est pas retenu.
+    pub(crate) fn poser_pour_la_sortie(cle: &AtomicBool, ordre: Self) {
+        let ordre = Self {
+            bypass_all: false,
+            ..ordre
+        };
+        if let Ok(mut t) = ordres().write() {
+            if ordre == Self::HISTORIQUE {
+                t.remove(&adresse(cle));
+            } else {
+                t.insert(adresse(cle), ordre);
+            }
+            ORDRES_POSES.store(t.len(), Ordering::Release);
+        }
+    }
+
+    /// rc14 — la sortie disparaît : son ordre aussi.
+    pub(crate) fn oublier_la_sortie(cle: &AtomicBool) {
+        Self::poser_pour_la_sortie(cle, Self::HISTORIQUE);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn etages(&self) -> [EtageLocal; NB_ETAGES] {
         self.etages
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn bypass_all(&self) -> bool {
         self.bypass_all
     }
+}
+
+/// rc14 — l'ordre TESS de chaque sortie locale, par l'adresse de son
+/// drapeau PURE (un `Arc<AtomicBool>` propre à la sortie, stable tant
+/// qu'elle vit). Seuls les ordres différents de l'historique y sont.
+static ORDRES_POSES: AtomicUsize = AtomicUsize::new(0);
+
+fn ordres() -> &'static RwLock<HashMap<usize, OrdreLocal>> {
+    static T: OnceLock<RwLock<HashMap<usize, OrdreLocal>>> = OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
+fn adresse(cle: &AtomicBool) -> usize {
+    std::ptr::from_ref(cle) as usize
 }
 
 /// TESS T14 — `id` est-il un greffon natif tiers : un identifiant que l'hôte

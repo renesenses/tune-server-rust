@@ -2067,6 +2067,11 @@ struct StreamingDsp {
     /// locale (qui compense par son volume), en PURE, interrupteur coupé, ou
     /// sans égaliseur ni crossfeed.
     compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
+    /// rc14 — le réglage des enceintes (greffon TESS `speaker-setup`) :
+    /// délai, gain et phase par voie, APRÈS tous les autres greffons (dernier
+    /// étage de l'exécuteur), avant la compensation. `None` : réglage absent,
+    /// neutre pour ce flux, PURE ou « Bypass all ».
+    enceintes: Option<crate::audio::reglage_enceintes::ProcesseurEnceintes>,
     /// #4407 — la cadence du PCM que ce porteur voit : de quoi rebâtir un
     /// égaliseur relevé en vol aux bons coefficients.
     sample_rate: u32,
@@ -2091,6 +2096,7 @@ impl StreamingDsp {
             || self.convolver.is_some()
             || self.crossfeed.is_some()
             || self.compensation.is_some()
+            || self.enceintes.is_some()
     }
 
     /// Le crossfeed de ce porteur sera-t-il réellement EXÉCUTÉ ?
@@ -2137,6 +2143,9 @@ impl StreamingDsp {
         if let Some(cf) = self.crossfeed.as_ref() {
             let inerte = if self.channels == 2 { "" } else { "(inerte)" };
             etages.extend(cf.decrire().into_iter().map(|e| format!("{e}{inerte}")));
+        }
+        if self.enceintes.is_some() {
+            etages.push(format!("enceintes@{flux}"));
         }
         if let Some(c) = self.compensation.as_ref() {
             etages.push(format!("compensation:{:+.2}dB@{flux}", c.cible_db()));
@@ -2469,6 +2478,8 @@ mod contenu_explicite_8088_tests;
 pub mod ecoute_validee_7852;
 #[cfg(test)]
 mod ecoute_validee_7852_tests;
+// Fil 3094 — un balayage de calibration périmé est écarté, pas rejoué.
+pub mod file_technique_3094;
 // #8076 — FLAC local vers DLNA en PURE : voie servie et échantillons exacts.
 #[cfg(test)]
 mod gapless_dlna_pure_8076_tests;
@@ -2573,6 +2584,9 @@ mod crossfeed_bibliotheque_reseau;
 mod compensation_reseau_5071_tests;
 #[cfg(test)]
 mod convolveur_en_flux_7642_tests;
+// rc14 — égaliseurs en série, « Bypass all » complet (retours de Rémi).
+#[cfg(test)]
+mod egaliseurs_en_serie_rc14_tests;
 
 // #4354 — repli à 176,4 kHz d'un DSD décimé qui manque son pré-tampon.
 #[cfg(test)]
@@ -2595,7 +2609,9 @@ mod service_wav_progressif_5080;
 mod service_wav_progressif_openhome_6718;
 
 mod dop_niveau_8813;
+// rc14 — TESS vers le DSD sur la sortie locale (modulateur T11b).
 mod dsp;
+mod modulation_dsd_locale;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
 /// #8968 (PR 0) — banc de mesure de la jointure entre deux pistes.
 #[cfg(test)]
@@ -2667,6 +2683,10 @@ mod pure_reaffectation_6780_tests;
 // 19/11/2026 — un réglage du suréchantillonneur relance le flux tout de suite.
 #[cfg(all(test, feature = "local-audio"))]
 mod surechantillonnage_immediat_tests;
+// rc14 (retour de Rémi, rc13.90) — un changement de chaîne TESS atteint le son
+// à la volée : désactivation effective, reprise = prochaine lecture.
+#[cfg(all(test, feature = "local-audio"))]
+mod tess_a_la_volee_rc14_tests;
 // #7932 — PURE contourne aussi la réaffectation des canaux de l'album joué.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_album_7932_tests;

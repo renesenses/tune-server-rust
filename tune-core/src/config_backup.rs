@@ -655,11 +655,15 @@ fn collect_streaming_tokens(
 /// Sealed tokens are skipped with a warning — use [`import_config_with_secret`]
 /// to restore them. Everything else comes back, so a restore is useful even
 /// with no secret at hand.
+///
+/// Restaure comme sur un serveur Premium : la seule route qui restaure une
+/// sauvegarde (`POST /system/config-backup/import`) exige le Premium et
+/// appelle [`import_config_with_secret`] avec la licence.
 pub fn import_config(
     backend: &Arc<dyn DbBackend>,
     snapshot: ConfigSnapshot,
 ) -> Result<ImportReport, String> {
-    import_config_with_secret(backend, snapshot, None)
+    import_config_with_secret(backend, snapshot, None, true)
 }
 
 /// Restore configuration, unsealing streaming tokens with `secret` — either the
@@ -668,10 +672,17 @@ pub fn import_config(
 /// A wrong secret is reported as a warning, not an error: the rest of the
 /// configuration has already been restored by then, and failing the whole
 /// operation would throw that away over a mistyped passphrase.
+///
+/// rc14 — `premium` : le compte a-t-il le droit Premium ? Le profil
+/// d'égaliseur de chaque zone et les préréglages suivent la règle de leurs
+/// routes ([`crate::config_export::egaliseurs`]) : sans le Premium, un
+/// égaliseur paramétrique ou une correction de pièce revient en égaliseur
+/// graphique au plus près, et `warnings` le dit.
 pub fn import_config_with_secret(
     backend: &Arc<dyn DbBackend>,
-    snapshot: ConfigSnapshot,
+    mut snapshot: ConfigSnapshot,
     secret: Option<&str>,
+    premium: bool,
 ) -> Result<ImportReport, String> {
     let mut report = ImportReport {
         zones_restored: 0,
@@ -689,10 +700,28 @@ pub fn import_config_with_secret(
     let (zones_restored, correspondances) =
         import_zones(backend, &snapshot.zones, &mut report.warnings)?;
     report.zones_restored = zones_restored;
+    // rc14 — les préréglages d'abord : les courbes casque qu'ils portent
+    // décident du droit que demande le profil de chaque zone.
+    use crate::config_export::egaliseurs as eq;
+    let mut prereglages = None;
+    for (_, valeur) in snapshot
+        .settings
+        .iter_mut()
+        .filter(|(c, _)| c == eq::CLE_PREREGLAGES_EQ)
+    {
+        *valeur = eq::prereglages_restaurables(valeur, premium, &mut report.warnings);
+        prereglages = Some(valeur.clone());
+    }
+    let contexte = eq::Contexte::nouveau(
+        &SettingsRepo::with_backend(backend.clone()),
+        premium,
+        prereglages.as_deref(),
+    );
     report.settings_restored = import_settings(
         backend,
         &snapshot.settings,
         &correspondances,
+        &contexte,
         &mut report.warnings,
     )?;
     report.playlists_restored =
@@ -1066,6 +1095,7 @@ fn import_settings(
     backend: &Arc<dyn DbBackend>,
     settings_list: &[(String, String)],
     correspondances: &Correspondances,
+    egaliseurs: &crate::config_export::egaliseurs::Contexte,
     warnings: &mut Vec<String>,
 ) -> Result<usize, String> {
     let settings = SettingsRepo::with_backend(backend.clone());
@@ -1080,8 +1110,9 @@ fn import_settings(
         }
         // TESS D1 : la chaîne TESS (reconstruite depuis les anciennes clés)
         // et un profil de pièce glissé hors de sa section ne passent pas par
-        // les réglages généraux.
-        if crate::tess::migration::cle_tenue_par_le_serveur(key) {
+        // les réglages généraux. Les profils d'égaliseur passent, selon la
+        // licence (rc14, plus bas).
+        if crate::tess::migration::cle_jamais_importee(key) {
             tenus_par_le_serveur.push(key);
             continue;
         }
@@ -1096,9 +1127,20 @@ fn import_settings(
                 volume_ecarte += 1;
                 continue;
             }
+            let cle_arrivee = gabarit.replace("{id}", &arrivee.id.to_string());
+            // rc14 — le profil d'égaliseur suit la règle de ses routes.
             // #8761 — validation stricte des chemins du jeu de convolution,
             // comme l'import de configuration (`config_export`).
-            let valeur = if gabarit == "ir_jeu_{id}" {
+            let valeur = if crate::tess::migration::cle_de_profil_d_egaliseur(&cle_arrivee) {
+                crate::config_export::egaliseurs::profil_restaurable(
+                    egaliseurs,
+                    &settings,
+                    Some(&cle_arrivee),
+                    value,
+                    &cle_arrivee,
+                    warnings,
+                )
+            } else if gabarit == "ir_jeu_{id}" {
                 match crate::audio::convolver::par_cadence::liste_du_jeu_importable(value) {
                     Some(v) => v,
                     None => {
@@ -1109,7 +1151,7 @@ fn import_settings(
             } else {
                 value.clone()
             };
-            settings.set(&gabarit.replace("{id}", &arrivee.id.to_string()), &valeur)?;
+            settings.set(&cle_arrivee, &valeur)?;
             count += 1;
             continue;
         }
@@ -1520,17 +1562,26 @@ fn import_alarms(
 fn import_eq_presets(
     backend: &Arc<dyn DbBackend>,
     presets: &[Value],
-    _warnings: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Result<usize, String> {
     let settings = SettingsRepo::with_backend(backend.clone());
     let mut count = 0;
     for p in presets {
         let key = p["key"].as_str().unwrap_or_default();
         let value = p["value"].as_str().unwrap_or_default();
-        if !key.is_empty() {
-            settings.set(key, value)?;
-            count += 1;
+        if key.is_empty() {
+            continue;
         }
+        // Cette section ne porte que les anciennes clés de préréglage ; toute
+        // autre clé relève des réglages généraux et de leurs règles.
+        if !is_eq_preset_key(key) {
+            warnings.push(format!(
+                "equalizer preset section: '{key}' is not a preset key; skipped"
+            ));
+            continue;
+        }
+        settings.set(key, value)?;
+        count += 1;
     }
     Ok(count)
 }
@@ -1662,8 +1713,16 @@ mod tests {
             ("ir_path_3".to_string(), "/d/ir/zone_3.wav".to_string()),
         ];
         let mut avertissements = Vec::new();
-        import_settings(&backend, &reglages, &correspondances, &mut avertissements).unwrap();
         let settings = SettingsRepo::with_backend(backend.clone());
+        let eq = crate::config_export::egaliseurs::Contexte::nouveau(&settings, true, None);
+        import_settings(
+            &backend,
+            &reglages,
+            &correspondances,
+            &eq,
+            &mut avertissements,
+        )
+        .unwrap();
         assert_eq!(
             settings.get("ir_jeu_9").unwrap().as_deref(),
             Some(r#"["/d/ir/zone_3_sr96000.wav"]"#)
@@ -1677,7 +1736,14 @@ mod tests {
         let reglages = vec![("ir_jeu_3".to_string(), r#"["../zone_1.wav"]"#.to_string())];
         let mut avertissements = Vec::new();
         settings.delete("ir_jeu_9").unwrap();
-        import_settings(&backend, &reglages, &correspondances, &mut avertissements).unwrap();
+        import_settings(
+            &backend,
+            &reglages,
+            &correspondances,
+            &eq,
+            &mut avertissements,
+        )
+        .unwrap();
         assert_eq!(settings.get("ir_jeu_9").unwrap(), None);
         assert!(
             avertissements.iter().any(|a| a.contains("ir_jeu_3")),
@@ -2028,7 +2094,7 @@ mod tests {
             .set("credentials_vault", "")
             .unwrap();
 
-        let report = import_config_with_secret(&fresh, snapshot, Some("pw")).unwrap();
+        let report = import_config_with_secret(&fresh, snapshot, Some("pw"), true).unwrap();
         assert_eq!(report.streaming_tokens_restored, 1);
 
         let vault = SettingsRepo::with_backend(fresh.clone())
@@ -2047,7 +2113,8 @@ mod tests {
         let snapshot = export_config_sealed(&backend, "forgotten").unwrap();
 
         let fresh = seeded_backend();
-        let report = import_config_with_secret(&fresh, snapshot, Some(recovery.display())).unwrap();
+        let report =
+            import_config_with_secret(&fresh, snapshot, Some(recovery.display()), true).unwrap();
         assert_eq!(report.streaming_tokens_restored, 1);
     }
 
@@ -2088,7 +2155,7 @@ mod tests {
         let snapshot = export_config_sealed(&backend, "right").unwrap();
 
         let fresh = seeded_backend();
-        let report = import_config_with_secret(&fresh, snapshot, Some("wrong")).unwrap();
+        let report = import_config_with_secret(&fresh, snapshot, Some("wrong"), true).unwrap();
         assert_eq!(report.streaming_tokens_restored, 0);
         assert!(!report.warnings.is_empty());
     }
@@ -2127,7 +2194,7 @@ mod tests {
         let after = export_config_sealed(&backend, "new").unwrap();
 
         let restore = |snap: ConfigSnapshot, secret: &str| {
-            import_config_with_secret(&seeded_backend(), snap, Some(secret))
+            import_config_with_secret(&seeded_backend(), snap, Some(secret), true)
                 .unwrap()
                 .streaming_tokens_restored
         };

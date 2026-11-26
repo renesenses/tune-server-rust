@@ -42,7 +42,26 @@ pub fn zone_enabled(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
 /// #8513 — les traitements de la zone sont-ils contournés ? En PURE, ou
 /// pendant le balayage d'une mesure de pièce ([`super::mesure_nue`]). Ne
 /// touche ni au réglage PURE ni au verrou de volume : seul le chemin DSP le lit.
+///
+/// rc14 — et sous « Bypass all » de la chaîne TESS : même garde, donc les
+/// mêmes étages contournés (égaliseurs, convolution, crossfeed, natifs,
+/// repli mono, réaffectation, suréchantillonnage, ReplayGain). Le volume de
+/// la zone reste, comme sous PURE. Les protections (DoP #8813) et les rampes
+/// anti-clic ne lisent PAS cette garde : voir [`pure_ou_mesure`].
 pub fn traitements_contournes(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
+    zone_enabled(db, zone_id)
+        || super::mesure_nue::active(zone_id)
+        || crate::tess::egaliseurs_en_serie::bypass_all_de_zone(
+            &SettingsRepo::with_backend(db.clone()),
+            zone_id,
+        )
+}
+
+/// rc14 — PURE ou une mesure de pièce, SANS « Bypass all ». « Bypass all »
+/// est un outil de comparaison, pas du bit-perfect : la protection du niveau
+/// DoP (#8813) et les rampes anti-clic (soft mute, fondus de pause, seek,
+/// stop) restent en service sous lui ; elles lisent cette garde-ci.
+pub fn pure_ou_mesure(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
     zone_enabled(db, zone_id) || super::mesure_nue::active(zone_id)
 }
 
@@ -79,8 +98,18 @@ pub fn volume_lock_override(db: &Arc<dyn DbBackend>, zone_id: i64) -> Option<boo
 /// #8920 — jamais sur une zone Devialet AIR : « plein volume en PURE »
 /// enverrait le haut de la course à l'ampli. Le volume y est tenu par
 /// l'ampli, sous les limites de confort et de sécurité, PURE ou non.
+///
+/// Retour de Didier (rc13.90) — jamais non plus pendant le balayage d'une
+/// mesure de pièce ([`super::mesure_nue`]) : la mesure règle elle-même un
+/// volume MODÉRÉ, et le verrou refusait cette baisse (« le mode PURE de
+/// cette zone tient le volume à 100 % ») : la mesure échouait en PURE.
+/// Le réglage PURE n'est pas touché ; le verrou revient avec la fin de la
+/// mesure, qui rend alors le volume d'avant (100 %).
 pub fn volume_lock_enabled(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
     if crate::outputs::devialet_air::reglages::zone_air(db, zone_id) {
+        return false;
+    }
+    if super::mesure_nue::active(zone_id) {
         return false;
     }
     volume_lock_override(db, zone_id).unwrap_or_else(|| global_volume_lock_enabled(db))
@@ -147,6 +176,32 @@ mod tests {
             traitements_contournes(&db, 851_311),
             "PURE contourne toujours"
         );
+    }
+
+    /// Retour de Didier (rc13.90) — PURE verrouillé : la mesure baisse le
+    /// volume à sa valeur de mesure, sans que PURE soit désactivé, puis le
+    /// verrou revient tel quel.
+    #[test]
+    fn une_mesure_leve_le_verrou_de_volume_pure_le_temps_du_balayage() {
+        let db = mem_db();
+        set(
+            &db,
+            "zone_851312_audiophile",
+            r#"{"enabled":true,"lock_volume":true}"#,
+        );
+        assert!(volume_lock_enabled(&db, 851_312));
+        assert_eq!(effective_volume(&db, 851_312, 0.4), 1.0);
+        let g = super::super::mesure_nue::Contournement::poser(851_312);
+        assert!(
+            zone_enabled(&db, 851_312),
+            "PURE ne doit pas être désactivé"
+        );
+        assert!(!volume_lock_enabled(&db, 851_312));
+        assert_eq!(effective_volume(&db, 851_312, 0.4), 0.4);
+        drop(g);
+        assert!(zone_enabled(&db, 851_312));
+        assert!(volume_lock_enabled(&db, 851_312), "verrou non rétabli");
+        assert_eq!(effective_volume(&db, 851_312, 0.4), 1.0);
     }
 
     #[test]

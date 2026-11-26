@@ -90,6 +90,24 @@ fn bandes() -> Value {
         "bands": [{ "freq": 1000.0, "gain": 3.0, "q": 1.41, "type": "peak" }]
     })
 }
+/// rc14 (#9517) — ce qu'écrit l'égaliseur GRAPHIQUE du client web
+/// (`EqualizerV2.svelte`, grille ISO de 10 bandes, Q 1.0 : `GRILLES_EQ` et
+/// `Q_GRILLE_EQ` de `eqGrilles.ts`). C'est la courbe gratuite ; une bande
+/// libre comme [`bandes`] est un égaliseur paramétrique, donc Premium.
+fn courbe_graphique() -> Value {
+    let grille = [
+        31.0, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+    ];
+    let bands: Vec<Value> = grille
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let gain = if i == 0 { 3.0 } else { 0.0 };
+            json!({ "freq": f, "gain": gain, "q": 1.0, "type": "peak" })
+        })
+        .collect();
+    json!({ "enabled": true, "bands": bands })
+}
 
 // ---------------------------------------------------------------------------
 // 1. La lecture reste GRATUITE — le verrou anti-« correction » de #2419.
@@ -146,15 +164,33 @@ async fn la_lecture_du_dsp_de_zone_reste_ouverte_sans_licence() {
 #[tokio::test]
 async fn premium_sdk_free_equalizer_writes_and_reads_real_bands() {
     let app = app_gratuit().await;
-    let (status, value) = ecrire(&app, EQ, bandes(), Some("fr")).await;
+    // La courbe de l'égaliseur graphique du client web : gratuite.
+    let (status, value) = ecrire(&app, EQ, courbe_graphique(), Some("fr")).await;
     assert_eq!(status, StatusCode::OK, "FREE EQ refused: {value}");
     let (_, stored) = lire(&app, EQ).await;
     assert_eq!(stored["enabled"], true);
+    assert_eq!(
+        stored["bands"].as_array().map(Vec::len),
+        Some(10),
+        "{stored}"
+    );
     assert_eq!(stored["bands"][0]["gain"], 3.0);
+    // Une bande libre (fréquence et Q arbitraires) est paramétrique :
+    // Premium, refusée en Free, et la courbe graphique reste en place.
+    let (status, value) = ecrire(&app, EQ, bandes(), Some("fr")).await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{value}");
+    assert_eq!(value["error"], "premium_required", "{value}");
+    assert_eq!(value["code"], "parametric_eq", "{value}");
+    let (_, stored) = lire(&app, EQ).await;
+    assert_eq!(
+        stored["bands"].as_array().map(Vec::len),
+        Some(10),
+        "{stored}"
+    );
     let (status, value) = ecrire(
         &app,
         "/api/v1/eq/presets",
-        json!({"name":"Free preset","bands":bandes()["bands"]}),
+        json!({"name":"Free preset","bands":courbe_graphique()["bands"]}),
         Some("fr"),
     )
     .await;
