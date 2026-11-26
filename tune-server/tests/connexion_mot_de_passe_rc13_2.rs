@@ -87,10 +87,21 @@ async fn appel(
     corps: &str,
     langue: Option<&str>,
 ) -> (StatusCode, Value) {
+    appel_methode(state, Method::POST, adresse, chemin, corps, langue).await
+}
+
+async fn appel_methode(
+    state: &AppState,
+    methode: Method,
+    adresse: &str,
+    chemin: &str,
+    corps: &str,
+    langue: Option<&str>,
+) -> (StatusCode, Value) {
     let pair: SocketAddr = adresse.parse().unwrap();
     let app: Router = tune_server::routes::router(state.clone()).layer(MockConnectInfo(pair));
     let mut req = Request::builder()
-        .method(Method::POST)
+        .method(methode)
         .uri(chemin)
         .header(header::CONTENT_TYPE, "application/json");
     if let Some(l) = langue {
@@ -441,6 +452,87 @@ async fn alias_default_du_profil_admin(state: &AppState, lan: &str) {
         .unwrap();
 }
 
+/// rc14 (relecture) — `admin` / `default` n'appartiennent qu'au profil 1 :
+/// aucun autre profil ne les prend (création, renommage, inscription, toute
+/// casse), et un profil `default` qui ne serait pas le 1 (base copiée) n'est
+/// jamais revendicable sans mot de passe.
+async fn noms_reserves_au_profil_1(state: &AppState, lan: &str) {
+    for nom in ["default", "Default", "DEFAULT", "admin", "Admin"] {
+        let corps = serde_json::json!({ "username": nom, "password": "capteur-1234" }).to_string();
+        let (st, v) = appel(state, CETTE_MACHINE, "/api/v1/auth/register", &corps, None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "inscription {nom:?} : {v}");
+        let corps = serde_json::json!({ "name": nom }).to_string();
+        let (st, v) = appel(state, CETTE_MACHINE, "/api/v1/profiles", &corps, None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "création {nom:?} : {v}");
+    }
+    let autre = state
+        .backend
+        .execute_returning_id(
+            "INSERT INTO profiles (username, display_name) VALUES ('salon', 'Salon')",
+            &[],
+        )
+        .unwrap();
+    for nom in ["default", "Default", "Admin"] {
+        let corps = serde_json::json!({ "name": nom }).to_string();
+        let (st, v) = appel_methode(
+            state,
+            Method::PUT,
+            CETTE_MACHINE,
+            &format!("/api/v1/profiles/{autre}"),
+            &corps,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "renommage {nom:?} : {v}");
+    }
+    // Le profil 1 garde le droit de porter ses noms.
+    let (st, v) = appel_methode(
+        state,
+        Method::PUT,
+        CETTE_MACHINE,
+        "/api/v1/profiles/1",
+        r#"{"name":"admin"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // Un profil `default` qui n'est pas le 1 (posé en base, hors API) : il
+    // capte le nom saisi, mais jamais sans mot de passe, même sur cette
+    // machine, authentification coupée.
+    state
+        .backend
+        .execute(
+            "UPDATE profiles SET username = 'default' WHERE id = ?",
+            &[&autre as &dyn ToSqlValue],
+        )
+        .unwrap();
+    for adresse in [CETTE_MACHINE, lan] {
+        let (st, v) = connexion(state, adresse, "default", "revendique-1234").await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{adresse} : {v}");
+    }
+    let hachage_de_l_autre = state
+        .backend
+        .query_one(
+            "SELECT password_hash_v2 FROM profiles WHERE id = ?",
+            &[&autre as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .unwrap()
+        .first()
+        .and_then(|v| v.as_string());
+    assert_eq!(hachage_de_l_autre, None, "rien n'est enregistré");
+    state
+        .backend
+        .execute("DELETE FROM profiles WHERE id = ?", &[&autre as &dyn ToSqlValue])
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_noms_reserves_au_profil_1() {
+    noms_reserves_au_profil_1(&etat_sqlite(), "192.168.1.69:50000").await;
+}
+
 #[tokio::test]
 async fn sqlite_alias_default_du_profil_admin() {
     alias_default_du_profil_admin(&etat_sqlite(), "192.168.1.68:50000").await;
@@ -516,5 +608,7 @@ async fn postgres_memes_scenarios() {
     hachages_illisibles(&state, "10.0.0.77:50000").await;
     remettre_a_zero(&state);
     alias_default_du_profil_admin(&state, "10.0.0.78:50000").await;
+    remettre_a_zero(&state);
+    noms_reserves_au_profil_1(&state, "10.0.0.79:50000").await;
     remettre_a_zero(&state);
 }

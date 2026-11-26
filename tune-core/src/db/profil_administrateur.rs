@@ -61,12 +61,23 @@ pub const SQL_PROFIL_PAR_NOM_DE_CONNEXION: &str = "(username = ? \
          AND NOT EXISTS (SELECT 1 FROM profiles alias_default \
                           WHERE alias_default.username = 'default')))";
 
-/// Les noms réservés au profil administrateur d'origine : jamais donnés à un
-/// profil créé par la liaison au compte Mozaiklabs.
+/// Les noms réservés au profil administrateur d'origine, casse et espaces
+/// ignorés : `admin` et `default` (son alias). Aucun AUTRE profil ne les prend
+/// — ni à la création, ni au renommage, ni à l'inscription, ni par la liaison
+/// au compte Mozaiklabs —, sinon il capterait l'alias `default`.
 pub fn nom_reserve(nom: &str) -> bool {
-    nom.eq_ignore_ascii_case(NOM_ADMINISTRATEUR)
-        || nom.eq_ignore_ascii_case(ANCIEN_NOM_ADMINISTRATEUR)
+    let nom = nom.trim();
+    nom.eq_ignore_ascii_case(NOM_ADMINISTRATEUR) || nom.eq_ignore_ascii_case(ANCIEN_NOM_ADMINISTRATEUR)
 }
+
+/// Le nom `nom` est-il refusé pour le profil `id` (`None` : profil à créer) ?
+/// Le profil 1 garde le droit de porter ses propres noms.
+pub fn nom_refuse_pour(id: Option<i64>, nom: &str) -> bool {
+    id != Some(ID_PROFIL_D_ORIGINE) && nom_reserve(nom)
+}
+
+/// Le message d'un refus de [`nom_refuse_pour`].
+pub const ERREUR_NOM_RESERVE: &str = "nom de profil réservé au profil administrateur";
 
 #[cfg(test)]
 mod tests {
@@ -308,6 +319,13 @@ mod tests {
         assert!(nom_reserve("admin"));
         assert!(nom_reserve("Admin"));
         assert!(nom_reserve("default"));
+        assert!(nom_reserve("DEFAULT"));
+        assert!(nom_reserve(" Default "));
         assert!(!nom_reserve("léa"));
+        assert!(!nom_reserve("administrateur"));
+        assert!(nom_refuse_pour(None, "Admin"));
+        assert!(nom_refuse_pour(Some(7), "default"));
+        assert!(!nom_refuse_pour(Some(1), "default"));
+        assert!(!nom_refuse_pour(Some(7), "léa"));
     }
 }

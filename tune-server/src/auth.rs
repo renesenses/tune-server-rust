@@ -1343,6 +1343,14 @@ async fn register(
     }
     let cree_par_un_administrateur = appelant.is_some();
     let username = body.username.trim().to_string();
+    // rc14 : `admin` / `default`, toute casse, n'appartiennent qu'au profil 1.
+    if tune_core::db::profil_administrateur::nom_reserve(&username) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "username already exists"})),
+        )
+            .into_response();
+    }
     if username.is_empty() || body.password.len() < 8 {
         return (
             StatusCode::BAD_REQUEST,
@@ -1645,9 +1653,11 @@ async fn login(
     // profil 1 renommé `admin` par la migration 158 — saisi sous l'un ou
     // l'autre nom. Un profil 1 renommé par l'utilisateur ne l'est pas, comme
     // avant.
-    let profil_d_origine = nom_du_profil == profil_admin::ANCIEN_NOM_ADMINISTRATEUR
-        || (profile_id == profil_admin::ID_PROFIL_D_ORIGINE
-            && nom_du_profil == profil_admin::NOM_ADMINISTRATEUR);
+    // Toujours le profil 1 : un autre profil nommé `default` (base ancienne,
+    // copie) n'est jamais revendicable sans mot de passe.
+    let profil_d_origine = profile_id == profil_admin::ID_PROFIL_D_ORIGINE
+        && (nom_du_profil == profil_admin::ANCIEN_NOM_ADMINISTRATEUR
+            || nom_du_profil == profil_admin::NOM_ADMINISTRATEUR);
     let premiere_connexion = sans_mot_de_passe && profil_d_origine && passwordless_default_allowed;
 
     // Try argon2 hash first (password_hash_v2), then fall back to SHA-256 (password_hash)
