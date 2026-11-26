@@ -262,6 +262,41 @@ impl EtageTess for AdaptateurCrossfeed<'_> {
     fn definir_bypass(&mut self, _: bool) {}
 }
 
+/// rc14 — le réglage des enceintes (`speaker-setup`), dernier greffon de
+/// l'exécuteur. Ses délais sont VOULUS (alignement des voies) : il annonce
+/// une latence nulle à l'exécuteur, pour que l'hôte ne les retire pas comme
+/// l'amorce du convolveur. Le chemin du signal publie le plus grand délai.
+struct AdaptateurEnceintes<'a> {
+    moteur: &'a mut Option<crate::audio::reglage_enceintes::ProcesseurEnceintes>,
+    canaux: usize,
+    cadence: u32,
+}
+
+impl EtageTess for AdaptateurEnceintes<'_> {
+    fn id(&self) -> &str {
+        crate::audio::reglage_enceintes::ID_GREFFON
+    }
+    fn preparer(&mut self, e: FormatFlux, max: usize) -> Result<Disposition, ErreurEtage> {
+        self.canaux = usize::from(e.channels);
+        Ok(Disposition::sur_place(e, max, 0))
+    }
+    fn traiter_sur_place(&mut self, t: &mut [f64], trames: usize) -> Result<(), ErreurEtage> {
+        verifier_tampon(t.len(), trames, self.canaux as u16)?;
+        if let Some(p) = self.moteur.as_mut() {
+            p.traiter(
+                &mut t[..trames * self.canaux],
+                self.canaux as u16,
+                self.cadence,
+            );
+        }
+        Ok(())
+    }
+    fn bypass(&self) -> bool {
+        false
+    }
+    fn definir_bypass(&mut self, _: bool) {}
+}
+
 /// Au-delà de ce nombre d'échantillons (32 Mi, 256 Mo en `f64`), une piste
 /// gardée pour la compensation l'est en `f32` : garde-fou mémoire (relecture
 /// de #9414). Une piste de 10 min en 192 kHz stéréo (230 M échantillons)
@@ -540,6 +575,8 @@ impl StreamingDsp {
             compensation,
             convolveur_reste_a_jeter,
             tess,
+            enceintes,
+            sample_rate,
             ..
         } = self;
         let EtatTess {
@@ -561,7 +598,12 @@ impl StreamingDsp {
             stereo: *channels == 2,
             canaux,
         };
-        let mut etages: [&mut dyn EtageTess; 3] = [&mut a_eq, &mut a_conv, &mut a_cf];
+        let mut a_enc = AdaptateurEnceintes {
+            moteur: &mut *enceintes,
+            canaux,
+            cadence: *sample_rate,
+        };
+        let mut etages: [&mut dyn EtageTess; 4] = [&mut a_eq, &mut a_conv, &mut a_cf, &mut a_enc];
         if let Err(error) = executeur.preparer(&mut etages, format, max_trames, false) {
             tracing::warn!(%error, canaux, "tess_network_chain_prepare_failed");
             return utiles;
@@ -674,6 +716,10 @@ impl StreamingDsp {
         if passage != Passage::Flux {
             if let Some(c) = convolver.as_mut() {
                 c.reset();
+            }
+            // rc14 — une piste entière ne garde pas la queue de la précédente.
+            if let Some(e) = enceintes.as_mut() {
+                e.reinitialiser();
             }
             *queue_restante = None;
             *convolveur_reste_a_jeter = None;

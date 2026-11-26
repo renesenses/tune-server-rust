@@ -765,6 +765,17 @@ pub mod sql {
     /// #5616 — le type lu dans la balise du fichier, posé SEULEMENT si la
     /// colonne est vide : un type déjà connu (MusicBrainz, service, édition
     /// manuelle, ou une balise lue avant) n'est jamais écrasé par un scan.
+    /// [rc14] Le code-barres lu dans la balise, posé SEULEMENT si la colonne
+    /// est vide : une valeur connue (MusicBrainz, service, édition) reste.
+    pub fn set_barcode_if_empty<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET barcode = {} WHERE id = {} \
+             AND (barcode IS NULL OR barcode = '')",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn set_release_type_if_empty<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET release_type = {} WHERE id = {} \
@@ -3634,6 +3645,18 @@ impl AlbumRepo {
         let params: [&dyn ToSqlValue; 2] = [&type_de_sortie, &album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// [rc14] Pose le code-barres lu dans la balise d'un fichier, seulement si
+    /// l'album n'en a pas encore. Rend `true` quand la ligne a changé.
+    pub fn poser_code_barres_si_vide(
+        &self,
+        album_id: i64,
+        code_barres: &str,
+    ) -> Result<bool, TuneError> {
+        let sql = self.dialect_sql(sql::set_barcode_if_empty, sql::set_barcode_if_empty);
+        let params: [&dyn ToSqlValue; 2] = [&code_barres, &album_id];
+        Ok(self.db.execute(&sql, &params)? > 0)
     }
 
     /// #5616 — pose le type lu dans la balise d'un fichier, seulement si

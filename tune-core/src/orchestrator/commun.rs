@@ -787,6 +787,11 @@ impl PlaybackOrchestrator {
         // connaît : son compte d'écoutes ne se rapproche plus par titre.
         track_id: Option<i64>,
     ) {
+        // Fil 3094 — un balayage de calibration n'est pas une écoute : ni
+        // historique, ni « Reprendre l'écoute », ni statistiques.
+        if crate::source_pcm::source_technique(source) {
+            return;
+        }
         self.armer_l_ecoute(
             zone_id,
             super::ecoute_validee_7852::EcouteEnAttente {

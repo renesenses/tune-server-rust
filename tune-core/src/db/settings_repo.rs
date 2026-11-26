@@ -138,6 +138,9 @@ impl SettingsRepo {
         if est_un_consentement_journalise(key) {
             self.journaliser_consentement(key, Some(value), lieu);
         }
+        // rc14 — trim, PURE ou verrou du volume : republiés pour la
+        // modulation DSD de TESS (volume juste avant le modulateur).
+        crate::tess::modulation_dsd::reglage_ecrit(&self.db, key);
         Ok(())
     }
 
@@ -150,6 +153,7 @@ impl SettingsRepo {
         if est_un_consentement_journalise(key) {
             self.journaliser_consentement(key, None, lieu);
         }
+        crate::tess::modulation_dsd::reglage_ecrit(&self.db, key);
         Ok(())
     }
 
@@ -463,6 +467,10 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
+        // rc14 : une base neuve naît avec `lyrics_lrclib_enabled` posé
+        // (`db::premier_lancement_rc14_tests`). Ces témoins comptent les
+        // lignes d'une table VIDE : la ligne de naissance est retirée.
+        db.execute_batch("DELETE FROM settings").unwrap();
         SettingsRepo::new(db)
     }
 

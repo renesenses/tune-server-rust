@@ -36,6 +36,7 @@ use tune_core::playback::ZoneState;
 use tune_core::tess::chemin::{EnService, GreffonsEnService, chemin_du_signal};
 use tune_core::tess::greffon::Origine;
 use tune_core::tess::migration::{lecture_dsd, lire_zone};
+use tune_core::tess::modulation_dsd::EtatModulation;
 use tune_core::tess::{
     ContexteExecution, ControleVolume, LectureDsd, SourceFlux, TauxDsd, TransportZone, VolumeZone,
     catalogue_de_reference,
@@ -73,6 +74,7 @@ pub(crate) fn en_service_d_apres_le_chemin(sp: &Value, volume_logiciel: bool) ->
         || steps.iter().any(|e| {
             (a_le_nom(e, "DSP") || a_le_nom(e, "Mono") || a_le_code(e, "crossfeed")) && altere(e)
                 || a_le_code(e, "channel_remap")
+                || a_le_code(e, "speaker_setup")
         });
     let mut hors_service = Vec::new();
     if sp
@@ -97,7 +99,34 @@ pub(crate) fn en_service_d_apres_le_chemin(sp: &Value, volume_logiciel: bool) ->
         upsampling,
         volume_logiciel,
         latences: Vec::new(),
+        modulation_dsd: None,
     }
+}
+
+/// rc14 — la modulation DSD de la piste qui joue (sortie locale), retenue par
+/// l'orchestrateur à sa décision. En service, les greffons de la zone passent
+/// DANS le flux (la sortie, qui reçoit un porteur DSD, n'en applique aucun) :
+/// la sonde de la sortie ne les voit donc pas, c'est ce constat qui fait foi.
+///
+/// Le headroom de TESS et le volume de la zone sont appliqués par le
+/// producteur, juste avant le modulateur (Q9) : ils sont en service dès que
+/// la zone les demande.
+pub(crate) fn avec_la_modulation_dsd(
+    en_service: &mut EnService,
+    etat: Option<EtatModulation>,
+    volume: &VolumeZone,
+) {
+    if let Some(EtatModulation::EnService(m)) = &etat {
+        en_service.greffons = GreffonsEnService::Sonde {
+            actif: m.plugins_in_stream,
+            // La réaffectation des canaux n'est pas portée par le flux modulé.
+            hors_service: vec![tune_core::tess::migration::ID_REAFFECTATION.to_owned()],
+        };
+        en_service.upsampling = true;
+        en_service.headroom_db = (m.headroom_db != 0.0).then_some(m.headroom_db);
+        en_service.volume_logiciel = volume.control == ControleVolume::Software && volume.db < 0.0;
+    }
+    en_service.modulation_dsd = etat;
 }
 
 fn taux_dsd(sample_rate: u32) -> TauxDsd {
@@ -239,9 +268,26 @@ pub(crate) fn chemin_tess_de_la_zone(
             (tune_core::audio::replaygain::facteur_de_zone(backend, zid, np.piste_rg()) - 1.0).abs()
                 > 1e-6
         }),
+        // rc14 — les voies que la sortie a ouvertes (après adaptation) : celles
+        // que le réglage des enceintes traite.
+        voies_de_sortie: ps
+            .transformations_reelles
+            .as_ref()
+            .map(|t| t.ouvert().canaux),
     };
     let resolution = lecture.chaine.resoudre(&catalogue, &ctx);
-    let en_service = en_service_d_apres_le_chemin(sp, volume_logiciel);
+    let mut en_service = en_service_d_apres_le_chemin(sp, volume_logiciel);
+    avec_la_modulation_dsd(
+        &mut en_service,
+        tune_core::tess::modulation_dsd::etat_pour(
+            zid,
+            ps.now_playing
+                .as_ref()
+                .and_then(|np| np.stream_id.as_deref()),
+            ps.now_playing.as_ref().and_then(|np| np.track_id),
+        ),
+        &ctx.volume,
+    );
     let intact = sp.get("bit_perfect").and_then(Value::as_bool);
     let chemin = chemin_du_signal(
         &lecture.chaine,
@@ -254,6 +300,20 @@ pub(crate) fn chemin_tess_de_la_zone(
     if !chemin.discrepancies.is_empty() {
         debug!(zone_id = zid, ecarts = ?chemin.discrepancies, "tess_chemin_ecarts");
     }
+    // rc14 (rc13.91) — « pas en service » dit pourquoi (refus de la sortie).
+    let mut chemin = chemin;
+    super::refus_surechantillonnage_tess::avec_le_refus_du_surechantillonneur(
+        chemin.steps.iter_mut().map(|n| &mut n.etape),
+        &lecture.chaine,
+        super::refus_surechantillonnage_tess::refus_du_chemin_historique(sp),
+    );
+    // Rémi (fil 3097) — la convolution sautée à cette cadence, de même.
+    let convolution = super::refus_surechantillonnage_tess::raison_de_la_convolution_du_chemin(sp);
+    super::refus_surechantillonnage_tess::avec_la_raison_de_la_convolution(
+        chemin.steps.iter_mut().map(|n| &mut n.etape),
+        &lecture.chaine,
+        convolution.as_ref().map(|(c, t)| (c.as_str(), t.as_str())),
+    );
     serde_json::to_value(chemin).ok()
 }
 

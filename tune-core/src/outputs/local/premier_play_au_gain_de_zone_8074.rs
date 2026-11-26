@@ -211,3 +211,24 @@ async fn premier_play_sur_une_sortie_asio_sans_graine_ne_sort_pas_a_pleine_echel
         en_db(attendu),
     );
 }
+
+/// Revue #9520 (point 4) — « Bypass all » pose `pure_bypass` sur la sortie
+/// (aucun traitement) mais n'est PAS PURE : la garde de départ bas reste
+/// armée. PURE (ou la mesure de pièce), lui, l'écarte toujours.
+#[tokio::test]
+async fn bypass_all_n_ecarte_pas_la_garde_de_depart_bas_9520() {
+    let bypass = LocalOutput::with_options("DAC".into(), true, "wasapi");
+    bypass.set_pure_bypass(true);
+    bypass.set_pure_ou_mesure(false);
+    assert!(
+        bypass.partir_bas_si_aucun_volume_pose().await,
+        "Bypass all : la sortie doit partir au niveau sans repère, jamais à l'unité"
+    );
+    assert!(gain_des_premiers_tampons(&bypass, 512) < 0.5);
+
+    let pure = LocalOutput::with_options("DAC".into(), true, "wasapi");
+    pure.set_pure_bypass(true);
+    pure.set_pure_ou_mesure(true);
+    assert!(!pure.partir_bas_si_aucun_volume_pose().await);
+    assert_eq!(gain_des_premiers_tampons(&pure, 512), 1.0);
+}

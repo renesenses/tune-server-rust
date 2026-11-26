@@ -8,7 +8,7 @@ const FIP: &str = "https://icecast.radiofrance.fr/fip-hifi.aac";
 fn repo_avec_fip(logo: Option<&str>) -> RadioRepo {
     let db = SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
-    migrations::run_migrations(&db).unwrap();
+    migrations::run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
     let repo = RadioRepo::new(db);
     // Les 24 stations semées le sont par la migration 33 : on ne récrit
     // pas FIP, on lui pose le logo que le rattrapage mozaiklabs lui aurait
