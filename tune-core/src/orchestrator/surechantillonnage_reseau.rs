@@ -261,12 +261,11 @@ impl PlaybackOrchestrator {
             let sortie = locked.as_any();
             if let Some(dlna) = sortie.downcast_ref::<crate::outputs::dlna::DlnaOutput>() {
                 dlna.probe_capabilities().await
-            } else if let Some(oh) =
-                sortie.downcast_ref::<crate::outputs::openhome::OpenHomeOutput>()
-            {
-                oh.probe_capabilities().await
             } else {
-                return None;
+                sortie
+                    .downcast_ref::<crate::outputs::openhome::OpenHomeOutput>()?
+                    .probe_capabilities()
+                    .await
             }
         };
         if !caps.probed {
