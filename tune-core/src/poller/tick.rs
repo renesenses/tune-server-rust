@@ -902,6 +902,22 @@ impl PositionPoller {
                     };
                     (output.take_output_failure(), output.take_paused_by_device())
                 };
+                // rc14 — un flux modulé vers le DSD dont la sortie n'a pas pu
+                // porter le DoP (périphérique ouvert à une autre cadence) :
+                // relancé à sa position, il repart en PCM, jamais en silence.
+                // La relance part en tâche DÉTACHÉE : le tick ne l'attend pas.
+                if let Some(constat) = failure.clone()
+                    && self.orchestrator.rupture_dsd_a_relancer(zone_id).await
+                {
+                    let orchestrateur = self.orchestrator.clone();
+                    tokio::spawn(async move {
+                        orchestrateur
+                            .relancer_apres_rupture_dsd(zone_id, constat)
+                            .await;
+                    });
+                    poll_states.remove(&zone_id);
+                    continue;
+                }
                 if failure.is_some() {
                     self.noter_tune_tested(zone_state, &device_id, false).await;
                 }
@@ -1285,9 +1301,18 @@ impl PositionPoller {
                 && self.orchestrator.streamer.stream_bytes_sent(sid).await == Some(0)
             {
                 let titre = np.title.clone();
+                // Fil 2972 — l'adresse de l'épisode, pour le marquer
+                // indisponible si l'éditeur a répondu 404/410.
+                let adresse = np.source_id.clone();
                 poll_states.remove(&zone_id);
-                Box::pin(self.arreter_sur_source_en_erreur(zone_id, &device_id, &titre, statut))
-                    .await;
+                Box::pin(self.arreter_sur_source_en_erreur(
+                    zone_id,
+                    &device_id,
+                    &titre,
+                    adresse.as_deref(),
+                    statut,
+                ))
+                .await;
                 continue;
             }
 

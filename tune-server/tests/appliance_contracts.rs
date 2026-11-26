@@ -17,3 +17,6 @@ fn lock_environment() -> std::sync::MutexGuard<'static, ()> {
 mod appliance;
 #[path = "appliance_storage.rs"]
 mod appliance_storage;
+// rc13.1 — la mise à jour depuis le réseau local, sans authentification.
+#[path = "maj_reseau_local_rc13_1.rs"]
+mod maj_reseau_local_rc13_1;

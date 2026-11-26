@@ -3003,6 +3003,18 @@ UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipnouveautes-hi
 UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipreggae-hifi.aac?id=radiofrance' WHERE url = 'https://icecast.radiofrance.fr/fipreggae-hifi.aac';
 UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac?id=radiofrance' WHERE url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac';
 ",
+    },    // rc14 — la session renouvelée tant qu'elle sert : les jetons de
+    // renouvellement (`POST /auth/refresh`). Seule l'empreinte SHA-256 du
+    // jeton est stockée, comme les clés Subsonic (139). Jumelle PG : 125.
+    // ⚠️ Numérotée 159 / PG 125 le 26/11 : la 158 / PG 124 est réservée par
+    // #9562 (profil administrateur « admin »), à fusionner AVANT celle-ci —
+    // sinon les gardes de contiguïté (`migration_count_matches`,
+    // `pg_migrations_are_contiguous_and_include_numeric_heals`) rougissent,
+    // et il faut renuméroter.
+    Migration {
+        version: 159,
+        name: "jetons_de_renouvellement",
+        up: include_str!("../../migrations/jetons_de_renouvellement.sql"),
     },
 ];
 
@@ -4295,7 +4307,49 @@ pub(crate) const TRACKS_ALBUM_COLLECTIONS_INDEX: &str =
      ON tracks(album_id, format, sample_rate, bit_depth, year, genre, file_mtime);
      CREATE INDEX IF NOT EXISTS idx_tracks_album_path ON tracks(album_id, file_path);";
 
+/// Les migrations SQLite qui SÈMENT des stations dans « Mes radios » :
+/// `seed_default_radios` (33), `semis_radios_annuaire_mozaiklabs` (90),
+/// `semis_radios_paradise_annuaire_2026_09_09` (98).
+///
+/// Retour de Rémi sur la rc13 : une trentaine de radios d'office dans « Mes
+/// radios » noie l'installation neuve ; l'écran Radios ouvre désormais
+/// l'annuaire quand la liste est vide. Ces migrations sont SAUTÉES sur une
+/// base qui naît (aucune ligne dans `_migrations`) ; une base existante les a
+/// jouées depuis longtemps et garde ses stations.
+pub(crate) const SEMIS_DE_RADIOS_SQLITE: [i32; 3] = [33, 90, 98];
+
+/// Les jumelles PostgreSQL : 42 (même fichier que la 90) et 54 (même fichier
+/// que la 98). Sur une base PG neuve, elles ne posent que leur marque.
+#[cfg(feature = "postgres")]
+pub(crate) const SEMIS_DE_RADIOS_PG: [i32; 2] = [42, 54];
+
+/// LRCLIB (paroles en ligne) activé à la NAISSANCE de la base — décision de
+/// Bertrand, rc14. `OR IGNORE` : jamais d'écrasement d'un choix posé.
+const SQL_LRCLIB_ACTIVE_A_LA_NAISSANCE_SQLITE: &str =
+    "INSERT OR IGNORE INTO settings (key, value) VALUES ('lyrics_lrclib_enabled', 'true')";
+
+/// Jumelle PostgreSQL de [`SQL_LRCLIB_ACTIVE_A_LA_NAISSANCE_SQLITE`].
+#[cfg(feature = "postgres")]
+const SQL_LRCLIB_ACTIVE_A_LA_NAISSANCE_PG: &str = "INSERT INTO settings (key, value) \
+     VALUES ('lyrics_lrclib_enabled', 'true') ON CONFLICT (key) DO NOTHING";
+
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
+    executer_les_migrations(db, false)
+}
+
+/// Les migrations, catalogue de radios COMPRIS même sur une base neuve — le
+/// comportement d'avant la rc14.
+///
+/// Réservé aux bancs d'essai qui vérifient le catalogue livré (forme, pays,
+/// adresses, logos) ou qui ont besoin de stations : ils ouvrent une base
+/// neuve, que [`run_migrations`] laisse désormais sans radio. Le serveur ne
+/// l'appelle jamais.
+#[doc(hidden)]
+pub fn run_migrations_avec_le_catalogue_de_radios(db: &SqliteDb) -> Result<(), String> {
+    executer_les_migrations(db, true)
+}
+
+fn executer_les_migrations(db: &SqliteDb, semer_meme_sur_base_neuve: bool) -> Result<(), String> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
             version INTEGER PRIMARY KEY,
@@ -4324,6 +4378,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         .map_err(|e| e.to_string())?
             > 0
     };
+
+    // Retour de Rémi sur la rc13 : une installation NEUVE ne reçoit plus de
+    // radios d'office. `current_version == 0` : aucune migration n'a jamais été
+    // notée dans cette base — elle naît maintenant. Une base existante a noté
+    // ses semis depuis longtemps ; elle n'est ni relue ni touchée.
+    let installation_neuve = current_version == 0 && !semer_meme_sur_base_neuve;
 
     if tables_exist && current_version == 0 {
         db.execute(
@@ -4378,7 +4438,16 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         migration_status::advance(migration.name, done);
         let step_started = std::time::Instant::now();
 
-        if !migration.up.is_empty() {
+        if installation_neuve && SEMIS_DE_RADIOS_SQLITE.contains(&migration.version) {
+            // Rien à semer sur une base neuve : « Mes radios » commence vide
+            // et l'écran ouvre l'annuaire. La migration est quand même notée,
+            // pour ne jamais être rejouée plus tard.
+            info!(
+                version = migration.version,
+                name = migration.name,
+                "semis_de_radios_saute_installation_neuve"
+            );
+        } else if !migration.up.is_empty() {
             db.execute_batch(migration.up)?;
         }
 
@@ -4812,6 +4881,14 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             ms = step_started.elapsed().as_millis() as u64,
             "migration_applied"
         );
+    }
+
+    if installation_neuve {
+        // Décision de Bertrand (rc14) : LRCLIB activé d'office sur une
+        // installation NEUVE seulement. Le réglage est POSÉ à la naissance de
+        // la base ; une base existante sans réglage reste désactivée.
+        db.execute_batch(SQL_LRCLIB_ACTIVE_A_LA_NAISSANCE_SQLITE)?;
+        info!("paroles_en_ligne_activees_installation_neuve");
     }
 
     migration_status::advance("contrôles finaux", done);
@@ -6437,6 +6514,12 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         123,
         "queue_items_format_streaming",
         include_str!("../../migrations/postgres/123_queue_items_format_streaming.sql"),
+    ), // Jumelle de la SQLite 159 (rc14) : les jetons de renouvellement de
+    // session. 124 est réservée par #9562, à fusionner avant.
+    (
+        125,
+        "jetons_de_renouvellement",
+        include_str!("../../migrations/postgres/125_jetons_de_renouvellement.sql"),
     ),
 ];
 
@@ -6575,6 +6658,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
              version plus recente de Tune. Aucune migration inverse n'existe."
         );
     }
+    // Base PG neuve : aucune migration notée. Une conversion SQLite → PG
+    // passe aussi par ici, et ses stations arrivent ensuite par la copie des
+    // données : rien n'est retiré, rien n'est semé en double.
+    let installation_neuve = current == 0;
     let pending = PG_MIGRATIONS
         .iter()
         .filter(|&&(v, _, _)| v > current)
@@ -6606,12 +6693,28 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
         migration_status::advance(name, done);
         let step_started = std::time::Instant::now();
 
-        // Each migration file manages its own BEGIN/COMMIT, so we
-        // execute the raw SQL directly.
-        sqlx::raw_sql(sql)
+        if installation_neuve && SEMIS_DE_RADIOS_PG.contains(&version) {
+            // Base neuve : aucune radio d'office (retour de Rémi, rc13). La
+            // marque est posée quand même, pour que le semis ne soit jamais
+            // rejoué — la 54 posait la sienne dans son propre texte.
+            sqlx::query(
+                "INSERT INTO schema_version (version, name) VALUES ($1, $2) \
+                 ON CONFLICT (version) DO NOTHING",
+            )
+            .bind(version)
+            .bind(name)
             .execute(pool)
             .await
             .map_err(|e| format!("pg migration {version} ({name}): {e}"))?;
+            info!(version, name, "semis_de_radios_saute_installation_neuve");
+        } else {
+            // Each migration file manages its own BEGIN/COMMIT, so we
+            // execute the raw SQL directly.
+            sqlx::raw_sql(sql)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("pg migration {version} ({name}): {e}"))?;
+        }
 
         done += 1;
         info!(
@@ -6620,6 +6723,24 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
             ms = step_started.elapsed().as_millis() as u64,
             "pg_migration_applied"
         );
+    }
+
+    if installation_neuve {
+        // Même décision que côté SQLite. Une conversion SQLite → PostgreSQL
+        // passe aussi ici avec une base « neuve » au sens des migrations, mais
+        // ses réglages y sont déjà copiés : seule une table `settings` VIDE
+        // désigne une vraie installation neuve.
+        let reglages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM settings")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("pg lecture settings: {e}"))?;
+        if reglages == 0 {
+            sqlx::raw_sql(SQL_LRCLIB_ACTIVE_A_LA_NAISSANCE_PG)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("pg lrclib à la naissance: {e}"))?;
+            info!("paroles_en_ligne_activees_installation_neuve");
+        }
     }
 
     migration_status::advance("contrôles finaux", done);
@@ -7715,7 +7836,7 @@ mod tests {
     fn le_catalogue_livre_a_une_forme_valide() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        run_migrations(&db).unwrap();
+        run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
 
         let stations: Vec<(String, String, String, String)> = {
             let conn = db.connection().lock().unwrap();
@@ -7808,7 +7929,7 @@ mod tests {
 
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        run_migrations(&db).unwrap();
+        run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
 
         let stations: Vec<(String, String)> = {
             let conn = db.connection().lock().unwrap();
@@ -7931,7 +8052,7 @@ mod tests {
         ];
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        run_migrations(&db).unwrap();
+        run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
 
         let compte = |url: &str| {
             let conn = db.connection().lock().unwrap();
@@ -8148,7 +8269,7 @@ mod tests {
     fn le_catalogue_livre_couvre_plusieurs_pays() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        run_migrations(&db).unwrap();
+        run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
 
         let stations: Vec<(String, String)> = {
             let conn = db.connection().lock().unwrap();
@@ -10474,7 +10595,10 @@ mod tests {
         // SQLite 155. Migration de DONNÉES : annule la bascule de la 118
         // (neutralisée) là où elle a eu lieu, DEFAULT '0'.
         // 123 : format des pistes UPnP en file (#8788), SQLite 156.
-        assert_eq!(pg_latest_version(), 123, "latest PG migration must be 123");
+        // 124 : profil administrateur « admin » (#9562), SQLite 158.
+        // 125 : `jetons_de_renouvellement` (session renouvelée, rc14),
+        // jumelle de la SQLite 159. Crée la table que `/auth/refresh` NOMME.
+        assert_eq!(pg_latest_version(), 125, "latest PG migration must be 125");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
@@ -11781,7 +11905,7 @@ mod tests_pure_classix_8119 {
     fn une_base_neuve_a_pure_classix_avec_un_x_8119() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        run_migrations(&db).unwrap();
+        run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
         assert_eq!(
             fiche(&db),
             vec![(
@@ -11800,7 +11924,7 @@ mod tests_pure_classix_8119 {
     fn une_fiche_retouchee_par_l_utilisateur_n_est_pas_reecrite_8119() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        run_migrations(&db).unwrap();
+        run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
         db.execute_batch(&format!(
             "UPDATE radio_stations SET name = 'Ma radio du matin', country = 'France', \
              genre = 'Jazz' WHERE url = '{FLUX}';"

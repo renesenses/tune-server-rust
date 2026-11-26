@@ -993,6 +993,32 @@ fn spawn_local_file_levels_decode_depuis(
     debut_fichier_ms: u64,
     depart_ms: u64,
 ) {
+    spawn_local_file_levels_decode_tranche(
+        bus,
+        playback,
+        zone_id,
+        play_seq,
+        path,
+        debut_fichier_ms,
+        None,
+        depart_ms,
+    );
+}
+
+/// #9184 — [`spawn_local_file_levels_decode_depuis`], borné à la FIN d'une
+/// tranche d'image SACD (`fin_iso_ms`, horloge de la zone) : la mesure
+/// s'arrête avec la piste au lieu de courir sur le reste du disque.
+#[allow(clippy::too_many_arguments)]
+fn spawn_local_file_levels_decode_tranche(
+    bus: Arc<EventBus>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    play_seq: u64,
+    path: String,
+    debut_fichier_ms: u64,
+    fin_iso_ms: Option<u64>,
+    depart_ms: u64,
+) {
     let depart_ms = i64::try_from(depart_ms).unwrap_or(i64::MAX);
     tokio::spawn(async move {
         let cadence = playback.clone();
@@ -1002,16 +1028,13 @@ fn spawn_local_file_levels_decode_depuis(
             spawn_braked_levels_sink_depuis(cadence, zone_id, levels_tx, consomme_ms, depart_ms);
         let ready = std::sync::Arc::new(tokio::sync::Notify::new());
         let result = tokio::task::spawn_blocking(move || {
-            crate::audio::decode::decode_to_pcm_streaming_seeked(
+            decoder_pour_les_niveaux(
                 &path,
-                None,
-                None,
-                None,
+                debut_fichier_ms,
+                fin_iso_ms,
                 sink_tx,
-                LEVELS_DECODE_CHUNK,
                 ready,
                 relais_tx,
-                debut_fichier_ms as f64 / 1000.0,
             )
         })
         .await;
@@ -1023,6 +1046,45 @@ fn spawn_local_file_levels_decode_depuis(
             Ok(Ok(_)) => {}
         }
     });
+}
+
+/// Le décodage (bloquant) du décodage-pour-niveaux d'un fichier : depuis
+/// `debut_fichier_ms`, et jusqu'à `fin_iso_ms` pour une image SACD (#9184 :
+/// le lecteur de l'image s'arrête à la trame de fin de la piste). Sans fin,
+/// ou pour un autre fichier, jusqu'au bout du fichier, comme avant.
+pub(crate) fn decoder_pour_les_niveaux(
+    path: &str,
+    debut_fichier_ms: u64,
+    fin_iso_ms: Option<u64>,
+    sink_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ready: std::sync::Arc<tokio::sync::Notify>,
+    relais_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+) -> Result<(u16, u32), String> {
+    let debut_s = debut_fichier_ms as f64 / 1000.0;
+    match fin_iso_ms {
+        Some(fin) if crate::audio::sacd::est_extension_iso(std::path::Path::new(path)) => {
+            crate::audio::decode::decode_iso_sacd_tranche_streaming(
+                path,
+                sink_tx,
+                LEVELS_DECODE_CHUNK,
+                ready,
+                relais_tx,
+                debut_s,
+                fin as f64 / 1000.0,
+            )
+        }
+        _ => crate::audio::decode::decode_to_pcm_streaming_seeked(
+            path,
+            None,
+            None,
+            None,
+            sink_tx,
+            LEVELS_DECODE_CHUNK,
+            ready,
+            relais_tx,
+            debut_s,
+        ),
+    }
 }
 
 /// Avance maximale du décodage-pour-niveaux d'une session proxy sur la
@@ -1075,6 +1137,55 @@ fn decode_http_stream_for_levels(
     levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
     reported_position_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
 ) -> Result<(), String> {
+    // Pas de timeout total : la connexion vit toute la piste (le débit est
+    // volontairement bridé au rythme de lecture, jamais idle assez longtemps
+    // pour un drop keep-alive CDN).
+    let response = crate::http::client::blocking_builder_pour(&url, "niveaux")
+        .timeout(None)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .and_then(|c| c.get(&url).send())
+        .map_err(|e| format!("levels probe fetch failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("levels probe HTTP error: {}", response.status()));
+    }
+    decode_source_for_levels(response, codec_hint, levels_tx, reported_position_ms)
+}
+
+/// Le décodage-pour-niveaux lui-même, sur une source déjà ouverte : la
+/// réponse HTTP de [`decode_http_stream_for_levels`], ou la prise d'une
+/// session mandataire (#9450, [`crate::http::prise_des_niveaux_9450`]).
+fn decode_source_for_levels<R: std::io::Read + Send + Sync + 'static>(
+    lecture: R,
+    codec_hint: String,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    reported_position_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
+) -> Result<(), String> {
+    decoder_les_niveaux(
+        lecture,
+        codec_hint,
+        levels_tx,
+        reported_position_ms,
+        0,
+        None,
+        None,
+    )
+}
+
+/// Le décodage-pour-niveaux, à partir de `depart_ms` dans la piste (un
+/// recalage de la prise, #9450) ; `duree_ms` reçoit la durée que l'en-tête
+/// annonce, quand il la dit.
+fn decoder_les_niveaux<R: std::io::Read + Send + Sync + 'static>(
+    lecture: R,
+    codec_hint: String,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    reported_position_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    depart_ms: i64,
+    duree_ms: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    // #9450 — un saut signalé par la prise : le décodeur freiné ne lit pas,
+    // il ne verrait jamais le message ; il s'interrompt pour se recaler.
+    interrompre: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), String> {
     use symphonia::core::audio::conv::IntoSample;
     use symphonia::core::codecs::CodecParameters;
     use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -1084,20 +1195,7 @@ fn decode_http_stream_for_levels(
     use symphonia::core::meta::MetadataOptions;
     use tracing::debug;
 
-    // Pas de timeout total : la connexion vit toute la piste (le débit est
-    // volontairement bridé au rythme de lecture, jamais idle assez longtemps
-    // pour un drop keep-alive CDN).
-    let response = crate::http::client::blocking_builder()
-        .timeout(None)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .and_then(|c| c.get(&url).send())
-        .map_err(|e| format!("levels probe fetch failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("levels probe HTTP error: {}", response.status()));
-    }
-
-    let source = ReadOnlySource::new(response);
+    let source = ReadOnlySource::new(lecture);
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
     let mut hint = Hint::new();
     if !codec_hint.is_empty() {
@@ -1130,13 +1228,24 @@ fn decode_http_stream_for_levels(
         .map(|c| c.count() as u16)
         .unwrap_or(2);
     let sample_rate = audio_params.sample_rate.unwrap_or(44100);
+    if let Some(d) = duree_ms.as_ref() {
+        let trames = format
+            .default_track(TrackType::Audio)
+            .and_then(|t| t.num_frames);
+        if let Some(n) = trames.filter(|_| sample_rate > 0) {
+            d.store(
+                (n as i64).saturating_mul(1000) / i64::from(sample_rate),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
 
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("levels probe decoder init failed: {e}"))?;
 
     // Position décodée (référentiel piste) pour le bridage.
-    let mut decoded_ms: i64 = 0;
+    let mut decoded_ms: i64 = depart_ms;
     loop {
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
@@ -1190,6 +1299,12 @@ fn decode_http_stream_for_levels(
             if levels_tx.is_closed() {
                 return Ok(());
             }
+            if interrompre
+                .as_ref()
+                .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Ok(());
+            }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     }
@@ -1208,7 +1323,250 @@ fn decode_http_stream_for_levels(
 /// changé entre-temps, le forwarder adoptait la génération de la NOUVELLE
 /// piste et survivait au lieu de mourir, publiant le PCM de l'ancienne sur
 /// l'horloge de la nouvelle (#1110).
-fn spawn_proxy_levels_probe_task(
+/// D'où la sonde de niveaux tire ses octets.
+pub(crate) enum SourceDesNiveaux {
+    /// Une adresse à ouvrir (CDN d'un épisode, Bandcamp, avance gapless).
+    Url(String),
+    /// #9450 — une session mandataire de Tune : la sonde lit ce que le
+    /// renderer tire, sans ouvrir de connexion. Le lecteur est créé par la
+    /// tâche, avec l'arrêt sur le forwarder.
+    Prise(Arc<AudioStreamer>, String),
+    /// #9450 — la prise garée d'une session pré-armée, reprise à l'avance
+    /// sans blanc ([`crate::http::prise_des_niveaux_9450::garer`]).
+    Garee(crate::http::prise_des_niveaux_9450::LecteurDePrise),
+}
+
+async fn spawn_proxy_levels_probe_task(
+    playback: Arc<PlaybackManager>,
+    bus: Arc<EventBus>,
+    zone_id: i64,
+    source: SourceDesNiveaux,
+    codec_hint: String,
+    play_seq: u64,
+) {
+    // #9450 — branchée ICI, avant le retour : l'appelant n'a pas encore rendu
+    // l'URL au renderer, ses premiers octets passent donc par la prise.
+    let lecteur = match source {
+        SourceDesNiveaux::Url(url) => {
+            sonder_une_adresse(playback, bus, zone_id, url, codec_hint, play_seq);
+            return;
+        }
+        SourceDesNiveaux::Garee(lecteur) => lecteur,
+        SourceDesNiveaux::Prise(streamer, stream_id) => {
+            // Une prise garée (avance sans blanc) se reprend : un nouveau
+            // branchement la remplacerait.
+            if let Some(l) = crate::http::prise_des_niveaux_9450::reprendre(&stream_id) {
+                l
+            } else {
+                match streamer
+                    .brancher_la_prise_des_niveaux(&stream_id, Box::new(|| false))
+                    .await
+                {
+                    Some(l) => l,
+                    None => {
+                        debug!(zone_id, stream_id = %stream_id, "proxy_levels_probe_sans_session");
+                        return;
+                    }
+                }
+            }
+        }
+    };
+    tokio::spawn(sonder_la_prise(
+        playback, bus, zone_id, lecteur, codec_hint, play_seq,
+    ));
+}
+
+/// Le lecteur d'une prise, partagé entre les décodages successifs d'une même
+/// piste (un par recalage).
+struct PartDeLecteur(Arc<std::sync::Mutex<crate::http::prise_des_niveaux_9450::LecteurDePrise>>);
+
+impl std::io::Read for PartDeLecteur {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).read(buf)
+    }
+}
+
+/// #9450 — la sonde d'une prise. Chaque saut du renderer termine le
+/// décodage en cours ; la sonde se RECALE : nouveau décodeur sur « en-tête +
+/// nouvelle position », nouveau forwarder daté de la position estimée
+/// (octet / longueur × durée). Le lecteur voit lui-même la piste remplacée
+/// (`play_seq`, génération des niveaux) : il ne reste jamais garé sur une
+/// prise muette, et le forwarder s'arrête avec lui (canal fermé).
+async fn sonder_la_prise(
+    playback: Arc<PlaybackManager>,
+    bus: Arc<EventBus>,
+    zone_id: i64,
+    lecteur: crate::http::prise_des_niveaux_9450::LecteurDePrise,
+    codec_hint: String,
+    play_seq: u64,
+) {
+    let generation = playback.levels_gen(zone_id);
+    let gen_au_depart = generation.load(std::sync::atomic::Ordering::Relaxed);
+    let piste_remplacee: Arc<dyn Fn() -> bool + Send + Sync> = {
+        let playback = playback.clone();
+        let handle = tokio::runtime::Handle::current();
+        let generation = generation.clone();
+        Arc::new(move || {
+            generation.load(std::sync::atomic::Ordering::Relaxed) != gen_au_depart
+                || handle.block_on(playback.current_play_seq(zone_id)) != play_seq
+        })
+    };
+    let lecteur = Arc::new(std::sync::Mutex::new(lecteur));
+    let duree_ms = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let mut recalages: u32 = 0;
+    loop {
+        let saut = lecteur
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prendre_le_saut();
+        let depart_ms = match saut {
+            None => 0,
+            Some(octet) => {
+                recalages += 1;
+                let total = lecteur.lock().unwrap_or_else(|e| e.into_inner()).total();
+                let mut duree = duree_ms.load(std::sync::atomic::Ordering::Relaxed);
+                if duree <= 0 {
+                    duree = playback
+                        .get_state(zone_id)
+                        .await
+                        .now_playing
+                        .map(|np| np.duration_ms)
+                        .unwrap_or(0);
+                }
+                let entete = lecteur
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .longueur_d_en_tete()
+                    .unwrap_or(0);
+                let depart = position_estimee_ms(
+                    octet.saturating_sub(entete),
+                    total.map(|t| t.saturating_sub(entete)),
+                    duree,
+                );
+                info!(
+                    zone_id,
+                    octet,
+                    depart_ms = depart,
+                    recalages,
+                    "proxy_levels_probe_recalee"
+                );
+                depart
+            }
+        };
+        let (levels_tx, consomme_ms) = spawn_paced_levels_forwarder_mesure(
+            bus.clone(),
+            playback.clone(),
+            zone_id,
+            play_seq,
+            depart_ms,
+        );
+        {
+            let tx = levels_tx.clone();
+            let remplacee = piste_remplacee.clone();
+            lecteur
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .poser_l_arret(Box::new(move || tx.is_closed() || remplacee()));
+        }
+        let reported = Arc::new(std::sync::atomic::AtomicI64::new(depart_ms));
+        lancer_l_echantillonneur(
+            playback.clone(),
+            zone_id,
+            levels_tx.clone(),
+            reported.clone(),
+            consomme_ms,
+            depart_ms,
+        );
+        let part = PartDeLecteur(lecteur.clone());
+        let hint = codec_hint.clone();
+        let duree = duree_ms.clone();
+        let signal = lecteur
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .signal_de_saut();
+        let pour_l_avance = lecteur.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let r = decoder_les_niveaux(
+                part,
+                hint,
+                levels_tx,
+                reported,
+                depart_ms,
+                Some(duree),
+                Some(signal),
+            );
+            // Interrompu au frein sur un saut signalé : rejoindre ce saut.
+            pour_l_avance
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .avancer_jusqu_au_saut();
+            r
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => debug!(zone_id, "proxy_levels_probe_ended"),
+            Ok(Err(e)) => debug!(zone_id, error = %e, "proxy_levels_probe_failed"),
+            Err(e) => debug!(zone_id, error = %e, "proxy_levels_probe_panic"),
+        }
+        let saut_en_attente = lecteur
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .commence_par_un_saut()
+            .is_some();
+        if !saut_en_attente || recalages >= 64 {
+            break;
+        }
+        let remplacee = piste_remplacee.clone();
+        if tokio::task::spawn_blocking(move || remplacee())
+            .await
+            .unwrap_or(true)
+        {
+            break;
+        }
+    }
+}
+
+/// La position, dans la piste, de l'octet `octet` : proportion de la longueur
+/// × durée. 0 quand l'une des deux manque.
+fn position_estimee_ms(octet: u64, total: Option<u64>, duree_ms: i64) -> i64 {
+    match total.filter(|&t| t > 0) {
+        Some(t) if duree_ms > 0 => {
+            ((u128::from(octet.min(t)) * duree_ms as u128) / u128::from(t)) as i64
+        }
+        _ => 0,
+    }
+}
+
+/// L'échantillonneur de position du frein (#3818), commun aux deux sondes.
+fn lancer_l_echantillonneur(
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    probe_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    reported: Arc<std::sync::atomic::AtomicI64>,
+    consomme_ms: Arc<std::sync::atomic::AtomicI64>,
+    depart_ms: i64,
+) {
+    tokio::spawn(async move {
+        while !probe_tx.is_closed() {
+            let state = playback.get_state(zone_id).await;
+            // #3818 — même référence que le puits freiné des fichiers
+            // locaux : une position rapportée figée n'affame plus la
+            // sonde à 30 s d'avance.
+            reported.store(
+                reference_du_frein(
+                    state.position_ms,
+                    depart_ms + consomme_ms.load(std::sync::atomic::Ordering::Relaxed),
+                ),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        }
+    });
+}
+
+/// La sonde d'une adresse extérieure (épisode, Bandcamp, avance gapless sans
+/// prise) : sa propre connexion, comme avant #9450.
+fn sonder_une_adresse(
     playback: Arc<PlaybackManager>,
     bus: Arc<EventBus>,
     zone_id: i64,
@@ -1219,28 +1577,15 @@ fn spawn_proxy_levels_probe_task(
     tokio::spawn(async move {
         let (levels_tx, consomme_ms) =
             spawn_paced_levels_forwarder_mesure(bus, playback.clone(), zone_id, play_seq, 0);
-        let reported = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-
-        let sampler_pos = reported.clone();
-        let sampler_probe_tx = levels_tx.clone();
-        let sampler_playback = playback.clone();
-        tokio::spawn(async move {
-            while !sampler_probe_tx.is_closed() {
-                let state = sampler_playback.get_state(zone_id).await;
-                // #3818 — même référence que le puits freiné des fichiers
-                // locaux : une position rapportée figée n'affame plus la
-                // sonde à 30 s d'avance.
-                sampler_pos.store(
-                    reference_du_frein(
-                        state.position_ms,
-                        consomme_ms.load(std::sync::atomic::Ordering::Relaxed),
-                    ),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-            }
-        });
-
+        let reported = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        lancer_l_echantillonneur(
+            playback,
+            zone_id,
+            levels_tx.clone(),
+            reported.clone(),
+            consomme_ms,
+            0,
+        );
         let result = tokio::task::spawn_blocking(move || {
             decode_http_stream_for_levels(url, codec_hint, levels_tx, reported)
         })
@@ -1453,6 +1798,9 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     pub(crate) radios_refusees: Arc<std::sync::Mutex<HashMap<i64, String>>>,
+    /// #9174 — les zones navigateur dont le lecteur écoute à distance (relais,
+    /// écoute directe) : voir `flux_a_distance_9174`.
+    zones_tirees_a_distance: flux_a_distance_9174::ZonesADistance,
     /// #4598 — l'énumération du parc local menée à la demande, sur le seul
     /// chemin du refus d'une zone locale (`gate_or_rebind_offline_zone`).
     /// Un champ et non un appel direct : les témoins y substituent un parc
@@ -1719,6 +2067,11 @@ struct StreamingDsp {
     /// locale (qui compense par son volume), en PURE, interrupteur coupé, ou
     /// sans égaliseur ni crossfeed.
     compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
+    /// rc14 — le réglage des enceintes (greffon TESS `speaker-setup`) :
+    /// délai, gain et phase par voie, APRÈS tous les autres greffons (dernier
+    /// étage de l'exécuteur), avant la compensation. `None` : réglage absent,
+    /// neutre pour ce flux, PURE ou « Bypass all ».
+    enceintes: Option<crate::audio::reglage_enceintes::ProcesseurEnceintes>,
     /// #4407 — la cadence du PCM que ce porteur voit : de quoi rebâtir un
     /// égaliseur relevé en vol aux bons coefficients.
     sample_rate: u32,
@@ -1743,6 +2096,7 @@ impl StreamingDsp {
             || self.convolver.is_some()
             || self.crossfeed.is_some()
             || self.compensation.is_some()
+            || self.enceintes.is_some()
     }
 
     /// Le crossfeed de ce porteur sera-t-il réellement EXÉCUTÉ ?
@@ -1789,6 +2143,9 @@ impl StreamingDsp {
         if let Some(cf) = self.crossfeed.as_ref() {
             let inerte = if self.channels == 2 { "" } else { "(inerte)" };
             etages.extend(cf.decrire().into_iter().map(|e| format!("{e}{inerte}")));
+        }
+        if self.enceintes.is_some() {
+            etages.push(format!("enceintes@{flux}"));
         }
         if let Some(c) = self.compensation.as_ref() {
             etages.push(format!("compensation:{:+.2}dB@{flux}", c.cible_db()));
@@ -2022,6 +2379,7 @@ impl PlaybackOrchestrator {
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            zones_tirees_a_distance: Default::default(),
             enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
             systeme_du_parc_local: std::env::consts::OS,
             sources_pcm: crate::source_pcm::SourcesPcm::default(),
@@ -2101,6 +2459,9 @@ impl PlaybackOrchestrator {
     pub(crate) const UPSAMPLER_REPLAY_FLOOR_MS: u64 = 1_500;
 }
 
+// Fil 3009, point 15 — l'album de service d'une écoute, repris de la file.
+#[cfg(test)]
+mod album_de_l_ecoute_de_service_3009_tests;
 // #8611 — contrôle parental : refus de lecture des artistes bloqués.
 pub mod artiste_bloque_8611;
 #[cfg(test)]
@@ -2117,9 +2478,16 @@ mod contenu_explicite_8088_tests;
 pub mod ecoute_validee_7852;
 #[cfg(test)]
 mod ecoute_validee_7852_tests;
+// Fil 3094 — un balayage de calibration périmé est écarté, pas rejoué.
+pub mod file_technique_3094;
 // #8076 — FLAC local vers DLNA en PURE : voie servie et échantillons exacts.
 #[cfg(test)]
 mod gapless_dlna_pure_8076_tests;
+// TESS T12b — la famille UPnP : faits du lecteur pour l'état effectif.
+mod acheminement_upnp_t12b;
+#[cfg(test)]
+mod acheminement_upnp_t12b_tests;
+pub use acheminement_upnp_t12b::{PisteEnCours, volume_reglable_retenu};
 // #7965 — radios (au nom de la station) et podcasts dans l'historique.
 mod historique_radio_podcast_7965;
 #[cfg(test)]
@@ -2139,6 +2507,14 @@ mod pause_sans_media_7894_tests;
 mod repli_de_peripherique;
 
 mod resolve_stream;
+// #9174 — une zone navigateur tirée à distance reçoit du FLAC indexé.
+pub mod flux_a_distance_9174;
+#[cfg(test)]
+mod flux_a_distance_9174_tests;
+/// #9174 — la première piste d'une zone tirée à distance part en FLAC ;
+/// index du remux et du ré-encodage sur une piste longue.
+#[cfg(test)]
+mod premiere_piste_a_distance_9174_tests;
 // #7148 — la sentinelle de streaming : résolution et décodage réels, sans son.
 pub mod sentinelle_streaming;
 // #6130 — quitter une radio sur une sortie DLNA : Stop, puis attendre le renderer.
@@ -2208,6 +2584,9 @@ mod crossfeed_bibliotheque_reseau;
 mod compensation_reseau_5071_tests;
 #[cfg(test)]
 mod convolveur_en_flux_7642_tests;
+// rc14 — égaliseurs en série, « Bypass all » complet (retours de Rémi).
+#[cfg(test)]
+mod egaliseurs_en_serie_rc14_tests;
 
 // #4354 — repli à 176,4 kHz d'un DSD décimé qui manque son pré-tampon.
 #[cfg(test)]
@@ -2230,7 +2609,9 @@ mod service_wav_progressif_5080;
 mod service_wav_progressif_openhome_6718;
 
 mod dop_niveau_8813;
+// rc14 — TESS vers le DSD sur la sortie locale (modulateur T11b).
 mod dsp;
+mod modulation_dsd_locale;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
 /// #8968 (PR 0) — banc de mesure de la jointure entre deux pistes.
 #[cfg(test)]
@@ -2302,6 +2683,10 @@ mod pure_reaffectation_6780_tests;
 // 19/11/2026 — un réglage du suréchantillonneur relance le flux tout de suite.
 #[cfg(all(test, feature = "local-audio"))]
 mod surechantillonnage_immediat_tests;
+// rc14 (retour de Rémi, rc13.90) — un changement de chaîne TESS atteint le son
+// à la volée : désactivation effective, reprise = prochaine lecture.
+#[cfg(all(test, feature = "local-audio"))]
+mod tess_a_la_volee_rc14_tests;
 // #7932 — PURE contourne aussi la réaffectation des canaux de l'album joué.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_album_7932_tests;
@@ -2325,6 +2710,15 @@ mod sorties_qui_decodent_le_fichier_9175_tests;
 // #9176 — OAAT ne lit plus le WAV en direct quand la zone traite le flux.
 #[cfg(test)]
 mod oaat_lecture_directe_9176_tests;
+// TESS T12 — faux serveur `/stream` des bancs de bout en bout (vraies sorties).
+#[cfg(test)]
+pub(crate) mod faux_serveur_de_flux_tess;
+// TESS T12a — la chaîne TESS sur OAAT, vérifiée sur un faux récepteur (#9176).
+#[cfg(all(test, feature = "oaat"))]
+mod tess_t12a_oaat_tests;
+// TESS T12c — AirPlay sous la chaîne TESS, sorties hors TESS (Q8).
+#[cfg(test)]
+mod tess_t12c_airplay_tests;
 // Suite de #9175 — saut et reprise de bout en bout avec une vraie sortie Sendspin.
 #[cfg(test)]
 mod sendspin_relance_9175_tests;
@@ -2540,6 +2934,10 @@ mod dst_en_dsf_6221_tests;
 /// réseau, même en DSD « natif » : il passe par le décodeur.
 #[cfg(test)]
 mod dst_jamais_brut_au_renderer_4378_tests;
+/// #9184 — une piste d'ISO SACD vers un renderer qui annonce le DSD part en
+/// DSF virtuel bâti sur la tranche ; mode « pcm » ou sans DSD, en PCM.
+#[cfg(test)]
+mod iso_sacd_dsf_9184_tests;
 
 #[cfg(test)]
 mod mesure_saut_cd_5079;

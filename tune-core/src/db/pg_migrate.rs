@@ -296,6 +296,12 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
 #[cfg_attr(not(test), allow(dead_code))]
 const TABLES_NON_COPIEES: &[(&str, &str)] = &[
     (
+        "jetons_de_renouvellement",
+        "sessions renouvelables (rc14) : créées par le script PG 125 ; après une bascule \
+         de moteur, chaque appareil se reconnecte une fois, comme après un renouvellement \
+         des secrets",
+    ),
+    (
         "sync_releve_pistes_neuf",
         "état courant figé le temps d'une comparaison (#8239) : vide en dehors d'elle",
     ),
@@ -3095,5 +3101,128 @@ mod tests {
             "ajout impossible apres la bascule, sequence non recalee :\n{}",
             ajouts.join("\n")
         );
+    }
+
+    // ── rc14 — premier lancement (retour de Rémi, décision de Bertrand) ────
+    //
+    // Préfixe `pg_bascule_` : l'étape « Bascule SQLite -> PostgreSQL » de
+    // `test-postgres.yml` les exécute avec `TUNE_TEST_PG_URL`.
+
+    async fn reglage_pg(url: &str, cle: &str) -> Option<String> {
+        let mut c = PgConnection::connect(url).await.unwrap();
+        let v: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = $1")
+            .bind(cle)
+            .fetch_optional(&mut c)
+            .await
+            .unwrap();
+        c.close().await.ok();
+        v
+    }
+
+    /// Une base PostgreSQL NEUVE : LRCLIB activé, aucune radio semée.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_rc14_base_pg_neuve_lrclib_active_sans_radios() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_rc14_pg_neuve";
+        let cible = base_jetable(&url, BASE).await;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&cible)
+            .await
+            .unwrap();
+        crate::db::migrations::run_pg_migrations(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("migrations : {e}"));
+        pool.close().await;
+
+        assert_eq!(
+            compte(&cible, "radio_stations").await,
+            0,
+            "aucune radio d'office"
+        );
+        assert_eq!(
+            reglage_pg(&cible, "lyrics_lrclib_enabled").await.as_deref(),
+            Some("true"),
+            "une base neuve naît avec les paroles en ligne activées"
+        );
+        supprimer_base(&url, BASE).await;
+    }
+
+    /// Bascule d'une base SQLite EXISTANTE qui n'a jamais touché la case
+    /// LRCLIB : ses réglages et ses radios passent, et LRCLIB n'est pas forcé.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_rc14_garde_reglages_et_radios_sans_forcer_lrclib() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_rc14_bascule_sans_lrclib";
+        let cible = base_jetable(&url, BASE).await;
+        let sqlite = sqlite_de_depart();
+        sqlite
+            .connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "DELETE FROM settings WHERE key = 'lyrics_lrclib_enabled';
+                 INSERT INTO settings (key, value) VALUES ('music_dirs', '[\"/srv/Musique\"]');
+                 INSERT INTO radio_stations (name, url) VALUES ('Ma station', 'https://exemple.invalid/flux');",
+            )
+            .unwrap();
+
+        migrate_sqlite_to_pg(&sqlite, &cible)
+            .await
+            .unwrap_or_else(|e| panic!("bascule : {e}"));
+
+        assert_eq!(
+            reglage_pg(&cible, "music_dirs").await.as_deref(),
+            Some("[\"/srv/Musique\"]"),
+            "les réglages de l'utilisateur passent"
+        );
+        assert_eq!(
+            compte(&cible, "radio_stations").await,
+            1,
+            "sa radio, et elle seule"
+        );
+        assert_eq!(
+            reglage_pg(&cible, "lyrics_lrclib_enabled").await,
+            None,
+            "une base existante sans réglage ne reçoit PAS LRCLIB d'office"
+        );
+        supprimer_base(&url, BASE).await;
+    }
+
+    /// Un refus LRCLIB posé dans SQLite reste un refus après la bascule.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_rc14_refus_lrclib_conserve() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_rc14_bascule_refus_lrclib";
+        let cible = base_jetable(&url, BASE).await;
+        let sqlite = sqlite_de_depart();
+        sqlite
+            .connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE settings SET value = 'false' WHERE key = 'lyrics_lrclib_enabled'",
+            )
+            .unwrap();
+
+        migrate_sqlite_to_pg(&sqlite, &cible)
+            .await
+            .unwrap_or_else(|e| panic!("bascule : {e}"));
+
+        assert_eq!(
+            reglage_pg(&cible, "lyrics_lrclib_enabled").await.as_deref(),
+            Some("false"),
+            "un choix explicite est respecté"
+        );
+        supprimer_base(&url, BASE).await;
     }
 }

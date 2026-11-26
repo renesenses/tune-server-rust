@@ -9,8 +9,10 @@
 //!
 //! Décision du 29/09 : longueur connue ⇒ `Content-Length` au `HEAD`, comme au
 //! `GET` ; longueur inconnue ⇒ ni `Accept-Ranges` ni `OP=01`. La longueur est
-//! celle que le CDN a rapportée au premier `GET` relayé : aucune requête amont
-//! n'est ajoutée pour le `HEAD`.
+//! celle que le CDN a rapportée au premier `GET` relayé. Depuis #9450, un
+//! `HEAD` qui arrive avant tout `GET` la demande à l'amont par une sonde
+//! `bytes=0-0` (3 s au plus) ; la longueur reste inconnue si l'amont ne répond
+//! pas.
 //!
 //! Le même scénario éprouve la ligne de diagnostic `proxy_get_amont` : statut
 //! et en-têtes du CDN, plage demandée, et AUCUNE URL (l'URL amont est signée).
@@ -20,6 +22,8 @@
 //! Contre-épreuves :
 //! - rendre au `HEAD` son ancienne branche (toujours `Accept-Ranges`/`OP=01`)
 //!   fait tomber l'étape « longueur inconnue » ;
+//! - retirer la sonde `bytes=0-0` du `HEAD` (#9450) fait tomber l'étape
+//!   « HEAD avant tout GET » ;
 //! - retirer `session.noter_longueur_amont(total)` de `proxy_stream` fait
 //!   tomber l'étape « longueur connue ».
 //!
@@ -199,8 +203,18 @@ async fn le_head_mandataire_dit_la_longueur_quand_il_la_sait_et_ne_promet_rien_s
     let id = "mandataire-5050";
     let sessions = session_mandataire(id, amont).await;
 
-    // 1. Longueur inconnue : aucun GET n'a encore rapporté la réponse du CDN.
-    let h = head(&sessions, id).await;
+    // 1. Longueur inconnue : aucun GET n'a rapporté la réponse du CDN, et la
+    //    sonde `bytes=0-0` du HEAD (#9450) ne joint pas l'amont (port fermé).
+    let id_muet = "mandataire-5050-amont-muet";
+    let amont_muet = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!(
+            "http://{}/file/track.flac?{SECRET}",
+            l.local_addr().unwrap()
+        )
+    };
+    let sessions_muettes = session_mandataire(id_muet, amont_muet).await;
+    let h = head(&sessions_muettes, id_muet).await;
     assert_eq!(
         entete(&h, "Accept-Ranges"),
         None,
@@ -212,6 +226,16 @@ async fn le_head_mandataire_dit_la_longueur_quand_il_la_sait_et_ne_promet_rien_s
         "longueur inconnue : pas de DLNA.ORG_OP=01"
     );
     assert_eq!(entete(&h, "Content-Length"), None);
+
+    // 1 bis. HEAD avant tout GET, amont joignable : la sonde `bytes=0-0`
+    //        (#9450) rapporte la longueur, que le HEAD annonce.
+    let h = head(&sessions, id).await;
+    assert_eq!(
+        entete(&h, "Content-Length").as_deref(),
+        Some(TOTAL.to_string().as_str()),
+        "HEAD avant tout GET : la sonde amont doit donner la longueur"
+    );
+    assert_eq!(entete(&h, "Accept-Ranges").as_deref(), Some("bytes"));
 
     // 2. Premier GET relayé (la sonde des VU-mètres, sans Range) : 200 et
     //    Content-Length du CDN ; la ligne de diagnostic le dit, sans URL.

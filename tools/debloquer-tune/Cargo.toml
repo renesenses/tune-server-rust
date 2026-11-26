@@ -1,0 +1,47 @@
+[package]
+name = "debloquer-tune"
+version = "1.0.0"
+edition = "2021"
+description = "Débloque la mise à jour d'un serveur Tune OS en rc12 : active l'authentification puis lance la mise à jour, depuis une page locale."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# HORS du workspace du serveur (table `[workspace]` vide ci-dessous), avec
+# son propre Cargo.lock : c'est un outil de l'utilisateur, posé sur SON
+# ordinateur, pas une pièce du serveur. Même doctrine que tools/moissonneur-roon.
+#
+# Dépendances volontairement minces et SANS TLS : l'outil ne parle qu'à un
+# serveur Tune du réseau local, en HTTP, et à lui seul. Aucune requête vers
+# Internet, aucune télémétrie.
+
+# Table vide : l'outil est SA PROPRE racine de workspace. Le manifeste racine
+# du dépôt n'a donc pas à le lister dans `exclude`, et rien du serveur
+# (`cargo … --workspace`, fmt, clippy) ne le voit.
+[workspace]
+
+[[bin]]
+name = "debloquer-tune"
+path = "src/main.rs"
+
+[lib]
+name = "debloquer_tune"
+path = "src/lib.rs"
+
+[dependencies]
+# Le petit serveur local, sur 127.0.0.1, qui sert la page.
+tiny_http = "0.12"
+# Les appels vers le Tune, partis du binaire (pas du navigateur : aucun CORS).
+ureq = { version = "2.12", default-features = false, features = ["json"] }
+# La découverte `_tune-server._tcp.local.`, même caisse que le serveur.
+mdns-sd = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Le jeton de session de la page locale.
+getrandom = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

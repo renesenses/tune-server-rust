@@ -43,6 +43,16 @@
 //!   elle désigne l'équipe du site, pas le propriétaire d'un serveur.
 //!
 //! D'où [`CLE_PROPRIETAIRE`], posé une fois, à la première liaison.
+//!
+//! # Changer de compte relié
+//!
+//! La déliaison efface l'état de licence mais garde le propriétaire. Sans
+//! autre règle, le compte relié ensuite ne pouvait plus jamais écrire les
+//! modules payants : son profil n'était pas le propriétaire. La propriété
+//! suit donc le nouveau compte dans deux cas seulement, tranchés par
+//! [`le_proprietaire_suit`] : la session authentifiée du propriétaire, ou une
+//! liaison faite par qui peut délier (administrateur, cette machine) alors
+//! qu'aucun compte n'est relié.
 
 use std::sync::Arc;
 
@@ -92,7 +102,7 @@ pub fn proprietaire(settings: &SettingsRepo) -> Option<i64> {
 /// Idempotent : rappelé avec le propriétaire déjà en place, il ne réécrit rien.
 /// Un profil qui n'est pas le propriétaire ne le devient jamais par ce chemin —
 /// changer de propriétaire est une décision explicite, pas un effet de bord
-/// d'une connexion.
+/// d'une connexion : voir [`suivre_le_compte_relie`].
 pub fn revendiquer(settings: &SettingsRepo, profil: i64) -> bool {
     if profil <= 0 {
         return false;
@@ -105,6 +115,75 @@ pub fn revendiquer(settings: &SettingsRepo, profil: i64) -> bool {
             true
         }
     }
+}
+
+/// Qui relie le compte du serveur, vu par la règle de transfert
+/// ([`le_proprietaire_suit`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Relieur {
+    /// Le profil d'une session AUTHENTIFIÉE (authentification active). Sans
+    /// authentification, une session ne prouve rien — le profil `default` s'y
+    /// ouvre sans mot de passe — et ce champ reste vide.
+    pub session_authentifiee: Option<i64>,
+    /// L'appelant a-t-il aussi le droit de DÉLIER le compte du serveur
+    /// (administrateur, ou cette machine sans authentification) ? Jamais vrai
+    /// pour une ronde lancée ou finie depuis le réseau local.
+    pub peut_delier: bool,
+    /// Un compte était-il relié au serveur au moment de la liaison (jeton ou
+    /// identité en base, « reconnexion requise » comprise) ?
+    pub compte_relie: bool,
+}
+
+/// Le propriétaire doit-il passer au profil `nouveau`, celui du compte que
+/// l'on vient de relier ? Le cœur de la règle, sans base de données.
+///
+/// Deux cas, et deux seulement :
+///
+/// 1. **la session authentifiée est celle du propriétaire** : il change
+///    lui-même de compte, la propriété le suit ;
+/// 2. **aucun compte n'est relié, et l'appelant est de ceux qui délient**
+///    (administrateur, ou cette machine) : le compte précédent a été délié,
+///    ce qui a déjà effacé l'état de licence (`clear_account_premium`). Il
+///    n'y a donc plus rien à prendre à personne, et la place se libère pour
+///    le compte suivant.
+///
+/// Tout le reste garde le propriétaire en place : un autre profil qui relie
+/// son compte pendant que celui du propriétaire est relié, ou n'importe quelle
+/// liaison venue du réseau local (qui ne peut pas délier).
+pub fn le_proprietaire_suit(proprietaire: Option<i64>, nouveau: i64, relieur: Relieur) -> bool {
+    if nouveau <= 0 {
+        return false;
+    }
+    let Some(p) = proprietaire else {
+        // Personne de désigné : `revendiquer` s'en charge.
+        return false;
+    };
+    if p == nouveau {
+        return false;
+    }
+    relieur.session_authentifiee == Some(p) || (relieur.peut_delier && !relieur.compte_relie)
+}
+
+/// Applique [`le_proprietaire_suit`] : désigne `nouveau` propriétaire si la
+/// règle le permet. Rend vrai si la propriété a changé de main. À appeler
+/// AVANT [`revendiquer`], qui dira ensuite si `nouveau` pilote la licence.
+pub fn suivre_le_compte_relie(settings: &SettingsRepo, nouveau: i64, relieur: Relieur) -> bool {
+    let ancien = proprietaire(settings);
+    if !le_proprietaire_suit(ancien, nouveau, relieur) {
+        return false;
+    }
+    if settings
+        .set(CLE_PROPRIETAIRE, &nouveau.to_string())
+        .is_err()
+    {
+        return false;
+    }
+    tracing::info!(
+        ancien = ancien.unwrap_or(0),
+        nouveau,
+        "licence_proprietaire_suit_le_compte_relie"
+    );
+    true
 }
 
 /// L'identifiant du profil portant ce courriel.
@@ -386,6 +465,82 @@ mod tests {
             assert_eq!(proprietaire(&s), None, "valeur brute : {brut:?}");
         }
     }
+    // ─────────────────── Changer de compte relié ───────────────────
+
+    fn relieur(session: Option<i64>, peut_delier: bool, compte_relie: bool) -> Relieur {
+        Relieur {
+            session_authentifiee: session,
+            peut_delier,
+            compte_relie,
+        }
+    }
+
+    /// 🔴 Le défaut : le compte précédent a été délié, cette machine relie un
+    /// autre compte. Sans transfert, ce compte n'écrit jamais les modules.
+    #[test]
+    fn apres_deliaison_cette_machine_fait_suivre_la_propriete() {
+        assert!(le_proprietaire_suit(Some(1), 2, relieur(None, true, false)));
+    }
+
+    /// Le propriétaire authentifié change lui-même de compte.
+    #[test]
+    fn le_proprietaire_authentifie_fait_suivre_la_propriete() {
+        assert!(le_proprietaire_suit(
+            Some(1),
+            2,
+            relieur(Some(1), true, true)
+        ));
+    }
+
+    /// La garde d'origine : un compte est relié et l'appelant n'est pas le
+    /// propriétaire authentifié — la propriété ne bouge pas.
+    #[test]
+    fn un_autre_profil_ne_s_empare_pas_du_serveur() {
+        assert!(!le_proprietaire_suit(
+            Some(1),
+            2,
+            relieur(Some(3), true, true)
+        ));
+        assert!(!le_proprietaire_suit(Some(1), 2, relieur(None, true, true)));
+    }
+
+    /// Le réseau local ne délie pas : il ne fait jamais suivre, même sans
+    /// compte relié.
+    #[test]
+    fn le_reseau_local_ne_fait_jamais_suivre() {
+        assert!(!le_proprietaire_suit(
+            Some(1),
+            2,
+            relieur(None, false, false)
+        ));
+    }
+
+    /// Ni profil nul, ni propriétaire absent (c'est `revendiquer`), ni
+    /// réécriture du même.
+    #[test]
+    fn les_cas_sans_objet_ne_font_rien() {
+        let libre = relieur(None, true, false);
+        assert!(!le_proprietaire_suit(Some(1), 0, libre));
+        assert!(!le_proprietaire_suit(Some(1), -1, libre));
+        assert!(!le_proprietaire_suit(None, 2, libre));
+        assert!(!le_proprietaire_suit(Some(2), 2, libre));
+    }
+
+    #[test]
+    fn suivre_le_compte_relie_ecrit_le_nouveau_proprietaire() {
+        let db = base();
+        let s = SettingsRepo::with_backend(db.clone());
+        let a = profil(&db, "a@exemple.test");
+        let b = profil(&db, "b@exemple.test");
+        assert!(revendiquer(&s, a));
+        assert!(!suivre_le_compte_relie(&s, b, relieur(None, true, true)));
+        assert_eq!(proprietaire(&s), Some(a));
+        assert!(suivre_le_compte_relie(&s, b, relieur(None, true, false)));
+        assert_eq!(proprietaire(&s), Some(b));
+        assert!(revendiquer(&s, b), "le nouveau proprietaire pilote");
+        assert!(!revendiquer(&s, a), "l'ancien ne pilote plus");
+    }
+
     /// #7082 : un seul profil, sans courriel -> la liaison s'y rattache.
     #[test]
     fn profil_unique_sans_courriel_est_rattache() {

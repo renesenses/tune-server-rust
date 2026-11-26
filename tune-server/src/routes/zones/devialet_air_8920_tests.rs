@@ -69,7 +69,8 @@ async fn recus(state: &crate::state::AppState, appareil: &str) -> Vec<f64> {
         .await
 }
 
-/// Volume fixe, cadence au-delà de 192 kHz, DSD natif ou « auto » : refusés
+/// Volume fixe, cadence au-delà de 192 kHz, DSD natif, « auto » ou DoP
+/// (débranché, TESS T12c) : refusés
 /// sur Devialet AIR, rien n'est écrit ni envoyé. Contre-épreuve DLNA.
 #[tokio::test]
 async fn air_8920_patch_refuse_volume_fixe_cadence_et_dsd() {
@@ -82,6 +83,8 @@ async fn air_8920_patch_refuse_volume_fixe_cadence_et_dsd() {
         (json!({ "max_sample_rate": 384000 }), "max_sample_rate"),
         (json!({ "dsd_mode": "native" }), "dsd_mode"),
         (json!({ "dsd_mode": "auto" }), "dsd_mode"),
+        // TESS T12c (décision du 17/11) : DoP débranché.
+        (json!({ "dsd_mode": "dop" }), "dsd_mode"),
     ] {
         let (statut, r) = appeler(
             &app,
@@ -102,7 +105,6 @@ async fn air_8920_patch_refuse_volume_fixe_cadence_et_dsd() {
     assert!(recus(&state, AMPLI).await.is_empty(), "rien n'est parti");
     for corps in [
         json!({ "max_sample_rate": 192000 }),
-        json!({ "dsd_mode": "dop" }),
         json!({ "dsd_mode": "pcm" }),
         json!({ "fixed_volume": false }),
     ] {
@@ -127,6 +129,7 @@ async fn air_8920_patch_refuse_volume_fixe_cadence_et_dsd() {
     for corps in [
         json!({ "max_sample_rate": 384000 }),
         json!({ "dsd_mode": "native" }),
+        json!({ "dsd_mode": "dop" }),
     ] {
         let (statut, r) = appeler(
             &app,

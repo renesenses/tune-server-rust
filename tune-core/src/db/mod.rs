@@ -44,6 +44,8 @@ pub mod facet_filter;
 pub mod facettes_classiques;
 pub mod favorite_facets_repo;
 pub mod favorites_reconcile;
+/// Fil 3094 — les lignes de file techniques (balayage de calibration).
+pub mod file_technique_3094;
 /// #5314 — le genre posé sur un album vaut pour ses pistes.
 pub mod genre_album_pistes;
 /// Albums masqués (#1391) — marqueurs réconciliés, sur le modèle des favoris.
@@ -52,6 +54,8 @@ pub mod history_repo;
 pub mod home_queries;
 /// Appareils ignorés (#1280) — faire taire un appareil, pas ses zones.
 pub mod ignored_device_repo;
+/// rc14 — les jetons de renouvellement de session (`POST /auth/refresh`).
+pub mod jetons_de_renouvellement;
 /// Lectures SQLite en cours, pour le relevé d'un gel de l'exécuteur (#5677).
 pub mod lectures_en_cours;
 /// #7619 — la révision de la bibliothèque, clé des caches de lecture (L4, L5).
@@ -141,6 +145,8 @@ pub mod zone_repo;
 #[cfg(test)]
 mod album_dr_provenance_tests;
 #[cfg(test)]
+mod code_barres_si_vide_tests;
+#[cfg(test)]
 mod consentements_redemarrage_8521_tests;
 #[cfg(test)]
 mod ecrivains_pendant_un_lot_de_scan_tests;
@@ -166,6 +172,9 @@ mod miroirs_de_qualite_7694_tests;
 mod notes_et_repartitions_7849_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
+/// Retour de Rémi sur la rc13 : installation neuve sans radios, LRCLIB actif.
+#[cfg(test)]
+mod premier_lancement_rc14_tests;
 #[cfg(test)]
 mod recherche_debut_de_mot_7619_tests;
 /// Discussion #8280 — « À découvrir » varie ses raisons : les requêtes des

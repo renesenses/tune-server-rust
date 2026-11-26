@@ -319,7 +319,10 @@ pub(super) async fn restore(
     // local (`config_backup::import`).
     let mut contenu = contenu;
     let ecartees = ecarter_du_contenu(&state, &mut contenu);
-    let rapport = match sc::restaurer(&state.backend, &contenu, corps.mode) {
+    // rc14 — le profil d'égaliseur et les préréglages suivent la règle de
+    // leurs routes : ce que la licence couvre (`config_export::egaliseurs`).
+    let premium = state.license.check_feature(Feature::ParametricEq).await;
+    let rapport = match sc::restaurer(&state.backend, &contenu, corps.mode, premium) {
         Ok(mut r) => {
             r.warnings.extend(ecartees);
             r

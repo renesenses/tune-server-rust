@@ -36,7 +36,34 @@ nohup cargo test -p tune-server --lib <filtre> > target/x.log 2>&1 &
 | `cargo clippy -p tune-core --lib --tests` | environ 6 min 40 après les tests | |
 | `cargo clippy -p tune-server --tests` | environ 8 min | |
 
+## Banc de cadences sur Windows
+
+Le job `windows-pr` compile et exécute aussi
+`scripts/banc-cadences-windows-8671.rs` avec `rustc --edition 2024 --test`.
+Le banc importe les trois modules de production (formats, masques et cadences)
+et leurs tests ; aucune logique n'est recopiée. Il ne dépend ni d'un compte
+ni d'un périphérique audio. Il vérifie la négociation sur Windows, sans prouver
+l'ouverture d'un pilote réel ni le décodage complet. Les tests Cargo du cœur
+couvrent séparément le décodeur, le mode strict et la fréquence fixe.
+
 ## Lancer peu de tests
+
+### Installeur Windows
+
+`cargo check` pour Windows ne compile pas le script NSIS de livraison.
+`python3 scripts/verifier-installeur-windows.py --makensis /chemin/vers/makensis`
+extrait ce script de `release.yml` et compile ses variantes avec et sans les
+outils facultatifs. Le job `windows-pr` exécute aussi ce banc sur Windows.
+Les fichiers embarqués sont factices ; aucun installeur ni serveur n'est
+exécuté. Le démarrage à l'ouverture de session et les choix de l'utilisateur
+restent à vérifier sur un vrai Windows.
+
+### Filtres et répétitions
+
+- Les fonctionnalités `journal-de-test`, `isolement-disque-de-test` et
+  `services-factices` appartiennent à `tune-core`. Pour reprendre le profil
+  Clippy de la CI avec ces fonctionnalités, sélectionner **les deux** paquets
+  (`-p tune-core -p tune-server`) ; `-p tune-server` seul est refusé par Cargo.
 
 - Filtrer par nom : `cargo test -p tune-core --lib -- <filtre1> <filtre2>`.
 - Répéter un test N fois sans recompiler : `cargo test -p tune-core --lib --no-run`,

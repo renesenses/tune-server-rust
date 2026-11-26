@@ -261,3 +261,135 @@ async fn un_jeton_valide_ouvre_toujours_le_reste_de_l_api() {
         "un jeton admin doit toujours ouvrir l'API"
     );
 }
+
+fn jeton_expire() -> String {
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &tune_server::auth::JwtClaims {
+            sub: "1".into(),
+            iat: 1,
+            exp: 2,
+            role: "user".into(),
+            sid: None,
+        },
+        &jsonwebtoken::EncodingKey::from_secret(b"test-jwt-secret"),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn les_refus_http_9413_conservent_le_message_de_la_couche_auth() {
+    let state = new_state();
+    enable_auth(&state);
+    let app = app(&state, DISTANT);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+
+    for (secret, entete, attendu) in [
+        ("test-jwt-secret", None, "authentication required"),
+        (
+            "test-jwt-secret",
+            Some("ApiKey incorrecte"),
+            "invalid api key",
+        ),
+        ("test-jwt-secret", Some("Bearer invalide"), "invalid token"),
+        ("", Some("Bearer invalide"), "no jwt secret configured"),
+    ] {
+        settings.set("jwt_secret", secret).unwrap();
+        let mut requete = Request::get("/api/v1/library/albums");
+        if let Some(valeur) = entete {
+            requete = requete.header(header::AUTHORIZATION, valeur);
+        }
+        let reponse = app
+            .clone()
+            .oneshot(requete.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(reponse.status(), StatusCode::UNAUTHORIZED);
+        let corps = axum::body::to_bytes(reponse.into_body(), 128)
+            .await
+            .unwrap();
+        assert_eq!(corps.as_ref(), attendu.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn les_justificatifs_de_session_9407_sont_coherents_sur_http_et_ws() {
+    let state = new_state();
+    enable_auth(&state);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings.set("api_key", "cle-du-banc").unwrap();
+    let app = app(&state, DISTANT);
+    let autre_secret = tune_server::auth::sign_jwt(1, "user", "autre-secret-du-banc").unwrap();
+    let valide = tune_server::auth::sign_jwt(1, "user", "test-jwt-secret").unwrap();
+
+    for (cas, valeur, accepte) in [
+        ("JWT valide", format!("Bearer {valide}"), true),
+        ("JWT expiré", format!("Bearer {}", jeton_expire()), false),
+        ("autre secret", format!("Bearer {autre_secret}"), false),
+        ("clé acceptée", "ApiKey cle-du-banc".into(), true),
+        ("clé différente", "ApiKey cle-du-test".into(), false),
+    ] {
+        let req = Request::get("/api/v1/library/albums")
+            .header(header::AUTHORIZATION, valeur)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            tune_server::auth::ws_authorized(&state, req.headers(), None),
+            accepte,
+            "WebSocket : {cas}"
+        );
+        let reponse = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            reponse.status(),
+            if accepte {
+                StatusCode::OK
+            } else {
+                StatusCode::UNAUTHORIZED
+            },
+            "HTTP : {cas}"
+        );
+    }
+
+    let entetes = axum::http::HeaderMap::new();
+    assert!(tune_server::auth::ws_authorized(
+        &state,
+        &entetes,
+        Some(&valide)
+    ));
+    assert!(!tune_server::auth::ws_authorized(
+        &state,
+        &entetes,
+        Some("ApiKey:cle-du-banc")
+    ));
+}
+
+#[tokio::test]
+async fn le_cookie_expire_9407_laisse_le_lecteur_lan_recevoir_le_wav() {
+    let state = new_state();
+    enable_auth(&state);
+    let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tune-core/tests/fixtures/wav/ref_16_44100_stereo.wav");
+    let fichier = wav.to_str().unwrap().to_owned();
+    let id = state
+        .backend
+        .execute_returning_id(
+            "INSERT INTO tracks (title, file_path, format) VALUES ('Témoin audio', ?, 'wav')",
+            &[&fichier],
+        )
+        .unwrap();
+    let url = chemin(&track_audio_url(BASE, id));
+    let requete = || {
+        Request::get(&url)
+            .header(header::COOKIE, format!("tune_session={}", jeton_expire()))
+            .header(header::RANGE, "bytes=0-11")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let lan = app(&state, RENDERER_LAN).oneshot(requete()).await.unwrap();
+    assert_eq!(lan.status(), StatusCode::PARTIAL_CONTENT);
+    let octets = axum::body::to_bytes(lan.into_body(), 12).await.unwrap();
+    assert_eq!(octets.as_ref(), &std::fs::read(wav).unwrap()[..12]);
+    let distant = app(&state, DISTANT).oneshot(requete()).await.unwrap();
+    assert_eq!(distant.status(), StatusCode::UNAUTHORIZED);
+}

@@ -116,15 +116,24 @@ pub fn estimer_le_reste(traitees: i64, restantes: i64, ecoule: Duration) -> Opti
 
 /// Ouvre une campagne si aucune n'est en cours pour cette tâche.
 ///
-/// `compter_les_restants` n'est appelé qu'à l'ouverture : c'est un `COUNT(*)`
-/// qui se paie sur une grosse bibliothèque.
+/// `compter_les_restants` est un `COUNT(*)` qui se paie sur une grosse
+/// bibliothèque : il n'est appelé qu'à l'ouverture, et sur une campagne
+/// ouverte dont le total est épuisé (voir [`recompter_si_epuise`]).
 pub fn ouvrir_si_besoin(tache: Tache, compter_les_restants: impl FnOnce() -> i64) {
-    if ETATS
-        .lock()
-        .map(|e| e.iter().any(|s| s.tache == tache && s.actif))
-        .unwrap_or(true)
-    {
+    let Ok(ouverte) = ETATS.lock().map(|e| {
+        e.iter()
+            .find(|s| s.tache == tache && s.actif)
+            .map(|s| s.traitees >= s.total)
+    }) else {
         return;
+    };
+    match ouverte {
+        Some(true) => {
+            recompter_si_epuise(tache, compter_les_restants);
+            return;
+        }
+        Some(false) => return,
+        None => {}
     }
     let restants = compter_les_restants().max(0);
     let instantane = {
@@ -159,6 +168,38 @@ pub fn ouvrir_si_besoin(tache: Tache, compter_les_restants: impl FnOnce() -> i64
     }
 }
 
+/// #9171 — une campagne ouverte dont toutes les pistes comptées à
+/// l'ouverture sont traitées, mais qui continue : un scan en cours a ajouté
+/// des pistes, qui sont devenues candidates. Le total était figé à
+/// l'ouverture (811 pistes), puis seulement aligné sur le compteur : la jauge
+/// restait à 100 % pendant que le compteur montait (3 314/3 314).
+///
+/// Le total devient `traitées + restantes`, recomptées. Le `COUNT(*)` n'est
+/// payé qu'ici, quand le total est épuisé — au plus une fois par lot —, pas à
+/// chaque lot. Sans piste ajoutée, le lot suivant ne trouve rien et la
+/// campagne se clôt comme avant.
+fn recompter_si_epuise(tache: Tache, compter_les_restants: impl FnOnce() -> i64) {
+    // Compté hors du verrou, que la route prend pour lire l'avancement.
+    let restants = compter_les_restants().max(0);
+    let Ok(mut etats) = ETATS.lock() else {
+        return;
+    };
+    let Some(s) = etats.iter_mut().find(|s| s.tache == tache && s.actif) else {
+        return;
+    };
+    let total = s.traitees + restants;
+    if total > s.total {
+        tracing::info!(
+            tache = tache.id(),
+            traitees = s.traitees,
+            ancien_total = s.total,
+            total,
+            "analyse_de_fond_total_recompte"
+        );
+        s.total = total;
+    }
+}
+
 /// `n` pistes de moins à traiter. Hors campagne : ignoré.
 pub fn avancer(tache: Tache, n: i64) {
     let instantane = {
@@ -170,7 +211,8 @@ pub fn avancer(tache: Tache, n: i64) {
         };
         s.traitees += n.max(0);
         // Un scan a pu ajouter des pistes : un total qui monte vaut mieux
-        // qu'une jauge au-delà de 100 %.
+        // qu'une jauge au-delà de 100 %. Ce n'est qu'un filet entre deux
+        // lots : le vrai total est recompté au lot suivant (#9171).
         if s.traitees > s.total {
             s.total = s.traitees;
         }
@@ -322,5 +364,34 @@ mod tests {
         assert!(!a.active);
         assert_eq!(a.processed, 10, "le compte reste lisible après la fin");
         assert_eq!(a.eta_seconds, None);
+    }
+
+    /// #9171 — un scan ajoute des pistes pendant la campagne : le total
+    /// épuisé est recompté au lot suivant, la jauge n'est pas bloquée à
+    /// 100 % pendant que le compteur monte.
+    #[test]
+    fn un_total_epuise_est_recompte_au_lot_suivant_9171() {
+        // Une tâche qu'aucun autre témoin ne touche (état de processus).
+        let t = Tache::Identification;
+        ouvrir_si_besoin(t, || 40);
+        avancer(t, 40);
+        // 60 pistes ajoutées par le scan, encore à traiter.
+        ouvrir_si_besoin(t, || 60);
+        let a = releve(t).expect("campagne ouverte");
+        assert_eq!(
+            (a.processed, a.total, a.remaining),
+            (40, 100, 60),
+            "le total doit être recompté quand il est épuisé"
+        );
+        // Total non épuisé : pas de nouveau comptage.
+        avancer(t, 25);
+        ouvrir_si_besoin(t, || panic!("ne recompte pas"));
+        avancer(t, 35);
+        // Plus rien d'ajouté : le total reste, la campagne se clôt à 100/100.
+        ouvrir_si_besoin(t, || 0);
+        let a = releve(t).unwrap();
+        assert_eq!((a.processed, a.total, a.remaining), (100, 100, 0));
+        clore(t);
+        assert!(!releve(t).unwrap().active);
     }
 }

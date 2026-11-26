@@ -236,6 +236,18 @@ pub async fn subscribe(
                 )),
             )
         })?;
+    // Fil du forum 3028 — s'abonner à soi-même recopierait toute la
+    // bibliothèque locale en albums `upnp` : refusé avant d'écrire la source.
+    if super::indexation_upnp::est_ce_serveur(&state, &server) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(crate::message_api::corps_refus(
+                "this_server",
+                "api.upnp.thisServer",
+                &[],
+            )),
+        ));
+    }
     let key = serde_json::to_string(&(&udn, &request.container)).map_err(error)?;
     let mut source = sources(state.backend.as_ref())
         .map_err(error)?
@@ -288,17 +300,89 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
             )),
         )
     })?;
-    let mut source = sources(state.backend.as_ref())
+    let trouvee = sources(state.backend.as_ref())
         .map_err(error)?
         .into_iter()
-        .find(|s| s.key == request.key)
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "source inconnue"})),
-            )
-        })?;
+        .find(|s| s.key == request.key);
+    let Some(mut source) = trouvee else {
+        // Fil du forum 3028 — une confirmation de retrait REJOUÉE vise une
+        // source déjà retirée : c'est un conflit, pas une source inconnue.
+        if request.action == "remove" && request.generation.is_some() {
+            return Err(revue_changee());
+        }
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "source inconnue"})),
+        ));
+    };
     match request.action.as_str() {
+        // Fil du forum 3028 — retirer la source ET ses pistes, en deux temps.
+        //
+        // 1. Sans la `generation` de l'aperçu en cours : l'APERÇU, une lecture
+        //    simple. Il est rangé dans la source (`report.removal`), lié à une
+        //    `generation` neuve, et la source passe en `removal`.
+        // 2. Avec cette `generation`, son `count` de pistes, dans l'heure :
+        //    le retrait, en UNE transaction qui relit le plan et refuse (409)
+        //    s'il ne correspond plus exactement à l'aperçu annoncé.
+        //
+        // Les deux temps passent hors de l'exécuteur (#4924).
+        "remove" => {
+            let nous = super::retrait_upnp::NotreAdresse::de(
+                &state,
+                source_vise_ce_serveur(&state, &source.udn).await,
+            );
+            let en_revue = source.status == "removal"
+                && request.generation.as_deref() == Some(source.generation.as_str());
+            if !en_revue {
+                if request.generation.is_some() {
+                    // Une génération qui n'est pas celle de l'aperçu en cours.
+                    return Err(revue_changee());
+                }
+                let annonce = hors_executeur(&state, &source, move |db, s| {
+                    super::retrait_upnp::preparer_le_retrait(db, &s.udn, &nous)
+                })
+                .await
+                .map_err(error)?;
+                source.status = "removal".into();
+                source.generation = uuid::Uuid::new_v4().to_string();
+                source.last_attempt = now_seconds();
+                source.pending.clear();
+                source.report = json!({ "removal": annonce });
+                save(state.backend.as_ref(), &source).map_err(error)?;
+                let mut corps = public(&source);
+                corps["removal"] = source.report["removal"].clone();
+                return Ok(Json(corps));
+            }
+            if now_seconds() - source.last_attempt > 3600 {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(crate::message_api::corps_refus(
+                        "upnp_review_expired",
+                        "api.upnp.reviewExpired",
+                        &[],
+                    )),
+                ));
+            }
+            let compte = request
+                .count
+                .and_then(|n| i64::try_from(n).ok())
+                .ok_or_else(revue_changee)?;
+            let annonce = source.report["removal"].clone();
+            return match hors_executeur(&state, &source, move |db, s| {
+                super::retrait_upnp::retirer_selon_le_plan(db, &s.udn, &nous, &annonce, compte)
+            })
+            .await
+            {
+                Ok(fait) => Ok(Json(json!({
+                    "key": source.key,
+                    "udn": source.udn,
+                    "status": "removed",
+                    "removal": fait,
+                }))),
+                Err(e) if e.starts_with(super::retrait_upnp::PLAN_CHANGE) => Err(revue_changee()),
+                Err(e) => Err(error(e)),
+            };
+        }
         "pause" => {
             source.enabled = false;
         }
@@ -334,7 +418,7 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
                     )),
                 ));
             }
-            let removed = hors_executeur(&state, &source, |db, s| remove_missing(db, s, true))
+            let removed = retirer_et_prevenir(&state, &source, true)
                 .await
                 .map_err(error)?;
             source.report["supprimees"] = json!(removed);
@@ -359,6 +443,18 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
     Ok(Json(result))
 }
 
+/// Fil du forum 3028 — le refus d'une revue qui ne correspond plus.
+fn revue_changee() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(crate::message_api::corps_refus(
+            "upnp_review_changed",
+            "api.upnp.reviewChanged",
+            &[],
+        )),
+    )
+}
+
 /// Le travail SQL d'une source sur le pool de fils bloquants de Tokio (#4924) :
 /// ni la lecture des liens ni le retrait ne tiennent un fil de l'exécuteur.
 async fn hors_executeur<T: Send + 'static>(
@@ -370,6 +466,24 @@ async fn hors_executeur<T: Send + 'static>(
     tokio::task::spawn_blocking(move || f(db.as_ref(), &source))
         .await
         .map_err(|e| format!("tâche de synchronisation perdue : {e}"))?
+}
+
+/// #8832 — invalider les vues seulement après le retrait effectivement validé.
+/// Confirmation et synchronisation automatique passent par le même chemin.
+async fn retirer_et_prevenir(
+    state: &AppState,
+    source: &Source,
+    confirme: bool,
+) -> Result<usize, String> {
+    let removed =
+        hors_executeur(state, source, move |db, s| remove_missing(db, s, confirme)).await?;
+    if removed > 0 {
+        state.event_bus.emit_typed(
+            tune_core::event_types::EventType::LibraryUpdated,
+            json!({"source": "upnp", "source_key": source.key, "removed": removed}),
+        );
+    }
+    Ok(removed)
 }
 
 fn member_ids(tx: &dyn DbTxHandle, key: &str) -> Result<Vec<i64>, String> {
@@ -584,6 +698,46 @@ pub(crate) fn enregistrer_les_membres(
     Ok(MembresDeLaPasse { avant, pending })
 }
 
+/// Fil du forum 3028 — cette source vise-t-elle CE Tune ?
+///
+/// Même calcul que le champ `this_server` de `GET /network/media-servers`
+/// (`discovery_setup::est_ce_serveur`), sur l'annonce la plus fraîche : le
+/// registre en mémoire, sinon le registre durable, sinon l'UDN seul. Un
+/// ancien UDN (base remise à zéro) est donc reconnu par son adresse, si
+/// l'UDN est encore au registre.
+pub(crate) async fn source_vise_ce_serveur(state: &AppState, udn: &str) -> bool {
+    let en_memoire = state.media_servers.lock().await.get(udn).cloned();
+    if let Some(ms) = en_memoire
+        && super::indexation_upnp::est_ce_serveur(state, &ms)
+    {
+        return true;
+    }
+    let enregistres =
+        tune_core::db::media_server_repo::MediaServerRepo::with_backend(state.backend.clone())
+            .lister()
+            .unwrap_or_default();
+    match enregistres.iter().find(|s| s.udn == udn) {
+        Some(s) => crate::discovery_setup::est_ce_serveur(
+            state,
+            &s.udn,
+            s.host.as_deref().unwrap_or_default(),
+            s.port.and_then(|p| u16::try_from(p).ok()).unwrap_or(0),
+            &s.location,
+        ),
+        // UDN absent du registre : l'UDN seul. Un ancien UDN de CE Tune qui a
+        // disparu du registre n'est donc pas reconnu (limite connue, rc15).
+        None => crate::discovery_setup::est_ce_serveur(state, udn, "", 0, ""),
+    }
+}
+
+/// L'état REFUSÉ d'une source qui vise ce Tune : désactivée, sans relance.
+fn refuser_ce_serveur(source: &mut Source) {
+    source.status = "this_server".into();
+    source.enabled = false;
+    source.pending.clear();
+    source.report = super::indexation_upnp::refus_ce_serveur(&source.udn);
+}
+
 async fn run_one(state: AppState, key: String) {
     let _guard = state.upnp_index_lock.lock().await;
     let result = async {
@@ -593,7 +747,16 @@ async fn run_one(state: AppState, key: String) {
         else {
             return Ok::<(), String>(());
         };
-        if !source.enabled || source.status == "confirmation" {
+        if !source.enabled || source.status == "confirmation" || source.status == "removal" {
+            return Ok(());
+        }
+        // Fil du forum 3028 — une source qui vise CE Tune (UDN actuel, ou
+        // ancien UDN annoncé sur nos adresses) est refusée et DÉSACTIVÉE :
+        // plus de relance horaire. Ses pistes restent jusqu'au retrait
+        // (`act`, action `remove`), qui rattache d'abord les liens.
+        if source_vise_ce_serveur(&state, &source.udn).await {
+            refuser_ce_serveur(&mut source);
+            save(state.backend.as_ref(), &source)?;
             return Ok(());
         }
         // A queued duplicate does not run again after the first has finished.
@@ -653,12 +816,14 @@ async fn run_one(state: AppState, key: String) {
             {
                 source.status = "confirmation".into();
             } else {
-                source.report["supprimees"] = json!(
-                    hors_executeur(&state, &source, |db, s| remove_missing(db, s, false)).await?
-                );
+                source.report["supprimees"] =
+                    json!(retirer_et_prevenir(&state, &source, false).await?);
                 source.pending.clear();
                 source.status = "ready".into();
             }
+        } else if source.report["code"] == "this_server" {
+            // Le refus d'`indexer` lui-même : même état que plus haut.
+            refuser_ce_serveur(&mut source);
         } else {
             source.status = if source.report["indexe"] == true {
                 "partial"
@@ -812,3 +977,7 @@ mod identites_upnp_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "piste_upnp_disparue_8832_tests.rs"]
+mod piste_upnp_disparue_8832_tests;

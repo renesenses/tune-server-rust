@@ -1004,3 +1004,686 @@ async fn authentification_comme_les_autres_routes_de_zone_t08() {
         assert_eq!(st, StatusCode::OK, "{m} {uri} {v}");
     }
 }
+
+/// T12b — une zone de la famille UPnP publie la voie de sa chaîne
+/// (`delivery`), conforme au schéma ; une zone locale ne la publie pas.
+/// Rien n'a joué : l'état ne SONDE pas (relecture du 23/11). DLNA et OpenHome
+/// restent `unknown` (aucune réponse mémorisée), donc un crossfeed seul n'y
+/// est pas promis ; BluOS et Chromecast acceptent le LPCM 16 bits par type,
+/// SlimProto le refuse.
+#[tokio::test]
+async fn la_famille_upnp_publie_la_voie_de_sa_chaine_t12b() {
+    for (sortie, appareil, lpcm, voie, crossfeed) in [
+        ("dlna", "uuid:absent-t12b", "unknown", "untouched", false),
+        (
+            "openhome",
+            "uuid:oh-absent-t12b",
+            "unknown",
+            "untouched",
+            false,
+        ),
+        (
+            "bluos",
+            "bluos:absent-t12b",
+            "accepted",
+            "progressive_lpcm",
+            true,
+        ),
+        (
+            "chromecast",
+            "cast:absent-t12b",
+            "accepted",
+            "progressive_lpcm",
+            true,
+        ),
+        (
+            "slimproto",
+            "slim:absent-t12b",
+            "refused",
+            "untouched",
+            false,
+        ),
+    ] {
+        let b = Banc::avec_sortie(true, sortie, appareil).await;
+        let (s, v) = b.get().await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{sortie} {e} : {v}"));
+        assert_eq!(v["delivery"]["route"], json!("untouched"), "{sortie} : {v}");
+        assert_eq!(v["delivery"]["reason"], json!("nothing_to_process"), "{v}");
+        let (s, v) = b
+            .brut(
+                Method::PUT,
+                &format!("/api/v1/zones/{}/dsp", b.zone),
+                Some(
+                    json!({"crossfeed": {"enabled": true, "amount": 0.35, "delay_ms": 0.3}})
+                        .to_string(),
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (_, v) = b.get().await;
+        conforme_au_schema("zone_response", &v).unwrap();
+        assert_eq!(v["delivery"]["route"], json!(voie), "{sortie} : {v}");
+        assert_eq!(
+            v["delivery"]["renderer_lpcm"],
+            json!(lpcm),
+            "{sortie} : {v}"
+        );
+        assert_eq!(
+            etape(&v, "crossfeed")["effective"],
+            json!(crossfeed),
+            "{sortie} : {v}"
+        );
+        if !crossfeed {
+            assert_eq!(
+                etape(&v, "crossfeed")["reason"],
+                json!("renderer_without_lpcm"),
+                "{v}"
+            );
+        }
+    }
+    // Contre-épreuve : une zone locale n'a pas de `delivery`.
+    let b = Banc::nouveau(true).await;
+    let (_, v) = b.get().await;
+    assert!(v.get("delivery").is_none(), "{v}");
+}
+
+/// T12b (relecture de suivi) — un `GET` d'état pendant qu'une LECTURE sonde
+/// un lecteur muet (elle garde le verrou de la sortie pendant la sonde SOAP) :
+/// la route n'attend ni la sonde ni le verrou, et répond en moins d'une
+/// seconde.
+#[tokio::test]
+async fn le_get_d_etat_n_attend_pas_la_sonde_d_une_lecture_t12b() {
+    let muet = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = muet.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut tenues = Vec::new();
+        while let Ok((sock, _)) = muet.accept().await {
+            tenues.push(sock);
+        }
+    });
+    let appareil = "uuid:muet-t12b-route";
+    let b = Banc::avec_sortie(true, "dlna", appareil).await;
+    b.state
+        .outputs
+        .lock()
+        .await
+        .register(Box::new(tune_core::outputs::dlna::DlnaOutput::new(
+            "Lecteur muet".into(),
+            appareil.into(),
+            "127.0.0.1".into(),
+            format!("http://127.0.0.1:{port}/av"),
+            format!("http://127.0.0.1:{port}/rc"),
+            Some(format!("http://127.0.0.1:{port}/cm")),
+        )));
+    // La lecture en parallèle : sa sonde tient le verrou de la sortie.
+    let orch = b.state.orchestrator.clone();
+    let sonde = tokio::spawn(async move { orch.dlna_accepte_lpcm(appareil, false).await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !sonde.is_finished(),
+        "la sonde de lecture doit être en cours"
+    );
+    let t0 = std::time::Instant::now();
+    let (s, v) = tokio::time::timeout(std::time::Duration::from_secs(1), b.get())
+        .await
+        .expect("le GET d'état répond en moins d'une seconde");
+    assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(s, StatusCode::OK, "{v}");
+    conforme_au_schema("zone_response", &v).unwrap();
+    assert_eq!(v["delivery"]["renderer_lpcm"], json!("unknown"), "{v}");
+    sonde.abort();
+}
+
+/// rc14 (GO du 25/11) — les égaliseurs sont COMBINABLES : graphique et
+/// paramétrique cochés ensemble passent (200), restent cochés, et sont tous
+/// deux effectifs. `zone_{id}_eq_profile` (anciennes routes) porte le
+/// premier ; un ancien client qui le lit ou l'écrit ne casse rien. Le groupe
+/// crossfeed, lui, reste exclusif.
+#[tokio::test]
+async fn deux_egaliseurs_coches_passent_et_s_enchainent_rc14() {
+    let b = Banc::nouveau(true).await;
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "equalizer-graphic", "enabled": true, "settings": profil(json!([]))},
+            {"id": "equalizer-parametric", "enabled": true, "settings": profil(bandes_parametriques())}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let c = b.chaine();
+    let coches: Vec<&str> = c
+        .plugins
+        .iter()
+        .filter(|m| m.enabled)
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(coches, ["equalizer-graphic", "equalizer-parametric"]);
+    for id in ["equalizer-graphic", "equalizer-parametric"] {
+        let e = etape(&v, id);
+        assert_eq!(e["effective"], json!(true), "{id} : {e}");
+        assert_eq!(e["reason"], Value::Null, "{id} : {e}");
+    }
+    // Ancien client : `GET /zones/{id}/eq` lit le principal (le graphique,
+    // à plat), et son `POST` le règle sans décocher le paramétrique.
+    let uri = format!("/api/v1/zones/{}/eq", b.zone);
+    let (s, eq) = b.brut(Method::GET, &uri, None, None).await;
+    assert_eq!(s, StatusCode::OK, "{eq}");
+    assert_eq!(eq["bands"], json!([]), "{eq}");
+    let (s, eq) = b
+        .brut(
+            Method::POST,
+            &uri,
+            Some(json!({"enabled": true, "bands": [{"freq": 1000.0, "gain": 2.0, "q": 1.0, "type": "peak"}]}).to_string()),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{eq}");
+    let c = b.chaine();
+    assert!(
+        c.plugins
+            .iter()
+            .any(|m| m.id == "equalizer-parametric" && m.enabled),
+        "{c:?}"
+    );
+    // Le catalogue ne publie plus de groupe « equalizer ».
+    let (_, cat) = b
+        .brut(Method::GET, "/api/v1/tess/catalog", None, None)
+        .await;
+    let groupes = cat["catalog"]["groups"].as_array().unwrap();
+    assert!(
+        !groupes.iter().any(|x| x["id"] == json!("equalizer")),
+        "{cat}"
+    );
+    // Groupe crossfeed inchangé : toujours 409.
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [{"id": "crossfeed", "enabled": true}, {"id": "crosstalk", "enabled": true}]}))
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    refus_conforme(&v, 409, "mutually_exclusive");
+}
+
+/// rc14 — une zone enregistrée sous l'exclusivité du 24/11 (paramétrique
+/// décoché avec `replaced_in_group` vers le graphique) : un compte Premium le
+/// retrouve coché (vue, moteur, puis enregistré au `PUT` suivant) ; un compte
+/// gratuit ne l'entendait pas et ne l'entend toujours pas (revue #9520).
+#[tokio::test]
+async fn une_zone_normalisee_par_l_exclusivite_retrouve_ses_egaliseurs_rc14() {
+    for premium in [true, false] {
+        let b = Banc::nouveau(true).await;
+        let (s, v) = b
+            .put(json!({"version": 1, "plugins": [
+                {"id": "equalizer-graphic", "enabled": true, "settings": profil(json!([]))},
+                {"id": "equalizer-parametric", "enabled": true, "settings": profil(bandes_parametriques())}
+            ]}))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        // La chaîne telle que #9512 l'aurait enregistrée.
+        let mut brute: Value = serde_json::from_str(&b.enregistree().unwrap()).unwrap();
+        for m in brute["plugins"].as_array_mut().unwrap() {
+            if m["id"] == json!("equalizer-parametric") {
+                m["enabled"] = json!(false);
+                m["settings"]["replaced_in_group"] = json!("equalizer-graphic");
+            }
+        }
+        b.settings()
+            .set(&cle_chaine_zone(b.zone), &brute.to_string())
+            .unwrap();
+        b.premium(premium).await;
+        let (_, v) = b.get().await;
+        let p = v["chain"]["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == json!("equalizer-parametric"))
+            .unwrap()
+            .clone();
+        assert_eq!(p["enabled"], json!(premium), "premium={premium} : {p}");
+        let moteur =
+            tune_core::tess::egaliseurs_en_serie::profil_du_moteur(&b.settings(), b.zone, premium);
+        let bandes = moteur.map_or(0, |p| p.bands.len());
+        assert_eq!(bandes, if premium { 2 } else { 0 }, "premium={premium}");
+        if premium {
+            // Renvoyée telle quelle, la vue s'enregistre recochée.
+            let (s, v) = b.put(v["chain"].clone()).await;
+            assert_eq!(s, StatusCode::OK, "{v}");
+            let c = b.chaine();
+            let m = c
+                .plugins
+                .iter()
+                .find(|m| m.id == "equalizer-parametric")
+                .unwrap();
+            assert!(
+                m.enabled && m.settings.get("replaced_in_group").is_none(),
+                "{m:?}"
+            );
+        }
+    }
+}
+
+/// rc14 — bornes de gain publiées au chemin que lit le web, et tenues au
+/// `PUT` : −30 / +15 dB pour le paramétrique et la pièce, −30 / +20 dB pour
+/// le casque (OPRA, #9519), ±12 dB pour le graphique.
+#[tokio::test]
+async fn les_bornes_de_gain_sont_publiees_et_tenues_rc14() {
+    let b = Banc::nouveau(true).await;
+    let (_, cat) = b
+        .brut(Method::GET, "/api/v1/tess/catalog", None, None)
+        .await;
+    let gain = |id: &str| {
+        cat["catalog"]["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == json!(id))
+            .unwrap()["settings_schema"]["properties"]["bands"]["items"]["properties"]["gain"]
+            .clone()
+    };
+    for (id, min, max) in [
+        ("equalizer-parametric", -30.0, 15.0),
+        ("equalizer-headphone", -30.0, 20.0),
+        ("room-correction", -30.0, 15.0),
+        ("equalizer-graphic", -12.0, 12.0),
+    ] {
+        let g = gain(id);
+        assert_eq!(
+            (g["minimum"].as_f64(), g["maximum"].as_f64()),
+            (Some(min), Some(max)),
+            "{id} : {g}"
+        );
+    }
+    let parametrique = |g: f64| {
+        json!({"version": 1, "plugins": [
+            {"id": "equalizer-parametric", "enabled": true,
+             "settings": profil(json!([{"freq": 3000.0, "gain": g, "q": 4.0, "type": "peak"}]))}
+        ]})
+    };
+    let (s, v) = b.put(parametrique(-30.0)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = b.put(parametrique(15.0)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    for g in [-30.5, 15.5] {
+        let avant = b.enregistree();
+        let (s, v) = b.put(parametrique(g)).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{g} : {v}");
+        refus_conforme(&v, 409, "invalid_settings");
+        assert_eq!(b.enregistree(), avant);
+    }
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "equalizer-graphic", "enabled": true,
+             "settings": profil(json!([{"freq": 1000.0, "gain": -13.0, "q": 1.0, "type": "peak"}]))}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    refus_conforme(&v, 409, "invalid_settings"); // #9519 — une correction casque OPRA à +20 dB passe.
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "equalizer-headphone", "enabled": true,
+             "settings": profil(json!([{"freq": 9000.0, "gain": 20.0, "q": 2.0, "type": "peak"}]))}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+/// rc14 — un paquet installé mais désactivé n'est pas « à installer » : il
+/// reste `plugin_unavailable`, sans `install_package`. Désinstallé, il
+/// redevient `plugin_not_installed` avec le paquet à installer.
+#[tokio::test]
+async fn catalogue_distingue_desactive_et_non_installe_rc14() {
+    let b = Banc::nouveau(true).await;
+    let etat = |rep: &Value, id: &str| {
+        rep["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == json!(id))
+            .unwrap()
+            .clone()
+    };
+    let catalogue = || async {
+        let (s, v) = b
+            .brut(Method::GET, "/api/v1/tess/catalog", None, None)
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        conforme_au_schema("catalog_response", &v).unwrap_or_else(|e| panic!("{e} : {v}"));
+        v
+    };
+    // Tout installé et actif : rien à installer.
+    let v = catalogue().await;
+    let eq = etat(&v, "equalizer-graphic");
+    assert_eq!(eq["available"], json!(true), "{eq}");
+    assert!(eq.get("install_package").is_none(), "{eq}");
+
+    b.settings()
+        .set("plugin_equalizer_enabled", "false")
+        .unwrap();
+    let v = catalogue().await;
+    let eq = etat(&v, "equalizer-graphic");
+    assert_eq!(eq["reason"], json!("plugin_unavailable"), "{eq}");
+    assert!(eq.get("install_package").is_none(), "{eq}");
+
+    b.settings()
+        .set("plugin_equalizer_installed", "false")
+        .unwrap();
+    b.settings()
+        .set("plugin_channel-remap_installed", "false")
+        .unwrap();
+    let v = catalogue().await;
+    for (id, paquet) in [
+        ("equalizer-graphic", "equalizer"),
+        ("equalizer-parametric", "equalizer"),
+        ("room-correction", "equalizer"),
+        ("channel-remap", "channel-remap"),
+    ] {
+        let e = etat(&v, id);
+        assert_eq!(e["available"], json!(false), "{e}");
+        assert_eq!(e["reason"], json!("plugin_not_installed"), "{e}");
+        assert_eq!(e["install_package"], json!(paquet), "{e}");
+    }
+    // Ni le crossfeed (installé), ni les greffons natifs tiers, ni le
+    // déclic en direct ne proposent d'installation.
+    for id in ["crossfeed", "crosstalk", "declick-live", "convolution"] {
+        let e = etat(&v, id);
+        assert!(e.get("install_package").is_none(), "{e}");
+        assert_ne!(e["reason"], json!("plugin_not_installed"), "{e}");
+    }
+}
+
+/// rc14 — le web ajoute la convolution cochée avant qu'un fichier soit
+/// choisi (`settings: null`). Ce n'est pas une chaîne invalide : 200, le
+/// maillon est inactif (`no_filter_selected`) et aucun `ir_path_{zone}`
+/// n'est posé. Contre-épreuve : avec un fichier, elle traite.
+#[tokio::test]
+async fn convolution_cochee_sans_fichier_acceptee_et_inactive_rc14() {
+    let b = Banc::nouveau(true).await;
+    let etape_conv = |v: &Value| {
+        v["signal_path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["plugin_id"] == json!("convolution"))
+            .unwrap_or_else(|| panic!("convolution absente du chemin : {v}"))
+            .clone()
+    };
+    let cle_ir = format!("ir_path_{}", b.zone);
+    for reglages in [Value::Null, json!({}), json!({"ir_path": "  "})] {
+        let (s, v) = b
+            .put(json!({"version": 1, "plugins": [
+                {"id": "convolution", "enabled": true, "settings": reglages}
+            ]}))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{reglages} → {v}");
+        conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{e} : {v}"));
+        let e = etape_conv(&v);
+        assert_eq!(e["requested"], json!(true), "{e}");
+        assert_eq!(e["effective"], json!(false), "{e}");
+        assert_eq!(e["reason"], json!("no_filter_selected"), "{e}");
+        assert!(b.settings().get(&cle_ir).unwrap().is_none());
+        // Relu par GET, même chose.
+        let (_, v) = b.get().await;
+        assert_eq!(etape_conv(&v)["reason"], json!("no_filter_selected"));
+    }
+    // Contre-épreuve : un fichier choisi, la convolution traite et le pose.
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "convolution", "enabled": true, "settings": {"ir_path": "/x.wav"}}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let e = etape_conv(&v);
+    assert_eq!(e["effective"], json!(true), "{e}");
+    assert!(e["reason"].is_null(), "{e}");
+    assert_eq!(
+        b.settings().get(&cle_ir).unwrap().as_deref(),
+        Some("/x.wav")
+    );
+}
+
+/// rc14 (relecture) — une zone a déjà `ir_path_{zone}` ; un client envoie la
+/// convolution cochée SANS fichier : la clé est effacée (comme décochée),
+/// sinon le DSP convoluerait encore `/a.wav` pendant que la réponse dit
+/// `no_filter_selected`.
+#[tokio::test]
+async fn convolution_cochee_sans_fichier_efface_l_ancien_ir_rc14() {
+    let cle_ir = |b: &Banc| format!("ir_path_{}", b.zone);
+    for reglages in [Value::Null, json!({}), json!({"ir_path": "  "})] {
+        let b = Banc::nouveau(true).await;
+        let (s, v) = b
+            .put(json!({"version": 1, "plugins": [
+                {"id": "convolution", "enabled": true, "settings": {"ir_path": "/a.wav"}}
+            ]}))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            b.settings().get(&cle_ir(&b)).unwrap().as_deref(),
+            Some("/a.wav")
+        );
+        let (s, v) = b
+            .put(json!({"version": 1, "plugins": [
+                {"id": "convolution", "enabled": true, "settings": reglages}
+            ]}))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{reglages} → {v}");
+        let e = v["signal_path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["plugin_id"] == json!("convolution"))
+            .unwrap()
+            .clone();
+        assert_eq!(e["effective"], json!(false), "{e}");
+        assert_eq!(e["reason"], json!("no_filter_selected"), "{e}");
+        assert!(
+            b.settings().get(&cle_ir(&b)).unwrap().is_none(),
+            "{reglages} : ir_path_{{zone}} encore posé"
+        );
+    }
+}
+
+/// rc14 (Rémi, base neuve) — le moteur `upsampler`, facultatif, n'est pas
+/// installé : l'étage fixe de suréchantillonnage demandé ne traite pas, et
+/// le chemin du signal le dit `plugin_not_installed` avec
+/// `params.install_package = "upsampler"` (avant : annoncé effectif alors
+/// que rien ne suréchantillonnait). Installé, il traite. Désactivé :
+/// `plugin_unavailable`, sans paquet.
+#[tokio::test]
+async fn surechantillonnage_non_installe_propose_l_installation_rc14() {
+    let b = Banc::nouveau(true).await;
+    b.settings()
+        .set("plugin_upsampler_installed", "false")
+        .unwrap();
+    let etape = |v: &Value| {
+        v["signal_path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["code"] == json!("upsampling"))
+            .unwrap()
+            .clone()
+    };
+    let corps =
+        json!({"version": 1, "fixed": {"upsampling": {"mode": "pcm", "filter": "polyvalent"}}});
+    let (s, v) = b.put(corps.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{e} : {v}"));
+    let e = etape(&v);
+    assert_eq!(e["requested"], json!(true), "{e}");
+    assert_eq!(e["effective"], json!(false), "{e}");
+    assert_eq!(e["reason"], json!("plugin_not_installed"), "{e}");
+    assert_eq!(e["params"]["install_package"], json!("upsampler"), "{e}");
+    let (_, v) = b.get().await;
+    assert_eq!(etape(&v)["reason"], json!("plugin_not_installed"));
+
+    // Installé (ce que fait `POST /plugins/upsampler/install`) : il traite.
+    b.settings()
+        .set("plugin_upsampler_installed", "true")
+        .unwrap();
+    let (_, v) = b.get().await;
+    let e = etape(&v);
+    assert_eq!(e["effective"], json!(true), "{e}");
+    assert!(e["reason"].is_null(), "{e}");
+
+    // Installé mais désactivé : indisponible, rien à installer.
+    b.settings()
+        .set("plugin_upsampler_enabled", "false")
+        .unwrap();
+    let (_, v) = b.get().await;
+    let e = etape(&v);
+    assert_eq!(e["reason"], json!("plugin_unavailable"), "{e}");
+    assert!(e["params"].get("install_package").is_none(), "{e}");
+}
+
+/// Revue #9520 (2) — un ancien client ne connaît qu'un égaliseur :
+/// `POST /zones/{id}/eq` `enabled: false` éteint TOUTE la série (le moteur
+/// n'applique plus rien, le `GET` le dit), et `enabled: true` les rallume
+/// toutes ensemble, réglages gardés.
+#[tokio::test]
+async fn revue_9520_ancien_client_eteint_l_egaliseur() {
+    let b = Banc::nouveau(true).await;
+    // Le graphique à plat (curseurs) : la façade qu'une ancienne route relit
+    // comme graphique.
+    let mut graphique = profil(json!([]));
+    graphique["bass_gain_db"] = json!(3.0);
+    let parametrique = profil(bandes_parametriques());
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            {"id": "equalizer-graphic", "enabled": true, "settings": graphique},
+            {"id": "equalizer-parametric", "enabled": true, "settings": parametrique}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let reglages = |c: &ChaineTess, id: &str| {
+        let m = c.plugins.iter().find(|m| m.id == id).unwrap();
+        let mut r = m.settings.clone();
+        if let Some(o) = r.as_object_mut() {
+            o.remove("off_by_legacy_eq");
+        }
+        (m.enabled, r)
+    };
+    let avant = b.chaine();
+    let uri = format!("/api/v1/zones/{}/eq", b.zone);
+    let (s, eq) = b
+        .brut(
+            Method::POST,
+            &uri,
+            Some(json!({"enabled": false}).to_string()),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{eq}");
+    let c = b.chaine();
+    for id in ["equalizer-graphic", "equalizer-parametric"] {
+        assert!(!reglages(&c, id).0, "{id} doit être éteint : {c:?}");
+    }
+    assert!(
+        tune_core::tess::egaliseurs_en_serie::profil_du_moteur(&b.settings(), b.zone, true)
+            .is_none(),
+        "le moteur ne doit plus rien appliquer"
+    );
+    let (_, eq) = b.brut(Method::GET, &uri, None, None).await;
+    assert_eq!(eq["enabled"], json!(false), "{eq}");
+    let (_, v) = b.get().await;
+    for id in ["equalizer-graphic", "equalizer-parametric"] {
+        assert_eq!(etape(&v, id)["effective"], json!(false), "{id}");
+    }
+
+    let (s, eq) = b
+        .brut(
+            Method::POST,
+            &uri,
+            Some(json!({"enabled": true}).to_string()),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{eq}");
+    let apres = b.chaine();
+    for id in ["equalizer-graphic", "equalizer-parametric"] {
+        assert_eq!(reglages(&apres, id), reglages(&avant, id), "{id}");
+    }
+    let p = tune_core::tess::egaliseurs_en_serie::profil_du_moteur(&b.settings(), b.zone, true)
+        .expect("série rallumée");
+    // Les trois curseurs du graphique puis les deux bandes du paramétrique.
+    assert_eq!(p.bands.len(), 5, "{p:?}");
+    let (_, eq) = b.brut(Method::GET, &uri, None, None).await;
+    assert_eq!(eq["enabled"], json!(true), "{eq}");
+}
+
+/// rc14 — le réglage des enceintes (`speaker-setup`) par l'API : publié au
+/// catalogue (gratuit, avant l'upsampling, bornes du schéma), accepté APRÈS
+/// la réaffectation sans Premium, recopié dans `zone_{id}_speaker_setup`,
+/// résolu juste avant l'upsampling ; hors bornes : 409 `invalid_settings`.
+#[tokio::test]
+async fn le_reglage_des_enceintes_par_l_api_rc14() {
+    let b = Banc::nouveau(false).await;
+    let (s, cat) = b
+        .brut(Method::GET, "/api/v1/tess/catalog", None, None)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{cat}");
+    conforme_au_schema("catalog_response", &cat).unwrap_or_else(|e| panic!("{e} : {cat}"));
+    let d = cat["catalog"]["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == json!("speaker-setup"))
+        .expect("speaker-setup au catalogue")
+        .clone();
+    assert_eq!(d["entitlement"], json!("free"));
+    assert_eq!(d["placement"]["position"], json!("before_upsampling"));
+    let voie = &d["settings_schema"]["properties"]["channels"]["items"]["properties"];
+    assert_eq!(voie["gain_db"]["minimum"], json!(-20.0));
+    assert_eq!(voie["gain_db"]["maximum"], json!(10.0));
+    assert_eq!(voie["distance_cm"]["maximum"], json!(2000.0));
+
+    let reglages = json!({ "channels": [
+        { "distance_cm": 343, "gain_db": 0, "invert": false },
+        { "distance_cm": 0, "gain_db": -3, "invert": true }
+    ], "invert_all": false });
+    let (s, v) = b
+        .put(json!({ "version": 1, "plugins": [
+            { "id": "channel-remap", "enabled": false, "settings": null },
+            { "id": "speaker-setup", "enabled": true, "settings": reglages.clone() }
+        ] }))
+        .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "compte gratuit, après la réaffectation : {v}"
+    );
+    conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{e} : {v}"));
+    let cle: Value = serde_json::from_str(
+        &b.settings()
+            .get(&format!("zone_{}_speaker_setup", b.zone))
+            .unwrap()
+            .expect("clé de zone écrite"),
+    )
+    .unwrap();
+    assert_eq!(cle["enabled"], json!(true));
+    assert_eq!(cle["channels"], reglages["channels"]);
+    // Résolu juste avant l'upsampling.
+    let chemin = v["signal_path"].as_array().unwrap();
+    let i = chemin
+        .iter()
+        .position(|e| e["code"] == json!("upsampling"))
+        .unwrap();
+    assert_eq!(chemin[i - 1]["plugin_id"], json!("speaker-setup"));
+    assert_eq!(etape(&v, "speaker-setup")["requested"], json!(true));
+
+    // Hors bornes : refusé, la clé ne bouge pas.
+    let (s, v) = b
+        .put(json!({ "version": 1, "plugins": [
+            { "id": "speaker-setup", "enabled": true,
+              "settings": { "channels": [{ "gain_db": 12 }] } }
+        ] }))
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("invalid_settings"), "{v}");
+    let apres: Value = serde_json::from_str(
+        &b.settings()
+            .get(&format!("zone_{}_speaker_setup", b.zone))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(apres, cle);
+}

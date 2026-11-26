@@ -40,11 +40,16 @@ use tune_calibration::eq::{
 use tune_calibration::target::TargetCurve;
 use tune_core::room_correction::{CorrectionFilter, FilterType, FrequencyPoint, RoomProfile};
 
-/// Bornes dures de la zone de correction.
+/// Bornes dures de la zone de correction. GO de Bertrand (rc13.91) : la
+/// limite haute monte à 1 kHz ; les DÉFAUTS ne bougent pas (300 Hz en un
+/// point, 500 Hz en moyenne), ni les plafonds de coupe.
 pub const F_MIN_HZ: f64 = 20.0;
-pub const F_MAX_HZ: f64 = 500.0;
+pub const F_MAX_HZ: f64 = 1000.0;
 /// Au-delà, une mesure en un seul point ne décrit plus la pièce.
 pub const F_SCHROEDER_HZ: f64 = 300.0;
+/// Limite haute par défaut d'une moyenne de positions ; au-delà, même une
+/// moyenne ne vaut plus que pour la zone mesurée.
+pub const F_MAX_SPATIALE_HZ: f64 = 500.0;
 pub const BANDES_MAX: usize = 10;
 /// Coupe cumulée maximale (dB, positif) de l'égaliseur proposé.
 pub const COUPE_MAX_DB: f64 = 12.0;
@@ -200,6 +205,11 @@ impl DemandeCorrection {
         if f_hi > F_SCHROEDER_HZ && !spatiale {
             avertissements.push(format!(
                 "correction jusqu'à {f_hi} Hz sur une mesure en un point : au-delà de {F_SCHROEDER_HZ} Hz, elle corrige surtout la position du micro"
+            ));
+        }
+        if f_hi > F_MAX_SPATIALE_HZ && spatiale {
+            avertissements.push(format!(
+                "correction jusqu'à {f_hi} Hz : au-delà de {F_MAX_SPATIALE_HZ} Hz, elle ne vaut que pour la zone mesurée autour de la place d'écoute"
             ));
         }
         let bandes = self.bandes_max.unwrap_or(cfg.max_bands);
@@ -479,14 +489,14 @@ mod tests {
                 f_max_hz: Some(2000.0),
                 ..Default::default()
             })
-            .contains("20–500")
+            .contains("20–1000")
         );
         assert!(
             refus(DemandeCorrection {
                 f_min_hz: Some(10.0),
                 ..Default::default()
             })
-            .contains("20–500")
+            .contains("20–1000")
         );
         assert!(
             refus(DemandeCorrection {
@@ -526,6 +536,33 @@ mod tests {
                 ..Default::default()
             })
             .contains("pente")
+        );
+        // GO rc13.91 : jusqu'à 1 kHz, permis, mais dit — en un point comme
+        // en moyenne de positions.
+        let pres = |p: Proposition| p.avertissements.iter().any(|a| a.contains("zone mesurée"));
+        let d1k = DemandeCorrection {
+            f_max_hz: Some(1000.0),
+            ..Default::default()
+        };
+        let p = proposer_positions(&piece(&[(700.0, 6.0, 5.0)]), &d1k, 5).unwrap();
+        assert_eq!(p.zone_hz.1, 1000.0);
+        assert!(
+            p.bandes
+                .iter()
+                .any(|b| (b.freq / 700.0).log2().abs() < 0.15),
+            "{:?}",
+            p.bandes
+        );
+        assert!(pres(p));
+        assert!(!pres(
+            proposer_positions(&m, &DemandeCorrection::default(), 5).unwrap()
+        ));
+        assert!(
+            proposer(&m, &d1k)
+                .unwrap()
+                .avertissements
+                .iter()
+                .any(|a| a.contains("position du micro"))
         );
         // Au-delà de 300 Hz : permis, mais dit.
         let p = proposer(
@@ -604,5 +641,157 @@ mod tests {
         let relu: tune_core::audio::eq::EqProfile = serde_json::from_str(&texte).unwrap();
         assert_eq!(relu.bands.len(), p.bandes.len());
         assert!(profil.measurement_data.unwrap().contains("frequency_hz"));
+    }
+
+    /// Retour de Didier (rc13.90) : « une seule fréquence corrigée », sur
+    /// 1 point comme sur 3. Trois pics, à 50, 120 et 250 Hz : trois bandes,
+    /// une par pic, en un point (20–300 Hz) comme en moyenne de positions
+    /// (20–500 Hz). Avec un GROS pic à 50 Hz (15 dB, au-delà du plafond de
+    /// 12 dB), la bande de 50 Hz se calait sur le plafond et rendait toute
+    /// autre bande infaisable : une seule bande sortait.
+    #[test]
+    fn trois_pics_donnent_trois_bandes_meme_si_l_un_depasse_le_plafond() {
+        let cas = [
+            (
+                "pics modérés",
+                [(50.0, 8.0, 4.0), (120.0, 6.0, 5.0), (250.0, 5.0, 6.0)],
+            ),
+            (
+                "gros pic à 50 Hz",
+                [(50.0, 15.0, 3.0), (120.0, 6.0, 5.0), (250.0, 5.0, 6.0)],
+            ),
+        ];
+        for (nom, modes) in cas {
+            let m = piece(&modes);
+            for positions in [1, 5] {
+                let p = proposer_positions(&m, &DemandeCorrection::default(), positions)
+                    .expect("proposition");
+                assert_eq!(
+                    p.bandes.len(),
+                    3,
+                    "{nom}, {positions} position(s) : {:?}",
+                    p.bandes
+                );
+                for f in [50.0, 120.0, 250.0] {
+                    assert!(
+                        p.bandes.iter().any(|b| (b.freq / f).log2().abs() < 0.15),
+                        "{nom}, {positions} position(s) : pic de {f} Hz non coupé : {:?}",
+                        p.bandes
+                    );
+                }
+                assert!(
+                    p.coupe_cumulee_db >= -COUPE_MAX_DB - 1e-6,
+                    "{nom} : coupe cumulée {} dB",
+                    p.coupe_cumulee_db
+                );
+                assert!(
+                    p.pic_apres_db < 2.0,
+                    "{nom} : pic résiduel {}",
+                    p.pic_apres_db
+                );
+            }
+        }
+    }
+
+    /// Capture de Didier (rc13.90) : « 1 filtre », et la seule différence
+    /// visible autour de 2 kHz. Pic de +12 dB à 50 Hz, pics à 120 et 250 Hz,
+    /// petit pic à 2 kHz : des bandes sur 50, 120 et 250 Hz, aucune hors de
+    /// la zone de correction, aucune à 2 kHz.
+    #[test]
+    fn le_cas_de_didier_corrige_le_grave_et_jamais_2_khz() {
+        let freqs = LogResponse::grid(15.0, 20_000.0, 48);
+        let modes: Vec<Band> = [
+            (50.0, 12.0, 3.0),
+            (120.0, 6.0, 5.0),
+            (250.0, 5.0, 6.0),
+            (2000.0, 5.0, 4.0),
+        ]
+        .iter()
+        .map(|(f, g, q)| Band {
+            freq: *f,
+            gain: *g,
+            q: *q,
+            kind: BandType::Peak,
+            channel: None,
+        })
+        .collect();
+        let db = bands_response_db(CADENCE, &modes, &freqs);
+        let m = LogResponse {
+            magnitude_db: db.iter().map(|d| d + 75.0).collect(),
+            freqs,
+        };
+        for positions in [1, 3] {
+            let p = proposer_positions(&m, &DemandeCorrection::default(), positions).unwrap();
+            for f in [50.0, 120.0, 250.0] {
+                assert!(
+                    p.bandes.iter().any(|b| (b.freq / f).log2().abs() < 0.15),
+                    "{positions} position(s) : {f} Hz non coupé : {:?}",
+                    p.bandes
+                );
+            }
+            assert!(
+                p.bandes
+                    .iter()
+                    .all(|b| b.freq >= p.zone_hz.0 && b.freq <= p.zone_hz.1),
+                "bande hors zone : {:?}",
+                p.bandes
+            );
+            // Et la courbe corrigée ne touche pas 2 kHz.
+            let i = p
+                .courbes
+                .freqs_hz
+                .iter()
+                .position(|f| *f >= 2000.0)
+                .unwrap();
+            assert!(
+                (p.courbes.corrigee_db[i] - p.courbes.mesure_db[i]).abs() < 0.3,
+                "2 kHz modifié"
+            );
+        }
+    }
+
+    /// Capture de Didier (17 h 56, moyenne de positions, 20–500 Hz) : UNE
+    /// bande, 53 Hz −12 dB Q 8,1, et « pic 11.0 dB → 8.1 dB » ; deux bosses
+    /// restaient (100–110 Hz, +8 dB ; 150–220 Hz large, +7 dB). La bande de
+    /// 53 Hz, calée sur le plafond cumulé, rendait toute autre bande
+    /// infaisable. Trois bandes au moins désormais, coupes seulement, plafond
+    /// cumulé respecté, et le pic résiduel nettement plus bas.
+    #[test]
+    fn la_capture_de_didier_corrige_aussi_les_bosses_suivantes() {
+        // +11 dB affiché après lissage 1/6 d'octave : un mode étroit d'environ
+        // +17 dB brut à 53 Hz (Q 8).
+        let m = piece(&[(53.0, 17.0, 8.0), (105.0, 8.0, 5.0), (180.0, 7.0, 1.5)]);
+        for positions in [3, 5] {
+            let p = proposer_positions(&m, &DemandeCorrection::default(), positions).unwrap();
+            assert!(
+                p.bandes.len() >= 3,
+                "{positions} positions : {:?}",
+                p.bandes
+            );
+            for f in [53.0, 105.0, 180.0] {
+                assert!(
+                    p.bandes.iter().any(|b| (b.freq / f).log2().abs() < 0.3),
+                    "{f} Hz non coupé : {:?}",
+                    p.bandes
+                );
+            }
+            assert!(
+                p.bandes.iter().all(|b| b.gain <= 0.0),
+                "relance : {:?}",
+                p.bandes
+            );
+            assert!(p.gain_max_db <= 1e-9);
+            assert!(
+                p.coupe_cumulee_db >= -COUPE_MAX_DB - 1e-6,
+                "coupe cumulée {}",
+                p.coupe_cumulee_db
+            );
+            assert!(
+                p.pic_apres_db < 4.0,
+                "pic résiduel {} dB (8,1 chez Didier) : {:?}",
+                p.pic_apres_db,
+                p.bandes
+            );
+        }
     }
 }

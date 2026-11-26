@@ -285,6 +285,7 @@ impl<'a> EtageNatif<'a> {
             self.pure_bypass,
             self.mono_downmix,
             self.adaptation,
+            self.spec.cadence(),
         ) else {
             // La première sonde 24 bits n'a pas ses 32 trames : les octets
             // restent en quarantaine, aucun mot n'a été produit.

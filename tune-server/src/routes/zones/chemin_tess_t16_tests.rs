@@ -237,6 +237,26 @@ fn zone_hqplayer_hors_tess() {
     assert_eq!(tess["badge"], "outside_tess");
 }
 
+/// TESS T12c (décision du 23/11) — zone HQPlayer avec égaliseur : Tune
+/// applique l'égaliseur (#1216), et le bloc TESS du chemin du signal le dit.
+/// Avant, la zone hors TESS éteignait tous ses greffons (« non appliqué »).
+#[test]
+fn zone_hqplayer_avec_egaliseur_le_bloc_tess_l_annonce_applique_t12c() {
+    let b = base();
+    let z = zone(&b, "hqplayer", "hqp-eq", 100.0);
+    armer_l_eq(&b, z.id.unwrap());
+    let mut ps = en_lecture(OutputDspState::Inactive, OutputVolumeState::Unity);
+    ps.output_signal_path = None;
+    let sp = build_signal_path(&ps, &z, &b, Some("HQPlayer"), "", None).expect("chemin");
+    let tess = chemin_tess_de_la_zone(&b, &z, &ps, &sp, true).unwrap();
+    let g = greffons_effectifs(&tess);
+    assert!(
+        g.iter().any(|id| id.starts_with("equalizer-")),
+        "l'égaliseur appliqué doit être annoncé appliqué : {tess}"
+    );
+    assert_eq!(tess["badge"], "altered_outside_tess", "{tess}");
+}
+
 #[test]
 fn chaine_illisible_pas_de_bloc_plutot_qu_une_chaine_inventee() {
     let b = base();

@@ -8,6 +8,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -44,7 +45,10 @@ pub struct JwtClaims {
 
 /// Durée d'une session ordinaire : 24 h.
 pub const DUREE_SESSION: u64 = 86400;
-/// Durée d'une session « rester connecté » (`"remember": true`) : 30 jours.
+/// Durée d'une session « rester connecté » (`"remember": true`) : 30 jours,
+/// GLISSANTS (rc14) — le jeton d'accès, lui, dure 24 h ([`DUREE_SESSION`]) et
+/// se renouvelle par `POST /auth/refresh` ; chaque renouvellement reporte
+/// l'échéance de la session à 30 jours.
 pub const DUREE_SESSION_LONGUE: u64 = 30 * 86400;
 
 pub fn sign_jwt(user_id: i64, role: &str, secret: &str) -> Result<String, String> {
@@ -226,12 +230,40 @@ fn sessions_longues(settings: &SettingsRepo) -> Vec<(String, SessionLongue)> {
 }
 
 fn effacer_sessions_longues(settings: &SettingsRepo) {
+    revoquer_toutes_les_sessions(settings.backend());
+}
+
+/// rc14 — RÉVOCATION GLOBALE réutilisable : toutes les sessions longues
+/// inscrites (`auth_session_token:*`) et toutes les familles de jetons de
+/// renouvellement ; les WebSocket ouvertes avec une session se ferment.
+///
+/// ⚠️ À appeler par tout chemin qui change `jwt_secret` ou un mot de passe
+/// administrateur hors des routes de ce module — en particulier la
+/// récupération de l'accès administrateur (#9564, `poser_le_mot_de_passe`),
+/// qui change le secret en SQL direct : elle doit exécuter
+/// `tune_core::db::jetons_de_renouvellement::revoquer_toutes_les_sessions_tx`
+/// DANS SA TRANSACTION (la PR fusionnée en second branche l'appel).
+pub fn revoquer_toutes_les_sessions(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    let settings = SettingsRepo::with_backend(backend.clone());
     for (cle, _) in settings
         .par_prefixe(PREFIXE_SESSION_LONGUE)
         .unwrap_or_default()
     {
         settings.delete(&cle).ok();
     }
+    crate::session_renouvelee::revoquer_tout(backend);
+}
+
+/// Désinscrit UNE session : son inscription (ses jetons d'accès ne valent
+/// plus rien) et sa famille de jetons de renouvellement (rc14). Les
+/// WebSocket ouvertes avec elle se ferment.
+fn oublier_session(settings: &SettingsRepo, sid: &str) {
+    settings
+        .delete(&format!("{PREFIXE_SESSION_LONGUE}{sid}"))
+        .ok();
+    crate::session_renouvelee::revoquer_famille(settings.backend(), sid);
 }
 
 /// Vérifie un jeton de session : signature et échéance, puis, pour une
@@ -242,8 +274,20 @@ pub fn verifier_jeton(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
 ) -> Result<JwtClaims, String> {
     let claims = verify_jwt(token, secret)?;
+    verifier_session(&claims, backend)?;
+    Ok(claims)
+}
+
+/// La session d'un jeton (son `sid`) vit-elle encore : inscrite, non échue,
+/// même compte, même rôle, même mot de passe ? Un jeton sans `sid` (session
+/// ordinaire) n'a rien à vérifier ici. Sert aussi aux WebSocket ouvertes
+/// (rc14), dont le jeton peut avoir expiré depuis la poignée de main.
+pub fn verifier_session(
+    claims: &JwtClaims,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Result<(), String> {
     let Some(sid) = claims.sid.as_deref() else {
-        return Ok(claims);
+        return Ok(());
     };
     let settings = SettingsRepo::with_backend(backend.clone());
     let session = settings
@@ -252,6 +296,9 @@ pub fn verifier_jeton(
         .flatten()
         .and_then(|v| serde_json::from_str::<SessionLongue>(&v).ok())
         .ok_or_else(|| "session revoked".to_string())?;
+    if session.expires_at <= maintenant_unix() {
+        return Err("session expired".to_string());
+    }
     let user_id = claims.sub.parse::<i64>().unwrap_or(-1);
     if session.user_id != user_id || session.role != claims.role {
         return Err("session revoked".to_string());
@@ -261,7 +308,21 @@ pub fn verifier_jeton(
     if empreinte != session.empreinte || (claims.role == "admin" && !is_admin) {
         return Err("session revoked".to_string());
     }
-    Ok(claims)
+    Ok(())
+}
+
+/// La signature seule, sans l'échéance : pour retrouver, à la déconnexion, la
+/// session d'un jeton d'accès déjà expiré. Jamais pour autoriser.
+fn verify_jwt_signature_seule(token: &str, secret: &str) -> Option<JwtClaims> {
+    let mut validation = Validation::default();
+    validation.validate_exp = false;
+    jsonwebtoken::decode::<JwtClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .ok()
+    .map(|data| data.claims)
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +391,93 @@ fn get_or_create_jwt_secret(settings: &SettingsRepo) -> String {
 // Middleware — auth layer applied to the API router
 // ---------------------------------------------------------------------------
 
+/// Méthodes de lecture : `get(...)` d'axum sert aussi HEAD.
+const LECTURE: &[&str] = &["GET", "HEAD"];
+
+/// La liste publique : les routes que la couche d'authentification laisse
+/// passer SANS jeton quand `auth_enabled = true` (hors exemption DIDL, qui
+/// dépend aussi de l'adresse de l'appelant et reste dans le middleware, et
+/// hors passerelle des sources réseau, plus bas).
+///
+/// **Correspondance exacte** : chemin tel que la couche le voit sans le
+/// préfixe `/api/v1`, et méthodes admises. Une route voisine (même préfixe,
+/// segment de plus) n'hérite JAMAIS de l'ouverture : `/system/health` est
+/// publique, `/system/health/monitor` demande un jeton. Ouvrir une route,
+/// c'est l'écrire ici en entier — et l'épreuve
+/// `auth_liste_publique_tests::tableau_des_routes_publiques_du_routeur` le
+/// montre.
+///
+/// Chaque entrée est une poignée de main documentée :
+///
+/// * `/system/health`, `/system/version` : sondes de vie (le `HEALTHCHECK`
+///   des images Docker vise `/system/health`) et découverte du serveur ;
+/// * `/system/peer-info` (GET) : la poignée de main entre deux serveurs Tune.
+///   L'autre bout l'appelle sans jeton (`fetch_peer_info`, admin.rs) et n'a
+///   aucun moyen d'en obtenir un. Surface étroite et délibérée : nom choisi
+///   par l'utilisateur, version, nombre de pistes, nombre de zones — ni
+///   music_dirs, ni IP, ni chemin, ni réglage. Un POST homonyme futur n'en
+///   hérite pas ;
+/// * `/cloud/sso/callback` (GET) : seul le retour du SSO est public (A5), le
+///   navigateur y revient de mozaiklabs.fr ; `authorize`, `status` et
+///   `disconnect` demandent une session ;
+/// * `/auth/login`, `/auth/refresh`, `/auth/logout` (POST), `/auth/config` et
+///   `/auth/activation` (GET, lecture de l'état seulement). Le reste de
+///   `/auth/` — inscription (seul un administrateur crée des comptes une fois
+///   l'authentification active), émission de jeton, clé d'API, écriture de la
+///   configuration, code d'activation — porte un jeton valide pour que le
+///   gestionnaire exige le rôle administrateur.
+///
+/// Ce qui n'y est volontairement PAS :
+///
+/// * `/system/profile` (fiche support) : elle expose music_dirs et l'IP LAN,
+///   trop large pour un appel anonyme. N'importe quel rôle authentifié la lit ;
+/// * `/system/stats`, `/system/health/monitor`, `/system/health/alerts` :
+///   mémoire, disque, alertes — l'écran qui les lit a une session ;
+/// * `/ws` : monté à la racine, hors de `/api/v1`, il ne passe pas par cette
+///   couche (`WsAuthorized` y fait le contrôle).
+pub(crate) const LISTE_PUBLIQUE: &[(&str, &[&str])] = &[
+    ("/system/health", LECTURE),
+    ("/system/version", LECTURE),
+    ("/system/peer-info", &["GET"]),
+    ("/cloud/sso/callback", &["GET"]),
+    ("/auth/login", &["POST"]),
+    ("/auth/refresh", &["POST"]),
+    ("/auth/logout", &["POST"]),
+    ("/auth/config", &["GET"]),
+    ("/auth/activation", &["GET"]),
+];
+
+/// Le chemin tel que la liste publique l'écrit : sans le préfixe `/api/v1`.
+///
+/// Les deux graphies arrivent ici, parce que cette couche enveloppe le
+/// routeur `api`, lui-même imbriqué sous `/api/v1` : que le préfixe soit
+/// encore sur l'URI dépend des rouages d'imbrication d'axum, et le contrôle
+/// ne doit pas cesser de mordre en silence si cela change.
+fn chemin_sans_prefixe_api(path: &str) -> &str {
+    match path.strip_prefix("/api/v1") {
+        Some(reste) if reste.starts_with('/') => reste,
+        _ => path,
+    }
+}
+
+/// La route `(method, path)` passe-t-elle la couche d'authentification sans
+/// jeton ? Voir [`LISTE_PUBLIQUE`].
+///
+/// Sortie du middleware pour qu'une épreuve puisse la confronter aux sondes
+/// qui vivent hors du code Rust — le `HEALTHCHECK` des images Docker en tête.
+pub(crate) fn est_route_publique(method: &axum::http::Method, path: &str) -> bool {
+    let chemin = chemin_sans_prefixe_api(path);
+    let lecture = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
+    LISTE_PUBLIQUE
+        .iter()
+        .any(|(public, methodes)| *public == chemin && methodes.contains(&method.as_str()))
+        // #8189 — la passerelle des sources réseau : un renderer n'a pas
+        // de session. Le gestionnaire exige le jeton signé, propre au
+        // fichier et de courte durée ; GET et HEAD seulement. Forme exacte
+        // `/sources-reseau/{id}/fichier`, rendue par le module lui-même.
+        || (lecture && crate::routes::sources_reseau::est_route_passerelle(path))
+}
+
 pub async fn auth_middleware(
     State(state): State<AppState>,
     mut request: Request,
@@ -347,67 +495,14 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    // Allow unauthenticated access to health, version, auth, and ws endpoints.
-    //
-    // These are *substring* matches, so any path segment an extension controls
-    // could otherwise smuggle itself into the allowlist: a plugin named `auth`
-    // (mounted at /ext/auth/…) or any plugin route containing `/auth/` would
-    // read as public and skip the token check entirely. Plugin namespaces are
-    // never public — settle that before the allowlist gets a chance to match.
-    //
-    // Both spellings are tested because this middleware layers the `api`
-    // router, which is itself nested under /api/v1: whether the prefix is
-    // still on the URI here depends on axum's nesting internals, and this
-    // check must not silently stop working if that changes.
+    // La liste publique (correspondance exacte, voir `LISTE_PUBLIQUE`).
+    // Les espaces des greffons (`/ext/…`) n'y figurent jamais : l'exemption
+    // DIDL plus bas les écarte aussi explicitement.
     let path = request.uri().path();
     let method = request.method().clone();
     let is_extension_route = path.starts_with("/ext/") || path.starts_with("/api/v1/ext/");
 
-    // Public allowlist. Health/version/ws/sso stay open. For /auth/ we no
-    // longer blanket-public the whole namespace (the old `contains("/auth/")`):
-    // the privileged endpoints — /auth/token, /auth/api-key, POST /auth/config —
-    // MUST require a valid admin token even when auth is enabled, otherwise
-    // enabling auth is defeated (an anonymous caller could mint a year-long JWT,
-    // rotate the API key, or turn auth back off). Only the genuinely-public
-    // handshakes are listed; everything else falls through to the token check.
-    if !is_extension_route
-        && (path.contains("/system/health")
-            || path.contains("/system/version")
-            // NB : /system/profile (fiche support) n'est volontairement PAS
-            // dans cette allowlist : la fiche expose music_dirs et l'IP LAN,
-            // trop large pour un appel anonyme quand l'auth est activée. Elle
-            // requiert donc un token — n'importe quel rôle, pas de RequireAdmin :
-            // l'écran Support est consulté par un utilisateur authentifié,
-            // jamais de façon anonyme.
-            // /system/peer-info EST public, et il doit l'etre : c'est la
-            // poignee de main entre deux serveurs Tune. Un serveur protege
-            // etait jusqu'ici IMPOSSIBLE a ajouter comme pair — l'autre bout
-            // appelle cette route sans jeton (fetch_peer_info, admin.rs), et
-            // il n'a aucun moyen d'en obtenir un.
-            //
-            // Contrairement a /system/profile juste au-dessus, la surface est
-            // etroite et delibere : nom choisi par l'utilisateur, version,
-            // nombre de pistes, nombre de zones. Ni music_dirs, ni IP, ni
-            // chemin de fichier, ni reglage. C'est ce qu'un serveur affiche
-            // deja de lui-meme dans la liste « serveurs du reseau » d'en face.
-            //
-            // GET seulement : la route est en lecture, et un POST homonyme
-            // futur ne doit pas heriter de cette ouverture.
-            || (method == axum::http::Method::GET
-                && (path == "/system/peer-info" || path == "/api/v1/system/peer-info"))
-            // Seul le retour du SSO est public (A5) : chemin exact, GET. Le
-            // navigateur y revient de mozaiklabs.fr ; `authorize`, `status`
-            // et `disconnect` demandent une session (le cookie la porte).
-            || (method == axum::http::Method::GET
-                && (path == "/cloud/sso/callback" || path == "/api/v1/cloud/sso/callback"))
-            || path == "/ws"
-            // #8189 — la passerelle des sources réseau : un renderer n'a pas
-            // de session. Le gestionnaire exige le jeton signé, propre au
-            // fichier et de courte durée ; GET et HEAD seulement.
-            || ((method == axum::http::Method::GET || method == axum::http::Method::HEAD)
-                && crate::routes::sources_reseau::est_route_passerelle(path))
-            || is_public_auth_route(&method, path))
-    {
+    if est_route_publique(&method, path) {
         return next.run(request).await;
     }
 
@@ -444,6 +539,14 @@ pub async fn auth_middleware(
         && (method == axum::http::Method::GET || method == axum::http::Method::HEAD)
         && tune_core::upnp_server::est_ressource_didl(path)
         && appelant_sur_le_reseau_local(&request)
+        // Un appelant qui porte un jeton VALIDE (le cookie de session du
+        // navigateur, qu'une balise `<img>` envoie d'elle-même) n'est pas un
+        // renderer : il passe par le contrôle de jeton ci-dessous, comme
+        // n'importe quelle requête authentifiée. Sans cela, le client web du
+        // LAN entrait par l'exemption et le relais de pochettes lui exigeait
+        // une signature qu'il n'a jamais portée. Un jeton absent ou invalide
+        // garde l'exemption telle qu'elle était.
+        && !porte_un_jeton_valide(&request, &settings)
     {
         // #4260 : le gestionnaire du relais de pochettes doit savoir que
         // l'appel est entré SANS jeton, par cette exemption — il exige alors
@@ -455,36 +558,69 @@ pub async fn auth_middleware(
     // Extract token from Authorization header or tune_session cookie
     let token = extract_token_from_request(&request);
 
-    match token {
-        Some(tok) if tok.starts_with("ApiKey:") => {
-            // API key auth
-            let key = &tok[7..];
-            let stored = settings.get("api_key").ok().flatten().unwrap_or_default();
-            if !stored.is_empty() && key == stored {
-                next.run(request).await
-            } else {
-                (StatusCode::UNAUTHORIZED, "invalid api key").into_response()
-            }
-        }
-        Some(tok) => {
-            let secret = match settings.get("jwt_secret").ok().flatten() {
-                Some(s) if !s.is_empty() => s,
-                _ => return (StatusCode::UNAUTHORIZED, "no jwt secret configured").into_response(),
-            };
-            match verifier_jeton(&tok, &secret, &state.backend) {
-                Ok(claims) => {
-                    let user_id = claims.sub.parse::<i64>().unwrap_or(0);
-                    request.extensions_mut().insert(AuthUser {
-                        user_id,
-                        role: claims.role,
-                    });
-                    next.run(request).await
-                }
-                Err(_) => (StatusCode::UNAUTHORIZED, "invalid token").into_response(),
-            }
-        }
-        None => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+    let Some(tok) = token else {
+        return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+    };
+    let Some(user) = valider_jeton(&tok, &settings) else {
+        let message = if tok.starts_with("ApiKey:") {
+            "invalid api key"
+        } else if settings
+            .get("jwt_secret")
+            .ok()
+            .flatten()
+            .is_none_or(|s| s.is_empty())
+        {
+            "no jwt secret configured"
+        } else {
+            "invalid token"
+        };
+        return (StatusCode::UNAUTHORIZED, message).into_response();
+    };
+    // Seul le JWT porte l’identité d’un profil utilisable par les extracteurs.
+    if !tok.starts_with("ApiKey:") {
+        request.extensions_mut().insert(user);
     }
+    next.run(request).await
+}
+
+pub(crate) fn cle_api_valide(cle: &str, settings: &SettingsRepo) -> bool {
+    let Some(attendue) = settings
+        .get("api_key")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    // Comparer des empreintes de longueur fixe, même si les clés ont des tailles différentes.
+    let recue = Sha256::digest(cle.as_bytes());
+    let configuree = Sha256::digest(attendue.as_bytes());
+    bool::from(recue.ct_eq(&configuree))
+}
+
+fn valider_jeton(tok: &str, settings: &SettingsRepo) -> Option<AuthUser> {
+    if let Some(cle) = tok.strip_prefix("ApiKey:") {
+        return cle_api_valide(cle, settings).then(|| AuthUser {
+            user_id: 0,
+            role: "api-key".into(),
+        });
+    }
+    let secret = settings
+        .get("jwt_secret")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())?;
+    // #9445 — un jeton de session (`sid`) ne vaut que tant que sa session
+    // est inscrite et que le compte n'a pas changé.
+    let claims = verifier_jeton(tok, &secret, settings.backend()).ok()?;
+    Some(AuthUser {
+        user_id: claims.sub.parse().unwrap_or(0),
+        role: claims.role,
+    })
+}
+
+fn porte_un_jeton_valide(request: &Request, settings: &SettingsRepo) -> bool {
+    extract_token_from_request(request).is_some_and(|tok| valider_jeton(&tok, settings).is_some())
 }
 
 /// Marqueur posé sur la requête quand elle est entrée par l'exemption DIDL
@@ -549,22 +685,6 @@ fn adresse_locale(ip: std::net::IpAddr) -> bool {
             v6.is_loopback() || (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
         }
     }
-}
-
-/// The only /auth/ endpoints reachable without a token when auth is enabled:
-/// login, logout, and the read-only config *status* (GET /auth/config).
-/// Everything else in the auth router — registration (only an
-/// administrator creates accounts once auth is on), token minting, API-key
-/// generation/read, and mutating the auth config — must carry a valid token so
-/// the handler can enforce the admin role.
-fn is_public_auth_route(method: &axum::http::Method, path: &str) -> bool {
-    use axum::http::Method;
-    path.ends_with("/auth/login")
-        || path.ends_with("/auth/logout")
-        || (method == Method::GET && path.ends_with("/auth/config"))
-        // L'écran d'activation lit seulement l'état (activée ou non, appel de
-        // cette machine ou non).
-        || (method == Method::GET && path.ends_with("/auth/activation"))
 }
 
 /// When auth is enabled, require the caller to present a valid admin token.
@@ -661,36 +781,42 @@ pub fn ws_authorized(
     if !auth_enabled {
         return true;
     }
+    ws_session(state, headers, query_token).is_some()
+}
 
-    let jwt_secret = settings
-        .get("jwt_secret")
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty());
-
-    // Header- or cookie-borne credential (Bearer JWT or ApiKey).
-    if let Some(tok) = extract_token_from_headers(headers) {
-        if let Some(key) = tok.strip_prefix("ApiKey:") {
-            let stored = settings.get("api_key").ok().flatten().unwrap_or_default();
-            if !stored.is_empty() && key == stored {
-                return true;
-            }
-        } else if let Some(secret) = &jwt_secret
-            && verifier_jeton(&tok, secret, &state.backend).is_ok()
-        {
-            return true;
-        }
-    }
-
-    // Query-param JWT (browser WebSocket can't set an Authorization header).
-    if let (Some(tok), Some(secret)) = (query_token, &jwt_secret)
-        && !tok.is_empty()
-        && verifier_jeton(tok, secret, &state.backend).is_ok()
+/// La poignée de main d'une WebSocket, authentification active : `None` si
+/// elle est refusée, sinon les revendications du JWT de SESSION qui l'a
+/// ouverte (`Some(None)` : clé d'API, cookie ou jeton sans `sid`).
+///
+/// rc14 — une WebSocket ouverte n'est PAS coupée à l'expiration de son jeton
+/// d'accès (24 h) : la poignée de main l'a authentifiée. Elle se ferme
+/// seulement quand SA session cesse de valoir ([`verifier_session`]) :
+/// déconnexion, révocation, mot de passe changé, compte supprimé ou
+/// rétrogradé. Voir `routes/ws.rs`.
+pub fn ws_session(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    query_token: Option<&str>,
+) -> Option<Option<JwtClaims>> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let session = |tok: &str| -> Option<JwtClaims> {
+        let secret = settings.get("jwt_secret").ok().flatten()?;
+        verify_jwt(tok, &secret).ok().filter(|c| c.sid.is_some())
+    };
+    if let Some(tok) = extract_token_from_headers(headers)
+        && valider_jeton(&tok, &settings).is_some()
     {
-        return true;
+        return Some(if tok.starts_with("ApiKey:") {
+            None
+        } else {
+            session(&tok)
+        });
     }
-
-    false
+    // Le paramètre du handshake accepte uniquement un JWT.
+    query_token
+        .filter(|tok| !tok.is_empty() && !tok.starts_with("ApiKey:"))
+        .filter(|tok| valider_jeton(tok, &settings).is_some())
+        .map(session)
 }
 
 // ---------------------------------------------------------------------------
@@ -712,45 +838,30 @@ impl FromRequestParts<AppState> for AuthUser {
         // Otherwise, try to extract directly (for routes outside the middleware layer)
         let settings = SettingsRepo::with_backend(state.backend.clone());
 
-        let secret = settings
+        let token = extract_token_from_headers(&parts.headers);
+        if let Some(tok) = token.as_deref()
+            && !tok.starts_with("ApiKey:")
+            && let Some(user) = valider_jeton(tok, &settings)
+        {
+            return Ok(user);
+        }
+        let message = if settings
             .get("jwt_secret")
             .ok()
             .flatten()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({"error": "authentication not configured"})),
-                )
-            })?;
-
-        let token = extract_token_from_headers(&parts.headers).ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "authentication required"})),
-            )
-        })?;
-
-        // Skip ApiKey tokens for the extractor
-        if token.starts_with("ApiKey:") {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "API key auth not supported for this endpoint, use JWT"})),
-            ));
-        }
-
-        let claims = verifier_jeton(&token, &secret, &state.backend).map_err(|_| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "invalid or expired token"})),
-            )
-        })?;
-
-        let user_id = claims.sub.parse::<i64>().unwrap_or(0);
-        Ok(AuthUser {
-            user_id,
-            role: claims.role,
-        })
+            .is_none_or(|s| s.is_empty())
+        {
+            "authentication not configured"
+        } else {
+            match token.as_deref() {
+                None => "authentication required",
+                Some(tok) if tok.starts_with("ApiKey:") => {
+                    "API key auth not supported for this endpoint, use JWT"
+                }
+                Some(_) => "invalid or expired token",
+            }
+        };
+        Err((StatusCode::UNAUTHORIZED, Json(json!({"error": message}))))
     }
 }
 
@@ -1126,46 +1237,308 @@ impl FromRequestParts<AppState> for AdminOuCetteMachine {
         if appel_depuis_cette_machine(parts, state).await {
             return Ok(AdminOuCetteMachine);
         }
-        let appelant = adresse_de_l_appelant(parts, state)
-            .await
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let relaye = crate::garde_du_relais::requete_relayee(&parts.headers);
-        let relais_port_80 = !crate::routes::appliance::bouclage_fiable();
-        let mandataire = derriere_un_mandataire(&parts.headers);
-        tracing::warn!(
-            chemin = %parts.uri.path(),
-            %appelant,
-            relaye,
-            relais_port_80,
-            mandataire,
-            "action_machine_refusee_hors_de_cette_machine_sans_authentification"
-        );
-        // Le refus dit ce que le serveur a vu : l'exploitant comprend tout de
-        // suite pourquoi « depuis cette machine » n'a pas été reconnu.
-        let (motif, message) = if relais_port_80 {
-            (
-                "port80_relay",
-                "This appliance relays port 80 to the server from 127.0.0.1, so a local \
-                 call cannot be told apart from the network: enable authentication and \
-                 sign in as an administrator (or rebuild the Tune OS image).",
-            )
-        } else {
-            (
-                "not_local",
-                "This action requires authentication to be enabled, or a call from this \
-                 machine (localhost).",
-            )
-        };
-        Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
+        Err(refus_action_reservee(parts, state, Refus::HorsDeCetteMachine).await)
+    }
+}
+
+/// Pourquoi une action réservée a été refusée : choisit la phrase rendue.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refus {
+    /// Ni administrateur, ni appel de cette machine.
+    HorsDeCetteMachine,
+    /// Installation d'une mise à jour sans authentification, appel venu
+    /// d'ailleurs que du réseau local (accès à distance, mandataire, VPN).
+    HorsDuReseauLocal,
+    /// Liaison du compte mozaiklabs.fr sans authentification, appel venu
+    /// d'ailleurs que du réseau local.
+    CompteHorsDuReseauLocal,
+}
+
+/// L'action que nomme le refus, d'après le chemin appelé : la clé de son
+/// libellé dans `i18n_server.json` (`api.machine.action.<clé>`).
+pub fn action_du_chemin(chemin: &str) -> &'static str {
+    let c = chemin.to_ascii_lowercase();
+    if c.contains("/cloud/sso") {
+        "account"
+    } else if c.contains("/update/channel") {
+        "updateChannel"
+    } else if c.contains("/update") {
+        "update"
+    } else if c.contains("/reboot") || c.contains("/restart") {
+        "restart"
+    } else if c.contains("/shutdown") {
+        "shutdown"
+    } else if c.contains("backup") || c.contains("restore") {
+        "backup"
+    } else if c.contains("/support") {
+        "support"
+    } else if c.contains("/cloud") {
+        "remote"
+    } else if c.contains("plugin") {
+        "extensions"
+    } else {
+        "other"
+    }
+}
+
+/// Le refus d'une action réservée : une phrase lisible, dans la langue de
+/// l'interface (`Accept-Language`, repli anglais), qui dit QUELLE action,
+/// POURQUOI, et COMMENT faire. Le client web affiche `message` tel quel.
+async fn refus_action_reservee(
+    parts: &mut Parts,
+    state: &AppState,
+    refus: Refus,
+) -> (StatusCode, Json<Value>) {
+    let appelant = adresse_de_l_appelant(parts, state)
+        .await
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let relaye = crate::garde_du_relais::requete_relayee(&parts.headers);
+    let relais_port_80 = !crate::routes::appliance::bouclage_fiable();
+    let mandataire = derriere_un_mandataire(&parts.headers);
+    let chemin = parts
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| parts.uri.path().to_string());
+    tracing::warn!(
+        chemin = %chemin,
+        %appelant,
+        relaye,
+        relais_port_80,
+        mandataire,
+        hors_du_reseau_local = refus != Refus::HorsDeCetteMachine,
+        "action_machine_refusee_hors_de_cette_machine_sans_authentification"
+    );
+    // Le refus dit ce que le serveur a vu : l'exploitant comprend tout de
+    // suite pourquoi « depuis cette machine » n'a pas été reconnu.
+    let (motif, cle) = match refus {
+        Refus::HorsDuReseauLocal => ("not_local_network", "api.machine.reservedOutsideLan"),
+        Refus::CompteHorsDuReseauLocal => {
+            ("not_local_network", "api.machine.reservedOutsideLanAccount")
+        }
+        Refus::HorsDeCetteMachine if relais_port_80 => {
+            ("port80_relay", "api.machine.reservedPort80Relay")
+        }
+        Refus::HorsDeCetteMachine => ("not_local", "api.machine.reservedNotLocal"),
+    };
+    let lang = crate::i18n::lang_from_header(&parts.headers);
+    let action_cle = action_du_chemin(&chemin);
+    let action = crate::i18n::t(&lang, &format!("api.machine.action.{action_cle}"));
+    (
+        StatusCode::FORBIDDEN,
+        Json(crate::message_api::avec_message_en(
+            json!({
                 "error": "auth_required",
+                "code": "auth_required",
                 "reason": motif,
-                "message": message,
+                "action": action_cle,
                 "caller": appelant,
                 "relayed": relaye,
-            })),
+            }),
+            &lang,
+            cle,
+            &[("action", action)],
+        )),
+    )
+}
+
+/// Adresse du RÉSEAU LOCAL : privée IPv4 (RFC 1918), lien local IPv4
+/// (169.254/16), unique locale IPv6 (fc00::/7), lien local IPv6 (fe80::/10),
+/// et leurs formes IPv4 d'une socket à double pile. PAS le partage
+/// d'adresses 100.64/10 (CGNAT, Tailscale) : c'est un accès à distance.
+pub fn adresse_du_reseau_local(ip: std::net::IpAddr) -> bool {
+    let v4_local = |v4: std::net::Ipv4Addr| v4.is_private() || v4.is_link_local();
+    match ip {
+        std::net::IpAddr::V4(v4) => v4_local(v4),
+        std::net::IpAddr::V6(v6) => {
+            let premier = v6.segments()[0];
+            (premier & 0xfe00) == 0xfc00
+                || (premier & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(v4_local)
+        }
+    }
+}
+
+/// L'appel vient-il du RÉSEAU LOCAL ? Mêmes critères que la garde d'hôte et
+/// d'origine (`garde_origine`), et jamais :
+///
+/// - une requête rejouée par le relais cloud ou l'écoute directe ;
+/// - une requête passée par un mandataire inverse (en-têtes, HTTP/1.0, ou
+///   mandataire déclaré par `TUNE_ALLOWED_ORIGINS` / `TUNE_ALLOWED_HOSTS`) ;
+/// - une adresse hors réseau local (Internet, CGNAT/Tailscale).
+///
+/// Le bouclage n'est accepté ici que sur une appliance Tune OS dont le relais
+/// du port 80 rouvre depuis 127.0.0.1 les connexions du réseau local
+/// (`appliance::bouclage_fiable` faux) : c'est exactement ce qu'il relaie.
+/// Ailleurs, le bouclage relève de [`appel_depuis_cette_machine`].
+async fn appel_depuis_le_reseau_local(parts: &mut Parts, state: &AppState) -> bool {
+    if crate::garde_du_relais::requete_relayee(&parts.headers) {
+        return false;
+    }
+    if parts.version == axum::http::Version::HTTP_10 {
+        return false;
+    }
+    if derriere_un_mandataire(&parts.headers) {
+        return false;
+    }
+    if !crate::garde_origine::hote_de_la_requete_accepte(&parts.headers) {
+        return false;
+    }
+    if !matches!(
+        crate::garde_origine::juger(&parts.method, &parts.headers),
+        crate::garde_origine::Verdict::Acceptee
+    ) {
+        return false;
+    }
+    let Some(ip) = adresse_de_l_appelant(parts, state).await else {
+        return false;
+    };
+    if adresse_de_cette_machine(ip) {
+        return !crate::routes::appliance::bouclage_fiable();
+    }
+    adresse_du_reseau_local(ip)
+}
+
+/// Garde de la SEULE installation d'une mise à jour officielle
+/// (`POST /system/update/install`).
+///
+/// - Authentification active : l'administrateur, comme [`AdminOuCetteMachine`].
+/// - Authentification coupée : un appel de cette machine, ou du RÉSEAU LOCAL
+///   ([`appel_depuis_le_reseau_local`]), à condition que la vérification de
+///   signature des mises à jour soit armée (clé minisign embarquée). La route
+///   ne prend aucune URL ni aucune version de l'appelant : elle installe la
+///   release officielle choisie par le vérificateur, après contrôle de la
+///   signature de `SHA256SUMS`.
+///
+/// Les autres actions de machine (redémarrer, éteindre, extensions, accès à
+/// distance, sauvegardes, canal de mise à jour) restent sous
+/// [`AdminOuCetteMachine`].
+pub struct AdminOuReseauLocalPourLaMiseAJour;
+
+impl FromRequestParts<AppState> for AdminOuReseauLocalPourLaMiseAJour {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if authentification_active(state) {
+            return <RequireAdmin as FromRequestParts<AppState>>::from_request_parts(parts, state)
+                .await
+                .map(|_| Self);
+        }
+        if appel_depuis_cette_machine(parts, state).await {
+            return Ok(Self);
+        }
+        if crate::routes::system::update::mise_a_jour_signee_exigee()
+            && appel_depuis_le_reseau_local(parts, state).await
+        {
+            tracing::info!("mise_a_jour_acceptee_depuis_le_reseau_local_sans_authentification");
+            return Ok(Self);
+        }
+        Err(refus_action_reservee(parts, state, Refus::HorsDuReseauLocal).await)
+    }
+}
+
+/// Garde de la LIAISON du compte mozaiklabs.fr du serveur
+/// (`GET /cloud/sso/authorize` et son retour `GET /cloud/sso/callback`), même
+/// règle que la mise à jour ([`AdminOuReseauLocalPourLaMiseAJour`]). La
+/// DÉLIAISON reste sous [`AdminOuCetteMachine`] (décision du 23/11) :
+///
+/// - authentification active : l'administrateur (un compte standard relie son
+///   propre profil, voir `routes::cloud::liaison_autorisee`) ;
+/// - authentification coupée : cette machine, ou le RÉSEAU LOCAL
+///   ([`appel_depuis_le_reseau_local`]) ; jamais le relais distant, un
+///   mandataire inverse ni une adresse hors réseau local.
+///
+/// Décision du 23/11 (option C) : depuis le réseau local, la liaison relie un
+/// serveur sans compte, ou reconnecte le MÊME compte ; remplacer le compte
+/// relié par un autre reste à cette machine ou à l'administrateur. Le compte
+/// n'est connu qu'après l'échange du code : la garde dit seulement par où
+/// l'appel est passé (`par_le_reseau_local`), et `routes::cloud` juge au
+/// retour, juste avant d'enregistrer la session ([`refus_compte_deja_relie`]).
+///
+/// La ronde OAuth garde ses propres verrous (PKCE, `state` à usage unique,
+/// `redirect_uri` mémorisée).
+pub struct AdminOuReseauLocalPourLeCompte {
+    /// Vrai quand seul le réseau local a ouvert la garde (ni administrateur,
+    /// ni cette machine).
+    pub par_le_reseau_local: bool,
+}
+
+impl FromRequestParts<AppState> for AdminOuReseauLocalPourLeCompte {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let admin_ou_machine = Self {
+            par_le_reseau_local: false,
+        };
+        if authentification_active(state) {
+            return <RequireAdmin as FromRequestParts<AppState>>::from_request_parts(parts, state)
+                .await
+                .map(|_| admin_ou_machine);
+        }
+        if appel_depuis_cette_machine(parts, state).await {
+            return Ok(admin_ou_machine);
+        }
+        if appel_depuis_le_reseau_local(parts, state).await {
+            tracing::info!("compte_accepte_depuis_le_reseau_local_sans_authentification");
+            return Ok(Self {
+                par_le_reseau_local: true,
+            });
+        }
+        Err(refus_action_reservee(parts, state, Refus::CompteHorsDuReseauLocal).await)
+    }
+}
+
+/// Refus de LIER depuis le réseau local, sans authentification, un AUTRE
+/// compte mozaiklabs.fr que celui déjà relié au serveur (décision du 23/11) :
+/// le remplacer reste à cette machine ou à l'administrateur. Motif `account_already_linked`,
+/// phrase `api.machine.accountAlreadyLinked` dans la langue de l'interface.
+pub fn refus_compte_deja_relie(entetes: &axum::http::HeaderMap) -> (StatusCode, Json<Value>) {
+    tracing::warn!("liaison_du_compte_refusee_depuis_le_reseau_local_compte_deja_relie");
+    let lang = crate::i18n::lang_from_header(entetes);
+    (
+        StatusCode::FORBIDDEN,
+        Json(crate::message_api::avec_message_en(
+            json!({
+                "error": "auth_required",
+                "code": "auth_required",
+                "reason": "account_already_linked",
+                "action": "account",
+            }),
+            &lang,
+            "api.machine.accountAlreadyLinked",
+            &[],
+        )),
+    )
+}
+
+/// Extracteur infaillible, même règle que [`AdminOuReseauLocalPourLeCompte`]
+/// sans rejet ni trace : `GET /cloud/sso/status` montre le compte relié
+/// (nom, courriel, photo) à qui peut le relier. Sans authentification, un
+/// appareil du réseau local voit donc le compte du serveur, et le menu du
+/// compte (photo de profil comprise) fonctionne ; le relais distant et les
+/// mandataires n'en voient toujours que « relié ».
+#[derive(Debug, Clone, Copy)]
+pub struct ReliePourLeCompteDuReseauLocal(pub bool);
+
+impl FromRequestParts<AppState> for ReliePourLeCompteDuReseauLocal {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if admin_ou_cette_machine(parts, state).await {
+            return Ok(Self(true));
+        }
+        Ok(Self(
+            !authentification_active(state) && appel_depuis_le_reseau_local(parts, state).await,
         ))
     }
 }
@@ -1178,6 +1551,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/register", post(register))
         .route("/login", post(login))
+        .route("/refresh", post(refresh))
         .route("/logout", post(logout))
         .route("/me", get(me))
         .route("/token", post(create_token))
@@ -1432,6 +1806,23 @@ fn session_cookie_pour(token: &str, headers: &axum::http::HeaderMap, duree: u64)
     }
 }
 
+/// Le refus de connexion : `error` inchangé (les clients le comparent) et un
+/// `message` lisible dans la langue de la requête, que le web affiche.
+/// Le même, que le compte existe ou non.
+fn refus_identifiants(headers: &axum::http::HeaderMap) -> Response {
+    let lang = crate::i18n::lang_from_header(headers);
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(crate::message_api::avec_message_en(
+            json!({"error": "invalid credentials", "code": "invalid_credentials"}),
+            &lang,
+            "api.auth.invalidCredentials",
+            &[],
+        )),
+    )
+        .into_response()
+}
+
 async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -1479,20 +1870,24 @@ async fn login(
         Some(r) => r,
         None => {
             record_login_failure(ip, operateur);
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "invalid credentials"})),
-            )
-                .into_response();
+            return refus_identifiants(&headers);
         }
     };
 
-    // A `default` profile with no password hash is claimable on first login
-    // (the provided password is persisted as the hash below — trust-on-first-use).
-    // That must never be reachable from the network once auth is enabled, or an
-    // attacker could seize the admin account before the operator sets a password.
-    // Allow it only when auth is disabled (the server is fully open anyway) or the
-    // request comes from loopback (the local operator performing first setup).
+    // Un compte n'est « sans mot de passe » que si AUCUN hachage n'est
+    // enregistré, ni l'ancien (SHA-256) ni le nouveau (argon2). Dès qu'il en a
+    // un, seul ce mot de passe ouvre la session, sur cette machine comme
+    // ailleurs.
+    let ancien_hachage = old_hash.as_deref().filter(|h| !h.is_empty());
+    let nouveau_hachage = new_hash.as_deref().filter(|h| !h.is_empty());
+    let sans_mot_de_passe = ancien_hachage.is_none() && nouveau_hachage.is_none();
+
+    // A `default` profile with no password hash at all is claimable on first
+    // login (the provided password is persisted as the hash below —
+    // trust-on-first-use). That must never be reachable from the network once
+    // auth is enabled. Allow it only when auth is disabled (the server is fully
+    // open anyway) or the request comes from loopback (the local operator
+    // performing first setup).
     let auth_enabled = settings
         .get("auth_enabled")
         .ok()
@@ -1500,59 +1895,33 @@ async fn login(
         .map(|v| v == "true")
         .unwrap_or(false);
     let passwordless_default_allowed = !auth_enabled || operateur;
+    let premiere_connexion =
+        sans_mot_de_passe && body.username == "default" && passwordless_default_allowed;
 
     // Try argon2 hash first (password_hash_v2), then fall back to SHA-256 (password_hash)
-    let valid_v2 = if let Some(ref h) = new_hash {
-        if !h.is_empty() {
-            verify_password(&body.password, h)
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let valid_v2 = nouveau_hachage.is_some_and(|h| verify_password(&body.password, h));
+    let valid_ancien = !valid_v2
+        && ancien_hachage
+            .is_some_and(|h| format!("{:x}", Sha256::digest(body.password.as_bytes())) == h);
 
-    let valid = if valid_v2 {
-        true
-    } else if let Some(ref h) = old_hash {
-        if !h.is_empty() {
-            // Legacy SHA-256 check
-            let provided_hash = format!("{:x}", Sha256::digest(body.password.as_bytes()));
-            provided_hash == *h
-        } else {
-            // No password set — allow login for the default profile (loopback/first-run only)
-            body.username == "default" && passwordless_default_allowed
-        }
-    } else {
-        // No password set — allow login for the default profile (loopback/first-run only)
-        body.username == "default" && passwordless_default_allowed
-    };
-
-    if !valid {
+    if !(valid_v2 || valid_ancien || premiere_connexion) {
         record_login_failure(ip, operateur);
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "invalid credentials"})),
-        )
-            .into_response();
+        return refus_identifiants(&headers);
     }
     clear_login_failures(ip);
 
-    // If logged in with old SHA-256 hash, upgrade to argon2. Le profil
-    // `default` sans mot de passe n'est réclamé (mot de passe enregistré) que
-    // par l'opérateur de cette machine : depuis le réseau, authentification
-    // coupée, la session est ouverte mais le compte administrateur n'est pas
-    // pris.
-    let ancien_hachage = old_hash.as_deref().is_some_and(|h| !h.is_empty());
-    if !valid_v2
-        && valid
-        && (ancien_hachage || operateur)
+    // Ce qui s'enregistre : l'ancien hachage converti en argon2 (puis effacé), seulement
+    // après sa vérification ; ou le premier mot de passe du compte `default`
+    // sans mot de passe, saisi par l'opérateur de cette machine (depuis le
+    // réseau, authentification coupée, la session est ouverte mais le compte
+    // n'est pas pris). Jamais rien d'autre.
+    if (valid_ancien || (premiere_connexion && operateur))
         && let Ok(upgraded) = hash_password(&body.password)
     {
         state
             .backend
             .execute(
-                "UPDATE profiles SET password_hash_v2 = ? WHERE id = ?",
+                "UPDATE profiles SET password_hash_v2 = ?, password_hash = NULL WHERE id = ?",
                 &[&upgraded as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
             )
             .ok();
@@ -1560,11 +1929,10 @@ async fn login(
 
     let role = if is_admin { "admin" } else { "user" };
     let secret = get_or_create_jwt_secret(&settings);
-    let duree = if body.remember {
-        DUREE_SESSION_LONGUE
-    } else {
-        DUREE_SESSION
-    };
+    // rc14 — le jeton d'accès dure toujours 24 h. « Rester connecté » inscrit
+    // en plus une session de 30 jours glissants et rend son jeton de
+    // renouvellement (`POST /auth/refresh`).
+    let duree = DUREE_SESSION;
     let sid = if body.remember {
         let sid = uuid::Uuid::new_v4().simple().to_string();
         let empreinte = etat_du_compte(&state.backend, profile_id)
@@ -1598,9 +1966,7 @@ async fn login(
         du_compte.sort_by_key(|(_, s)| (s.created_at, s.ordre));
         let en_trop = (du_compte.len() + 1).saturating_sub(MAX_SESSIONS_LONGUES_PAR_COMPTE);
         for (ancien, _) in du_compte.iter().take(en_trop) {
-            settings
-                .delete(&format!("{PREFIXE_SESSION_LONGUE}{ancien}"))
-                .ok();
+            oublier_session(&settings, ancien);
         }
         if let Err(e) = inscrire_session_longue(&settings, &sid, &session) {
             return (
@@ -1626,15 +1992,35 @@ async fn login(
 
     let cookie = session_cookie_pour(&token, &headers, duree);
 
-    let mut response = Json(json!({
+    let mut corps = json!({
         "token": token,
         "token_type": "Bearer",
         "expires_in": duree,
         "username": body.username,
         "user_id": profile_id,
         "role": role,
-    }))
-    .into_response();
+    });
+    // rc14 — la famille de renouvellement de la session, même identifiant.
+    if let Some(sid) = sid.as_deref() {
+        let client = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok());
+        match tune_core::db::jetons_de_renouvellement::JetonsDeRenouvellementRepo::with_backend(
+            state.backend.clone(),
+        )
+        .ouvrir_famille(
+            sid,
+            profile_id,
+            client,
+            crate::session_renouvelee::maintenant(),
+        ) {
+            Ok(emis) => ajouter_le_renouvellement(&mut corps, &emis),
+            // Sans jeton de renouvellement, la session vaut 24 h : le client
+            // se reconnectera, comme avant.
+            Err(e) => tracing::warn!(error = %e, "session_sans_jeton_de_renouvellement"),
+        }
+    }
+    let mut response = Json(corps).into_response();
 
     response
         .headers_mut()
@@ -1644,16 +2030,184 @@ async fn login(
 }
 
 // ---------------------------------------------------------------------------
+// POST /auth/refresh — rc14, la session renouvelée tant qu'elle sert
+// ---------------------------------------------------------------------------
+
+/// Ajoute `refresh_token` et `refresh_expires_in` à une réponse de session.
+/// Les anciens clients ignorent ces deux champs.
+fn ajouter_le_renouvellement(
+    corps: &mut Value,
+    emis: &tune_core::db::jetons_de_renouvellement::Emis,
+) {
+    if let Some(obj) = corps.as_object_mut() {
+        obj.insert("refresh_token".into(), json!(emis.jeton));
+        obj.insert(
+            "refresh_expires_in".into(),
+            json!(tune_core::db::jetons_de_renouvellement::DUREE_RENOUVELLEMENT),
+        );
+    }
+}
+
+#[derive(Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+/// `POST /auth/refresh {refresh_token}` — rend un nouveau jeton d'accès de
+/// 24 h (même session `sid`) et un NOUVEAU jeton de renouvellement
+/// (rotation) ; l'ancien ne sert plus. L'échéance de la session est reportée
+/// à 30 jours. Publique (le jeton d'accès peut être expiré), relayée par le
+/// pont comme `/auth/login`.
+///
+/// Refus (`code`) :
+/// - 401 `refresh_token_invalid` : inconnu ;
+/// - 401 `refresh_token_expired` : 30 jours sans usage ;
+/// - 401 `refresh_token_revoked` : session désinscrite (déconnexion,
+///   révocation par l'administrateur, plafond, secrets renouvelés), mot de
+///   passe changé, compte supprimé ;
+/// - 401 `refresh_token_reused` : jeton déjà consommé qui revient au-delà de
+///   2 min, second rejeu dans la famille, ou rejeu d'un jeton dont le
+///   successeur a déjà servi — vol présumé, la session entière est révoquée.
+///
+/// Un jeton consommé il y a moins de 2 min (réponse perdue) rend le MÊME
+/// successeur, sans rien révoquer, une fois par 7 jours et par session. La
+/// session meurt aussi 90 jours après la connexion, quel que soit l'usage.
+///
+/// Tous les 401 veulent dire : retour à l'écran de connexion.
+async fn refresh(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RefreshRequest>,
+) -> Response {
+    use tune_core::db::jetons_de_renouvellement::{JetonsDeRenouvellementRepo, Refus};
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let refus = |statut: StatusCode, code: &str| {
+        (statut, Json(json!({"error": code, "code": code}))).into_response()
+    };
+    let maintenant = crate::session_renouvelee::maintenant();
+    // La clé qui dérive le successeur d'un jeton (rejeu idempotent) : le
+    // secret de signature, propre au serveur ; le renouveler révoque tout.
+    let secret = get_or_create_jwt_secret(&settings);
+    let emis = match JetonsDeRenouvellementRepo::with_backend(state.backend.clone()).renouveler(
+        body.refresh_token.trim(),
+        secret.as_bytes(),
+        maintenant,
+    ) {
+        Ok(e) => e,
+        Err(r) => {
+            return match r {
+                Refus::Inconnu => refus(StatusCode::UNAUTHORIZED, "refresh_token_invalid"),
+                Refus::Expire | Refus::Revoque | Refus::Reutilise => {
+                    // La famille vient d'être révoquée par le dépôt : la
+                    // session qui porte le même identifiant part avec elle.
+                    if let Some((sid, _)) =
+                        JetonsDeRenouvellementRepo::with_backend(state.backend.clone())
+                            .session_du_jeton(body.refresh_token.trim())
+                    {
+                        oublier_session(&settings, &sid);
+                    }
+                    let code = match r {
+                        Refus::Expire => "refresh_token_expired",
+                        Refus::Reutilise => "refresh_token_reused",
+                        _ => "refresh_token_revoked",
+                    };
+                    refus(StatusCode::UNAUTHORIZED, code)
+                }
+                Refus::Base => refus(StatusCode::SERVICE_UNAVAILABLE, "database_unavailable"),
+            };
+        }
+    };
+    let sid = emis.famille.clone();
+    let cle = format!("{PREFIXE_SESSION_LONGUE}{sid}");
+    // L'inscription de la session est l'autorité (#9445) : sans elle, ou
+    // échue, ou pour un autre compte, pas de renouvellement.
+    let session = settings
+        .get(&cle)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str::<SessionLongue>(&v).ok())
+        .filter(|s| s.user_id == emis.profile_id && s.expires_at > maintenant as u64);
+    // Le rôle se relit à chaque renouvellement : un compte rétrogradé perd
+    // l'administration au plus tard au renouvellement suivant.
+    let compte = etat_du_compte(&state.backend, emis.profile_id);
+    let (Some(mut session), Some((is_admin, empreinte))) = (session, compte) else {
+        oublier_session(&settings, &sid);
+        return refus(StatusCode::UNAUTHORIZED, "refresh_token_revoked");
+    };
+    if empreinte != session.empreinte {
+        oublier_session(&settings, &sid);
+        return refus(StatusCode::UNAUTHORIZED, "refresh_token_revoked");
+    }
+    let role = if is_admin { "admin" } else { "user" };
+    session.role = role.to_string();
+    session.expires_at = emis.expire_le as u64;
+    if let Err(e) = inscrire_session_longue(&settings, &sid, &session) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("session registration failed: {e}")})),
+        )
+            .into_response();
+    }
+    let token = match signer_session(emis.profile_id, role, &secret, DUREE_SESSION, Some(&sid)) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("token generation failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let mut corps = json!({
+        "token": token,
+        "token_type": "Bearer",
+        "expires_in": DUREE_SESSION,
+        "username": session.username,
+        "user_id": emis.profile_id,
+        "role": role,
+    });
+    ajouter_le_renouvellement(&mut corps, &emis);
+    let mut response = Json(corps).into_response();
+    if let Ok(cookie) = session_cookie(&token, &headers).parse() {
+        response
+            .headers_mut()
+            .insert(axum::http::header::SET_COOKIE, cookie);
+    }
+    response
+}
+
+// ---------------------------------------------------------------------------
 // POST /auth/logout
 // ---------------------------------------------------------------------------
+
+/// Corps FACULTATIF de `POST /auth/logout` (rc14). Un client qui n'envoie
+/// rien garde le comportement de #9445.
+#[derive(Deserialize, Default)]
+struct LogoutRequest {
+    /// Le jeton de renouvellement de cet appareil : sa session est
+    /// désinscrite, même si le jeton d'accès est expiré ou absent.
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
 
 async fn logout(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    corps: axum::body::Bytes,
 ) -> impl IntoResponse {
     // La session longue présentée (en-tête ou cookie) est désinscrite : son
     // jeton ne vaut plus rien après la déconnexion.
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    let demande: LogoutRequest = serde_json::from_slice(&corps).unwrap_or_default();
+    if let Some(rt) = demande.refresh_token.as_deref()
+        && let Some((sid, _)) =
+            tune_core::db::jetons_de_renouvellement::JetonsDeRenouvellementRepo::with_backend(
+                state.backend.clone(),
+            )
+            .session_du_jeton(rt)
+    {
+        oublier_session(&settings, &sid);
+    }
     if let Some(secret) = settings
         .get("jwt_secret")
         .ok()
@@ -1680,12 +2234,12 @@ async fn logout(
             );
         }
         for jeton in presentes {
-            if let Ok(claims) = verify_jwt(&jeton, &secret)
+            // rc14 — signature seule : un jeton d'accès de 24 h déjà échu
+            // désigne encore sa session de 30 jours.
+            if let Some(claims) = verify_jwt_signature_seule(&jeton, &secret)
                 && let Some(sid) = claims.sid
             {
-                settings
-                    .delete(&format!("{PREFIXE_SESSION_LONGUE}{sid}"))
-                    .ok();
+                oublier_session(&settings, &sid);
             }
         }
     }
@@ -1811,6 +2365,7 @@ async fn revoquer_session(
     if let Err(e) = settings.delete(&cle) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
     }
+    oublier_session(&settings, &id);
     tracing::info!(session = %id, "session_longue_revoquee");
     Json(json!({ "revoked": id })).into_response()
 }
@@ -1921,6 +2476,9 @@ async fn set_auth_config(
         && !secret.is_empty()
     {
         settings.set("jwt_secret", secret).ok();
+        // rc14 — un secret posé à la main coupe tous les jetons d'accès : les
+        // sessions et leurs jetons de renouvellement ne les font pas renaître.
+        effacer_sessions_longues(&settings);
     }
 
     let enabled = settings
@@ -1952,8 +2510,8 @@ impl FromRequestParts<AppState> for DepuisCetteMachine {
     }
 }
 
-/// Code d'activation à usage unique, écrit sur la CONSOLE du serveur
-/// seulement (voir [`emettre_code_activation`]).
+/// Code d'activation à usage unique, écrit sur la CONSOLE du serveur et dans
+/// son fichier journal local (voir [`emettre_code_activation`]).
 pub struct CodeActivation {
     code: String,
     emis: std::time::Instant,
@@ -2018,7 +2576,7 @@ fn normaliser_code(saisi: &str) -> String {
 /// Ce que donne une demande de code.
 #[derive(Debug, PartialEq, Eq)]
 pub enum EmissionCode {
-    /// Un nouveau code est sur la console.
+    /// Un nouveau code est sur la console et dans le fichier journal.
     Emis,
     /// Un code encore valable est déjà en cours : il n'est pas remplacé et
     /// ses essais ne sont pas remis à zéro.
@@ -2031,13 +2589,18 @@ fn code_valable(c: &CodeActivation) -> bool {
     c.emis.elapsed() <= DUREE_CODE_ACTIVATION && c.essais_rates < ESSAIS_CODE_ACTIVATION
 }
 
+/// Cible `tracing` de la ligne qui porte le code d'activation. Seule la couche
+/// FICHIER du journal la reçoit (`bootstrap::installer_le_journal`) : la
+/// console a déjà la ligne par `eprintln!`.
+pub const CIBLE_CODE_ACTIVATION: &str = "tune_server::code_activation";
+
 /// Émet un code, s'il n'y en a pas déjà un de valable, et l'écrit sur la
 /// CONSOLE du serveur (sortie d'erreur : `docker logs`, `journalctl -u tune`,
-/// en SSH sur Tune OS ; sous Windows sans console, le fichier journal) — jamais dans le journal de `tracing`, que l'API sert
-/// (`/system/logs`, rapports de bogue). La ligne porte
+/// en SSH sur Tune OS) et dans le FICHIER JOURNAL local (`tune-server.log`),
+/// pour les installations sans console visible. La ligne porte
 /// [`tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION`], que tous les
-/// lecteurs de journaux retirent (cas d'une sortie d'erreur redirigée dans le
-/// fichier journal).
+/// lecteurs de journaux retirent : elle ne sort ni par l'API
+/// (`/system/logs`, rapports de bogue), ni vers le site.
 pub fn emettre_code_activation(state: &AppState) -> EmissionCode {
     let mut etat = state.code_activation_auth.lock().unwrap();
     if etat.en_cours.as_ref().is_some_and(code_valable) {
@@ -2057,24 +2620,18 @@ pub fn emettre_code_activation(state: &AppState) -> EmissionCode {
     });
     etat.derniere_emission = Some(std::time::Instant::now());
     drop(etat);
-    eprintln!(
+    let ligne = format!(
         "{} {code} — Tune : code d'activation de l'authentification, usage unique, {} min. \
          Saisissez-le dans Réglages > Système > Authentification. / One-time code to enable \
          authentication in Settings > System > Authentication.",
         tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION,
         DUREE_CODE_ACTIVATION.as_secs() / 60,
     );
+    eprintln!("{ligne}");
+    // La même ligne dans le fichier journal local : Daphile, `nohup`, un
+    // service ou Windows sans console n'ont pas de console visible.
+    tracing::warn!(target: CIBLE_CODE_ACTIVATION, "{ligne}");
     tracing::warn!("auth_activation_code_ecrit_sur_la_console");
-    // Windows sans console (`lancement_sans_console`) : la sortie d'erreur
-    // ne va nulle part. Le code part aussi dans le fichier journal, que seul
-    // l'exploitant de la machine lit ; tous les lecteurs de l'API retirent
-    // la ligne (marqueur).
-    #[cfg(windows)]
-    tracing::warn!(
-        "{} {} (Windows : fichier journal tune-server.log)",
-        tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION,
-        code,
-    );
     EmissionCode::Emis
 }
 
@@ -2186,7 +2743,7 @@ fn refus_activation_hors_machine() -> Response {
         Json(json!({
             "error": "activation_code_required",
             "reason": "not_local",
-            "message": "Enabling authentication from another device requires the one-time code written to the server console (POST /auth/activation/code; docker logs, journalctl -u tune — on Tune OS over SSH —, or the log file on Windows), or a call from this machine.",
+            "message": "Enabling authentication from another device requires the one-time code written to the server console and to the log file tune-server.log (POST /auth/activation/code; docker logs, journalctl -u tune — on Tune OS over SSH —, or the log file), or a call from this machine.",
         })),
     )
         .into_response()
@@ -2529,35 +3086,35 @@ mod cette_machine_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::is_public_auth_route;
+    use super::est_route_publique;
     use axum::http::Method;
 
     #[test]
     fn only_handshake_auth_routes_are_public() {
-        // Public: login, logout, register, and the read-only config status (GET).
-        assert!(is_public_auth_route(&Method::POST, "/api/v1/auth/login"));
-        assert!(is_public_auth_route(&Method::POST, "/api/v1/auth/logout"));
-        assert!(is_public_auth_route(&Method::GET, "/api/v1/auth/config"));
+        // Public: login, logout, and the read-only config status (GET).
+        assert!(est_route_publique(&Method::POST, "/api/v1/auth/login"));
+        assert!(est_route_publique(&Method::POST, "/api/v1/auth/logout"));
+        // rc14 — le renouvellement : le jeton d'accès peut être expiré.
+        assert!(est_route_publique(&Method::POST, "/api/v1/auth/refresh"));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/refresh"));
+        assert!(est_route_publique(&Method::GET, "/api/v1/auth/config"));
         // Nesting may strip the /api/v1 prefix — both spellings must hold.
-        assert!(is_public_auth_route(&Method::POST, "/auth/login"));
+        assert!(est_route_publique(&Method::POST, "/auth/login"));
     }
 
     #[test]
     fn privileged_auth_routes_are_never_public() {
         // The P0: these must never be reachable without a token.
-        assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/config"));
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/config"));
         // Sécurité : l'inscription n'est plus publique sous authentification.
-        assert!(!is_public_auth_route(
-            &Method::POST,
-            "/api/v1/auth/register"
-        ));
-        assert!(!is_public_auth_route(&Method::POST, "/auth/register"));
-        assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/token"));
-        assert!(!is_public_auth_route(&Method::GET, "/api/v1/auth/token"));
-        assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/api-key"));
-        assert!(!is_public_auth_route(&Method::GET, "/api/v1/auth/api-key"));
-        assert!(!is_public_auth_route(&Method::GET, "/api/v1/auth/me"));
-        assert!(!is_public_auth_route(
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/register"));
+        assert!(!est_route_publique(&Method::POST, "/auth/register"));
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/token"));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/token"));
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/api-key"));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/api-key"));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/me"));
+        assert!(!est_route_publique(
             &Method::POST,
             "/api/v1/system/audio/asio-warm-scan/rearm"
         ));
@@ -2565,13 +3122,15 @@ mod tests {
 
     #[test]
     fn unrelated_paths_are_not_matched() {
-        assert!(!is_public_auth_route(
-            &Method::GET,
-            "/api/v1/library/albums"
-        ));
-        assert!(!is_public_auth_route(
-            &Method::POST,
-            "/api/v1/system/restart"
-        ));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/library/albums"));
+        assert!(!est_route_publique(&Method::POST, "/api/v1/system/restart"));
     }
 }
+
+#[cfg(test)]
+#[path = "auth_sondes_docker_tests.rs"]
+mod sondes_docker_tests;
+
+#[cfg(test)]
+#[path = "auth_liste_publique_tests.rs"]
+mod auth_liste_publique_tests;

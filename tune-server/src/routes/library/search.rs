@@ -23,6 +23,45 @@ pub(super) struct AcousticQuery {
     pub query: String,
     /// Max tracks to return (clamped 1..=200; default 50).
     pub limit: Option<i64>,
+    /// #9157 — `true` par défaut : la sélection est tirée au hasard, pondérée
+    /// par la proximité, dans le vivier des pistes les plus proches, et change
+    /// donc à chaque rappel d'une ambiance. `false` rend l'ancien classement
+    /// déterministe (les `limit` plus proches, dans l'ordre).
+    #[serde(default, alias = "varier")]
+    pub vary: Option<bool>,
+    /// #9157 — graine du tirage (tests, ou rejouer une sélection). Absente :
+    /// graine tirée de l'aléa du système. Ignorée quand `vary` vaut `false`.
+    #[serde(default, alias = "graine")]
+    pub seed: Option<u64>,
+}
+
+/// #9157 — profondeur de classement à demander puis ordre à appliquer.
+/// Sans variation : `limit * 2` (sur-échantillonnage du dédoublonnage), ordre
+/// du cosinus. Avec : tout le vivier, remis dans un ordre tiré au hasard et
+/// pondéré par la proximité ; les `limit` premières après dédoublonnage sont
+/// alors un tirage sans remise dans ce vivier.
+#[cfg_attr(not(feature = "audio-embedding"), allow(dead_code))]
+fn profondeur_sans_genre(limit: usize, vary: bool) -> usize {
+    if vary {
+        tune_core::audio::embedding_store::taille_du_vivier(limit).max(limit * 2)
+    } else {
+        limit * 2
+    }
+}
+
+#[cfg_attr(not(feature = "audio-embedding"), allow(dead_code))]
+fn varier_si_demande(
+    ranked: Vec<(i64, f32)>,
+    limit: usize,
+    vary: bool,
+    seed: Option<u64>,
+) -> Vec<(i64, f32)> {
+    use tune_core::audio::embedding_store;
+    if !vary {
+        return ranked;
+    }
+    let graine = seed.unwrap_or_else(embedding_store::graine_au_hasard);
+    embedding_store::varier_le_classement(ranked, embedding_store::taille_du_vivier(limit), graine)
 }
 
 /// Clé de dédoublonnage d'un enregistrement : titre normalisé (casse/espaces),
@@ -370,12 +409,17 @@ pub(super) async fn acoustic_search(
     // Croiser exige le cosinus des pistes étiquetées où qu'elles soient dans
     // le classement : on le garde alors en entier (il est déjà calculé en
     // entier par `rank_by_vector`, seule la troncature change).
+    let vary = body.vary.unwrap_or(true);
     let profondeur = if etiquetees.is_empty() {
-        limit * 2
+        profondeur_sans_genre(limit, vary)
     } else {
         usize::MAX
     };
     let ranked = embedding_store::rank_by_vector(&state.backend, &qvec, profondeur, None);
+    // #9157 — une ambiance rappelée tire une autre sélection dans son vivier.
+    // Avec un genre reconnu, le vivier permuté reste en tête du classement
+    // complet : `croiser` y prend les pistes du genre puis la découverte.
+    let ranked = varier_si_demande(ranked, limit, vary, body.seed);
     if ranked.is_empty() && etiquetees.is_empty() {
         // Une liste vide couvrait deux situations opposées : bibliothèque pas
         // encore analysée, ou requête sans correspondance. L'utilisateur ne
@@ -479,6 +523,73 @@ pub(super) async fn acoustic_search(
     Err(crate::error::AppError::service_unavailable(
         "acoustic search is not available in this build",
     ))
+}
+
+#[cfg(test)]
+mod tests_9157 {
+    use super::{AcousticQuery, profondeur_sans_genre, varier_si_demande};
+
+    /// Classement de 600 pistes, du plus proche (id 1) au plus lointain.
+    fn classement(n: usize) -> Vec<(i64, f32)> {
+        (0..n)
+            .map(|i| (i as i64 + 1, 0.4 - 0.0005 * i as f32))
+            .collect()
+    }
+
+    /// Ce que la route garde après variation : les `limit` premières (le
+    /// dédoublonnage n'a rien à retirer ici).
+    fn appel(vary: bool, seed: Option<u64>) -> Vec<i64> {
+        let limit = 50;
+        let mut ranked = classement(600);
+        ranked.truncate(profondeur_sans_genre(limit, vary));
+        varier_si_demande(ranked, limit, vary, seed)
+            .into_iter()
+            .take(limit)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn triee(mut v: Vec<i64>) -> Vec<i64> {
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn par_defaut_le_corps_demande_la_variation() {
+        let q: AcousticQuery = serde_json::from_str(r#"{"query":"jazz"}"#).unwrap();
+        assert_eq!(q.vary.unwrap_or(true), true);
+        assert_eq!(q.seed, None);
+        let q: AcousticQuery =
+            serde_json::from_str(r#"{"query":"jazz","varier":false,"graine":7}"#).unwrap();
+        assert_eq!((q.vary, q.seed), (Some(false), Some(7)));
+        let q: AcousticQuery =
+            serde_json::from_str(r#"{"query":"jazz","vary":false,"seed":7}"#).unwrap();
+        assert_eq!((q.vary, q.seed), (Some(false), Some(7)));
+    }
+
+    #[test]
+    fn deux_appels_donnent_deux_selections_toutes_dans_le_vivier() {
+        let a = appel(true, None);
+        let b = appel(true, None);
+        assert_eq!(a.len(), 50);
+        assert_ne!(triee(a.clone()), triee(b.clone()));
+        let vivier = tune_core::audio::embedding_store::taille_du_vivier(50) as i64;
+        assert!(a.iter().chain(b.iter()).all(|id| (1..=vivier).contains(id)));
+    }
+
+    #[test]
+    fn la_meme_graine_redonne_la_meme_selection() {
+        assert_eq!(appel(true, Some(42)), appel(true, Some(42)));
+        assert_ne!(triee(appel(true, Some(42))), triee(appel(true, Some(43))));
+    }
+
+    #[test]
+    fn contre_epreuve_vary_false_garde_l_ancien_classement() {
+        let attendu: Vec<i64> = (1..=50).collect();
+        assert_eq!(appel(false, None), attendu);
+        assert_eq!(appel(false, Some(42)), attendu);
+        assert_eq!(profondeur_sans_genre(50, false), 100);
+    }
 }
 
 #[cfg(test)]

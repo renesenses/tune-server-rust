@@ -22,6 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
+use tune_plugin_audio_support::echantillon::Echantillon;
 
 /// User-facing EQ profile combining room macro settings + perceptual sliders.
 #[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
@@ -57,7 +58,33 @@ pub struct EqProfile {
         deserialize_with = "HeadroomMode::lire"
     )]
     pub headroom_mode: HeadroomMode,
+    /// rc14 — la marge MANUELLE de l'étape Headroom de TESS (dB, ≤ 0). Une
+    /// seule marge, jamais deux qui se cumulent : la réserve appliquée est la
+    /// plus forte des deux atténuations, `min(manuelle, calculée)`
+    /// ([`Self::reserve_db_at`]) — la réserve « Sûre » n'est jamais perdue,
+    /// et le limiteur ne travaille jamais en continu. Sans aucune bande, le
+    /// profil n'est plus qu'un gain fixe de cette valeur. Posée par l'hôte au
+    /// chargement d'une chaîne TESS, jamais enregistrée ni lue en JSON (le
+    /// profil d'une zone s'écrit et se relit à l'octet près comme avant).
+    #[serde(skip)]
+    #[cfg_attr(feature = "schemas", schemars(skip))]
+    pub reserve_imposee_db: Option<f64>,
+    /// rc14 — calculer la norme L1 de toute la cascade même si aucune bande
+    /// ne pousse : posé pour une SÉRIE d'égaliseurs, pour qu'une série
+    /// purement soustractive n'ait pas de falaise (0 dB de réserve, puis
+    /// plusieurs dB dès qu'une bande passe à +0,01 dB). Jamais en JSON.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schemas", schemars(skip))]
+    pub reserve_l1_toujours: bool,
 }
+
+/// rc14 — bornes du gain d'une bande appliquées par le moteur, en dB. La
+/// borne basse descend à −30 dB (atténuations profondes : résonances de
+/// pièce, pics de casque) ; la haute reste à +24 dB, comme avant, pour qu'un
+/// profil enregistré ne change pas de son. L'API publie une plage d'usage
+/// plus étroite côté hausse (TESS : −30 / +15 dB).
+pub const GAIN_BANDE_MIN_DB: f64 = -30.0;
+pub const GAIN_BANDE_MAX_DB: f64 = 24.0;
 
 /// Réserve anti-saturation de l'égaliseur, au choix de l'utilisateur (#5171).
 #[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
@@ -288,7 +315,7 @@ impl EqBandSpec {
         // Clamp to sane, stable ranges (mirrors the /eq router validation).
         let freq = self.freq.clamp(10.0, sample_rate * 0.45);
         let q = self.q.clamp(0.1, 30.0);
-        let gain = self.gain.clamp(-24.0, 24.0);
+        let gain = self.gain.clamp(GAIN_BANDE_MIN_DB, GAIN_BANDE_MAX_DB);
         match self.band_type.as_str() {
             "low_shelf" => low_shelf(freq, gain, sample_rate),
             "high_shelf" => high_shelf(freq, gain, sample_rate),
@@ -312,6 +339,8 @@ impl Default for EqProfile {
             treble_gain_db: 0.0,
             bands: Vec::new(),
             headroom_mode: HeadroomMode::Safe,
+            reserve_imposee_db: None,
+            reserve_l1_toujours: false,
         }
     }
 }
@@ -451,7 +480,7 @@ impl EqProfile {
     /// avant #4594 et ça l'est encore, à l'échantillon près.
     pub fn automatic_headroom_db_at(&self, channel: u16, sample_rate: f64) -> f64 {
         let (au_moins_une_bande_pousse, cascade) = self.cascade_a_gain(channel, sample_rate);
-        let l1_db = if au_moins_une_bande_pousse {
+        let l1_db = if au_moins_une_bande_pousse || self.reserve_l1_toujours {
             let l1 = norme_l1(&cascade);
             if l1 > 1.0 {
                 20.0 * l1.log10() + MARGE_DE_TRONCATURE_DB
@@ -482,9 +511,14 @@ impl EqProfile {
     /// quelle : rien d'autre n'est calculé, le résultat est le même au bit
     /// près qu'avant #5171.
     pub fn reserve_db_at(&self, channel: u16, sample_rate: f64) -> f64 {
-        match self.headroom_mode {
+        let calculee = match self.headroom_mode {
             HeadroomMode::Safe => self.automatic_headroom_db_at(channel, sample_rate),
             HeadroomMode::Realistic => self.reserve_realiste_db_at(channel, sample_rate),
+        };
+        // rc14 — la marge manuelle de TESS : la plus forte des deux.
+        match self.reserve_imposee_db.filter(|d| d.is_finite()) {
+            Some(db) => db.min(0.0).min(calculee),
+            None => calculee,
         }
     }
 
@@ -693,7 +727,12 @@ impl EqProfile {
         }
         let cascades = self.cascades(sample_rate, channels);
         if cascades.iter().all(|c| c.is_empty()) {
-            return 0.0;
+            // rc14 — un gain fixe (marge manuelle de TESS sans bande) : c'est
+            // tout ce qu'il retire au niveau moyen.
+            return self
+                .reserve_imposee_db
+                .filter(|d| d.is_finite())
+                .map_or(0.0, |d| d.min(0.0));
         }
         let reserves: Vec<f64> = (0..cascades.len() as u16)
             .map(|ch| 10.0_f64.powf(self.reserve_db_at(ch, sample_rate) / 10.0))
@@ -1208,7 +1247,13 @@ impl EqProcessor {
             .collect();
         // Un profil dont TOUTES les bandes sont neutres, ou qui ne vise aucun
         // canal existant, ne doit pas rester « actif » a ne rien faire.
-        let enabled = profile.enabled && filters.iter().any(|f| !f.is_empty());
+        // rc14 — un profil sans bande qui porte la marge manuelle de TESS
+        // est un gain fixe : il reste actif.
+        let enabled = profile.enabled
+            && (filters.iter().any(|f| !f.is_empty())
+                || profile
+                    .reserve_imposee_db
+                    .is_some_and(|d| d.is_finite() && d < 0.0));
 
         Self {
             filters,
@@ -1366,6 +1411,22 @@ impl EqProcessor {
     /// filter states out of step and every later chunk would be filtered with
     /// the wrong channel's history.
     pub fn process_interleaved(&mut self, samples: &mut [f32]) -> EqProcessStats {
+        self.traiter_entrelace(samples)
+    }
+
+    /// TESS T06 — [`Self::process_interleaved`] sur un tampon **`f64`**
+    /// entrelacé (pleine échelle ±1,0), tel que l'exécuteur TESS le tient.
+    ///
+    /// Même cascade, même état par canal, mêmes compteurs, même limiteur :
+    /// seule la représentation change, et AUCUN arrondi vers `f32` n'a lieu
+    /// ni à l'entrée ni à la sortie. Le chemin `f32` reste celui d'avant au
+    /// bit près (il partage cette boucle, voir
+    /// [`tune_plugin_audio_support::echantillon`]).
+    pub fn process_interleaved_f64(&mut self, samples: &mut [f64]) -> EqProcessStats {
+        self.traiter_entrelace(samples)
+    }
+
+    fn traiter_entrelace<T: Echantillon>(&mut self, samples: &mut [T]) -> EqProcessStats {
         let mut stats = EqProcessStats::default();
         if !self.enabled || samples.is_empty() || self.channels == 0 {
             return stats;
@@ -1389,7 +1450,7 @@ impl EqProcessor {
             for (ch, sample) in frame.iter_mut().enumerate() {
                 let state = &mut self.states[ch];
                 let cascade = &self.filters[ch];
-                let mut s = *sample as f64 * self.preamp_gains[ch];
+                let mut s = sample.vers_f64() * self.preamp_gains[ch];
                 if !s.is_finite() {
                     stats.non_finite_samples += 1;
                     s = 0.0;
@@ -1408,7 +1469,7 @@ impl EqProcessor {
                         s.abs(),
                     );
                 }
-                *sample = s as f32;
+                *sample = T::depuis_f64(s);
             }
         }
         self.ecretage.noter_vus(samples.len() as u64);
@@ -1494,7 +1555,7 @@ impl EqProcessor {
     }
 
     /// [`Self::process_interleaved`] en mode « Réaliste ».
-    fn process_interleaved_limite(&mut self, samples: &mut [f32]) -> EqProcessStats {
+    fn process_interleaved_limite<T: Echantillon>(&mut self, samples: &mut [T]) -> EqProcessStats {
         const LSB_REFERENCE: f64 = 8_388_608.0;
         let mut stats = EqProcessStats::default();
         let ch_count = self.channels as usize;
@@ -1504,7 +1565,7 @@ impl EqProcessor {
 
         for (fi, frame) in samples.chunks_exact_mut(ch_count).enumerate() {
             for (ch, sample) in frame.iter().enumerate() {
-                let mut s = *sample as f64 * self.preamp_gains[ch];
+                let mut s = sample.vers_f64() * self.preamp_gains[ch];
                 if !s.is_finite() {
                     stats.non_finite_samples += 1;
                     s = 0.0;
@@ -1525,7 +1586,7 @@ impl EqProcessor {
                         s.abs(),
                     );
                 }
-                *sample = s as f32;
+                *sample = T::depuis_f64(s);
             }
         }
         self.ecretage.noter_vus(samples.len() as u64);
@@ -1613,6 +1674,22 @@ impl EqProcessor {
 
     pub fn preamp_db(&self, channel: u16) -> Option<f64> {
         self.preamp_db.get(channel as usize).copied()
+    }
+
+    /// TESS T06 — pour le banc sonore SEULEMENT : les coefficients préparés
+    /// `[b0, b1, b2, a1, a2]` de la cascade de chaque canal et le pré-gain
+    /// linéaire de chaque canal, tels que la boucle les applique. Le banc en
+    /// tire une référence en précision étendue (double-double), calculée à
+    /// part de la récurrence `f64` du moteur.
+    #[doc(hidden)]
+    pub fn coefficients_du_banc(&self) -> (Vec<Vec<[f64; 5]>>, Vec<f64>) {
+        (
+            self.filters
+                .iter()
+                .map(|c| c.iter().map(|b| [b.b0, b.b1, b.b2, b.a1, b.a2]).collect())
+                .collect(),
+            self.preamp_gains.clone(),
+        )
     }
 
     /// Reprendre l'historique des filtres du processeur que celui-ci remplace,

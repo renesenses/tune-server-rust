@@ -26,6 +26,21 @@ pub fn sortie_compatible(type_sortie: &str) -> bool {
 
 /// Le choix reste mémorisé sous PURE/strict, sans transformer le flux.
 pub fn demandee_active(db: &Arc<dyn DbBackend>, id: i64) -> Option<u32> {
+    // rc14 — ni sous « Bypass all » : aucun traitement, rééchantillonnage compris.
+    if crate::tess::egaliseurs_en_serie::bypass_all_de_zone(
+        &SettingsRepo::with_backend(db.clone()),
+        id,
+    ) {
+        return None;
+    }
+    demandee_active_hors_bypass(db, id)
+}
+
+/// Revue #9520 — [`demandee_active`] sans regarder « Bypass all » : ce que
+/// la bascule de « Bypass all » allume ou éteint. `None` sous PURE, en
+/// bit-perfect strict ou sur une sortie qui impose sa cadence (AirPlay) :
+/// la bascule n'y change rien.
+pub fn demandee_active_hors_bypass(db: &Arc<dyn DbBackend>, id: i64) -> Option<u32> {
     if super::audiophile::zone_enabled(db, id) || super::bitperfect_strict::zone_enabled(db, id) {
         return None;
     }

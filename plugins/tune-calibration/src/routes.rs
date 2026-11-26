@@ -3,6 +3,11 @@
 //! * `GET  /microphones` — les entrées audio (micros) et les étalonnages déposés ;
 //! * `POST /microphones/etalonnages` — déposer un fichier d'étalonnage
 //!   (`{ "nom", "texte" }`, texte miniDSP ou REW `.cal`) ;
+//! * `POST /niveaux` — test de niveau du micro avant la mesure (rc14) :
+//!   `{ "mode": "signal" | "ecoute", "entree", "voie_micro", "zone_id",
+//!   "volume", "voies", "duree_s" }` (202, `{ "id" }`) ; `GET /niveaux/{id}`
+//!   — vumètre, bruit de fond, verdict ; `DELETE /niveaux/{id}` — annuler
+//!   (voir `niveau.rs`) ;
 //! * `POST /zones/{zone}/mesures` — lancer une mesure (202, `{ "id" }`) ;
 //! * `GET  /mesures` — toutes les mesures connues (avancement) ;
 //! * `GET  /mesures/{id}` — l'avancement d'une mesure ;
@@ -38,6 +43,13 @@
 //!   récente donne 409 `unsupported_version` ;
 //! * `POST /sessions/{id}/correction` et `/correction/profil` — C2 sur la
 //!   moyenne (défauts d'une moyenne spatiale : 20–500 Hz, 10 bandes) ;
+//! * `POST /mesures/{id}/correction/fir` et `/sessions/{id}/correction/fir`
+//!   — FIR de correction (C3, T10b) : cible et bornes comme C2, plus
+//!   relance, longueur, phase excédentaire (mesure seulement), format ; rend
+//!   la description (latence exacte, courbes prévues) ; rien n'est écrit ;
+//! * `POST /mesures/{id}/correction/fir.wav` et `/sessions/{id}/correction/fir.wav`
+//!   — le même calcul, rendu en RI `.wav` (flottant 64 ou 32 bits), à déposer
+//!   par `POST /api/v1/room-correction/ir/upload/{zone}?per_rate=1` ;
 //! * `POST /comparaisons` — A/B : `{ "avant", "apres" }` (ids de mesure ou de
 //!   session), `f_min_hz`, `f_max_hz`, `cible` facultatifs.
 //!
@@ -62,6 +74,7 @@ use serde_json::{Value, json};
 use tune_core::license::{Feature, LicenseManager};
 
 use crate::correction::{DemandeCorrection, Proposition, proposer};
+use crate::correction_fir::{DemandeFir, PropositionFir, proposer_fir};
 use crate::generateur::Voies;
 use crate::mesure::{Controleur, Demande};
 use crate::modes::{Entree, proposer_estimation, simuler};
@@ -119,6 +132,11 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
     Router::new()
         .route("/microphones", get(microphones))
         .route("/microphones/etalonnages", post(deposer_etalonnage))
+        .route("/niveaux", post(crate::niveau::http::lancer))
+        .route(
+            "/niveaux/{id}",
+            get(crate::niveau::http::avancement).delete(crate::niveau::http::annuler),
+        )
         .route("/zones/{zone}/mesures", post(lancer))
         .route("/mesures", get(mesures))
         .route("/mesures/{id}", get(avancement).delete(annuler))
@@ -126,6 +144,8 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
         .route("/mesures/{id}/ri.wav", get(ri_wav))
         .route("/mesures/{id}/correction", post(correction))
         .route("/mesures/{id}/correction/profil", post(correction_profil))
+        .route("/mesures/{id}/correction/fir", post(mesure_fir))
+        .route("/mesures/{id}/correction/fir.wav", post(mesure_fir_wav))
         .route("/zones/{zone}/sessions", post(creer_session))
         .route("/sessions", get(sessions))
         .route(
@@ -140,6 +160,8 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
             "/sessions/{id}/correction/profil",
             post(session_correction_profil),
         )
+        .route("/sessions/{id}/correction/fir", post(session_fir))
+        .route("/sessions/{id}/correction/fir.wav", post(session_fir_wav))
         .route("/comparaisons", post(comparer))
         .route("/simulations", post(simulation))
         .route("/simulations/{id}/correction", post(simulation_correction))
@@ -153,6 +175,28 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
 
 fn refus(code: StatusCode, motif: &str, message: String) -> Response {
     (code, Json(json!({ "error": motif, "message": message }))).into_response()
+}
+
+/// Fil 3094 — la zone n'a pas de sortie active (deux zones sur le même
+/// appareil, celle-ci orpheline) : 409, motif stable, et la zone à utiliser.
+pub fn refus_sortie_inactive(inactive: &crate::hote::SortieInactive) -> Response {
+    let (porteuse_id, porteuse_nom) = match &inactive.porteuse {
+        Some((id, nom)) => (Some(*id), Some(nom.clone())),
+        None => (None, None),
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": crate::hote::SortieInactive::MOTIF,
+            "message": inactive.message(),
+            "params": {
+                "device": inactive.appareil(),
+                "holder_zone_id": porteuse_id,
+                "holder_zone_name": porteuse_nom,
+            },
+        })),
+    )
+        .into_response()
 }
 
 async fn microphones(State(etat): State<EtatRoutes>) -> Response {
@@ -176,7 +220,8 @@ async fn microphones(State(etat): State<EtatRoutes>) -> Response {
                     "frequences": e.frequences,
                     "bits_servis": e.bits_servis,
                     "virtuelle": e.virtuelle,
-                    "mesurable": e.frequence_courante == Some(crate::mesure::FREQUENCE_MESURE),
+                    // rc14 — toute fréquence de `cadence::FREQUENCES_ACCEPTEES`.
+                    "mesurable": e.frequence_courante.is_some_and(crate::cadence::acceptee),
                 })
             })
             .collect(),
@@ -186,7 +231,9 @@ async fn microphones(State(etat): State<EtatRoutes>) -> Response {
     };
     Json(json!({
         "pile": pile,
+        // Gardée pour les clients d'avant la rc14 ; la liste fait foi.
         "frequence_requise": crate::mesure::FREQUENCE_MESURE,
+        "frequences_acceptees": crate::cadence::FREQUENCES_ACCEPTEES,
         "entrees": entrees,
         "etalonnages": etat.controleur.etalonnages(),
     }))
@@ -242,6 +289,9 @@ struct DemandeMesure {
     /// Plafonds plus stricts seulement ; les valeurs par défaut sont des maxima.
     max_spl_db: Option<f64>,
     max_play_dbfs: Option<f64>,
+    /// Mesure de vérification : la zone joue avec sa correction.
+    #[serde(default)]
+    avec_correction: bool,
 }
 
 // Le refus est la réponse HTTP prête, comme `proposition_pour`.
@@ -283,6 +333,7 @@ fn demande_de(zone: i64, d: DemandeMesure) -> Result<Demande, Response> {
         demande.politique.max_play_dbfs = p;
     }
     demande.voies = voies;
+    demande.avec_correction = d.avec_correction;
     Ok(demande)
 }
 
@@ -296,9 +347,19 @@ async fn lancer(
         Err(r) => return r,
     };
     let c = etat.controleur.clone();
-    let r = tokio::task::spawn_blocking(move || c.lancer(demande))
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()));
+    let r = tokio::task::spawn_blocking(move || match c.hote.sortie_inactive(zone) {
+        // Fil 3094 — refus structuré : motif stable, appareil et zone
+        // porteuse en paramètres, pour que le client le dise dans sa langue.
+        Some(inactive) => Err(Err(inactive)),
+        None => c.lancer(demande).map_err(Ok),
+    })
+    .await
+    .unwrap_or_else(|e| Err(Ok(e.to_string())));
+    let r = match r {
+        Err(Err(inactive)) => return refus_sortie_inactive(&inactive),
+        Err(Ok(e)) => Err(e),
+        Ok(id) => Ok(id),
+    };
     match r {
         Ok(id) => (
             StatusCode::ACCEPTED,
@@ -833,5 +894,148 @@ async fn comparer(State(etat): State<EtatRoutes>, Json(d): Json<DemandeComparais
     match etat.controleur.comparer(&d) {
         Ok(ab) => Json(ab).into_response(),
         Err(e) => refus(StatusCode::UNPROCESSABLE_ENTITY, "comparaison_refusee", e),
+    }
+}
+
+// ── C3 : FIR de correction (T10b) ──────────────────────────────────────────
+
+/// Le FIR d'une mesure terminée (RI comprise) ou de la moyenne d'une
+/// session ; calcul hors de la boucle asynchrone.
+async fn fir_pour(
+    etat: &EtatRoutes,
+    id: &str,
+    session: bool,
+    demande: DemandeFir,
+) -> Result<(Option<i64>, PropositionFir), Response> {
+    let refusee = |e: String| refus(StatusCode::UNPROCESSABLE_ENTITY, "correction_refusee", e);
+    let (zone, reponse, ri, positions, avert) = if session {
+        if etat.controleur.sessions.session(id).is_none() {
+            return Err(session_inconnue(id));
+        }
+        let zone = etat.controleur.sessions.session(id).and_then(|s| s.zone_id);
+        let (r, n) = etat.controleur.reponse_de(id).map_err(refusee)?;
+        (zone, r, None, n, Vec::new())
+    } else {
+        let Some(m) = etat.controleur.mesure(id) else {
+            return Err(refus(
+                StatusCode::NOT_FOUND,
+                "mesure_inconnue",
+                format!("aucune mesure « {id} »"),
+            ));
+        };
+        let (Some(r), Some(ri)) = (m.resultat(), m.reponse_impulsionnelle()) else {
+            return Err(refus(
+                StatusCode::CONFLICT,
+                "mesure_sans_resultat",
+                "la mesure n'est pas terminée".into(),
+            ));
+        };
+        let mut avert = Vec::new();
+        let t = &r.traitements_zone;
+        if t.egaliseur || t.correction_ir {
+            avert.push(
+                "l'égaliseur ou la correction IR de la zone était actif pendant la mesure : le filtre s'y ajoute, refaire la mesure sans eux"
+                    .to_string(),
+            );
+        }
+        if t.pure {
+            avert.push(
+                "la zone est en PURE : aucune correction ne s'y entend tant que PURE est actif"
+                    .to_string(),
+            );
+        }
+        let reponse = tune_calibration::analysis::LogResponse {
+            freqs: r.reponse.freqs_hz.clone(),
+            magnitude_db: r.reponse.db.clone(),
+        };
+        (Some(m.demande.zone_id), reponse, Some(ri), 1, avert)
+    };
+    let calcul = tokio::task::spawn_blocking(move || {
+        proposer_fir(&reponse, ri.as_deref(), &demande, positions)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    let mut p = calcul.map_err(refusee)?;
+    p.avertissements.extend(avert);
+    Ok((zone, p))
+}
+
+fn fir_json(id: &str, zone_id: Option<i64>, p: &PropositionFir) -> Response {
+    let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("id".into(), json!(id));
+        o.insert("zone_id".into(), json!(zone_id));
+        // Le dépôt est un second geste, par la route du serveur.
+        o.insert(
+            "deposer".into(),
+            json!(zone_id.map(|z| format!("/api/v1/room-correction/ir/upload/{z}?per_rate=1"))),
+        );
+    }
+    Json(v).into_response()
+}
+
+fn fir_wav(id: &str, p: &PropositionFir) -> Response {
+    match p.wav() {
+        Ok(octets) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "audio/wav".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", p.nom_de_fichier(id)),
+                ),
+                (
+                    header::HeaderName::from_static("x-tune-latence-trames"),
+                    p.latence_trames.to_string(),
+                ),
+            ],
+            octets,
+        )
+            .into_response(),
+        Err(e) => refus(StatusCode::INTERNAL_SERVER_ERROR, "fir_non_ecrit", e),
+    }
+}
+
+async fn mesure_fir(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeFir>,
+) -> Response {
+    match fir_pour(&etat, &id, false, d).await {
+        Ok((zone, p)) => fir_json(&id, zone, &p),
+        Err(r) => r,
+    }
+}
+
+async fn mesure_fir_wav(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeFir>,
+) -> Response {
+    match fir_pour(&etat, &id, false, d).await {
+        Ok((_, p)) => fir_wav(&id, &p),
+        Err(r) => r,
+    }
+}
+
+async fn session_fir(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeFir>,
+) -> Response {
+    match fir_pour(&etat, &id, true, d).await {
+        Ok((zone, p)) => fir_json(&id, zone, &p),
+        Err(r) => r,
+    }
+}
+
+async fn session_fir_wav(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeFir>,
+) -> Response {
+    match fir_pour(&etat, &id, true, d).await {
+        Ok((_, p)) => fir_wav(&id, &p),
+        Err(r) => r,
     }
 }

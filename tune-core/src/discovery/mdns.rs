@@ -866,6 +866,15 @@ fn service_to_device(
                 "airplay_requires_pairing".to_string(),
                 serde_json::Value::Bool(true),
             );
+            // #9379 — ce bit seul dit « appairage unique avec le code affiché
+            // par le récepteur » (owntone : `ONE_TIME_PAIRING_REQUIRED`,
+            // jamais de transitoire dans ce cas). `airplay_requires_pairing`
+            // ne le distingue pas : les bits de `features` le posent sur
+            // presque tout récepteur AirPlay 2, HomePod compris.
+            caps.insert(
+                CAP_AIRPLAY_CODE_A_L_ECRAN.to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
 
         // Groupe AirPlay 2 (paire stéréo, multi-room) : `gid` identifie le
@@ -1278,6 +1287,11 @@ fn detect_local_subnet() -> Option<String> {
 /// `flags` TXT bit meaning "the receiver requires a PIN / password".
 /// (RAOP/AirPlay `flags`, bit 9.)
 const AIRPLAY_FLAG_PIN_REQUIRED: u64 = 0x200;
+
+/// #9379 — capacité posée quand le TXT `flags`/`sf` porte le bit 9 : le
+/// récepteur (Apple TV, Mac…) n'accepte qu'un appairage unique avec le code
+/// qu'il affiche ; ni le transitoire ni le code par défaut `3939` ne passent.
+pub const CAP_AIRPLAY_CODE_A_L_ECRAN: &str = "airplay_code_a_l_ecran";
 
 // AirPlay feature bits relevant to whether pairing is mandatory. The `features`
 // value is a 64-bit mask; the low 32 bits are the first word and the high 32
@@ -1949,6 +1963,62 @@ mod tests {
             device.capabilities.get("airplay_requires_pairing"),
             Some(&serde_json::Value::Bool(true))
         );
+    }
+
+    /// #9379 — Apple TV 4K sondée le 19/08 (#1944) : `statusFlags 0x18644`,
+    /// bit 9 posé. Le TXT `flags` le répète : la capacité le dit.
+    #[test]
+    fn apple_tv_flags_bit_9_annonce_le_code_a_l_ecran_9379() {
+        let properties = [
+            ("deviceid", "2E:C8:42:93:79:01"),
+            ("features", "0x4A7FDFD5,0x3C177FDE"),
+            ("flags", "0x18644"),
+            ("model", "AppleTV14,1"),
+        ];
+        let svc = ServiceInfo::new(
+            AIRPLAY_SERVICE,
+            "salon",
+            "salon.local.",
+            "192.168.1.37",
+            7000,
+            &properties[..],
+        )
+        .expect("ServiceInfo Apple TV")
+        .as_resolved_service();
+        let device = service_to_device(&svc, OutputType::Airplay, 7000);
+        assert_eq!(
+            device.capabilities.get(CAP_AIRPLAY_CODE_A_L_ECRAN),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    /// Contre-épreuve : un HomePod (appairage transitoire) dont `flags`
+    /// n'a pas le bit 9 n'est pas marqué, même si `features` exige un
+    /// appairage HomeKit.
+    #[test]
+    fn homepod_sans_bit_9_n_annonce_pas_de_code_a_l_ecran_9379() {
+        let properties = [
+            ("deviceid", "D2:7C:CE:93:79:01"),
+            ("features", "0x4A7FDFD5,0x3C177FDE"),
+            ("flags", "0x18404"),
+            ("model", "AudioAccessory5,1"),
+        ];
+        let svc = ServiceInfo::new(
+            AIRPLAY_SERVICE,
+            "Zone 15",
+            "homepod.local.",
+            "192.168.1.45",
+            7000,
+            &properties[..],
+        )
+        .expect("ServiceInfo HomePod")
+        .as_resolved_service();
+        let device = service_to_device(&svc, OutputType::Airplay, 7000);
+        assert_eq!(
+            device.capabilities.get("airplay_requires_pairing"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(device.capabilities.get(CAP_AIRPLAY_CODE_A_L_ECRAN), None);
     }
 
     #[test]

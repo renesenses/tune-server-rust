@@ -554,3 +554,29 @@ async fn un_album_cd_au_mur_de_codec_est_une_source_alteree_9067() {
         assert!(!ids.contains(&14), "{mot} : {ids:?}");
     }
 }
+
+/// #9472 — sur la route de l'album aussi, une piste rangée « douteuse » sur
+/// une coupure basse se lit non concluante, sans raison ni coupure, et ne
+/// compte pas dans le badge.
+#[tokio::test]
+async fn une_coupure_basse_rangee_ne_se_publie_pas_pour_l_album_9472() {
+    let (app, state) = banc();
+    state
+        .backend
+        .execute_batch(
+            "INSERT INTO albums (id, title) VALUES (12, 'Grave');
+             INSERT INTO tracks (id, title, album_id, file_path, format, duration_ms) VALUES
+               (121, 'Un', 12, '/m/121.flac', 'flac', 60000);
+             INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, bits_effectifs, sample_rate, bits_declares)
+               VALUES (121, 'douteux', 'coupure_spectrale', 1400.0, 24, 96000, 24);",
+        )
+        .unwrap();
+    montrer_douteux(&app, true).await;
+    let c = get(&app, "/api/v1/library/albums/12/hires").await;
+    assert_ne!(c["verdict"], "douteux", "{c}");
+    assert!(c["coupure_hz"].is_null(), "{c}");
+    let p = &c["pistes"][0];
+    assert_eq!(p["verdict"], "non_concluant", "{p}");
+    assert!(p["raison"].is_null(), "{p}");
+    assert!(p["coupure_hz"].is_null(), "{p}");
+}

@@ -172,7 +172,8 @@ async fn cafe_del_mar_du_portail_se_joue_depuis_l_annuaire_7200() {
 }
 
 fn etat() -> tune_server::state::AppState {
-    tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap()
+    tune_server::state::AppState::new_avec_catalogue_de_radios(":memory:", 0, Default::default())
+        .unwrap()
 }
 
 /// Un faux annuaire : 200 + `ETag`, ou 304 quand on lui rend son `ETag`.

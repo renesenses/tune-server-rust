@@ -492,3 +492,91 @@ fn empreinte_stable_deterministe() {
     std::fs::write(&f, b"01234").unwrap();
     assert_ne!(a, empreinte_stable(c, &std::fs::metadata(&f).unwrap()));
 }
+
+/// #9248 (fil du forum 2967) — une piste Monkey's Audio 44,1 kHz / 16 bits
+/// dont la base garde une onde de 200 zéros (celle du décodeur APE maison de
+/// juin-juillet 2026, qui rendait du silence) : l'ancien contrat la
+/// resservait telle quelle, le client l'écartait comme « toute plate », et la
+/// piste n'avait jamais d'onde. Elle est maintenant recalculée.
+#[tokio::test]
+async fn une_onde_plate_en_base_est_recalculee_9248() {
+    let banc = Banc::new();
+    let ape = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tune-core/tests/fixtures/ape/sine_16s_c3000.ape"
+    );
+    banc.state
+        .backend
+        .execute(
+            "INSERT INTO tracks (id, title, file_path, duration_ms, source) VALUES (9248, 'ape', ?, 16000, 'local')",
+            &[&ape.to_string()],
+        )
+        .unwrap();
+    let plate = serde_json::to_string(&vec![0.0f32; 200]).unwrap();
+    TrackRepo::with_backend(banc.state.backend.clone())
+        .set_waveform(9248, &plate)
+        .unwrap();
+
+    let (statut, v) = banc.demander(9248, None).await;
+    assert_eq!(statut, StatusCode::OK);
+    let points = onde(&v);
+    assert_eq!(points.len(), 200);
+    assert!(
+        points.iter().any(|x| *x > 0.5),
+        "l'onde plate en base est resservie au lieu d'être recalculée : {v}"
+    );
+    let en_base: Vec<f32> = serde_json::from_str(&banc.en_base(9248).unwrap()).unwrap();
+    assert!(
+        en_base.iter().any(|x| *x > 0.5),
+        "la base garde l'onde plate"
+    );
+}
+
+#[test]
+fn onde_dessinable_comme_le_client_web() {
+    assert!(onde_dessinable(&json!([0.0, 0.4])));
+    assert!(!onde_dessinable(&json!([0.0, 0.0, 0.0])));
+    assert!(!onde_dessinable(&json!([0.7])));
+    assert!(!onde_dessinable(&json!([])));
+    assert!(!onde_dessinable(&json!([0.5, null])));
+    assert!(!onde_dessinable(&Value::Null));
+}
+
+/// #9248, relecture — une piste réellement muette rend, recalculée, une onde
+/// plate elle aussi : elle ne doit pas être redécodée à chaque demande. La
+/// seconde demande sert l'onde en base sans décoder : on y glisse une onde
+/// plate de 2 points, qu'un décodage remplacerait par 200.
+#[tokio::test]
+async fn une_piste_muette_n_est_recalculee_qu_une_fois_9248() {
+    let banc = Banc::new();
+    let id = 92_481;
+    let chemin = banc.dossier.path().join("muette.wav");
+    ecrire_wav(&chemin, 4, 4);
+    banc.state
+        .backend
+        .execute(
+            "INSERT INTO tracks (id, title, file_path, duration_ms, source) VALUES (?, 'muette', ?, 4000, 'local')",
+            &[&id, &chemin.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+    let repo = TrackRepo::with_backend(banc.state.backend.clone());
+    repo.set_waveform(id, &serde_json::to_string(&vec![0.0f32; 200]).unwrap())
+        .unwrap();
+
+    // Première demande : l'onde plate en base est recalculée… et reste plate.
+    let (statut, v) = banc.demander(id, None).await;
+    assert_eq!(statut, StatusCode::OK);
+    let premiere = onde(&v);
+    assert_eq!(premiere.len(), 200);
+    assert!(premiere.iter().all(|x| *x == 0.0), "{v}");
+
+    // Seconde demande : pas de nouveau décodage.
+    repo.set_waveform(id, "[0.0,0.0]").unwrap();
+    let (statut, v) = banc.demander(id, None).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(
+        onde(&v).len(),
+        2,
+        "la piste muette a été redécodée à la seconde demande : {v}"
+    );
+}

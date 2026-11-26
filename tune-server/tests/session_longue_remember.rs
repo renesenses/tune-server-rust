@@ -1,6 +1,10 @@
 //! Session « rester connecté » des remotes : `POST /auth/login` avec
-//! `"remember": true` rend un jeton de 30 jours, listé et révocable par
+//! `"remember": true` ouvre une session de 30 jours, listée et révocable par
 //! l'administrateur ; sans ce champ, rien ne change (24 h).
+//!
+//! rc14 — la session dure 30 jours GLISSANTS, mais son jeton d'accès dure
+//! 24 h : la connexion rend aussi un jeton de renouvellement
+//! (`POST /auth/refresh`, voir `session_renouvelee_rc14.rs`).
 
 use axum::Router;
 use axum::body::Body;
@@ -117,9 +121,24 @@ async fn remember_donne_trente_jours_et_sans_lui_rien_ne_change() {
     let state = preparer();
 
     let v = connexion(&state, "alice", r#","remember":true"#).await;
-    assert_eq!(v["expires_in"], TRENTE_JOURS, "{v}");
+    // rc14 — jeton d'accès de 24 h, session de 30 jours renouvelable.
+    assert_eq!(v["expires_in"], 86400, "{v}");
+    assert_eq!(v["refresh_expires_in"], TRENTE_JOURS, "{v}");
+    assert!(
+        v["refresh_token"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("tune_rt_")),
+        "{v}"
+    );
     let long = v["token"].as_str().unwrap();
-    assert_eq!(duree_du_jeton(long), TRENTE_JOURS);
+    assert_eq!(duree_du_jeton(long), 86400);
+    assert!(
+        tune_server::auth::verify_jwt(long, SECRET)
+            .unwrap()
+            .sid
+            .is_some(),
+        "le jeton d'accès porte sa session"
+    );
     assert_eq!(v["role"], "user", "aucun élargissement de rôle");
     assert_eq!(moi(&state, long).await, StatusCode::OK);
 
@@ -127,6 +146,7 @@ async fn remember_donne_trente_jours_et_sans_lui_rien_ne_change() {
         let v = connexion(&state, "alice", extra).await;
         assert_eq!(v["expires_in"], 86400, "{extra} : {v}");
         assert_eq!(duree_du_jeton(v["token"].as_str().unwrap()), 86400);
+        assert!(v.get("refresh_token").is_none(), "{extra} : {v}");
     }
 }
 

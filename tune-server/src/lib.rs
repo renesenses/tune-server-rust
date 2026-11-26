@@ -54,6 +54,8 @@ mod instance_existante;
 pub(crate) mod lancement_sans_console;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod navigateur_windows;
+/// #9174 — d'où écoute le lecteur d'une zone navigateur (relais ou local).
+pub mod provenance_navigateur_9174;
 pub mod retard_de_l_executeur_9391;
 pub use tune_http_types::error;
 #[cfg(feature = "local-audio")]
@@ -86,6 +88,8 @@ pub mod releve_memoire;
 pub mod reprise_des_passes;
 pub mod routes;
 pub mod scan_import;
+/// rc14 — la session renouvelée tant qu'elle sert (`POST /auth/refresh`).
+pub mod session_renouvelee;
 /// L'echelle de dialectes CIFS, partagee par la route de montage et par le
 /// remontage au demarrage. Voir [`smb`] pour ce que leur divergence coutait.
 pub mod smb;

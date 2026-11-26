@@ -417,11 +417,17 @@ mod canaux_tests_5336 {
 }
 
 pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
+    // Revue #9520 — le droit Premium du compte, pour le panneau du signal.
+    let premium_du_compte = state.license.is_premium().await;
     let repo = ZoneRepo::with_backend(state.backend.clone());
     // #5077 — une zone masquée qui joue reste dans la liste.
     let zones = super::zones_a_montrer(&state).await;
     // DUP-1 (phase 2) : l'age de la derniere reponse, une requete pour toutes.
     let ages = repo.ages_depuis_derniere_vue().unwrap_or_default();
+    // #9044 (rc14) — les appareils oubliés, lus une fois pour toute la liste.
+    let oublis = crate::routes::devices::oubli_auto_9044::lire_oublis(
+        &tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone()),
+    );
     let devices = state.scanner.devices().await;
     // Manually-added devices (e.g. legacy DLNA renderers that never appear in
     // SSDP discovery) are registered as outputs but absent from `devices`.
@@ -458,6 +464,7 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             );
             obj.insert("current_track".into(), json!(ps.now_playing));
             inject_metadata_anchor(obj, &ps);
+            inject_dsd_porte(obj, "current_track", &ps);
             inject_session_context(obj, &ps);
             obj.insert(
                 "device_volume_observation".into(),
@@ -550,18 +557,7 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 &devices,
                 &registered_output_ids,
             );
-            let signal_path = build_signal_path(
-                &ps,
-                z,
-                &state.backend,
-                renderer_label,
-                audio_backend_de_la_zone,
-                wire.as_ref(),
-            );
-            // #7084 — composant AirPlay 2 absent : la zone le dit.
-            super::composant_airplay2_7084::injecter_composant_airplay2_manquant(obj, z);
-            let signal_path = signal_path_sous_licence(
-                &state.license,
+            let signal_path = avec_le_droit(premium_du_compte, || {
                 build_signal_path(
                     &ps,
                     z,
@@ -569,7 +565,22 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                     renderer_label,
                     audio_backend_de_la_zone,
                     wire.as_ref(),
-                ),
+                )
+            });
+            // #7084 — composant AirPlay 2 absent : la zone le dit.
+            super::composant_airplay2_7084::injecter_composant_airplay2_manquant(obj, z);
+            let signal_path = signal_path_sous_licence(
+                &state.license,
+                avec_le_droit(premium_du_compte, || {
+                    build_signal_path(
+                        &ps,
+                        z,
+                        &state.backend,
+                        renderer_label,
+                        audio_backend_de_la_zone,
+                        wire.as_ref(),
+                    )
+                }),
             )
             .await;
             // #8569 — sortie au volume non réglable : pas d'étape Volume.
@@ -661,6 +672,12 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                     .unwrap_or(false),
             };
             obj.insert("online".into(), json!(online));
+            crate::routes::devices::oubli_auto_9044::injecter_oubli(
+                obj,
+                z.output_device_id.as_deref(),
+                online,
+                &oublis,
+            );
             for (cle, valeur) in
                 super::presence::Presence::qualifier(online, ages.get(&zone_id).copied()).champs()
             {
@@ -699,6 +716,8 @@ pub(crate) async fn get_zone(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
+    // Revue #9520 — le droit Premium du compte, pour le panneau du signal.
+    let premium_du_compte = state.license.is_premium().await;
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let audio_backend_pref = state.display_audio_backend();
     #[cfg(feature = "local-audio")]
@@ -728,6 +747,7 @@ pub(crate) async fn get_zone(
                     json!(mode_exclusif_applique(&state, zone.output_device_id.as_deref()).await),
                 );
                 inject_metadata_anchor(obj, &ps);
+                inject_dsd_porte(obj, "current_track", &ps);
                 inject_session_context(obj, &ps);
                 obj.insert(
                     "device_volume_observation".into(),
@@ -809,17 +829,7 @@ pub(crate) async fn get_zone(
                     &devices,
                     &registered_output_ids,
                 );
-                let signal_path = build_signal_path(
-                    &ps,
-                    &zone,
-                    &state.backend,
-                    renderer_label,
-                    audio_backend_de_la_zone,
-                    wire.as_ref(),
-                );
-                super::composant_airplay2_7084::injecter_composant_airplay2_manquant(obj, &zone);
-                let signal_path = signal_path_sous_licence(
-                    &state.license,
+                let signal_path = avec_le_droit(premium_du_compte, || {
                     build_signal_path(
                         &ps,
                         &zone,
@@ -827,7 +837,21 @@ pub(crate) async fn get_zone(
                         renderer_label,
                         audio_backend_de_la_zone,
                         wire.as_ref(),
-                    ),
+                    )
+                });
+                super::composant_airplay2_7084::injecter_composant_airplay2_manquant(obj, &zone);
+                let signal_path = signal_path_sous_licence(
+                    &state.license,
+                    avec_le_droit(premium_du_compte, || {
+                        build_signal_path(
+                            &ps,
+                            &zone,
+                            &state.backend,
+                            renderer_label,
+                            audio_backend_de_la_zone,
+                            wire.as_ref(),
+                        )
+                    }),
                 )
                 .await;
                 // #8569 — voir la note au site jumeau (`list_zones`).
@@ -902,6 +926,16 @@ pub(crate) async fn get_zone(
                         .unwrap_or(false),
                 };
                 obj.insert("online".into(), json!(online));
+                crate::routes::devices::oubli_auto_9044::injecter_oubli(
+                    obj,
+                    zone.output_device_id.as_deref(),
+                    online,
+                    &crate::routes::devices::oubli_auto_9044::lire_oublis(
+                        &tune_core::db::settings_repo::SettingsRepo::with_backend(
+                            state.backend.clone(),
+                        ),
+                    ),
+                );
                 let age = ZoneRepo::with_backend(state.backend.clone())
                     .ages_depuis_derniere_vue()
                     .unwrap_or_default()

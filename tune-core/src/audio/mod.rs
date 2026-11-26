@@ -14,8 +14,13 @@ pub mod autoeq_base;
 pub mod bornes_cue;
 pub mod canaux_declares;
 pub mod canaux_reseau_4573;
+/// rc14 — les réglages du greffon « Casque » tirés d'une correction OPRA.
+pub mod casque_opra;
 /// #6385 — les profils d'égaliseur OPRA (JSON), lus vers le même modèle.
 pub mod opra;
+/// rc14 — la base OPRA en ligne (greffon TESS « Casque ») : recherche,
+/// corrections, copie locale.
+pub mod opra_base;
 
 pub mod bitperfect_strict;
 /// #4969 — la carte des canaux de SORTIE (réaffectation, disposition,
@@ -70,6 +75,10 @@ pub mod dsf;
 pub mod dsf_depuis_dst;
 #[cfg(test)]
 mod dsf_depuis_dst_tests_6221;
+/// #9184 — une tranche d'ISO SACD servie en DSF virtuel (DSD natif réseau).
+pub mod dsf_depuis_iso;
+#[cfg(test)]
+mod dsf_depuis_iso_tests_9184;
 /// #4833 — le DSF décodé au fil de l'eau depuis HTTP produit le même PCM que
 /// le fichier (mesuré : comptes, cadence, RMS, corrélation, vitesse).
 #[cfg(test)]
@@ -111,6 +120,8 @@ pub mod frequence_fixe;
 pub mod garde_de_hausse;
 pub mod http_range;
 pub mod image_cdda;
+/// TESS T09a — import d'un jeu de réponses (`.wav`, `.zip`, `.cfg` Convolver).
+pub mod import_ri;
 /// #5299 — les fichiers audio d'une image ISO de données, lus sans la monter.
 pub mod iso9660;
 pub mod iso_sacd;
@@ -120,6 +131,8 @@ pub mod m4a;
 /// Matroska (`.mkv`/`.mka`/`.webm`) : la sonde de la piste audio — admis si
 /// un décodeur livré la lit, compté-nommé sinon (#3633).
 pub mod matroska;
+/// #9174 — une SEEKTABLE pour le FLAC servi à un navigateur tiré à distance.
+pub mod seektable_flac_9174;
 // #8513 — traitements de zone contournés pendant une mesure de pièce.
 /// La forme d'onde d'une piste (crêtes, RMS, écrêtage) pour sa fiche
 /// technique (fil du forum 2793).
@@ -149,6 +162,8 @@ pub mod pipeline;
 /// #6044 — le greffon « Réaffectation des canaux » : réglage par zone et par
 /// album, résolution de la règle qui s'applique à une piste.
 pub mod reaffectation_canaux;
+// rc14 — greffon TESS « Speaker Setup » (distance, gain, phase par voie).
+pub mod reglage_enceintes;
 pub mod reglages_de_volume;
 pub mod replaygain;
 pub mod repli_dsd_4354;

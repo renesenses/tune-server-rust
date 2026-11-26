@@ -20,13 +20,15 @@ use axum::http::HeaderMap;
 /// `Accept-Language` parse so an unsupported browser locale falls back to
 /// [`FALLBACK`].
 ///
-/// Seize langues depuis le turc (web#3170) — après le norvégien bokmål, le polonais et le grec
-/// (rc9) —, les mêmes que
+/// Vingt langues depuis le néerlandais, le chinois traditionnel, le russe et
+/// l'ukrainien (rc14) — après le turc (web#3170), le norvégien bokmål, le
+/// polonais et le grec (rc9) —, les mêmes que
 /// l'interface web (`tune-web-client/src/lib/locales/`). Chaque clé de
 /// `i18n_server.json` doit porter chacune d'elles : le test
 /// `chaque_cle_porte_chaque_langue` le garde.
 pub const SUPPORTED: &[&str] = &[
     "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi", "nb", "pl", "el", "tr",
+    "nl", "zh-Hant", "ru", "uk",
 ];
 
 /// Langue de repli du serveur : l'anglais, comme le client web. Ni un en-tête
@@ -42,17 +44,34 @@ fn table() -> &'static HashMap<String, HashMap<String, String>> {
 }
 
 /// Base d'une étiquette de langue, en minuscules : `fr-FR` → `fr`, `EN` →
-/// `en`, `zh-Hant-TW` → `zh`. C'est la forme sous laquelle les langues sont
-/// comparées partout côté serveur (`SUPPORTED`, blocs de notes de version…).
+/// `en`. C'est la forme sous laquelle les langues sont comparées partout côté
+/// serveur (`SUPPORTED`, blocs de notes de version…).
+///
+/// Seule exception, le chinois, qui s'écrit de deux façons (rc14) : voir
+/// [`ecriture_chinoise`]. `zh-Hant-TW`, `zh-TW` et `zh-HK` → `zh-Hant` ;
+/// `zh-CN`, `zh-Hans-HK` et `zh` → `zh`.
 pub fn base_tag(tag: &str) -> String {
-    alias_langue(
-        tag.trim()
-            .split('-')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_lowercase(),
-    )
+    let etiquette = tag.trim().to_lowercase();
+    let morceaux: Vec<&str> = etiquette.split(['-', '_']).map(str::trim).collect();
+    let base = morceaux.first().copied().unwrap_or("");
+    if base == "zh" {
+        return ecriture_chinoise(&morceaux[1..]).to_string();
+    }
+    alias_langue(base.to_string())
+}
+
+/// Le chinois traditionnel (`zh-Hant` : Taïwan, Hong Kong, Macao) ou
+/// simplifié (`zh` : Chine continentale, Singapour), d'après la suite d'une
+/// étiquette `zh-…` déjà en minuscules. L'écriture explicite (`hant`, `hans`)
+/// l'emporte sur la région ; sans elle, `tw`, `hk` et `mo` désignent le
+/// traditionnel. Même règle que le client web (`langueParDefaut.ts`).
+fn ecriture_chinoise(suite: &[&str]) -> &'static str {
+    match suite.first().copied() {
+        Some("hant") => "zh-Hant",
+        Some("hans") => "zh",
+        _ if suite.iter().any(|m| matches!(*m, "tw" | "hk" | "mo")) => "zh-Hant",
+        _ => "zh",
+    }
 }
 
 /// Le norvégien s'annonce `no` (ou `nn`, nynorsk, faute de mieux) : l'interface
@@ -71,7 +90,7 @@ pub fn alias_langue(base: String) -> String {
 /// tri stable, l'ordre d'écriture départage les égalités —, sans les entrées
 /// refusées (`q=0`), sans le joker `*` ni les poids illisibles.
 ///
-/// `de;q=0.5, ja, zh-TW;q=0.8` → `["ja", "zh", "de"]`.
+/// `de;q=0.5, ja, zh-TW;q=0.8` → `["ja", "zh-Hant", "de"]`.
 pub fn langues_acceptees(entete: &str) -> Vec<String> {
     let mut candidates: Vec<(f32, String)> = entete
         .split(',')
@@ -98,7 +117,7 @@ pub fn langues_acceptees(entete: &str) -> Vec<String> {
 
 /// Resolve the request language from `Accept-Language`: the preferred
 /// supported language by `q` weight (e.g. `pt-BR,pt;q=0.9,fr;q=0.8` -> `fr`,
-/// `zh-TW` -> `zh`). Without any supported language — or without the header
+/// `zh-TW` -> `zh-Hant`, `zh-CN` -> `zh`). Without any supported language — or without the header
 /// — [`FALLBACK`], English.
 pub fn lang_from_header(headers: &HeaderMap) -> String {
     headers
@@ -169,7 +188,8 @@ mod tests {
     fn base_tag_reduit_a_la_base_minuscule() {
         assert_eq!(base_tag("fr-FR"), "fr");
         assert_eq!(base_tag(" EN-gb "), "en");
-        assert_eq!(base_tag("zh-Hant-TW"), "zh");
+        assert_eq!(base_tag("zh-Hant-TW"), "zh-Hant");
+        assert_eq!(base_tag("zh-CN"), "zh");
         assert_eq!(base_tag(""), "");
     }
 
@@ -240,8 +260,12 @@ mod tests {
 
     #[test]
     fn le_prefixe_de_langue_est_retenu() {
-        assert_eq!(lang_from_header(&en_tetes("zh-TW")), "zh");
-        assert_eq!(lang_from_header(&en_tetes("zh-Hant-TW;q=0.9, pt")), "zh");
+        assert_eq!(lang_from_header(&en_tetes("zh-TW")), "zh-Hant");
+        assert_eq!(
+            lang_from_header(&en_tetes("zh-Hant-TW;q=0.9, pt")),
+            "zh-Hant"
+        );
+        assert_eq!(lang_from_header(&en_tetes("zh-CN")), "zh");
         assert_eq!(lang_from_header(&en_tetes("ES-mx ; q=0.7")), "es");
     }
 
@@ -249,7 +273,7 @@ mod tests {
     fn langues_acceptees_trie_et_filtre() {
         assert_eq!(
             langues_acceptees("de;q=0.5, ja, zh-TW;q=0.8, *;q=0.1, it;q=0"),
-            ["ja", "zh", "de"]
+            ["ja", "zh-Hant", "de"]
         );
         assert!(langues_acceptees("").is_empty());
     }
@@ -322,6 +346,46 @@ mod tests {
             t("tr", "ai.zonesAvailable"),
             "Kullanılabilir bölgeler: {zones}",
             "« zone » se dit « bölge », comme dans l'interface web"
+        );
+    }
+
+    /// Le néerlandais, le chinois traditionnel, le russe et l'ukrainien sont
+    /// des langues de l'interface (rc14). Le chinois se négocie par son
+    /// écriture : `zh-TW`, `zh-HK` et `zh-Hant` donnent le traditionnel,
+    /// `zh-CN` et `zh-Hans-HK` le simplifié.
+    ///
+    /// Contre-épreuve : retirer `"zh-Hant"` de `SUPPORTED` fait retomber
+    /// `zh-TW` sur `"en"` ; ramener `base_tag` à la seule base le fait
+    /// retomber sur `"zh"`.
+    #[test]
+    fn les_quatre_langues_de_la_rc14_sont_servies() {
+        assert_eq!(lang_from_header(&en_tetes("nl-NL,nl;q=0.9,en;q=0.8")), "nl");
+        assert_eq!(lang_from_header(&en_tetes("nl-BE")), "nl");
+        assert_eq!(lang_from_header(&en_tetes("ru-RU,ru;q=0.9,en;q=0.8")), "ru");
+        assert_eq!(lang_from_header(&en_tetes("uk-UA,uk;q=0.9,ru;q=0.8")), "uk");
+        assert_eq!(lang_from_header(&en_tetes("zh-TW,zh;q=0.9")), "zh-Hant");
+        assert_eq!(lang_from_header(&en_tetes("zh-HK")), "zh-Hant");
+        assert_eq!(lang_from_header(&en_tetes("zh-MO")), "zh-Hant");
+        assert_eq!(lang_from_header(&en_tetes("zh-Hant")), "zh-Hant");
+        assert_eq!(lang_from_header(&en_tetes("zh-CN,zh;q=0.9")), "zh");
+        assert_eq!(lang_from_header(&en_tetes("zh-Hans-HK")), "zh");
+        assert_eq!(lang_from_header(&en_tetes("zh")), "zh");
+        // Le paramètre `?lang=zh-Hant` du client web est rendu tel quel.
+        assert_eq!(
+            lang_from_request(Some("zh-Hant"), &HeaderMap::new()),
+            "zh-Hant"
+        );
+        assert_eq!(t("nl", "metafield.composer"), "Componist");
+        assert_eq!(t("zh-Hant", "metafield.composer"), "作曲家");
+        assert_eq!(t("ru", "metafield.composer"), "Композитор");
+        assert_eq!(t("uk", "metafield.composer"), "Композитор");
+        assert_eq!(t("zh-Hant", "ai.zonesAvailable"), "可用的區域：{zones}");
+        assert_eq!(t("ru", "ai.zonesAvailable"), "Доступные зоны: {zones}");
+        assert_eq!(t("uk", "ai.zonesAvailable"), "Доступні зони: {zones}");
+        // Le traditionnel n'est pas le simplifié : deux textes différents.
+        assert_ne!(
+            t("zh-Hant", "ai.zonesAvailable"),
+            t("zh", "ai.zonesAvailable")
         );
     }
 
@@ -429,6 +493,10 @@ mod tests {
             ("pl", "Dostęp i tokeny"),
             ("el", "Πρόσβαση και διακριτικά"),
             ("tr", "Erişim ve belirteçler"),
+            ("nl", "Toegang en tokens"),
+            ("zh-Hant", "存取與權杖"),
+            ("ru", "Доступ и токены"),
+            ("uk", "Доступ і токени"),
         ];
         assert_eq!(onglet.len(), super::SUPPORTED.len());
         for (lang, libelle) in onglet {

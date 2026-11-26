@@ -776,6 +776,7 @@ async fn les_routes_d_extraction_exigent_un_administrateur() {
     for (methode, uri, corps) in [
         ("GET", "/lecteurs", None),
         ("GET", "/extraction/reglages", None),
+        ("GET", "/extraction/dossiers", None),
         (
             "PUT",
             "/extraction/reglages",
@@ -1620,4 +1621,172 @@ mod verification_ar {
         assert_eq!(base.appels(), 1, "une seule consultation pour le disque");
         m.liberer();
     }
+}
+
+/// Fil forum 3036 — le choix du dossier de l'extraction descend sous
+/// l'emplacement de la bibliothèque : trois niveaux, puis la destination
+/// choisie est acceptée. Rien ne sort de l'emplacement : ni `..`, ni un
+/// autre dossier, ni un lien symbolique posé dedans.
+#[tokio::test]
+async fn le_choix_du_dossier_descend_sans_sortir_de_la_bibliotheque_3036() {
+    let banc = Banc::new(simule(), Arc::new(SansReseau));
+    let racine = banc.racine().to_string_lossy().to_string();
+    std::fs::create_dir_all(banc.racine().join("Classique/Bach/Cantates")).unwrap();
+    std::fs::create_dir_all(banc.racine().join(".tune")).unwrap();
+    std::fs::write(banc.racine().join("Classique/notes.txt"), b"x").unwrap();
+    let q = |c: &str| format!("/extraction/dossiers?chemin={}", encode(c));
+    let noms = |v: &Value| -> Vec<String> {
+        v["dossiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["nom"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Sans chemin : les emplacements eux-mêmes.
+    let (code, v) = banc.appel("GET", "/extraction/dossiers", None).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["courant"], Value::Null);
+    assert_eq!(v["dossiers"][0]["chemin"], racine.as_str());
+
+    // Trois niveaux sous l'emplacement (ni fichier, ni dossier caché).
+    let (code, v) = banc.appel("GET", &q(&racine), None).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(noms(&v), ["Classique"]);
+    assert_eq!(v["parent"], Value::Null, "l'emplacement est le haut");
+    let niveau1 = v["dossiers"][0]["chemin"].as_str().unwrap().to_string();
+    let (_, v) = banc.appel("GET", &q(&niveau1), None).await;
+    assert_eq!(noms(&v), ["Bach"]);
+    assert_eq!(v["parent"], racine.as_str());
+    let niveau2 = v["dossiers"][0]["chemin"].as_str().unwrap().to_string();
+    let (_, v) = banc.appel("GET", &q(&niveau2), None).await;
+    assert_eq!(noms(&v), ["Cantates"]);
+    let niveau3 = v["dossiers"][0]["chemin"].as_str().unwrap().to_string();
+    let (code, v) = banc.appel("GET", &q(&niveau3), None).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["courant"], niveau3.as_str());
+    assert!(noms(&v).is_empty());
+    let (code, v) = banc
+        .appel(
+            "PUT",
+            "/extraction/reglages",
+            Some(json!({ "destination": niveau3 })),
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["destination"], niveau3.as_str());
+
+    // Sorties de l'emplacement : refusées, sans rien lister.
+    let ailleurs = tempfile::tempdir().unwrap();
+    std::fs::create_dir(ailleurs.path().join("secret")).unwrap();
+    let motif = |v: &Value| v["error"].as_str().map(str::to_string);
+    let (code, v) = banc.appel("GET", &q(&format!("{racine}/..")), None).await;
+    assert_eq!(
+        (code, motif(&v).as_deref()),
+        (StatusCode::BAD_REQUEST, Some("destination_invalide"))
+    );
+    let (code, v) = banc
+        .appel("GET", &q(&ailleurs.path().to_string_lossy()), None)
+        .await;
+    assert_eq!(
+        (code, motif(&v).as_deref()),
+        (StatusCode::BAD_REQUEST, Some("hors_bibliotheque"))
+    );
+    assert!(v.get("dossiers").is_none(), "{v}");
+    #[cfg(unix)]
+    {
+        let lien = banc.racine().join("Classique/lien");
+        std::os::unix::fs::symlink(ailleurs.path(), &lien).unwrap();
+        let (_, v) = banc.appel("GET", &q(&niveau1), None).await;
+        assert_eq!(
+            noms(&v),
+            ["Bach"],
+            "le lien vers l'extérieur n'est pas proposé"
+        );
+        let (code, v) = banc.appel("GET", &q(&lien.to_string_lossy()), None).await;
+        assert_eq!(
+            (code, motif(&v).as_deref()),
+            (StatusCode::BAD_REQUEST, Some("hors_bibliotheque"))
+        );
+    }
+    // Un dossier qui n'existe pas encore se choisit, mais ne se liste pas.
+    let (code, v) = banc
+        .appel("GET", &q(&format!("{racine}/Nouveau")), None)
+        .await;
+    assert_eq!(
+        (code, motif(&v).as_deref()),
+        (StatusCode::NOT_FOUND, Some("dossier_introuvable"))
+    );
+}
+
+/// Encodage d'URL minimal pour les témoins (chemins de dossiers temporaires).
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Fil forum 3036 (relecture) — un réglage ou un lancement forgé ne range
+/// pas un CD dans un dossier masqué : `.tune`, `duplicates`.
+#[tokio::test]
+async fn reglage_et_lancement_refusent_un_dossier_masque_3036() {
+    let banc = Banc::new(simule(), Arc::new(SansReseau));
+    let racine = banc.racine().to_string_lossy().to_string();
+    std::fs::create_dir_all(banc.racine().join(".tune")).unwrap();
+    let (code, v) = banc
+        .appel(
+            "PUT",
+            "/extraction/reglages",
+            Some(json!({ "destination": format!("{racine}/.tune") })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("dossier_masque"))
+    );
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "destination": format!("{racine}/duplicates") })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("dossier_masque"))
+    );
+    assert!(
+        !banc.racine().join("duplicates").exists(),
+        "rien n'est créé"
+    );
+}
+
+/// Fil forum 3036 (relecture) — un dossier en « . » que le scan parcourt
+/// se règle, et le réglage tient : pas de retour silencieux au premier
+/// emplacement.
+#[tokio::test]
+async fn un_reglage_dans_un_dossier_en_point_tient_3036() {
+    let banc = Banc::new(simule(), Arc::new(SansReseau));
+    let racine = banc.racine().to_string_lossy().to_string();
+    let special = format!("{racine}/.38 Special");
+    std::fs::create_dir_all(&special).unwrap();
+    let (code, v) = banc
+        .appel(
+            "PUT",
+            "/extraction/reglages",
+            Some(json!({ "destination": special })),
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let (_, v) = banc.appel("GET", "/extraction/reglages", None).await;
+    assert_eq!(
+        (v["destination"].as_str(), v["destination_source"].as_str()),
+        (Some(special.as_str()), Some("reglage"))
+    );
 }
