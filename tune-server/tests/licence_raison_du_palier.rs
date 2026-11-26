@@ -244,7 +244,11 @@ async fn premium_hors_ligne_dit_la_grace_et_sa_fin() {
 
     let rep = activer(&app).await;
     assert_eq!(rep["tier"], "premium", "{rep}");
-    assert_eq!(rep["reason"], Value::Null, "rien à dire d'un Premium confirmé : {rep}");
+    assert_eq!(
+        rep["reason"],
+        Value::Null,
+        "rien à dire d'un Premium confirmé : {rep}"
+    );
 
     // Le site tombe : le Premium déjà validé reste, et la grâce se dit.
     *reponse.lock().unwrap() = (503, json!({}));

@@ -1522,17 +1522,25 @@ pub fn lire_reponse_licence(
         r.reason = Some(RaisonLicence::ServerUnreachable);
         return r;
     };
-    let date_passee = r.expires_at.as_deref().is_some_and(is_timestamp_past);
+    // Le site écrit ses dates AVEC décalage (`+02:00`) : `parse_timestamp`
+    // les lit, `is_timestamp_past` (Zulu seul) non.
+    let date_passee = r
+        .expires_at
+        .as_deref()
+        .and_then(parse_timestamp)
+        .is_some_and(|d| d < chrono::Utc::now());
     if !valide {
         // Le battement ne porte pas `expired_at`, seulement son message.
-        let message_echu = ["message", "license_message"].iter().any(|c| {
-            texte(body, c).is_some_and(|m| m.eq_ignore_ascii_case("License expired"))
-        });
-        r.reason = Some(if body.get("expired_at").is_some() || date_passee || message_echu {
-            RaisonLicence::KeyExpired
-        } else {
-            RaisonLicence::KeyInvalid
-        });
+        let message_echu = ["message", "license_message"]
+            .iter()
+            .any(|c| texte(body, c).is_some_and(|m| m.eq_ignore_ascii_case("License expired")));
+        r.reason = Some(
+            if body.get("expired_at").is_some() || date_passee || message_echu {
+                RaisonLicence::KeyExpired
+            } else {
+                RaisonLicence::KeyInvalid
+            },
+        );
         return r;
     }
     let premium = body.get("license_tier").and_then(|v| v.as_str()) == Some("premium");
@@ -1543,7 +1551,10 @@ pub fn lire_reponse_licence(
 }
 
 /// Minutes avant que la session tenue ailleurs ne se libère d'elle-même.
-fn minutes_avant_liberation(active_since: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+fn minutes_avant_liberation(
+    active_since: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<i64> {
     let vu = parse_timestamp(active_since?)?;
     let ecoule = (now - vu).num_minutes().max(0);
     Some((SESSION_TTL_MINUTES - ecoule).clamp(1, SESSION_TTL_MINUTES))
@@ -3097,34 +3108,61 @@ mod raison_du_palier_tests {
     #[test]
     fn chaque_reponse_du_site_a_sa_raison() {
         let r = |s, b: serde_json::Value| lire_reponse_licence(Some(s), Some(&b)).reason;
-        assert_eq!(lire_reponse_licence(None, None).reason, Some(RaisonLicence::ServerUnreachable));
+        assert_eq!(
+            lire_reponse_licence(None, None).reason,
+            Some(RaisonLicence::ServerUnreachable)
+        );
         assert_eq!(r(429, json!({})), Some(RaisonLicence::RateLimited));
         assert_eq!(r(503, json!({})), Some(RaisonLicence::ServerUnreachable));
-        assert_eq!(lire_reponse_licence(Some(200), None).reason, Some(RaisonLicence::ServerUnreachable));
-        assert_eq!(r(200, json!({"ok": true})), Some(RaisonLicence::ServerUnreachable));
         assert_eq!(
-            r(200, json!({"license_valid": false, "session_conflict": true})),
+            lire_reponse_licence(Some(200), None).reason,
+            Some(RaisonLicence::ServerUnreachable)
+        );
+        assert_eq!(
+            r(200, json!({"ok": true})),
+            Some(RaisonLicence::ServerUnreachable)
+        );
+        assert_eq!(
+            r(
+                200,
+                json!({"license_valid": false, "session_conflict": true})
+            ),
             Some(RaisonLicence::SessionConflict)
         );
         assert_eq!(
-            r(200, json!({"license_valid": false, "message": "Invalid license key"})),
+            r(
+                200,
+                json!({"license_valid": false, "message": "Invalid license key"})
+            ),
             Some(RaisonLicence::KeyInvalid)
         );
         assert_eq!(
-            r(200, json!({"license_valid": false, "expired_at": "2020-01-01T00:00:00+01:00"})),
+            r(
+                200,
+                json!({"license_valid": false, "expired_at": "2020-01-01T00:00:00+01:00"})
+            ),
             Some(RaisonLicence::KeyExpired)
         );
         assert_eq!(
-            r(200, json!({"license_valid": false, "license_message": "License expired"})),
+            r(
+                200,
+                json!({"license_valid": false, "license_message": "License expired"})
+            ),
             Some(RaisonLicence::KeyExpired)
         );
         assert_eq!(
-            r(200, json!({"license_valid": true, "license_tier": "free",
-                          "license_expires_at": "2020-01-01T00:00:00+01:00"})),
+            r(
+                200,
+                json!({"license_valid": true, "license_tier": "free",
+                          "license_expires_at": "2020-01-01T00:00:00+01:00"})
+            ),
             Some(RaisonLicence::KeyExpired)
         );
         assert_eq!(
-            r(200, json!({"license_valid": true, "license_tier": "premium"})),
+            r(
+                200,
+                json!({"license_valid": true, "license_tier": "premium"})
+            ),
             None
         );
     }
@@ -3159,7 +3197,10 @@ mod raison_du_palier_tests {
         assert_eq!(e.reason, RaisonLicence::GracePeriod);
         assert!(e.grace_until.is_some());
         // Validation fraîche et réussie : rien à dire.
-        let ok = lire_reponse_licence(Some(200), Some(&json!({"license_valid": true, "license_tier": "premium"})));
+        let ok = lire_reponse_licence(
+            Some(200),
+            Some(&json!({"license_valid": true, "license_tier": "premium"})),
+        );
         assert_eq!(raison_du_palier(&etat, Some(&ok), now), None);
     }
 

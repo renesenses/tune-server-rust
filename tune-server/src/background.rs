@@ -2629,7 +2629,10 @@ async fn revalider_la_cle(
                 license.noter_reponse(tune_core::license::lire_reponse_licence(Some(statut), None));
                 return Some((Verdict::Echec, "reponse illisible".into()));
             };
-            license.noter_reponse(tune_core::license::lire_reponse_licence(Some(statut), Some(&body)));
+            license.noter_reponse(tune_core::license::lire_reponse_licence(
+                Some(statut),
+                Some(&body),
+            ));
             // Meme lecture du verdict que le battement et que les deux routes.
             let (tier, expires_at) = match tune_core::license::verdict_licence(&body) {
                 tune_core::license::VerdictLicence::Absent => {

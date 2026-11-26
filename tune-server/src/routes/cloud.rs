@@ -2225,7 +2225,10 @@ pub(crate) async fn raison_du_palier_json(state: &AppState) -> (Value, Value) {
 fn noter_reponse_licence(state: &AppState, upstream_status: Option<u16>, body: Option<&Value>) {
     state
         .license
-        .noter_reponse(tune_core::license::lire_reponse_licence(upstream_status, body));
+        .noter_reponse(tune_core::license::lire_reponse_licence(
+            upstream_status,
+            body,
+        ));
 }
 
 /// Validate the currently-stored license key against mozaiklabs.fr and apply
@@ -2455,13 +2458,14 @@ async fn license_validate(
     let ls = state.license.license_state().await;
     let Some(ref key) = ls.license_key else {
         return reponse_validation(
-                &state,
+            &state,
             MotifValidation::AucuneCle,
             json!({
                 "tier": "free",
                 "message": "No license key configured",
             }),
-        ).await;
+        )
+        .await;
     };
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -2494,7 +2498,8 @@ async fn license_validate(
                     "message": format!("Validation request failed: {e}"),
                     "cached": true,
                 }),
-            ).await;
+            )
+            .await;
         }
     };
 
@@ -2504,7 +2509,7 @@ async fn license_validate(
         noter_reponse_licence(&state, Some(statut_amont), None);
         info!("license_validate_endpoint_not_found, keeping cached state");
         return reponse_validation(
-                &state,
+            &state,
             MotifValidation::PointAccesAbsent,
             json!({
                 "tier": ls.tier,
@@ -2512,7 +2517,8 @@ async fn license_validate(
                 "cached": true,
                 "upstream_status": StatusCode::NOT_FOUND.as_u16(),
             }),
-        ).await;
+        )
+        .await;
     }
 
     if !resp.status().is_success() {
@@ -2520,7 +2526,7 @@ async fn license_validate(
         noter_reponse_licence(&state, Some(statut_amont), None);
         warn!(status = %status, "license_validate_server_error");
         return reponse_validation(
-                &state,
+            &state,
             MotifValidation::StatutDistant,
             json!({
                 "tier": ls.tier,
@@ -2528,7 +2534,8 @@ async fn license_validate(
                 "cached": true,
                 "upstream_status": status.as_u16(),
             }),
-        ).await;
+        )
+        .await;
     }
 
     // Parse the server's authoritative response.
@@ -2545,7 +2552,8 @@ async fn license_validate(
                     "message": format!("Failed to parse response: {e}"),
                     "cached": true,
                 }),
-            ).await;
+            )
+            .await;
         }
     };
 
@@ -2571,7 +2579,8 @@ async fn license_validate(
                     "message": "The licence server returned no verdict; the cached tier is kept.",
                     "cached": true,
                 }),
-            ).await;
+            )
+            .await;
         }
         tune_core::license::VerdictLicence::Expiree => {
             info!("license_invalidated_by_server_validate (authoritative expiry)");
@@ -2590,7 +2599,8 @@ async fn license_validate(
                     "tier": "free",
                     "message": "License key is not valid",
                 }),
-            ).await;
+            )
+            .await;
         }
         tune_core::license::VerdictLicence::RefusTransitoire => {
             // Un refus nu n'est pas une revocation : Premium survit dans la
@@ -2621,14 +2631,15 @@ async fn license_validate(
 
     let updated = state.license.license_state().await;
     reponse_validation(
-                &state,
+        &state,
         MotifValidation::Confirmee,
         json!({
             "tier": updated.tier,
             "expires_at": updated.expires_at,
             "last_validated": updated.last_validated,
         }),
-    ).await
+    )
+    .await
 }
 
 /// #3906 — les neuf sorties de `POST /cloud/license/validate` doivent être
