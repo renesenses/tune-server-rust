@@ -26,8 +26,14 @@
 //! [`nouvelle_lecture`]) : un son d'une autre écoute n'est jamais rejoué. Seul
 //! l'enchaînement sans blanc (même flux de sortie) garde l'historique.
 //!
-//! **Entrée en PURE sans fondu**, comme les autres étages : PURE rend le flux
-//! intact dès le bloc suivant. La sortie de PURE, elle, passe par un fondu.
+//! **Entrée en PURE par un fondu** (rc14, sécurité auditive, relecture de
+//! #9556) : la sortie l'arme AVANT son drapeau ([`entrer_en_pure`]). Le
+//! réglage passe en fondu au signal sec TENU au niveau de chaque voie (la
+//! réserve des gains n'est plus rendue d'un coup), puis le niveau remonte
+//! vers celui d'avant le réglage, borné par le volume, jamais au-delà ; à
+//! volume inchangé, PURE redevient bit-perfect au bout. Sans cet armement
+//! (drapeau posé seul), PURE rend le flux intact dès le bloc suivant. La
+//! sortie de PURE passe par un fondu.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -151,6 +157,52 @@ pub(crate) fn alimenter<T: Echantillon>(
     }
 }
 
+/// rc14 (sécurité auditive) — l'ENTRÉE en PURE de la sortie, avant son
+/// drapeau : un réglage qui agit fond vers le sec tenu au niveau de chaque
+/// voie, puis remonte vers `borne` (rapport `volume d'avant / volume
+/// courant`, #6741), jamais au-delà. Hors temps réel.
+pub(crate) fn entrer_en_pure(cle: &AtomicBool, borne: f64) {
+    if let Some(c) = creneau(cle)
+        && let Ok(mut p) = c.lock()
+    {
+        p.entrer_en_pure(borne);
+    }
+}
+
+/// rc14 — la SORTIE de PURE de la sortie : une entrée en cours repart vers
+/// le réglage par un fondu ; une entrée armée qui n'a pas joué est annulée.
+pub(crate) fn sortir_de_pure(cle: &AtomicBool) {
+    if let Some(c) = creneau(cle)
+        && let Ok(mut p) = c.lock()
+    {
+        p.sortir_de_pure();
+    }
+}
+
+/// rc14 — un geste de volume sous PURE : la remontée suit la borne.
+pub(crate) fn borner_en_pure(cle: &AtomicBool, borne: f64) {
+    if let Some(c) = creneau(cle)
+        && let Ok(mut p) = c.lock()
+    {
+        p.borner_en_pure(borne);
+    }
+}
+
+/// rc14 — « Rendre le niveau » (#6524) sous PURE.
+pub(crate) fn liberer_en_pure(cle: &AtomicBool) {
+    if let Some(c) = creneau(cle)
+        && let Ok(mut p) = c.lock()
+    {
+        p.liberer_en_pure();
+    }
+}
+
+/// rc14 — le niveau tenu par l'entrée en PURE (dB, le plus bas des voies)
+/// et s'il remonte : le voyant « niveau réduit ».
+pub(crate) fn garde_en_pure(cle: &AtomicBool) -> Option<(f64, bool)> {
+    creneau(cle).and_then(|c| c.lock().ok().and_then(|p| p.garde_en_pure()))
+}
+
 /// La sortie disparaît : son réglage aussi.
 pub(crate) fn oublier(cle: &AtomicBool) {
     if POSES.load(Ordering::Acquire) == 0 {
@@ -166,10 +218,20 @@ pub(crate) fn oublier(cle: &AtomicBool) {
 /// Faux sous PURE, sous DoP (`dop`), sans réglage, ou au repos sur un réglage
 /// neutre.
 pub(crate) fn agit(cle: &AtomicBool, dop: bool) -> bool {
-    if dop || cle.load(Ordering::Relaxed) {
+    if dop {
         return false;
     }
-    creneau(cle).is_some_and(|c| c.lock().is_ok_and(|p| !p.neutre_au_repos()))
+    let pure = cle.load(Ordering::Relaxed);
+    // rc14 — sous PURE, seule l'entrée en cours touche encore le signal.
+    creneau(cle).is_some_and(|c| {
+        c.lock().is_ok_and(|p| {
+            if pure {
+                p.en_transition_pure()
+            } else {
+                !p.neutre_au_repos()
+            }
+        })
+    })
 }
 
 /// Les réglages posés sur cette sortie (`None` : aucun).
@@ -198,10 +260,20 @@ pub(crate) fn traiter<T: Echantillon>(
     let pure = cle.load(Ordering::Relaxed);
     c.lock()
         .map(|mut p| {
-            if pure {
+            if pure && p.en_transition_pure() {
+                // rc14 — entrée en PURE : fondu, puis remontée bornée.
+                p.traiter_en_pure(mots, canaux, cadence)
+            } else if pure {
                 p.contourner(mots, canaux, cadence);
                 false
             } else {
+                // rc14 — PURE quitté pendant son entrée : retour au réglage
+                // par le fondu habituel. Une entrée armée dont le drapeau
+                // n'est pas encore levé n'est pas annulée : le bloc reste
+                // réglé, le fondu partira au premier bloc sous PURE.
+                if p.en_transition_pure() && p.transition_commencee() {
+                    p.sortir_de_pure();
+                }
                 p.traiter(mots, canaux, cadence)
             }
         })

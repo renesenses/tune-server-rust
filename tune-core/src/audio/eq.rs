@@ -541,17 +541,37 @@ impl EqProcessor {
         if !self.est_neutre() {
             return None;
         }
-        let gains = self.gain_garde.as_ref()?;
+        // rc14 (sécurité auditive, relecture de #9556) — une chaîne sortante
+        // (PURE) encore en fondu : la piste suivante ne la rejoue pas (la
+        // frontière de piste n'a rien à raccorder), mais elle en reprend le
+        // NIVEAU, multiplié au gain gardé, et la transition qui le rend
+        // (rampe rapide de `REMONTEE_RAPIDE_TESS_MS`, bornée, #6741). Sans quoi
+        // le sec repartait à 0 dB : toute la réserve d'une convolution d'un
+        // coup. Vaut aussi pour l'égaliseur coupé de transition, qui ne
+        // gardait encore rien.
+        let chaine = self
+            .chaine_sortante
+            .as_ref()
+            .map(|c| c.gain.clamp(ChaineSortante::GAIN_MIN, 1.0) as f32);
+        let gains = match (self.gain_garde.as_ref(), chaine) {
+            (Some(g), _) => g.clone(),
+            (None, Some(_)) => vec![1.0],
+            (None, None) => return None,
+        };
         let premier = *gains.first()?;
         let gains = if gains.iter().all(|g| (g - premier).abs() < 1e-7) {
             vec![premier]
         } else if usize::from(channels.max(1)) == gains.len() {
-            gains.clone()
+            gains
         } else {
             // Canaux différents et gains inégaux : on garde la moyenne plutôt
             // que de décaler les canaux.
             vec![gains.iter().sum::<f32>() / gains.len() as f32]
         };
+        let gains: Vec<f32> = gains.iter().map(|g| g * chaine.unwrap_or(1.0)).collect();
+        if gains.iter().all(|g| (g - 1.0).abs() < 1e-6) {
+            return None;
+        }
         let mut reporte = Self {
             engine: Engine::Neutre,
             sample_rate,
@@ -564,7 +584,7 @@ impl EqProcessor {
             borne_de_remontee: self.borne_de_remontee,
             libere: self.libere,
             chaine_sortante: None,
-            rampe_rapide: self.rampe_rapide,
+            rampe_rapide: self.rampe_rapide || chaine.is_some(),
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         };
@@ -888,11 +908,27 @@ impl EqProcessor {
             return;
         }
         self.gain_garde = Some(depart.clone());
+        self.rampe_rapide = true;
         self.lancer_la_rampe(depart);
         let total = (u64::from(self.sample_rate) * u64::from(ms) / 1000).max(1) as usize;
         if let Some(ext) = self.extinction.as_mut() {
             ext.total = total;
         }
+    }
+
+    /// rc14 (relecture de #9556) — on QUITTE PURE pendant le fondu de la
+    /// chaîne sortante : la chaîne reprend sa place dans le flux (la sortie
+    /// la réinstalle), le fondu vers le sec n'a plus lieu d'être. La chaîne
+    /// est retirée de cet étage, qui peut de nouveau se mettre au repos
+    /// (sinon il restait monté pour toujours : seul le chemin PURE la
+    /// fond), et son crossfeed est RENDU à l'appelant, historique compris,
+    /// pour revenir tout de suite dans la sortie. Le gain gardé de l'étage
+    /// (préampli d'un égaliseur coupé) n'est pas touché : le niveau de la
+    /// chaîne revient avec elle.
+    pub fn abandonner_la_chaine_sortante(
+        &mut self,
+    ) -> Option<super::crossfeed::CrossfeedProcessor> {
+        self.chaine_sortante.take().and_then(|c| c.crossfeed)
     }
 
     /// rc14 (série TESS) — « Rendre le niveau » sur un égaliseur ACTIF qui

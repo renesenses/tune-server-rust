@@ -21,6 +21,8 @@ struct Banc {
     droite: f32,
     gains_db: Vec<f64>,
     gauche: Vec<f32>,
+    /// RMS de la voie gauche, bloc par bloc (pente locale du sinus).
+    rms_gauche: Vec<f64>,
     identiques: Vec<bool>,
 }
 
@@ -40,6 +42,7 @@ impl Banc {
             droite: 1.0,
             gains_db: Vec::new(),
             gauche: Vec::new(),
+            rms_gauche: Vec::new(),
             identiques: Vec::new(),
         }
     }
@@ -113,6 +116,49 @@ impl Banc {
                     .all(|(a, b)| a.to_bits() == b.to_bits()),
             );
             self.gauche.extend(pcm.iter().step_by(2));
+            let g: f64 = pcm.iter().step_by(2).map(|x| f64::from(*x).powi(2)).sum();
+            self.rms_gauche.push((g / BLOC as f64).sqrt());
+        }
+    }
+
+    /// rc14 (relecture de #9556) — chaque bloc de `[depuis, jusqu_a)` reste
+    /// dans `[avant − creux, avant + 0,5]` dB : ni hausse (un `gain` non
+    /// appliqué au sec : le niveau montait au sec en 300 ms, sans marche
+    /// d'un bloc à l'autre — les contre-épreuves ne le voyaient pas), ni
+    /// creux au-delà de celui qu'explique la latence de la convolution.
+    fn tenir_le_niveau(&self, depuis: usize, jusqu_a: usize, avant: f64, creux: f64, quoi: &str) {
+        for (n, db) in self.gains_db[depuis..jusqu_a].iter().enumerate() {
+            assert!(
+                *db <= avant + 0.5,
+                "{quoi} : {db:+.2} dB au bloc {n}, au-dessus du niveau d'avant {avant:+.2} dB"
+            );
+            assert!(
+                *db >= avant - creux,
+                "{quoi} : {db:+.2} dB au bloc {n}, sous {:+.2} dB",
+                avant - creux
+            );
+        }
+    }
+
+    /// rc14 (relecture de #9556) — aucun clic, mesuré LOCALEMENT : chaque
+    /// pas d'un échantillon au suivant (voie gauche, un sinus à tout
+    /// instant) reste sous la pente du sinus au niveau des deux blocs qui
+    /// l'encadrent. L'ancienne mesure prenait la pente au niveau le plus
+    /// HAUT de toute la fenêtre : un raccord sec au milieu d'un niveau bas
+    /// passait inaperçu.
+    fn sans_clic_local(&self, depuis: usize, jusqu_a: usize, quoi: &str) {
+        let pente_par_rms =
+            std::f64::consts::SQRT_2 * 2.0 * std::f64::consts::PI * self.freq / f64::from(TAUX);
+        for b in depuis.max(1)..jusqu_a {
+            let rms = self.rms_gauche[b].max(self.rms_gauche[b - 1]);
+            let plafond = rms * pente_par_rms * 1.15 + 1e-6;
+            for i in b * BLOC..(b + 1) * BLOC {
+                let pas = f64::from((self.gauche[i] - self.gauche[i - 1]).abs());
+                assert!(
+                    pas <= plafond,
+                    "{quoi} : clic au bloc {b} (échantillon {i}) : pas {pas:.6} > {plafond:.6}"
+                );
+            }
         }
     }
 
@@ -200,6 +246,12 @@ fn convolution_sous_pure_volume_inchange_fondu_puis_bit_perfect_rc14() {
     assert!(banc.sortie.eq.lock().unwrap().is_none());
     assert!(banc.sortie.preampli_garde().is_none());
     assert!(!matches!(banc.etat(), OutputDspState::Applied));
+    // Relecture de #9556 : pendant le fondu (300 ms), le niveau TIENT celui
+    // d'avant (jamais au-dessus ; le creux de −6 dB au plus vient du
+    // décalage de 1 024 trames, voir `fondre_la_chaine_sortante`), puis
+    // remonte en 450 ms ; aucun clic mesuré localement.
+    banc.tenir_le_niveau(entree, entree + 30, avant, 7.0, "fondu de la convolution");
+    banc.sans_clic_local(entree, entree + 100, "convolution sous PURE");
 }
 
 /// Convolution sous PURE, volume MONTÉ (+6 dB) depuis la pose de la
@@ -248,12 +300,22 @@ fn convolution_sous_pure_volume_monte_jamais_au_dessus_de_la_borne_rc14() {
 fn crossfeed_et_mono_sous_pure_fondu_puis_bit_perfect_rc14() {
     let mut banc = Banc::new(500);
     banc.droite = 0.0;
+    // Relecture de #9556 : à 1 kHz, l'entrée en PURE (après 0,5 s) tombe
+    // sur un passage à zéro du sinus, où un raccord sec ne se voit pas ;
+    // 997,3 Hz la place en pleine pente (contre-épreuve : sans fondu, le
+    // clic local est mesuré).
+    banc.freq = 997.3;
     banc.sortie
         .set_crossfeed(Some(crate::audio::crossfeed::CrossfeedProcessor::new(
             TAUX, 0.6, 0.3,
         )));
     banc.sortie.set_mono_downmix(true);
     banc.jouer(50);
+    let avant = *banc.gains_db.last().unwrap();
+    assert!(
+        avant < -1.0,
+        "prémisse : la chaîne baisse le niveau ({avant:.2} dB)"
+    );
     banc.entrer_en_pure();
     let entree = banc.gains_db.len();
     banc.jouer(100);
@@ -263,6 +325,124 @@ fn crossfeed_et_mono_sous_pure_fondu_puis_bit_perfect_rc14() {
     assert!(f64::from(banc.ecart_max_depuis(entree - 1)) <= banc.pente_db(haut) * 1.05);
     assert!(banc.identiques[entree + 99]);
     assert!(banc.sortie.eq.lock().unwrap().is_none());
+    // Relecture de #9556 : le niveau TIENT celui d'avant pendant le fondu,
+    // jamais au-dessus, puis remonte ; aucun clic mesuré localement. Le
+    // creux toléré (3 dB) vient de la répartition entre voies : le traité
+    // joue sur les deux voies, le sec sur la gauche seule ; à mi-fondu leurs
+    // énergies ne s'ajoutent pas tout à fait (le crossfeed déphase aussi).
+    banc.tenir_le_niveau(entree, entree + 30, avant, 3.0, "fondu crossfeed et mono");
+    banc.sans_clic_local(entree, entree + 100, "crossfeed et mono sous PURE");
+}
+
+/// rc14 (relecture de #9556, M) — piste SUIVANTE pendant le fondu de la
+/// chaîne (convolution sans égaliseur, volume inchangé) : la nouvelle piste
+/// reprend le niveau de la chaîne et la transition, au lieu de repartir au
+/// sec (+12 dB d'un coup). Comme l'orchestrateur à la piste suivante sous
+/// PURE : crossfeed, égaliseur et repli mono posés à vide.
+#[test]
+fn piste_suivante_pendant_le_fondu_sans_hausse_brutale_rc14() {
+    let mut banc = Banc::new(500).avec_convolution(0.25);
+    banc.jouer(50);
+    let avant = *banc.gains_db.last().unwrap();
+    banc.entrer_en_pure();
+    banc.jouer(10);
+    let s = &banc.sortie;
+    s.set_pure_bypass(true);
+    s.set_replaygain_factor(1.0);
+    s.set_crossfeed(None);
+    s.set_eq(None);
+    s.set_mono_downmix(false);
+    let suivante = banc.gains_db.len();
+    banc.jouer(150);
+    // Le premier bloc repart du niveau de la chaîne (la remontée de 450 ms
+    // y ajoute au plus 0,3 dB), pas du sec. Le bloc d'avant pouvait être
+    // plus bas (creux du fondu, voir `fondre_la_chaine_sortante`) : on
+    // compare au niveau d'avant PURE, puis aucune marche ensuite.
+    banc.tenir_le_niveau(
+        suivante,
+        suivante + 1,
+        avant,
+        1.5,
+        "début de la piste suivante",
+    );
+    assert!(
+        banc.marche_max_depuis(suivante + 1) < 1.0,
+        "marche de {:.2} dB après la piste suivante",
+        banc.marche_max_depuis(suivante + 1)
+    );
+    // La transition reprend sa vitesse (450 ms), jamais au-dessus du sec.
+    let a_100_ms = banc.gains_db[suivante + 10];
+    assert!(
+        a_100_ms < -3.0,
+        "à 100 ms de la piste suivante, déjà {a_100_ms:+.2} dB : remontée trop brutale"
+    );
+    assert!(banc.max_db_depuis(suivante) <= 0.01);
+    assert!(*banc.identiques.last().unwrap(), "bit-perfect au bout");
+    assert!(banc.sortie.eq.lock().unwrap().is_none());
+}
+
+/// rc14 (relecture de #9556, m) — on QUITTE PURE pendant le fondu de la
+/// chaîne : la convolution reprend sa place, l'étage de transition se met au
+/// repos et quitte la chaîne (il restait monté pour toujours), sans hausse.
+#[test]
+fn quitter_pure_pendant_le_fondu_l_etage_se_met_au_repos_rc14() {
+    let mut banc = Banc::new(500).avec_convolution(0.25);
+    banc.jouer(50);
+    let avant = *banc.gains_db.last().unwrap();
+    banc.entrer_en_pure();
+    banc.jouer(10);
+    // Comme `refresh_zone_pure_dsp` à la sortie de PURE.
+    let s = &banc.sortie;
+    s.set_pure_bypass(false);
+    s.replace_crossfeed_live(None);
+    s.replace_eq_live(None);
+    s.set_mono_downmix(false);
+    let sortie = banc.gains_db.len();
+    banc.jouer(50);
+    assert!(
+        banc.sortie.eq.lock().unwrap().is_none(),
+        "l'étage de transition doit quitter la chaîne"
+    );
+    banc.tenir_le_niveau(sortie, sortie + 50, avant, 7.0, "sortie de PURE");
+    let fin = *banc.gains_db.last().unwrap();
+    assert!(
+        (fin - avant).abs() < 0.2,
+        "la convolution joue à {fin:.2} dB"
+    );
+    assert!(matches!(banc.etat(), OutputDspState::Applied));
+}
+
+/// rc14 (relecture de #9556, m) — on QUITTE PURE pendant le fondu, sans que
+/// l'orchestrateur recharge le crossfeed (sortie de PURE pendant le
+/// démarrage d'un flux : seul le drapeau est posé) : le crossfeed pris à
+/// l'entrée revient tout de suite dans la sortie, pas à la piste suivante.
+#[test]
+fn quitter_pure_pendant_le_fondu_rend_le_crossfeed_rc14() {
+    let mut banc = Banc::new(500);
+    banc.sortie
+        .set_crossfeed(Some(crate::audio::crossfeed::CrossfeedProcessor::new(
+            TAUX, 0.6, 0.3,
+        )));
+    banc.jouer(50);
+    banc.entrer_en_pure();
+    banc.jouer(10);
+    assert!(
+        !banc.sortie.has_crossfeed(),
+        "prémisse : pris par la chaîne"
+    );
+    banc.sortie.set_pure_bypass(false);
+    assert!(banc.sortie.has_crossfeed(), "le crossfeed doit revenir");
+    banc.jouer(10);
+    assert!(matches!(banc.etat(), OutputDspState::Applied));
+    assert!(
+        banc.sortie
+            .eq
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|p| !p.fond_une_chaine()),
+        "plus aucune chaîne en fondu"
+    );
 }
 
 /// Attend (au plus 3 s) que la garde du rendu ait fini sa rampe, en

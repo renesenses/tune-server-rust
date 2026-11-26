@@ -1301,11 +1301,18 @@ impl PlaybackOrchestrator {
         // rc14 (sécurité auditive) — le flux qui reprend le niveau gardé du
         // flux refait (`load_streaming_dsp`) reprend aussi sa référence : le
         // préampli ne remonte que si le volume redescend au niveau d'avant.
-        if let Some(report) = self
-            .niveaux_reseau_a_reporter
-            .lock()
-            .unwrap()
-            .remove(&zone_id)
+        // rc14 (relecture de #9556) — seulement si un flux refait de la
+        // MÊME piste l'a repris (`load_streaming_dsp`) : le poste d'une autre
+        // piste ne consomme pas le report.
+        let repris = {
+            let mut reports = self.niveaux_reseau_a_reporter.lock().unwrap();
+            if reports.get(&zone_id).is_some_and(|r| r.pris) {
+                reports.remove(&zone_id)
+            } else {
+                None
+            }
+        };
+        if let Some(report) = repris
             && report.depuis.elapsed() < super::eq_en_vol::NiveauAReporter::VALIDITE
             && let Some(avant) = report.volume_avant
         {
@@ -1343,19 +1350,35 @@ impl PlaybackOrchestrator {
     }
 
     /// rc14 (sécurité auditive, flux réseau REFAIT) — le niveau gardé que le
-    /// prochain flux de la zone doit reprendre, s'il est encore valable.
+    /// flux refait de `piste` sur la zone doit reprendre, s'il est encore
+    /// valable. Relecture de #9556 : un report ne vaut que pour la piste du
+    /// flux quitté ; une autre piste lancée sur la zone n'est ni forcée au
+    /// transcodage ni jouée au niveau gardé.
     pub(super) fn niveau_reseau_a_reporter(
         &self,
         zone_id: i64,
+        piste: crate::audio::replaygain::PisteRg<'_>,
+    ) -> Option<super::eq_en_vol::NiveauAReporter> {
+        self.niveau_reseau_a_reporter_en_le_prenant(zone_id, piste, false)
+    }
+
+    fn niveau_reseau_a_reporter_en_le_prenant(
+        &self,
+        zone_id: i64,
+        piste: crate::audio::replaygain::PisteRg<'_>,
+        prendre: bool,
     ) -> Option<super::eq_en_vol::NiveauAReporter> {
         let mut reports = self.niveaux_reseau_a_reporter.lock().unwrap();
-        match reports.get(&zone_id) {
-            Some(r) if r.depuis.elapsed() < super::eq_en_vol::NiveauAReporter::VALIDITE => Some(*r),
-            Some(_) => {
+        match reports.get_mut(&zone_id) {
+            Some(r) if r.depuis.elapsed() >= super::eq_en_vol::NiveauAReporter::VALIDITE => {
                 reports.remove(&zone_id);
                 None
             }
-            None => None,
+            Some(r) if r.piste == super::eq_en_vol::PisteDuReport::de(piste) => {
+                r.pris |= prendre;
+                Some(r.clone())
+            }
+            _ => None,
         }
     }
 
@@ -1421,6 +1444,10 @@ impl PlaybackOrchestrator {
             niveau,
             volume_avant,
             depuis: std::time::Instant::now(),
+            piste: np.map_or_else(Default::default, |n| {
+                super::eq_en_vol::PisteDuReport::de(n.piste_rg())
+            }),
+            pris: false,
         };
         if report.borne(self.volume_de_zone_en_milliemes(zone_id)) >= 1.0 {
             return;
@@ -2640,7 +2667,7 @@ impl PlaybackOrchestrator {
         // niveau gardé du flux quitté, borné (#6741). Sans égaliseur, un
         // égaliseur coupé le porte ; avec un égaliseur, la hausse de son
         // préampli est retenue (`EqProcessor::reprendre_la_retenue_de`).
-        if let Some(report) = self.niveau_reseau_a_reporter(zone_id) {
+        if let Some(report) = self.niveau_reseau_a_reporter_en_le_prenant(zone_id, piste, true) {
             let borne = report.borne(self.volume_de_zone_en_milliemes(zone_id));
             if let Some(garde) = crate::audio::eq::EqProcessor::neutre_qui_garde(
                 sample_rate,

@@ -1700,7 +1700,10 @@ impl LocalOutput {
         let actif = self.convolver_config.lock().is_ok_and(|c| c.is_some())
             || self.crossfeed.lock().is_ok_and(|c| c.is_some())
             || self.mono_downmix.load(Ordering::Relaxed)
-            || self.replaygain_seul.load(Ordering::SeqCst) < 1000;
+            || self.replaygain_seul.load(Ordering::SeqCst) < 1000
+            // rc14 (relecture de #9556) — un réglage des enceintes qui agit
+            // (sa réserve baisse les voies).
+            || enceintes_de_sortie::agit(&self.pure_bypass, false);
         if !actif {
             self.volume_avant_traitement
                 .store(u32::MAX, Ordering::SeqCst);
@@ -1745,6 +1748,14 @@ impl LocalOutput {
         if let Ok(mut eq) = self.eq.lock() {
             self.borner_la_remontee(&mut eq);
         }
+        // rc14 (relecture de #9556) — l'entrée en PURE du réglage des
+        // enceintes suit la même borne.
+        if self.pure_bypass.load(Ordering::Relaxed) {
+            enceintes_de_sortie::borner_en_pure(
+                &self.pure_bypass,
+                self.borne_de_la_transition_pure(),
+            );
+        }
         // rc14 — la garde du rendu suit la même borne (jamais vers le bas).
         if self.pure_bypass.load(Ordering::Relaxed)
             && self.reserve_du_surechantillonneur.garde() < 1.0 - 1e-6
@@ -1775,6 +1786,9 @@ impl LocalOutput {
         {
             p.liberer_le_gain_garde();
         }
+        // rc14 (relecture de #9556) — et le niveau tenu par l'entrée en PURE
+        // du réglage des enceintes.
+        enceintes_de_sortie::liberer_en_pure(&self.pure_bypass);
         // rc14 — et la garde du rendu de l'entrée en PURE.
         if self.reserve_du_surechantillonneur.garde() < 1.0 - 1e-6 {
             self.reserve_du_surechantillonneur
@@ -1799,6 +1813,22 @@ impl LocalOutput {
                 .lock()
                 .ok()
                 .and_then(|e| e.as_ref().and_then(|p| p.preampli_garde()))
+        };
+        // rc14 (relecture de #9556) — le niveau que tient l'entrée en PURE du
+        // réglage des enceintes s'y ajoute : même voyant, même geste.
+        let etage = match (
+            etage,
+            enceintes_de_sortie::garde_en_pure(&self.pure_bypass)
+                .filter(|_| self.pure_bypass.load(Ordering::Relaxed)),
+        ) {
+            (Some(e), Some((db, en_retour))) => Some(super::super::audio::eq::PreampliGarde {
+                db: e.db + db,
+                en_retour: e.en_retour || en_retour,
+            }),
+            (None, Some((db, en_retour))) => {
+                Some(super::super::audio::eq::PreampliGarde { db, en_retour })
+            }
+            (e, None) => e,
         };
         // rc14 — la garde du rendu (ReplayGain retiré par PURE) s'y ajoute :
         // même voyant, même geste.
@@ -2378,6 +2408,12 @@ impl LocalOutput {
         let sortie = !bypass && self.pure_bypass.load(Ordering::Relaxed);
         if entree {
             self.entrer_en_pure_par_un_fondu();
+            // rc14 (relecture de #9556) — le réglage des enceintes aussi :
+            // fondu, puis le niveau d'avant le réglage, jamais au-delà.
+            enceintes_de_sortie::entrer_en_pure(
+                &self.pure_bypass,
+                self.borne_de_la_transition_pure(),
+            );
             // rc14 — le ReplayGain (remis à l'unité par l'orchestrateur), la
             // compensation de niveau et la part portée par l'égaliseur tombent
             // au RENDU : la garde du rendu tient le niveau d'avant, posée
@@ -2386,6 +2422,15 @@ impl LocalOutput {
         } else if sortie {
             // Sortir de PURE ne garde rien : la chaîne revient à son niveau.
             self.reserve_du_surechantillonneur.poser_la_garde(1.0);
+            // rc14 (relecture de #9556) — une chaîne sortante encore en
+            // fondu reprend sa place : l'étage de transition peut se mettre
+            // au repos, et le crossfeed revient tout de suite (historique
+            // compris), même quand l'orchestrateur ne le recharge pas (sortie
+            // de PURE pendant le démarrage d'un flux).
+            executeur_tess::abandonner_la_chaine_sortante(&self.eq, &self.crossfeed);
+            // rc14 (relecture de #9556) — et l'entrée en PURE du réglage des
+            // enceintes, si elle est en cours.
+            enceintes_de_sortie::sortir_de_pure(&self.pure_bypass);
         }
         self.pure_bypass.store(bypass, Ordering::Relaxed);
         self.pure_ou_mesure.store(bypass, Ordering::Relaxed);
@@ -2740,6 +2785,7 @@ impl LocalOutput {
         reglages: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
     ) {
         enceintes_de_sortie::poser(&self.pure_bypass, dans_la_chaine, reglages);
+        self.suivre_le_volume_avant_le_traitement();
     }
 
     /// rc14 — une NOUVELLE lecture démarre (lancement, reprise, seek, piste
@@ -2751,6 +2797,7 @@ impl LocalOutput {
         reglages: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
     ) {
         enceintes_de_sortie::nouvelle_lecture(&self.pure_bypass, dans_la_chaine, reglages);
+        self.suivre_le_volume_avant_le_traitement();
     }
 
     /// rc14 — les voies qu'a vues le réglage des enceintes de cette sortie au

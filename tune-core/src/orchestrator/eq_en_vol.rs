@@ -94,7 +94,7 @@ const VOLUME_INCONNU: u32 = u32::MAX;
 /// démarre alors au niveau `niveau` (préampli gardé), borné comme une
 /// coupure en vol (#6741) : il ne remonte que quand le volume redescend à
 /// `volume_avant`, ou par « Rendre le niveau » (#6524).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct NiveauAReporter {
     /// Gain hors courbe du flux quitté, linéaire, < 1.
     pub(crate) niveau: f64,
@@ -102,6 +102,34 @@ pub(crate) struct NiveauAReporter {
     pub(crate) volume_avant: Option<u32>,
     /// Quand il a été retenu : un report trop vieux ne sert plus.
     pub(crate) depuis: std::time::Instant,
+    /// rc14 (relecture de #9556) — la piste du flux quitté : le report ne
+    /// vaut que pour le flux refait de CETTE piste, jamais pour une autre
+    /// lancée entre-temps sur la zone (il forçait son transcodage et la
+    /// jouait au niveau gardé). Voir [`PisteDuReport`].
+    pub(crate) piste: PisteDuReport,
+    /// Repris par un flux refait de cette piste (`load_streaming_dsp`) :
+    /// le poste de relève qui naît ensuite en reprend la référence de
+    /// volume, et le report est consommé.
+    pub(crate) pris: bool,
+}
+
+/// rc14 (relecture de #9556) — l'identité d'une piste pour un report de
+/// niveau : celle du ReplayGain (`PisteRg`), bibliothèque ou service. Deux
+/// pistes non identifiées se confondent (radio, URL directe) : la zone et la
+/// durée de vie bornent alors seules le report.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PisteDuReport {
+    track_id: Option<i64>,
+    service: Option<(String, String)>,
+}
+
+impl PisteDuReport {
+    pub(crate) fn de(piste: crate::audio::replaygain::PisteRg<'_>) -> Self {
+        Self {
+            track_id: piste.track_id,
+            service: piste.service.map(|(s, id)| (s.to_string(), id.to_string())),
+        }
+    }
 }
 
 impl NiveauAReporter {
@@ -914,6 +942,8 @@ mod tests {
             niveau: 0.25,
             volume_avant: Some(250),
             depuis: std::time::Instant::now(),
+            piste: Default::default(),
+            pris: false,
         };
         assert_eq!(r.borne(Some(250)), 1.0);
         assert_eq!(r.borne(Some(200)), 1.0);
@@ -921,7 +951,7 @@ mod tests {
         assert_eq!(r.borne(None), 0.0);
         let inconnu = super::NiveauAReporter {
             volume_avant: None,
-            ..r
+            ..r.clone()
         };
         assert_eq!(inconnu.borne(Some(100)), 0.0);
     }

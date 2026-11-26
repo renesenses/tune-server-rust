@@ -139,7 +139,8 @@ async fn flux_refait_volume_monte_reprend_le_niveau_garde_rc14() {
     couper_l_egaliseur(&o, z);
     o.retenir_le_niveau_du_flux_refait(z, Some(&en_lecture("flux-a")));
     assert!(
-        o.niveau_reseau_a_reporter(z).is_some(),
+        o.niveau_reseau_a_reporter(z, crate::audio::replaygain::PisteRg::AUCUNE)
+            .is_some(),
         "volume monté : le niveau gardé doit être reporté"
     );
     // Le routage : le flux refait passe par le flux traité.
@@ -187,7 +188,10 @@ async fn flux_refait_volume_inchange_rien_n_est_reporte_rc14() {
     flux_avec_egaliseur(&o, z, "flux-a");
     couper_l_egaliseur(&o, z);
     o.retenir_le_niveau_du_flux_refait(z, Some(&en_lecture("flux-a")));
-    assert!(o.niveau_reseau_a_reporter(z).is_none());
+    assert!(
+        o.niveau_reseau_a_reporter(z, crate::audio::replaygain::PisteRg::AUCUNE)
+            .is_none()
+    );
     let mut dsp = o.load_streaming_dsp(z, crate::audio::replaygain::PisteRg::AUCUNE, SR, 2);
     assert!(!dsp.is_active());
     let mut b = bloc(3);
@@ -219,9 +223,69 @@ async fn flux_refait_sans_poste_lit_l_empreinte_rc14() {
         .unwrap();
     couper_l_egaliseur(&o, z);
     o.retenir_le_niveau_du_flux_refait(z, Some(&en_lecture("fichier-a")));
-    let report = o.niveau_reseau_a_reporter(z).expect("report");
+    let report = o
+        .niveau_reseau_a_reporter(z, crate::audio::replaygain::PisteRg::AUCUNE)
+        .expect("report");
     assert_eq!(report.volume_avant, Some(250));
     assert!((20.0 * report.niveau.log10() - preampli).abs() < 0.05);
     assert_eq!(super::dsp::niveau_de_l_empreinte("pure"), 1.0);
     let _ = EqProcessor::neutre_qui_garde(SR, 2, report.niveau, 0.0).expect("neutre");
+}
+
+/// rc14 (relecture de #9556) — un report ne vaut que pour la piste du flux
+/// quitté : une AUTRE piste lancée sur la zone pendant sa durée de vie n'est
+/// ni forcée au flux traité ni jouée au niveau gardé, et son poste ne le
+/// consomme pas ; le flux refait de la piste quittée, lui, le reprend.
+#[tokio::test]
+async fn un_report_ne_vaut_que_pour_sa_piste_rc14() {
+    use crate::audio::replaygain::PisteRg;
+    let o = orchestrateur();
+    let z = zone(&o, 25.0);
+    let (_ancien, preampli) = flux_avec_egaliseur(&o, z, "flux-a");
+    ZoneRepo::with_backend(o.db.clone())
+        .update_volume(z, 50.0)
+        .unwrap();
+    o.noter_le_volume_aux_postes(z, 0.5);
+    couper_l_egaliseur(&o, z);
+    let quittee = crate::playback::NowPlaying {
+        stream_id: Some("flux-a".into()),
+        track_id: Some(41),
+        ..Default::default()
+    };
+    o.retenir_le_niveau_du_flux_refait(z, Some(&quittee));
+    let autre = PisteRg::bibliotheque(42);
+    assert!(
+        o.niveau_reseau_a_reporter(z, autre).is_none(),
+        "une autre piste ne reprend pas le niveau gardé"
+    );
+    assert!(o.niveau_reseau_a_reporter(z, PisteRg::AUCUNE).is_none());
+    let mut dsp = o.load_streaming_dsp(z, autre, SR, 2);
+    assert!(
+        !dsp.is_active(),
+        "une autre piste n'est pas forcée au flux traité"
+    );
+    let mut b = bloc(5);
+    dsp.process(&mut b, 16);
+    assert_eq!(b, bloc(5), "une autre piste : le sec, à l'octet");
+    // Le poste de l'autre piste ne consomme pas le report.
+    o.noter_eq_en_vol(z, "flux-autre", EqEnVol::pour_le_relais(false));
+    let meme = PisteRg::bibliotheque(41);
+    assert!(o.niveau_reseau_a_reporter(z, meme).is_some());
+    // Le flux refait de la piste quittée le reprend, au niveau gardé.
+    let mut dsp = o.load_streaming_dsp(z, meme, SR, 2);
+    assert!(dsp.is_active());
+    let nouveau = EqEnVol::pour_le_relais(false);
+    o.noter_eq_en_vol(z, "flux-b", nouveau.clone());
+    dsp.en_vol = Some(nouveau.clone());
+    let sec = rms(&bloc(0));
+    for n in 0..20 {
+        let mut b = bloc(n);
+        dsp.process(&mut b, 16);
+        let db = 20.0 * (rms(&b) / sec).log10();
+        assert!(db <= preampli + 0.1, "bloc {n} : {db:+.2} dB");
+    }
+    assert!(
+        o.niveau_reseau_a_reporter(z, meme).is_none(),
+        "repris : le report est consommé"
+    );
 }
