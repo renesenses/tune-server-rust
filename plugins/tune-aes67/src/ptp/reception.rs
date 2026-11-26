@@ -256,7 +256,7 @@ mod tests {
         let en_file = Instant::now();
         std::thread::sleep(Duration::from_millis(10));
         let (n, arrivee) = reception.recevoir(&mut tampon).unwrap();
-        assert_eq!((n, tampon), (1, [b'x']));
+        assert_eq!((n, tampon), (1, *b"x"));
         assert!(arrivee.unwrap() <= en_file);
     }
 
