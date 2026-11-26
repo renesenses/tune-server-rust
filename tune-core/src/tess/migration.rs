@@ -51,6 +51,7 @@
 //! | `zone_{id}_native_plugin_{p}` | greffon `{p}` (Crossfeed Pro, Crosstalk, paquets tiers), idem |
 //! | `zone_{id}_mono_downmix` | `mono-downmix` (greffon dédié, D2), coché si `"true"` sur une sortie locale |
 //! | `zone_{id}_channel_remap` | `channel-remap`, en dernier, idem |
+//! | `zone_{id}_speaker_setup` | `speaker-setup` (rc14, réglage des enceintes), idem ; s'exécute après la réaffectation |
 //! | `zone_{id}_upsampler` | `fixed.upsampling` : `pcm` avec `filter`, `max_ratio`, `max_rate_hz` si `enabled`, sinon `off` |
 //! | `zone_{id}_audiophile`, `zone_{id}_strict_bitperfect` | hors chaîne : [`LectureZone::pure`] (`ContexteExecution.pure`) |
 //! | `zone_{id}_level_compensation` | hors chaîne : [`LectureZone::compensation_de_niveau`] (T07) |
@@ -108,6 +109,8 @@ pub const ID_CONVOLUTION: &str = "convolution";
 pub const ID_CROSSFEED: &str = "crossfeed";
 pub const ID_MONO: &str = "mono-downmix";
 pub const ID_REAFFECTATION: &str = "channel-remap";
+/// rc14 — le réglage des enceintes (distance, gain, phase par voie).
+pub const ID_ENCEINTES: &str = crate::audio::reglage_enceintes::ID_GREFFON;
 
 /// D1 : réglage d'un `room-correction` qui dit d'où vient la correction :
 /// [`ORIGINE_MESURE`] (micro, Premium) ou [`ORIGINE_ESTIMATION`] (calculée
@@ -125,6 +128,11 @@ pub const MARQUE_MONO_INERTE: &str = "inert_on_network";
 /// par la migration parce qu'un membre plus prioritaire était coché avec lui
 /// ; sa valeur est l'id du gagnant. L'ancienne clé, elle, reste cochée.
 pub const MARQUE_REMPLACE: &str = "replaced_in_group";
+
+/// rc14 (revue #9520) — réglage d'une façade de l'égaliseur DÉCOCHÉE parce
+/// qu'un ancien client a éteint l'égaliseur (`enabled: false` dans
+/// `zone_{id}_eq_profile`) ; l'ancien client qui le rallume la recoche.
+pub const MARQUE_ETEINT_PAR_L_ANCIENNE_CLE: &str = "off_by_legacy_eq";
 
 /// Les quatre façades portées par `zone_{id}_eq_profile`.
 pub const FACADES_EQ: [&str; 4] = [
@@ -236,16 +244,19 @@ pub enum Partie {
     Natif(String),
     Mono,
     Reaffectation,
+    /// rc14 — `zone_{id}_speaker_setup`.
+    Enceintes,
     Surechantillonnage,
 }
 
 impl Partie {
-    const FIXES: [Partie; 6] = [
+    const FIXES: [Partie; 7] = [
         Partie::Egaliseur,
         Partie::Convolution,
         Partie::Crossfeed,
         Partie::Mono,
         Partie::Reaffectation,
+        Partie::Enceintes,
         Partie::Surechantillonnage,
     ];
 
@@ -258,6 +269,7 @@ impl Partie {
             Self::Natif(id) => format!("native_plugin_{id}"),
             Self::Mono => "mono_downmix".into(),
             Self::Reaffectation => "channel_remap".into(),
+            Self::Enceintes => "speaker_setup".into(),
             Self::Surechantillonnage => "upsampler".into(),
         }
     }
@@ -269,6 +281,7 @@ impl Partie {
             "crossfeed" => Self::Crossfeed,
             "mono_downmix" => Self::Mono,
             "channel_remap" => Self::Reaffectation,
+            "speaker_setup" => Self::Enceintes,
             "upsampler" => Self::Surechantillonnage,
             autre => Self::Natif(autre.strip_prefix("native_plugin_")?.to_owned()),
         })
@@ -283,6 +296,7 @@ impl Partie {
             Self::Natif(id) => crate::audio::natifs_tiers::cle_de_zone(zone_id, id),
             Self::Mono => format!("zone_{zone_id}_mono_downmix"),
             Self::Reaffectation => crate::audio::reaffectation_canaux::cle_de_zone(zone_id),
+            Self::Enceintes => crate::audio::reglage_enceintes::cle_de_zone(zone_id),
             Self::Surechantillonnage => crate::audio::surechantillonnage::cle_de_zone(zone_id),
         }
     }
@@ -384,6 +398,12 @@ fn decoder(partie: &Partie, cle: &str, brut: Option<&str>) -> Result<Decodee, Er
             .map_err(|e| corrompue(cle, format!("not channel remap settings: {e}")))?;
             Decodee::Objet(m)
         }
+        Partie::Enceintes => {
+            let m = objet(cle, brut)?;
+            crate::audio::reglage_enceintes::ReglagesEnceintes::lire(&Value::Object(m.clone()))
+                .map_err(|e| corrompue(cle, format!("not speaker setup settings: {e}")))?;
+            Decodee::Objet(m)
+        }
         // Un chemin vide ne désigne aucune réponse impulsionnelle.
         Partie::Convolution if brut.trim().is_empty() => Decodee::Absente,
         Partie::Convolution => Decodee::Chemin(brut.to_owned()),
@@ -474,7 +494,8 @@ pub fn origine_de_la_piece(profil: &Value) -> &'static str {
     }
 }
 
-fn memes_bandes(a: &[EqBandSpec], b: &[EqBandSpec]) -> bool {
+/// Deux listes de bandes identiques (fréquence, gain et Q à 1e-6 près).
+pub fn memes_bandes(a: &[EqBandSpec], b: &[EqBandSpec]) -> bool {
     let proche = |x: f64, y: f64| (x - y).abs() < 1e-6;
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
@@ -507,6 +528,44 @@ pub fn classer_egaliseur(
     } else {
         ID_EQ_PARAMETRIQUE
     }
+}
+
+/// rc14 — la façade que prendrait `profil` s'il était écrit dans
+/// `zone_{id}_eq_profile` par une ancienne route (`PUT /zones/{id}/dsp`,
+/// `POST /zones/{id}/eq`, `POST /eq/presets/{id}/activate`) : la même
+/// [`classer_egaliseur`] que la lecture de la chaîne, avec le profil de pièce
+/// de la zone et la façade qu'elle porte aujourd'hui. Une chaîne illisible ne
+/// donne pas de façade précédente. Rien n'est écrit.
+pub fn facade_d_un_profil_ecrit(
+    settings: &SettingsRepo,
+    zone_id: i64,
+    profil: &EqProfile,
+) -> &'static str {
+    let precedente = lire_zone(settings, zone_id, true)
+        .ok()
+        .and_then(|l| egaliseur_principal(&l.chaine).map(|i| l.chaine.plugins[i].id.clone()));
+    // Même courbe que l'égaliseur en service (l'éteindre, le rallumer,
+    // changer sa réserve) : la façade principale est gardée. C'est la règle
+    // de la lecture après #9532 (`facade_d_une_ecriture`) ; une fois
+    // #9532/#9534 intégrées, cette fonction doit appeler
+    // `facade_d_une_ancienne_ecriture`.
+    let actuel = settings
+        .get(&Partie::Egaliseur.cle(zone_id))
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_str::<EqProfile>(&b).ok());
+    if let Some(p) = precedente.as_deref()
+        && let Some(facade) = FACADES_EQ.iter().copied().find(|f| *f == p)
+        && actuel.is_some_and(|a| memes_bandes(&a.bands, &profil.bands))
+    {
+        return facade;
+    }
+    let piece = profil_de_piece(settings, zone_id);
+    classer_egaliseur(
+        profil,
+        piece.as_ref().map(|(p, _)| p),
+        precedente.as_deref(),
+    )
 }
 
 /// D1 : réécrit l'origine de chaque `room-correction` d'après
@@ -578,7 +637,15 @@ fn marques_par_le_serveur(reference: Option<&ChaineTess>, chaine: &ChaineTess) -
                 || valeur
                     .as_str()
                     .is_some_and(|g| coches.iter().any(|id| id == g));
-            if (m.enabled || !deja_posee || !gagnant_coche)
+            // Revue #9520 v2 — la marque d'une façade de l'égaliseur écartée au
+            // profit d'une autre façade (exclusivité du 24/11, #9512) est une
+            // marque du serveur : gardée sur une façade décochée, pour qu'un
+            // compte gratuit ne recoche pas un paramétrique qu'il n'entendait
+            // pas ([`normaliser_les_egaliseurs`]).
+            let marque_egaliseur = marque == MARQUE_REMPLACE
+                && FACADES_EQ.contains(&m.id.as_str())
+                && valeur.as_str().is_some_and(|g| FACADES_EQ.contains(&g));
+            if (m.enabled || !(deja_posee || marque_egaliseur) || !gagnant_coche)
                 && let Value::Object(s) = &mut m.settings
             {
                 s.remove(marque);
@@ -633,6 +700,8 @@ fn rang(id: &str) -> u8 {
         6
     } else if id == ID_REAFFECTATION {
         7
+    } else if id == ID_ENCEINTES {
+        8
     } else {
         5
     }
@@ -707,17 +776,264 @@ struct ContexteZone {
     /// Aucune chaîne enregistrée : c'est la migration (D2 ne s'applique
     /// qu'à ce moment-là).
     premiere_lecture: bool,
+    /// Les bandes de `zone_{id}_eq_profile` à la dernière synchronisation
+    /// (l'ombre), quand elles se lisent.
+    bandes_synchronisees: Option<Vec<EqBandSpec>>,
+}
+
+/// La façade que garde l'égaliseur principal quand une ancienne route
+/// réécrit `zone_{id}_eq_profile` SANS en changer la courbe (l'éteindre, le
+/// rallumer, changer sa réserve) : la sienne. Seule une nouvelle courbe se
+/// reclasse ([`classer_egaliseur`]).
+///
+/// Sans cela, une correction de pièce dont les bandes ne sont pas (ou plus)
+/// celles de `room_profile_{id}` (ajoutée à la main, sans profil de pièce ;
+/// profil de pièce remplacé depuis) devenait « Égaliseur graphique » ou
+/// « paramétrique » dès que l'égaliseur était éteint par l'écran de
+/// l'égaliseur ou un client mobile : la correction disparaissait du chemin
+/// du signal.
+///
+/// Les bandes d'avant sont celles des réglages du maillon, sinon (réglages
+/// `null`, maillon ajouté sans réglages) celles de l'ombre.
+fn facade_gardee(
+    principal: Option<&MaillonGreffon>,
+    profil: &EqProfile,
+    bandes_synchronisees: Option<&[EqBandSpec]>,
+) -> Option<&'static str> {
+    let m = principal?;
+    let facade = FACADES_EQ.iter().copied().find(|f| *f == m.id)?;
+    memes_bandes(&bandes_du_maillon(m, bandes_synchronisees)?, &profil.bands).then_some(facade)
+}
+
+/// Les bandes d'une façade : celles de ses réglages, sinon (réglages
+/// `null`) celles de `zone_{id}_eq_profile` à la dernière synchronisation.
+fn bandes_du_maillon(
+    m: &MaillonGreffon,
+    bandes_synchronisees: Option<&[EqBandSpec]>,
+) -> Option<Vec<EqBandSpec>> {
+    match &m.settings {
+        Value::Null => bandes_synchronisees.map(<[EqBandSpec]>::to_vec),
+        s => serde_json::from_value(s.get("bands")?.clone()).ok(),
+    }
+}
+
+/// La façade que porte `zone_{id}_eq_profile` : la première cochée ; si
+/// aucune ne l'est, celle dont les bandes sont celles de l'ancienne clé
+/// (`bandes`), sinon la première. Sans la deuxième règle, une chaîne
+/// `[correction de pièce décochée, graphique décoché]` éteinte par un ancien
+/// client faisait reprendre la correction de pièce au rallumage : elle était
+/// reclassée en graphique et le vrai graphique supprimé comme doublon.
+fn facade_de_l_ancienne_cle(chaine: &ChaineTess, bandes: Option<&[EqBandSpec]>) -> Option<usize> {
+    let facades = || {
+        chaine
+            .plugins
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| FACADES_EQ.contains(&m.id.as_str()))
+    };
+    facades()
+        .find(|(_, m)| m.enabled)
+        .or_else(|| {
+            let b = bandes?;
+            facades()
+                .find(|(_, m)| bandes_du_maillon(m, Some(b)).is_some_and(|x| memes_bandes(&x, b)))
+        })
+        .or_else(|| facades().next())
+        .map(|(i, _)| i)
+}
+
+/// rc14 — LA règle qui dit quelle façade prend un profil écrit dans
+/// `zone_{id}_eq_profile` par une ancienne route : celle du maillon
+/// principal si la courbe ne change pas ([`facade_gardee`]), sinon
+/// [`classer_egaliseur`]. La lecture de la chaîne ([`lire_zone`]) et les
+/// gardes de droit des anciennes routes doivent l'appliquer toutes deux.
+pub fn facade_d_une_ecriture(
+    principal: Option<&MaillonGreffon>,
+    bandes_synchronisees: Option<&[EqBandSpec]>,
+    profil: &EqProfile,
+    piece: Option<&EqProfile>,
+) -> &'static str {
+    facade_gardee(principal, profil, bandes_synchronisees)
+        .unwrap_or_else(|| classer_egaliseur(profil, piece, principal.map(|m| m.id.as_str())))
+}
+
+/// [`facade_d_une_ecriture`] pour la zone, d'après ce qu'elle porte
+/// aujourd'hui (chaîne lue, `zone_{id}_eq_profile`, profil de pièce) : la
+/// façade que prendrait `profil` s'il était écrit par une ancienne route.
+/// Rien n'est écrit. Une chaîne illisible ne donne pas de façade principale.
+pub fn facade_d_une_ancienne_ecriture(
+    settings: &SettingsRepo,
+    zone_id: i64,
+    profil: &EqProfile,
+) -> &'static str {
+    let actuel: Option<Vec<EqBandSpec>> = settings
+        .get(&Partie::Egaliseur.cle(zone_id))
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_str::<EqProfile>(&b).ok())
+        .map(|p| p.bands);
+    let chaine = lire_zone(settings, zone_id, true).ok().map(|l| l.chaine);
+    let principal = chaine
+        .as_ref()
+        .and_then(|c| facade_de_l_ancienne_cle(c, actuel.as_deref()).map(|i| &c.plugins[i]));
+    let piece = profil_de_piece(settings, zone_id);
+    facade_d_une_ecriture(
+        principal,
+        actuel.as_deref(),
+        profil,
+        piece.as_ref().map(|(p, _)| p),
+    )
+}
+
+/// rc14 — répare à la LECTURE une chaîne abîmée en rc13.90 : un
+/// « Égaliseur paramétrique » dont les bandes sont celles du profil de pièce
+/// ACTUEL de la zone redevient `room-correction` (les deux demandent le
+/// Premium, sauf une estimation sans micro, Free, qui est bien une
+/// correction de pièce). Une correction reclassée parce que son profil a été
+/// REMPLACÉ depuis (ses bandes sont celles de l'ancien profil) n'est pas
+/// reconnue ici : elle l'est à l'application du nouveau profil
+/// ([`poser_la_correction_de_piece`], qui la remplace). Le graphique n'est
+/// jamais touché : pour un compte gratuit, c'est aussi la vue convertie
+/// (D1). Rien n'est fait si la chaîne porte déjà une correction de pièce.
+/// Rend `true` si la chaîne a changé.
+pub fn reparer_la_correction_de_piece(chaine: &mut ChaineTess, piece: Option<&EqProfile>) -> bool {
+    let Some(piece) = piece.filter(|p| !p.bands.is_empty()) else {
+        return false;
+    };
+    if chaine.plugins.iter().any(|m| m.id == ID_CORRECTION_PIECE) {
+        return false;
+    }
+    let Some(m) = chaine.plugins.iter_mut().find(|m| {
+        m.id == ID_EQ_PARAMETRIQUE
+            && bandes_du_maillon(m, None).is_some_and(|b| memes_bandes(&b, &piece.bands))
+    }) else {
+        return false;
+    };
+    m.id = ID_CORRECTION_PIECE.to_owned();
+    true
+}
+
+/// rc14 — la clé qui garde les bandes de la dernière correction de pièce
+/// APPLIQUÉE à la zone ([`poser_la_correction_de_piece`]) : une correction
+/// reclassée plus tard en paramétrique reste reconnaissable.
+pub fn cle_correction_appliquee(zone_id: i64) -> String {
+    format!("zone_{zone_id}_room_correction_applied")
+}
+
+/// Ce que l'application d'un profil de pièce a fait à la chaîne.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PoseDeLaCorrection {
+    pub bilan: BilanEcriture,
+    /// La chaîne enregistrée après l'écriture.
+    pub chaine: ChaineTess,
+    /// L'id de la façade remplacée par la correction (un paramétrique qui
+    /// était une ancienne correction de pièce), s'il y en a une.
+    pub remplacee: Option<String>,
+    /// Les AUTRES égaliseurs cochés, qui jouent en série avec la correction.
+    pub en_serie: Vec<String>,
+}
+
+/// Les bandes de la dernière correction de pièce APPLIQUÉE à la zone
+/// ([`cle_correction_appliquee`]), si on les a. L'égaliseur d'avant TESS
+/// (`cle_sauvegarde_eq`) n'est PAS une preuve : il peut être un paramétrique
+/// de l'utilisateur (AutoEQ, réglage manuel).
+fn anciennes_corrections(settings: &SettingsRepo, zone_id: i64) -> Vec<Vec<EqBandSpec>> {
+    settings
+        .get(&cle_correction_appliquee(zone_id))
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_str::<EqProfile>(&b).ok())
+        .map(|p| p.bands)
+        .filter(|b| !b.is_empty())
+        .into_iter()
+        .collect()
+}
+
+/// rc14 (égaliseurs en série) — `POST /room-correction/profiles/{zone}/apply`
+/// : pose le maillon `room-correction` de la chaîne avec les bandes de
+/// `profil`, coché, et l'enregistre par [`ecrire_chaine`].
+///
+/// - un maillon `room-correction` déjà présent est mis à jour sur place ;
+/// - sinon, un « Égaliseur paramétrique » qui ÉTAIT une correction de pièce
+///   (ses bandes sont celles du profil actuel ou de la dernière correction
+///   appliquée, [`anciennes_corrections`]) est REMPLACÉ, pour qu'il ne reste
+///   qu'une correction ;
+/// - sinon, la correction est ajoutée à la suite des égaliseurs.
+///
+/// Les autres façades ne sont pas touchées ; [`PoseDeLaCorrection::en_serie`]
+/// dit lesquelles, cochées, jouent en série avec elle.
+/// `zone_{id}_eq_profile` reste l'égaliseur principal (la première façade
+/// cochée).
+pub fn poser_la_correction_de_piece(
+    settings: &SettingsRepo,
+    zone_id: i64,
+    profil: &EqProfile,
+) -> Result<PoseDeLaCorrection, ErreurMigration> {
+    let lecture = lire_zone(settings, zone_id, true)?;
+    let mut chaine = lecture.chaine;
+    if chaine.version > VERSION_CHAINE {
+        return Err(ErreurMigration::VersionPlusRecente {
+            trouvee: chaine.version,
+        });
+    }
+    let reglages = match serde_json::to_value(profil) {
+        Ok(Value::Object(m)) => sans_enabled(m),
+        _ => {
+            return Err(ErreurMigration::ReglagesInvalides {
+                id: ID_CORRECTION_PIECE.into(),
+                raison: "room correction profile is not an object".into(),
+            });
+        }
+    };
+    let mut remplacee = None;
+    if !chaine.plugins.iter().any(|m| m.id == ID_CORRECTION_PIECE) {
+        let mut connues = anciennes_corrections(settings, zone_id);
+        connues.push(profil.bands.clone());
+        let synchronisees = lecture
+            .ombre
+            .get(&Partie::Egaliseur.nom())
+            .and_then(|o| o.as_deref())
+            .and_then(|b| serde_json::from_str::<EqProfile>(b).ok())
+            .map(|p| p.bands);
+        if let Some(m) = chaine.plugins.iter_mut().find(|m| {
+            m.id == ID_EQ_PARAMETRIQUE
+                && bandes_du_maillon(m, synchronisees.as_deref())
+                    .is_some_and(|b| connues.iter().any(|c| memes_bandes(c, &b)))
+        }) {
+            remplacee = Some(m.id.clone());
+            m.id = ID_CORRECTION_PIECE.to_owned();
+        }
+    }
+    poser(&mut chaine, ID_CORRECTION_PIECE, true, reglages);
+    let en_serie = chaine
+        .plugins
+        .iter()
+        .filter(|m| m.enabled && m.id != ID_CORRECTION_PIECE && FACADES_EQ.contains(&m.id.as_str()))
+        .map(|m| m.id.clone())
+        .collect();
+    let bilan = ecrire_chaine(settings, zone_id, &chaine)?;
+    stockage(settings.set(
+        &cle_correction_appliquee(zone_id),
+        &serde_json::to_string(profil).map_err(|e| ErreurMigration::Stockage(e.to_string()))?,
+    ))?;
+    let chaine = lire_zone(settings, zone_id, true)?.chaine;
+    Ok(PoseDeLaCorrection {
+        bilan,
+        chaine,
+        remplacee,
+        en_serie,
+    })
 }
 
 fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, ctx: &ContexteZone) {
     match (partie, valeur) {
         (Partie::Egaliseur, Decodee::Egaliseur(m, profil)) => {
-            let principal = egaliseur_principal(chaine);
-            let precedente = principal.map(|i| chaine.plugins[i].id.clone());
-            let id = classer_egaliseur(
+            let principal = facade_de_l_ancienne_cle(chaine, ctx.bandes_synchronisees.as_deref());
+            let id = facade_d_une_ecriture(
+                principal.map(|i| &chaine.plugins[i]),
+                ctx.bandes_synchronisees.as_deref(),
                 &profil,
                 ctx.piece.as_ref().map(|(p, _)| p),
-                precedente.as_deref(),
             );
             let mut settings = sans_enabled(m);
             if id == ID_CORRECTION_PIECE
@@ -730,6 +1046,35 @@ fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, ctx: &Co
                 enabled: profil.enabled,
                 settings,
             };
+            // rc14 (revue #9520) — un ancien client ne connaît qu'UN
+            // égaliseur : l'éteindre éteint toute la série (les autres façades
+            // cochées sont décochées avec [`MARQUE_ETEINT_PAR_L_ANCIENNE_CLE`],
+            // réglages gardés) ; le rallumer rallume ensemble celles qu'il
+            // avait éteintes.
+            for (j, m) in chaine.plugins.iter_mut().enumerate() {
+                if Some(j) == principal || !FACADES_EQ.contains(&m.id.as_str()) {
+                    continue;
+                }
+                let marque = m
+                    .settings
+                    .get(MARQUE_ETEINT_PAR_L_ANCIENNE_CLE)
+                    .and_then(Value::as_bool)
+                    == Some(true);
+                if !profil.enabled && m.enabled {
+                    if !m.settings.is_object() {
+                        m.settings = Value::Object(Map::new());
+                    }
+                    if let Value::Object(s) = &mut m.settings {
+                        s.insert(MARQUE_ETEINT_PAR_L_ANCIENNE_CLE.into(), Value::Bool(true));
+                    }
+                    m.enabled = false;
+                } else if profil.enabled && marque {
+                    if let Value::Object(s) = &mut m.settings {
+                        s.remove(MARQUE_ETEINT_PAR_L_ANCIENNE_CLE);
+                    }
+                    m.enabled = true;
+                }
+            }
             match principal {
                 Some(i) => {
                     // Un autre maillon portait déjà cet id : l'ancienne clé
@@ -777,6 +1122,11 @@ fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, ctx: &Co
             poser(chaine, ID_REAFFECTATION, on, sans_enabled(m));
         }
         (Partie::Reaffectation, _) => retirer(chaine, ID_REAFFECTATION),
+        (Partie::Enceintes, Decodee::Objet(m)) => {
+            let on = coche(&m);
+            poser(chaine, ID_ENCEINTES, on, sans_enabled(m));
+        }
+        (Partie::Enceintes, _) => retirer(chaine, ID_ENCEINTES),
         (Partie::Mono, Decodee::Mono(true)) if ctx.sortie_locale || !ctx.premiere_lecture => {
             poser(chaine, ID_MONO, true, Value::Null)
         }
@@ -1034,6 +1384,11 @@ pub fn lire_zone(
         piece: profil_de_piece(settings, zone_id),
         sortie_locale,
         premiere_lecture: depuis_les_anciennes_cles,
+        bandes_synchronisees: ombre_lue
+            .get(&Partie::Egaliseur.nom())
+            .and_then(|o| o.as_deref())
+            .and_then(|brut| serde_json::from_str::<EqProfile>(brut).ok())
+            .map(|p| p.bands),
     };
     // Les parties disparues depuis l'ombre (un réglage tiers effacé) : on les
     // applique comme absentes.
@@ -1057,6 +1412,10 @@ pub fn lire_zone(
     }
 
     exclusivite_du_groupe(&mut chaine, &|id| membre_en_service(settings, id));
+    // rc14 — les égaliseurs écartés par l'exclusivité du 24/11 reprennent
+    // leur place : ils sont combinables. Les façades Premium, seulement là où
+    // le droit est connu (vue d'un compte Premium, moteur, `PUT`).
+    normaliser_les_egaliseurs(&mut chaine, false);
     // D2 (18/11 soir) : la zone est passée d'une sortie locale au réseau
     // depuis la dernière synchronisation, et l'interrupteur mono n'a pas
     // bougé : même règle qu'à la migration, le mono est décoché d'office
@@ -1099,6 +1458,7 @@ pub fn lire_zone(
     // D1 : l'origine d'une correction de pièce ne vient jamais du stockage
     // brut de la chaîne (un client a pu l'écrire) : elle est recalculée
     // d'après `room_profile_{id}`, comme à l'écriture.
+    reparer_la_correction_de_piece(&mut chaine, ctx.piece.as_ref().map(|(p, _)| p));
     let mut chaine = origines_par_le_serveur(settings, zone_id, &chaine);
 
     let conversion = if premium {
@@ -1141,6 +1501,49 @@ fn membre_en_service(settings: &SettingsRepo, id: &str) -> bool {
     }
 }
 
+/// rc14 (retours de Rémi, GO du 25/11) — les façades de l'égaliseur sont
+/// COMBINABLES et s'appliquent en série ([`super::egaliseurs_en_serie`]).
+/// L'exclusivité posée la veille (#9512) décochait, dans une chaîne ou un
+/// préréglage enregistrés, chaque façade cochée après la première, avec la
+/// marque [`MARQUE_REMPLACE`] vers elle. Ces façades sont RECOCHÉES (c'était
+/// le choix de l'auditeur) et la marque retirée.
+///
+/// Revue #9520 — une façade Premium (paramétrique, correction de pièce
+/// mesurée) n'est recochée que si `premium` : sur un compte gratuit, elle
+/// n'était pas entendue avant et ne doit pas l'être maintenant. Une façade
+/// cochée perd aussi la marque [`MARQUE_ETEINT_PAR_L_ANCIENNE_CLE`]. Rend
+/// `true` si la chaîne a changé.
+pub fn normaliser_les_egaliseurs(chaine: &mut ChaineTess, premium: bool) -> bool {
+    let mut change = false;
+    for m in &mut chaine.plugins {
+        if !FACADES_EQ.contains(&m.id.as_str()) {
+            continue;
+        }
+        let ecartee = m
+            .settings
+            .get(MARQUE_REMPLACE)
+            .and_then(Value::as_str)
+            .is_some_and(|g| FACADES_EQ.contains(&g));
+        let demande_le_premium =
+            m.id == ID_EQ_PARAMETRIQUE || (m.id == ID_CORRECTION_PIECE && !correction_estimee(m));
+        if ecartee
+            && (premium || !demande_le_premium)
+            && let Value::Object(s) = &mut m.settings
+        {
+            s.remove(MARQUE_REMPLACE);
+            m.enabled = true;
+            change = true;
+        }
+        if m.enabled
+            && let Value::Object(s) = &mut m.settings
+            && s.remove(MARQUE_ETEINT_PAR_L_ANCIENNE_CLE).is_some()
+        {
+            change = true;
+        }
+    }
+    change
+}
+
 /// Décision B : une chaîne ne coche qu'un membre du groupe crossfeed. Quand
 /// les anciennes clés en cochent plusieurs, on garde celui qui traite
 /// aujourd'hui (#7616 : Crosstalk > `crossfeed-*` > crossfeed intégré, parmi
@@ -1156,6 +1559,11 @@ fn exclusivite_du_groupe(chaine: &mut ChaineTess, en_service: &dyn Fn(&str) -> b
         .map(|m| m.id.clone())
         .collect();
     for m in &mut chaine.plugins {
+        // rc14 — les façades de l'égaliseur ont leur propre règle
+        // ([`normaliser_les_egaliseurs`]) : jamais recochées ici.
+        if FACADES_EQ.contains(&m.id.as_str()) {
+            continue;
+        }
         let gagnant = m.settings.get(MARQUE_REMPLACE).and_then(Value::as_str);
         if !m.enabled
             && let Some(g) = gagnant
@@ -1471,7 +1879,11 @@ fn projeter_egaliseur(
     courant: Option<&str>,
 ) -> Result<Ecriture, ErreurMigration> {
     let actuel = objet_courant(courant);
-    let voulu = match egaliseur_principal(chaine).map(|i| &chaine.plugins[i]) {
+    let bandes_actuelles: Option<Vec<EqBandSpec>> = courant
+        .and_then(|b| serde_json::from_str::<EqProfile>(b).ok())
+        .map(|p| p.bands);
+    let principal = facade_de_l_ancienne_cle(chaine, bandes_actuelles.as_deref());
+    let voulu = match principal.map(|i| &chaine.plugins[i]) {
         Some(m) => {
             let mut base = match &m.settings {
                 Value::Object(s) => s.clone(),
@@ -1492,6 +1904,7 @@ fn projeter_egaliseur(
             // L'origine d'une correction de pièce (D1) n'appartient qu'à la
             // chaîne.
             base.remove(CHAMP_ORIGINE);
+            base.remove(MARQUE_ETEINT_PAR_L_ANCIENNE_CLE);
             base.insert("enabled".into(), Value::Bool(m.enabled));
             serde_json::from_value::<EqProfile>(Value::Object(base.clone())).map_err(|e| {
                 ErreurMigration::ReglagesInvalides {
@@ -1523,12 +1936,11 @@ fn projeter_convolution(
     let voulu = match chaine.plugins.iter().find(|m| m.id == ID_CONVOLUTION) {
         Some(m) if m.enabled => match m.settings.get("ir_path").and_then(Value::as_str) {
             Some(p) if !p.trim().is_empty() => Some(p.to_owned()),
-            _ => {
-                return Err(ErreurMigration::ReglagesInvalides {
-                    id: m.id.clone(),
-                    raison: "settings.ir_path is missing".into(),
-                });
-            }
+            // Cochée sans fichier choisi (ajoutée depuis « + Ajouter ») :
+            // acceptée, inactive à la résolution (`no_filter_selected`). Comme
+            // décochée : un `ir_path_{zone}` déjà posé est effacé, sinon le
+            // DSP convoluerait encore un fichier que l'écran dit absent.
+            _ => None,
         },
         // Décochée ou retirée : la convolution n'a pas d'état « décoché »
         // dans les anciennes clés ; le chemin reste dans la chaîne.
@@ -1629,6 +2041,10 @@ fn projeter(
             .map(|_| ())
             .map_err(|e| e.to_string())
         }),
+        Partie::Enceintes => projeter_objet(trouver(ID_ENCEINTES), courant, |m| {
+            crate::audio::reglage_enceintes::ReglagesEnceintes::lire(&Value::Object(m.clone()))
+                .map(|_| ())
+        }),
         Partie::Mono => Ok(projeter_mono(chaine, courant)),
         Partie::Surechantillonnage => Ok(projeter_surechantillonnage(chaine, courant)),
     }
@@ -1639,7 +2055,8 @@ fn projeter(
 pub struct BilanEcriture {
     /// Les anciennes clés réécrites ou effacées. La route qui écrit (T08)
     /// rafraîchit la sortie vivante pour chacune, comme les anciennes routes
-    /// (`REGLAGES_A_RAFRAICHIR`).
+    /// (`REGLAGES_A_RAFRAICHIR`). rc14 : la clé du réglage des enceintes y
+    /// figure aussi, sans être réécrite, quand « Bypass all » bascule.
     pub cles_modifiees: Vec<String>,
     /// La chaîne enregistrée a changé.
     pub chaine_ecrite: bool,
@@ -1692,6 +2109,12 @@ fn ecrire_chaine_avec(
         }
     };
     let chaine = &marques_par_le_serveur(reference.as_ref(), chaine);
+    // rc14 — « Bypass all » coupe le réglage des enceintes sans changer sa
+    // clé : la bascule doit tout de même atteindre la sortie vivante.
+    let bypass_bascule_les_enceintes = chaine.plugins.iter().any(|m| m.id == ID_ENCEINTES)
+        && reference
+            .as_ref()
+            .is_some_and(|r| r.bypass_all != chaine.bypass_all);
 
     let mut inst = lire_instantane(settings, zone_id)?;
     let mut parties: Vec<Partie> = inst.keys().cloned().collect();
@@ -1734,6 +2157,45 @@ fn ecrire_chaine_avec(
             Ecriture::Rien => continue,
         }
         bilan.cles_modifiees.push(cle);
+    }
+    // rc14 — le moteur lit aussi la chaîne : un égaliseur en série (2ᵉ façade
+    // cochée, réglée ou déplacée) ou un headroom manuel changé change le son
+    // sans toucher `eq_profile` ; « Bypass all » change tout sans toucher
+    // aucune ancienne clé ; l'ordre des greffons cochés règle celui des
+    // étages de la sortie locale. La route qui écrit rafraîchit d'après ces
+    // clés (l'égaliseur, la chaîne pour « Bypass all », l'ordre).
+    if let Some(r) = &reference {
+        let cle_eq = Partie::Egaliseur.cle(zone_id);
+        if super::egaliseurs_en_serie::signature(r) != super::egaliseurs_en_serie::signature(chaine)
+            && !bilan.cles_modifiees.contains(&cle_eq)
+        {
+            bilan.cles_modifiees.push(cle_eq);
+        }
+        if r.bypass_all != chaine.bypass_all {
+            bilan.cles_modifiees.push(super::cle_chaine_zone(zone_id));
+        }
+        if super::egaliseurs_en_serie::ordre_des_coches(r)
+            != super::egaliseurs_en_serie::ordre_des_coches(chaine)
+        {
+            bilan
+                .cles_modifiees
+                .push(super::egaliseurs_en_serie::cle_ordre_tess(zone_id));
+        }
+    }
+    let cle_enceintes = Partie::Enceintes.cle(zone_id);
+    if bypass_bascule_les_enceintes && !bilan.cles_modifiees.contains(&cle_enceintes) {
+        // Pas réécrite : seulement à rafraîchir (voir `BilanEcriture`).
+        bilan.cles_modifiees.push(cle_enceintes);
+    }
+
+    // La correction de pièce retirée de la chaîne : la trace de la dernière
+    // correction appliquée ne désigne plus rien.
+    if reference
+        .as_ref()
+        .is_some_and(|r| r.plugins.iter().any(|m| m.id == ID_CORRECTION_PIECE))
+        && !chaine.plugins.iter().any(|m| m.id == ID_CORRECTION_PIECE)
+    {
+        stockage(settings.delete(&cle_correction_appliquee(zone_id)))?;
     }
 
     entre();

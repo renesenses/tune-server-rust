@@ -114,6 +114,8 @@ fn matches_pattern(event_type: &str, pattern: &str) -> bool {
 /// state (transport, volume, now-playing, queue) so the client renders the
 /// truth without polling.
 async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
+    // Revue #9520 — le droit Premium du compte, pour le panneau du signal.
+    let premium_du_compte = state.license.is_premium().await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     // #5077 — même liste que `GET /zones` : une zone masquée qui joue en est.
     let zones = crate::routes::zones::zones_a_montrer(state).await;
@@ -149,15 +151,17 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
         let signal_path = crate::routes::zones::signal_path_sous_licence_lang(
             lang,
             &state.license,
-            crate::routes::zones::build_signal_path_lang(
-                lang,
-                &ps,
-                z,
-                &state.backend,
-                renderer_label,
-                audio_backend_de_la_zone,
-                wire.as_ref(),
-            ),
+            crate::routes::zones::avec_le_droit(premium_du_compte, || {
+                crate::routes::zones::build_signal_path_lang(
+                    lang,
+                    &ps,
+                    z,
+                    &state.backend,
+                    renderer_label,
+                    audio_backend_de_la_zone,
+                    wire.as_ref(),
+                )
+            }),
         )
         .await;
         let output_capabilities =

@@ -19,9 +19,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::VERSION_CONTRAT;
-use super::chaine::{ChaineTess, ErreurChaine};
+use super::chaine::{ChaineTess, ErreurChaine, Upsampling};
 use super::greffon::Catalogue;
-use super::resolution::{Badge, ContexteExecution, EtapeResolue, EtatVolume, MotifEtape};
+use super::modulation_dsd::{CapacitesDsd, MotifDsdRefuse};
+use super::reseau_upnp::{AcheminementUpnp, FaitsUpnp, acheminer, appliquer, famille_upnp};
+use super::resolution::{
+    Badge, CodeEtape, ContexteExecution, EtapeResolue, EtatVolume, MotifEtape, PlacementVolume,
+    Resolution,
+};
 use super::zones::{Applicabilite, TransportZone};
 
 /// La réponse de `GET /zones/{id}/tess` (et d'un `PUT` accepté).
@@ -42,6 +47,21 @@ pub struct ReponseTessZone {
     pub signal_path: Vec<EtapeResolue>,
     /// Les greffons qu'on peut ajouter (« + Add plugin »), avec leurs droits.
     pub catalog: Catalogue,
+    /// T12b — famille UPnP seulement : la voie par laquelle la chaîne atteint
+    /// le lecteur (relais progressif LPCM, transcodage, ou aucune) et son
+    /// motif. Absent ailleurs ; un client qui ne le connaît pas l'ignore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<AcheminementUpnp>,
+    /// Avertissements d'un `PUT` accepté (T17 : `active_preset_not_stored`
+    /// quand le marqueur « ACTIVE » n'a pas pu être tenu). Absent si vide.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    /// rc14 — ce que la sortie de la zone fait de chaque cible DSD
+    /// (`tess::modulation_dsd::CapacitesDsd`) : acceptée ou non, en natif ou
+    /// en DoP, avec son motif. Posé par le serveur ; absent d'un serveur
+    /// antérieur, qu'un client lit comme « inconnu ».
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsd_capabilities: Option<CapacitesDsd>,
 }
 
 impl ReponseTessZone {
@@ -52,7 +72,28 @@ impl ReponseTessZone {
         catalog: Catalogue,
         ctx: &ContexteExecution<'_>,
     ) -> Self {
-        let r = chain.resoudre(&catalog, ctx);
+        Self::depuis_avec_le_lecteur(zone_id, chain, active_preset, catalog, ctx, None)
+    }
+
+    /// T12b — comme [`Self::depuis`], et, sur une zone de la famille UPnP
+    /// dont la lecture a établi les faits du lecteur, la voie de la chaîne :
+    /// un étage que la voie ne porte pas est publié éteint, avec son motif.
+    pub fn depuis_avec_le_lecteur(
+        zone_id: i64,
+        chain: ChaineTess,
+        active_preset: Option<String>,
+        catalog: Catalogue,
+        ctx: &ContexteExecution<'_>,
+        lecteur: Option<&FaitsUpnp>,
+    ) -> Self {
+        let mut r = chain.resoudre(&catalog, ctx);
+        let delivery = lecteur
+            .filter(|_| famille_upnp(ctx.transport) && ctx.transport.applicabilite().appliquee())
+            .map(|f| {
+                let a = acheminer(&r, f);
+                appliquer(&mut r, &a);
+                a
+            });
         Self {
             contract_version: VERSION_CONTRAT,
             zone_id,
@@ -65,7 +106,69 @@ impl ReponseTessZone {
             badge: r.badge,
             signal_path: r.etapes,
             catalog,
+            delivery,
+            warnings: Vec::new(),
+            dsd_capabilities: None,
         }
+    }
+
+    /// rc14 — publie les capacités DSD de la sortie et les reporte sur le
+    /// chemin résolu : vers le DSD, une cible que la sortie locale ne prend
+    /// pas éteint l'upsampling et le modulateur (`dsd_not_supported_by_output`,
+    /// `detail` = motif précis) ; une cible acceptée dit son transport. Les
+    /// sorties réseau ne sont pas touchées (`not_applied_on_transport`).
+    pub fn avec_capacites_dsd(mut self, capacites: CapacitesDsd) -> Self {
+        let cible = match &self.chain.fixed.upsampling {
+            Upsampling::Dsd { rate, .. } => capacites.cible(*rate).cloned(),
+            _ => None,
+        };
+        if let Some(cible) = cible.filter(|_| self.transport == TransportZone::Local) {
+            let f = &cible.famille_44k1;
+            let mut modifie = false;
+            for e in self.signal_path.iter_mut().filter(|e| {
+                e.effective && matches!(e.code, CodeEtape::Upsampling | CodeEtape::DsdModulator)
+            }) {
+                if f.accepted {
+                    if e.code == CodeEtape::DsdModulator {
+                        let mut p = match e.params.take() {
+                            Some(Value::Object(m)) => m,
+                            _ => Map::new(),
+                        };
+                        p.insert("order".into(), json!(capacites.modulator_order));
+                        p.insert("rate_hz".into(), json!(f.rate_hz));
+                        p.insert("transport".into(), json!(f.transport));
+                        p.insert("dop_rate_hz".into(), json!(f.dop_rate_hz));
+                        p.insert(
+                            "zero_dbfs_modulation".into(),
+                            json!(super::modulation_dsd::MODULATION_A_0_DBFS),
+                        );
+                        e.params = Some(Value::Object(p));
+                    }
+                } else {
+                    e.effective = false;
+                    e.reason = Some(MotifEtape::DsdNotSupportedByOutput);
+                    e.detail = f.reason.map(|m| m.as_str().to_owned());
+                    modifie = true;
+                }
+            }
+            if modifie {
+                if self.volume.placement == Some(PlacementVolume::BeforeDsdModulator) {
+                    self.volume.placement = Some(PlacementVolume::AtRender);
+                }
+                let mut r = Resolution {
+                    etapes: std::mem::take(&mut self.signal_path),
+                    headroom_db: self.headroom_db,
+                    volume: self.volume,
+                    badge: self.badge,
+                };
+                r.recalculer_les_etapes_finales();
+                self.signal_path = r.etapes;
+                self.headroom_db = r.headroom_db;
+                self.badge = r.badge;
+            }
+        }
+        self.dsd_capabilities = Some(capacites);
+        self
     }
 }
 
@@ -79,9 +182,14 @@ pub struct EtatGreffonCatalogue {
     /// Installé, activé et branché dans l'hôte.
     pub available: bool,
     /// Pourquoi il ne traiterait pas s'il était coché, dans l'ordre de la
-    /// résolution : `plugin_unavailable` d'abord, puis `premium_required` ;
-    /// `None` : utilisable.
+    /// résolution : `plugin_not_installed` ou `plugin_unavailable` d'abord,
+    /// puis `premium_required` ; `None` : utilisable.
     pub reason: Option<MotifEtape>,
+    /// Avec `plugin_not_installed` seulement : le paquet à installer
+    /// (`POST /plugins/{install_package}/install`), qui rend le greffon
+    /// disponible sans redémarrage. Absent sinon ; un client ancien l'ignore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_package: Option<String>,
 }
 
 /// La réponse de `GET /tess/catalog` : le catalogue (schémas de réglages,
@@ -99,13 +207,29 @@ pub struct ReponseCatalogue {
 
 impl ReponseCatalogue {
     pub fn depuis(catalog: Catalogue, premium: bool, disponible: &dyn Fn(&str) -> bool) -> Self {
+        Self::depuis_avec_installation(catalog, premium, disponible, &|_| None)
+    }
+
+    /// Comme [`Self::depuis`] ; `a_installer(id)` rend le paquet facultatif
+    /// qui manque à un greffon indisponible (égaliseur, réaffectation des
+    /// canaux sur une base neuve) : le motif est alors `plugin_not_installed`
+    /// avec `install_package`, au lieu de `plugin_unavailable`.
+    pub fn depuis_avec_installation(
+        catalog: Catalogue,
+        premium: bool,
+        disponible: &dyn Fn(&str) -> bool,
+        a_installer: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
         let plugins = catalog
             .plugins
             .iter()
             .map(|d| {
                 let entitled = premium || !d.demande_le_premium();
                 let available = disponible(&d.id);
-                let reason = if !available {
+                let install_package = if available { None } else { a_installer(&d.id) };
+                let reason = if install_package.is_some() {
+                    Some(MotifEtape::PluginNotInstalled)
+                } else if !available {
                     Some(MotifEtape::PluginUnavailable)
                 } else if !entitled {
                     Some(MotifEtape::PremiumRequired)
@@ -117,6 +241,7 @@ impl ReponseCatalogue {
                     entitled,
                     available,
                     reason,
+                    install_package,
                 }
             })
             .collect();
@@ -166,7 +291,29 @@ pub fn schema_json() -> Value {
         .iter()
         .map(ErreurChaine::code)
         .collect();
-    json!({
+    // T12b — `delivery` est défini hors du grand littéral : `json!` y atteint
+    // sa limite de récursion.
+    let delivery = json!({
+        "type": "object",
+        "required": ["route", "reason", "detail", "renderer_lpcm", "lpcm_bits"],
+        "properties": {
+            "route": enumere(&["untouched", "progressive_lpcm", "file_transcode"]),
+            "reason": { "enum": ["nothing_to_process", "renderer_without_lpcm",
+                                 "progressive_off", "service_not_streamable",
+                                 "dsd_converted_to_pcm", null] },
+            "detail": texte_ou_null.clone(),
+            "renderer_lpcm": enumere(&["accepted", "refused", "unknown"]),
+            "lpcm_bits": { "type": "integer" }
+        },
+        "additionalProperties": false
+    });
+    let motifs_etape = json!({ "enum": ["outside_tess", "pure_mode", "bypass_all",
+        "dsd_source_native", "chain_version_unsupported", "unknown_value", "unknown_plugin",
+        "plugin_unavailable", "premium_required", "stereo_only", "replaced_in_group",
+        "nothing_to_protect", "volume_not_software", "nothing_to_quantize", "not_in_service",
+        "renderer_without_lpcm", "not_applied_on_transport", "plugin_not_installed",
+        "no_filter_selected", "dsd_not_supported_by_output", "neutral_settings", null] });
+    let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://mozaiklabs.fr/schemas/tess/contract-1.json",
         "title": "TESS API contract",
@@ -236,7 +383,7 @@ pub fn schema_json() -> Value {
                 "type": "object", "required": ["channels", "position", "exclusive_group"],
                 "properties": {
                     "channels": enumere(&["any", "stereo_only", "remaps"]),
-                    "position": enumere(&["free", "last_plugin"]),
+                    "position": enumere(&["free", "last_plugin", "before_upsampling"]),
                     "exclusive_group": { "$ref": "#/$defs/exclusive_group" }
                 },
                 "additionalProperties": false
@@ -280,7 +427,9 @@ pub fn schema_json() -> Value {
                             "id": { "$ref": "#/$defs/id" },
                             "entitled": { "type": "boolean" },
                             "available": { "type": "boolean" },
-                            "reason": { "enum": ["plugin_unavailable", "premium_required", null] }
+                            "reason": { "enum": ["plugin_not_installed", "plugin_unavailable",
+                                                 "premium_required", null] },
+                            "install_package": { "$ref": "#/$defs/id" }
                         },
                         "additionalProperties": false
                     } }
@@ -310,11 +459,7 @@ pub fn schema_json() -> Value {
                     "fixed": { "type": "boolean" },
                     "requested": { "type": "boolean" },
                     "effective": { "type": "boolean" },
-                    "reason": { "enum": ["outside_tess", "pure_mode", "bypass_all", "dsd_source_native",
-                                         "chain_version_unsupported", "unknown_value", "unknown_plugin",
-                                         "plugin_unavailable", "premium_required", "stereo_only",
-                                         "replaced_in_group", "nothing_to_protect", "volume_not_software",
-                                         "nothing_to_quantize", "not_in_service", null] },
+                    "reason": motifs_etape,
                     "detail": texte_ou_null,
                     "params": objet_ou_null,
                     "latency_frames": entier_ou_null
@@ -346,7 +491,9 @@ pub fn schema_json() -> Value {
                     "badge": enumere(&["bit_perfect", "processed_by_tess", "outside_tess",
                                        "altered_outside_tess"]),
                     "signal_path": { "type": "array", "items": { "$ref": "#/$defs/step" } },
-                    "catalog": { "$ref": "#/$defs/catalog" }
+                    "catalog": { "$ref": "#/$defs/catalog" },
+                    // Facultatif (T17) : avertissements d'un `PUT` accepté.
+                    "warnings": { "type": "array", "items": { "type": "string" } }
                 },
                 "additionalProperties": false
             },
@@ -356,7 +503,11 @@ pub fn schema_json() -> Value {
                     "id": { "$ref": "#/$defs/id" },
                     "name": { "type": "string" },
                     "builtin": { "type": "boolean" },
-                    "chain": { "$ref": "#/$defs/chain" }
+                    "chain": { "$ref": "#/$defs/chain" },
+                    // Facultatif (T17) : seulement dans la réponse d'un
+                    // `POST /tess/presets` dont le marqueur « ACTIVE » n'a
+                    // pas pu être posé (`active_preset_not_stored`).
+                    "warnings": { "type": "array", "items": { "type": "string" } }
                 },
                 "additionalProperties": false
             },
@@ -381,11 +532,67 @@ pub fn schema_json() -> Value {
                     // `detail`, `upgrade_url` sur un 402 seulement.
                     "error": { "enum": codes_refus },
                     "message": { "type": "string" },
-                    "upgrade_url": { "type": "string" }
+                    "upgrade_url": { "type": "string" },
+                    // rc14 — `dsd_not_supported_by_output` seulement : le
+                    // motif précis et les capacités de la sortie.
+                    "reason": { "type": "string" },
+                    "dsd_capabilities": { "type": "object" }
                 },
                 "additionalProperties": false
             }
         }
+    });
+    schema["$defs"]["delivery"] = delivery;
+    schema["$defs"]["zone_response"]["properties"]["delivery"] =
+        json!({ "$ref": "#/$defs/delivery" });
+    schema["$defs"]["dsd_capabilities"] = schema_capacites_dsd();
+    schema["$defs"]["zone_response"]["properties"]["dsd_capabilities"] =
+        json!({ "$ref": "#/$defs/dsd_capabilities" });
+    schema
+}
+
+/// rc14 — le schéma de `dsd_capabilities` (voir [`CapacitesDsd`]).
+fn schema_capacites_dsd() -> Value {
+    let mut motifs: Vec<Value> = MotifDsdRefuse::TOUS
+        .iter()
+        .map(|m| json!(m.as_str()))
+        .collect();
+    motifs.push(Value::Null);
+    let famille = json!({
+        "type": "object",
+        "required": ["rate_hz", "accepted", "transport", "dop_rate_hz", "reason", "native_reason"],
+        "properties": {
+            "rate_hz": { "type": "integer" },
+            "accepted": { "type": "boolean" },
+            "transport": { "enum": ["native", "dop", null] },
+            "dop_rate_hz": { "type": ["integer", "null"] },
+            "reason": { "enum": motifs },
+            "native_reason": { "type": ["string", "null"] }
+        },
+        "additionalProperties": false
+    });
+    let mut cible = famille.clone();
+    cible["required"]
+        .as_array_mut()
+        .expect("liste")
+        .extend([json!("rate"), json!("family_48k")]);
+    cible["properties"]["rate"] = json!({ "enum": ["dsd64", "dsd128", "dsd256"] });
+    cible["properties"]["family_48k"] = famille;
+    json!({
+        "type": "object",
+        "required": ["dsd_mode", "output_local", "modulator_order", "reference_level",
+                     "volume_placement", "machine_measured", "status", "targets"],
+        "properties": {
+            "dsd_mode": { "type": "string" },
+            "output_local": { "type": "boolean" },
+            "modulator_order": { "type": "integer" },
+            "reference_level": { "type": "string" },
+            "volume_placement": { "const": "before_dsd_modulator" },
+            "machine_measured": { "type": "boolean" },
+            "status": { "enum": ["known", "unknown"] },
+            "targets": { "type": "array", "items": cible }
+        },
+        "additionalProperties": false
     })
 }
 
@@ -574,6 +781,8 @@ mod tests {
                 control: ControleVolume::Software,
                 db: -18.0,
             },
+            replaygain_actif: false,
+            voies_de_sortie: None,
         }
     }
 
@@ -630,6 +839,71 @@ mod tests {
         }
     }
 
+    /// T12b — `delivery` n'apparaît que sur la famille UPnP, suit le schéma
+    /// strict et celui de lecture, et fait l'aller-retour ; l'étage casque
+    /// éteint faute de LPCM porte `renderer_without_lpcm`.
+    #[test]
+    fn la_voie_upnp_est_publiee_sur_la_seule_famille_upnp() {
+        use crate::tess::reseau_upnp::{FaitsUpnp, LpcmDuLecteur, OrigineDuFlux, VoieUpnp};
+        let casque_seul = ChaineTess {
+            plugins: vec![MaillonGreffon {
+                id: "crossfeed".into(),
+                enabled: true,
+                settings: Value::Null,
+            }],
+            ..ChaineTess::default()
+        };
+        let faits = FaitsUpnp {
+            lpcm: LpcmDuLecteur::Refused,
+            lpcm_bits: 16,
+            progressif_arme: false,
+            origine: OrigineDuFlux::Library,
+            replaygain_actif: false,
+            service_decodable_au_fil: true,
+            format_impose_le_transcodage: false,
+        };
+        for t in TransportZone::ALL {
+            for c in [
+                ChaineTess::default(),
+                chaine_complete(),
+                casque_seul.clone(),
+            ] {
+                let r = ReponseTessZone::depuis_avec_le_lecteur(
+                    12,
+                    c.clone(),
+                    None,
+                    catalogue_de_reference(),
+                    &ctx(t),
+                    Some(&faits),
+                );
+                assert_eq!(r.delivery.is_some(), super::famille_upnp(t), "{t:?}");
+                let v = serde_json::to_value(&r).unwrap();
+                strict("zone_response", &v).unwrap_or_else(|e| panic!("{t:?} : {e}"));
+                lecture("zone_response", &v).unwrap_or_else(|e| panic!("{t:?} : {e}"));
+                assert_eq!(serde_json::from_value::<ReponseTessZone>(v).unwrap(), r);
+            }
+        }
+        let r = ReponseTessZone::depuis_avec_le_lecteur(
+            12,
+            casque_seul.clone(),
+            None,
+            catalogue_de_reference(),
+            &ctx(TransportZone::Dlna),
+            Some(&faits),
+        );
+        assert_eq!(r.delivery.as_ref().unwrap().route, VoieUpnp::Untouched);
+        let cf = r
+            .signal_path
+            .iter()
+            .find(|e| e.plugin_id.as_deref() == Some("crossfeed"))
+            .unwrap();
+        assert_eq!(cf.reason, Some(MotifEtape::RendererWithoutLpcm));
+        // Contre-épreuve : sans faits du lecteur, rien ne change (`depuis`).
+        let sans = reponse(TransportZone::Dlna, casque_seul);
+        assert!(sans.delivery.is_none());
+        assert_eq!(sans.badge, Badge::ProcessedByTess);
+    }
+
     #[test]
     fn un_client_v1_lit_une_reponse_plus_recente() {
         let mut v = serde_json::to_value(reponse(TransportZone::Oaat, chaine_complete())).unwrap();
@@ -662,7 +936,7 @@ mod tests {
         assert_eq!(r.badge, Badge::OutsideTess);
         // Contre-épreuve sur OAAT.
         let r = reponse(TransportZone::Oaat, chaine_complete());
-        assert_eq!(r.headroom_db, -3.0);
+        assert_eq!(r.headroom_db, crate::tess::chaine::HEADROOM_AUTO_DB);
         assert!(r.volume.placement.is_some());
     }
 
@@ -756,6 +1030,41 @@ mod tests {
                 (!premium).then_some(MotifEtape::PremiumRequired)
             );
         }
+        // rc14 — un paquet facultatif à installer : motif distinct et paquet
+        // nommé ; ce qui n'a rien à installer reste `plugin_unavailable`.
+        let a_installer = |id: &str| (id == "equalizer-graphic").then(|| "equalizer".to_owned());
+        let r = ReponseCatalogue::depuis_avec_installation(
+            catalogue_de_reference(),
+            true,
+            &|id: &str| id != "declick-live" && id != "equalizer-graphic",
+            &a_installer,
+        );
+        let v = serde_json::to_value(&r).unwrap();
+        strict("catalog_response", &v).unwrap();
+        lecture("catalog_response", &v).unwrap();
+        assert_eq!(serde_json::from_value::<ReponseCatalogue>(v).unwrap(), r);
+        let etat = |id: &str| r.plugins.iter().find(|p| p.id == id).unwrap().clone();
+        assert_eq!(
+            etat("equalizer-graphic").reason,
+            Some(MotifEtape::PluginNotInstalled)
+        );
+        assert_eq!(
+            etat("equalizer-graphic").install_package.as_deref(),
+            Some("equalizer")
+        );
+        assert_eq!(
+            etat("declick-live").reason,
+            Some(MotifEtape::PluginUnavailable)
+        );
+        assert_eq!(etat("declick-live").install_package, None);
+        // Un greffon disponible n'a jamais rien à installer.
+        let r = ReponseCatalogue::depuis_avec_installation(
+            catalogue_de_reference(),
+            true,
+            &tout,
+            &a_installer,
+        );
+        assert!(r.plugins.iter().all(|p| p.install_package.is_none()));
         // Contre-épreuve : un champ de plus n'est pas émis par ce serveur.
         let mut v = serde_json::to_value(ReponseCatalogue::depuis(
             catalogue_de_reference(),

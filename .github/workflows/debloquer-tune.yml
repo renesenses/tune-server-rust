@@ -1,0 +1,306 @@
+name: Débloquer Tune
+
+# Construit l'outil « Débloquer Tune » (tools/debloquer-tune, HORS workspace,
+# son propre Cargo.lock) et, sur demande, l'attache à SA release
+# `debloquer-tune-v1` — jamais à une release de Tune.
+#
+# Pourquoi une release à part, en PRÉ-VERSION, au tag qui ne ressemble à rien :
+#  - la mise à jour des serveurs lit `tag_name` sans le `v` : « debloquer-tune-v1 »
+#    n'y donne aucun numéro, donc jamais une version « plus récente » (updater.rs,
+#    `select_release`) ; aucune archive ne s'appelle `tune-server-*` ;
+#  - le site n'ingère que la liste blanche `vX.Y.Z` / `tune-os-…`
+#    (ReleaseIngestor::TUNE_TAG_PATTERNS, #5477) ;
+#  - `--latest=false` : la « dernière release » du dépôt reste celle de Tune.
+#
+# Signature :
+#  - macOS : Developer ID + runtime durci + horodatage, PUIS notarisation et
+#    agrafage de l'app (mêmes secrets que release.yml : APPLE_CERTIFICATE_P12,
+#    APPLE_TEAM_ID, ASC_API_KEY_* ou APPLE_ID). Sans secrets : app ad hoc et
+#    avertissement, Gatekeeper la bloquera.
+#  - Windows : même étape que release.yml, active SEULEMENT si
+#    WIN_SIGN_CERT_BASE64 / WIN_SIGN_CERT_PWD existent. Au 23/11/2026, ils
+#    n'existent pas : le .exe part non signé et SmartScreen s'affiche
+#    (« Informations complémentaires › Exécuter quand même »).
+#
+# Sur PR : les tests seuls. Build, signature et publication : lancement manuel :
+#   gh workflow run debloquer-tune.yml -R renesenses/tune-server-rust -f publier=true
+
+on:
+  # Sur PR : le job de TESTS seulement (les jobs de build et de publication
+  # sont réservés au lancement manuel, voir leurs `if:`).
+  pull_request:
+    paths:
+      - "tools/debloquer-tune/**"
+      - ".github/workflows/debloquer-tune.yml"
+  workflow_dispatch:
+    inputs:
+      publier:
+        description: "Attacher les fichiers à la release debloquer-tune-v1 (sinon : artefacts du run seulement)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debloquer-tune-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  MANIFESTE: tools/debloquer-tune/Cargo.toml
+
+jobs:
+  tests:
+    name: Tests (faux serveur Tune)
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    timeout-minutes: 20  # ~2 min de compilation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+          rustflags: ""
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/debloquer-tune
+          key: debloquer-tune-linux
+      - name: Format
+        run: cargo fmt --manifest-path "$MANIFESTE" --check
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path "$MANIFESTE" --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --no-fail-fast --locked --manifest-path "$MANIFESTE"
+
+  windows:
+    name: Windows x86_64
+    needs: tests
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 30  # ~3 min de compilation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          rustflags: ""
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/debloquer-tune
+          key: debloquer-tune-windows
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --manifest-path "$MANIFESTE" --target x86_64-pc-windows-msvc
+      - name: Renommer
+        shell: bash
+        run: |
+          mkdir -p sortie
+          cp tools/debloquer-tune/target/x86_64-pc-windows-msvc/release/debloquer-tune.exe sortie/Debloquer-Tune-windows-x86_64.exe
+      # Le secret ne vit QUE dans ces deux étapes : celle-ci n'en sort qu'un
+      # oui/non, la suivante signe.
+      - name: Certificat présent ?
+        id: certificat
+        shell: bash
+        env:
+          WIN_SIGN_CERT_BASE64: ${{ secrets.WIN_SIGN_CERT_BASE64 }}
+        run: |
+          if [ -n "$WIN_SIGN_CERT_BASE64" ]; then echo "present=oui" >> "$GITHUB_OUTPUT"; else echo "present=non" >> "$GITHUB_OUTPUT"; fi
+      # Même étape que release.yml (« Sign Windows binaries »), sur ce seul .exe.
+      - name: Signer (si le certificat est présent)
+        if: steps.certificat.outputs.present == 'oui'
+        env:
+          WIN_SIGN_CERT_BASE64: ${{ secrets.WIN_SIGN_CERT_BASE64 }}
+          WIN_SIGN_CERT_PWD: ${{ secrets.WIN_SIGN_CERT_PWD }}
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "tune-sign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WIN_SIGN_CERT_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe introuvable dans le SDK Windows" }
+          $t = "sortie\Debloquer-Tune-windows-x86_64.exe"
+          & $signtool.FullName sign /f $pfx /p $env:WIN_SIGN_CERT_PWD `
+            /fd SHA256 /tr http://timestamp.sectigo.com /td SHA256 /v $t
+          if ($LASTEXITCODE -ne 0) { throw "échec de signature : $t" }
+          & $signtool.FullName verify /pa /v $t
+          if ($LASTEXITCODE -ne 0) { throw "signature invalide : $t" }
+          Remove-Item $pfx -Force
+      - name: Non signé
+        if: steps.certificat.outputs.present != 'oui'
+        shell: bash
+        run: echo "::warning::WIN_SIGN_CERT_BASE64 absent — Debloquer-Tune-windows-x86_64.exe part NON signé (SmartScreen s'affichera)."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debloquer-tune-windows
+          path: sortie/Debloquer-Tune-windows-x86_64.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS (app universelle)
+    needs: tests
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ fromJSON(vars.RUNNER_MACOS || '"macos-14"') }}
+    timeout-minutes: 45  # ~4 min de compilation + notarisation (souvent 2-10 min)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: aarch64-apple-darwin,x86_64-apple-darwin
+          rustflags: ""
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/debloquer-tune
+          key: debloquer-tune-macos
+      - name: Build (arm64 + x86_64)
+        run: |
+          set -euo pipefail
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --manifest-path "$MANIFESTE" --target "$t"
+          done
+      - name: Assembler l'app
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version' "$MANIFESTE" | cut -d'"' -f2)
+          APP="sortie/Débloquer Tune.app"
+          mkdir -p "$APP/Contents/MacOS"
+          lipo -create -output "$APP/Contents/MacOS/debloquer-tune" \
+            tools/debloquer-tune/target/aarch64-apple-darwin/release/debloquer-tune \
+            tools/debloquer-tune/target/x86_64-apple-darwin/release/debloquer-tune
+          sed "s/__VERSION__/$VERSION/g" tools/debloquer-tune/macos/Info.plist > "$APP/Contents/Info.plist"
+          plutil -lint "$APP/Contents/Info.plist"
+          lipo -info "$APP/Contents/MacOS/debloquer-tune"
+      - name: Importer le certificat
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12" ]; then echo "Pas de certificat"; exit 0; fi
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          # Un trousseau laissé par un lancement interrompu ferait échouer
+          # `create-keychain` (runner Mac auto-hébergé : il persiste).
+          security delete-keychain debloquer.keychain 2>/dev/null || true
+          security create-keychain -p actions debloquer.keychain
+          security default-keychain -s debloquer.keychain
+          security unlock-keychain -p actions debloquer.keychain
+          security import "$RUNNER_TEMP/certificate.p12" -k debloquer.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions debloquer.keychain
+          rm "$RUNNER_TEMP/certificate.p12"
+      - name: Signer, notariser, agrafer
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          APP="sortie/Débloquer Tune.app"
+          ZIP="sortie/Debloquer-Tune-macos.zip"
+          if [ -z "$APPLE_TEAM_ID" ]; then
+            echo "::warning::APPLE_TEAM_ID absent — app signée ad hoc seulement : Gatekeeper la bloquera."
+            codesign --force --sign - "$APP"
+            ditto -c -k --keepParent "$APP" "$ZIP"
+            exit 0
+          fi
+          IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
+          # Même reprise que release.yml : sans réponse du serveur
+          # d'horodatage, codesign rend 0 sans horodatage et --verify rejette.
+          ok=0
+          for i in 1 2 3 4 5; do
+            if codesign --force --options runtime --timestamp \
+                 --identifier fr.mozaiklabs.debloquer-tune \
+                 --sign "$IDENTITY" "$APP" \
+               && codesign --verify --strict --deep --verbose=2 "$APP"; then
+              ok=1; break
+            fi
+            echo "::warning::codesign a échoué (essai $i/5) — nouvelle tentative dans $((i * 15)) s"
+            sleep $((i * 15))
+          done
+          [ "$ok" = 1 ] || { echo "::error::codesign a échoué 5 fois"; exit 1; }
+
+          if [ -n "$ASC_API_KEY_P8" ]; then
+            KEY_FILE="$RUNNER_TEMP/AuthKey.p8"
+            printf '%s' "$ASC_API_KEY_P8" > "$KEY_FILE"
+            trap 'rm -f "$KEY_FILE"' EXIT
+            AUTH=(--key "$KEY_FILE" --key-id "$ASC_API_KEY_ID" --issuer "$ASC_API_ISSUER_ID")
+          elif [ -n "$APPLE_ID" ]; then
+            AUTH=(--apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID")
+          else
+            echo "::warning::Aucun identifiant de notarisation — app signée mais NON notarisée : Gatekeeper avertira."
+            ditto -c -k --keepParent "$APP" "$ZIP"
+            exit 0
+          fi
+          # Notariser une archive de l'app, puis agrafer le ticket sur l'app
+          # elle-même et refaire l'archive : c'est celle-là qui est publiée.
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/a-notariser.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/a-notariser.zip" "${AUTH[@]}" --wait --timeout 1200 \
+            | tee "$RUNNER_TEMP/notarisation.log"
+          grep -q "status: Accepted" "$RUNNER_TEMP/notarisation.log" \
+            || { echo "::error::Notarisation refusée — voir « xcrun notarytool log <id> »"; exit 1; }
+          for i in 1 2 3 4 5; do
+            xcrun stapler staple "$APP" && break
+            echo "::warning::stapler a échoué (essai $i/5)"; sleep $((i * 20))
+          done
+          xcrun stapler validate "$APP"
+          spctl --assess --type execute --verbose=2 "$APP"
+          ditto -c -k --keepParent "$APP" "$ZIP"
+      # Toujours, même en échec : le trousseau importé ne doit pas survivre au
+      # job, et le trousseau par défaut redevient celui de la session.
+      - name: Nettoyer le trousseau
+        if: always()
+        run: |
+          security default-keychain -s "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
+          security delete-keychain debloquer.keychain 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debloquer-tune-macos
+          path: sortie/Debloquer-Tune-macos.zip
+          if-no-files-found: error
+
+  publier:
+    name: Publier sur debloquer-tune-v1
+    needs: [windows, macos]
+    if: github.event_name == 'workflow_dispatch' && inputs.publier
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE: debloquer-tune-v1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: debloquer-tune-*
+          path: fichiers
+          merge-multiple: true
+      - name: Créer ou compléter la release de l'outil
+        run: |
+          set -euo pipefail
+          ls -l fichiers
+          (cd fichiers && sha256sum Debloquer-Tune-* > SHA256SUMS-debloquer-tune.txt)
+          if ! gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Débloquer Tune (outil, hors Tune) — v1" \
+              --notes-file tools/debloquer-tune/NOTES-RELEASE.md \
+              --prerelease \
+              --latest=false
+          fi
+          gh release upload "$RELEASE" --repo "$GITHUB_REPOSITORY" --clobber fichiers/*
+      # Garde : aucune release de Tune ne doit porter ces fichiers.
+      - name: Vérifier que les releases de Tune sont intactes
+        run: |
+          set -euo pipefail
+          for tag in $(gh release list --repo "$GITHUB_REPOSITORY" --limit 15 --json tagName --jq '.[].tagName' | grep '^v'); do
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -qi '^debloquer-tune'; then
+              echo "::error::la release $tag porte un fichier Debloquer-Tune"; exit 1
+            fi
+          done
+          echo "aucune release de Tune ne porte l'outil"

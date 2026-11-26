@@ -175,6 +175,7 @@ quick-xml = { workspace = true }
 mdns-sd = { workspace = true }
 urlencoding = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true }
 # Verifies minisign signatures over release checksums (self-update, audit
 # item 8). Pure-Rust, no libsodium — verify-only, the trusted key is embedded.
 minisign-verify = "0.2"
@@ -299,6 +300,12 @@ path = "tests/pont_administration.rs"
 [[test]]
 name = "relais_routes_relayables"
 path = "tests/relais_routes_relayables.rs"
+
+# #9174 — la provenance du lecteur d'une zone navigateur (relais ou local).
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "relais_format_compresse_9174"
+path = "tests/relais_format_compresse_9174.rs"
 
 # Garde de la couche d'authentification (routes privilégiées, profil
 # `default`, premier lancement). `autotests = false` plus haut : sans cette
@@ -1271,6 +1278,10 @@ path = "tests/bibliotheque_rest_ordre_alphabetique_4956.rs"
 name = "repertoires_ordre_alphabetique_5582"
 path = "tests/repertoires_ordre_alphabetique_5582.rs"
 
+[[test]]
+name = "bridge_cle_api_9413"
+path = "tests/bridge_cle_api_9413.rs"
+
 # #4260 — `/library/artwork/proxy` n'est plus un relais ouvert (SSRF) : URL
 # signées pour ce que la DIDL publie (#4061), liste d'hôtes pour le reste,
 # refus des adresses internes APRÈS résolution DNS, redirections à la main.
@@ -1331,6 +1342,16 @@ path = "tests/web_response_contracts.rs"
 [[test]]
 name = "indexation_upnp_2219"
 path = "tests/indexation_upnp_2219.rs"
+
+# Fil du forum 3028 : Tune ne s'indexe pas lui-même (UDN et adresses locales).
+[[test]]
+name = "auto_indexation_upnp_3028"
+path = "tests/auto_indexation_upnp_3028.rs"
+
+# Fil du forum 3028, suite : source refusée, retrait qui rattache, this_server.
+[[test]]
+name = "auto_indexation_upnp_suite_3028"
+path = "tests/auto_indexation_upnp_suite_3028.rs"
 
 [[test]]
 name = "refus_oaat_upnp_2219"
@@ -1544,6 +1565,29 @@ path = "tests/tess_migration_routes_t02.rs"
 [[test]]
 name = "tess_api_routes_t08"
 path = "tests/tess_api_routes_t08.rs"
+
+# rc14 — l'égaliseur paramétrique est Premium sur les routes historiques
+# (`/zones/{id}/dsp`, `/zones/{id}/eq`, `/eq/presets/{id}/activate`) comme
+# par TESS ; graphique et casque libres.
+[[test]]
+name = "eq_parametrique_premium_rc14"
+path = "tests/eq_parametrique_premium_rc14.rs"
+
+# rc14 — TESS vers le DSD sur la sortie locale : capacités, 402, 409, chemin.
+[[test]]
+name = "tess_dsd_sortie_locale_rc14"
+path = "tests/tess_dsd_sortie_locale_rc14.rs"
+
+# TESS T09a — import d'un jeu de convolution (.zip de RI, .cfg Convolver),
+# archive piégée refusée sans toucher au jeu en place.
+[[test]]
+name = "import_convolution_t09a"
+path = "tests/import_convolution_t09a.rs"
+
+# TESS T17 — préréglages de chaîne globaux et mode d'application.
+[[test]]
+name = "tess_prereglages_routes_t17"
+path = "tests/tess_prereglages_routes_t17.rs"
 
 # #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
 # et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans
@@ -2254,11 +2298,24 @@ path = "tests/durcissement_routes_admin.rs"
 name = "activation_authentification"
 path = "tests/activation_authentification.rs"
 
+# rc13.2 : connexion de `default` sur cette machine et depuis le réseau local,
+# après l'activation et sur une base rc12 (ancien hachage). SQLite, et
+# PostgreSQL quand `TUNE_TEST_PG_URL` est posée (feature `postgres`).
+[[test]]
+name = "connexion_mot_de_passe_rc13_2"
+path = "tests/connexion_mot_de_passe_rc13_2.rs"
+
 # Le code d'activation ne sort par aucun lecteur de journal (TUNE_LOG_FILE
 # posé pour tout le processus : cible à part).
 [[test]]
 name = "code_activation_hors_des_journaux"
 path = "tests/code_activation_hors_des_journaux.rs"
+
+# Le code d'activation est aussi écrit dans le fichier journal local, et nulle
+# part ailleurs (vrai abonné `tracing`, `TUNE_LOG_FILE` posé : cible à part).
+[[test]]
+name = "code_activation_dans_le_fichier_journal"
+path = "tests/code_activation_dans_le_fichier_journal.rs"
 
 # #8135 — une radio comme élément d'une playlist (ajout, liste, lecture,
 # export/import). `autotests = false` plus haut : sans cette cible, jamais compilé.

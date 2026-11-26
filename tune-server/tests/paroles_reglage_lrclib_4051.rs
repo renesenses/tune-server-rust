@@ -25,8 +25,9 @@
 //!
 //! ## Les quatre témoins
 //!
-//! 1. Sur une base vierge, `GET /system/config` **publie** le réglage à
-//!    `false`. Il l'omettait : une clé absente se lit « je ne sais pas », pas
+//! 1. Sur une base vierge, `GET /system/config` **publie** le réglage — à
+//!    `true` depuis la rc14 (une base NEUVE naît avec le réglage posé à
+//!    « true »), `false` avant. Il l'omettait : une clé absente se lit « je ne sais pas », pas
 //!    « non » — la règle que ce même fichier applique déjà à
 //!    `local_exclusive_mode_supported` et `replaygain_analysis_enabled`, et que
 //!    `GET /system/profile` respecte pour CETTE clé-ci depuis #3577.
@@ -173,9 +174,10 @@ async fn le_reglage_lrclib_se_lit_et_son_refus_se_dit() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(
         config.get(CLE),
-        Some(&json!(false)),
-        "sur une base vierge, GET /system/config doit PUBLIER le réglage à false, \
-         pas omettre la clé — une clé absente se lit « je ne sais pas », pas « non »"
+        Some(&json!(true)),
+        "sur une base vierge, GET /system/config doit PUBLIER le réglage (activé \
+         depuis la rc14), pas omettre la clé — une clé absente se lit « je ne \
+         sais pas », pas « non »"
     );
     // Le voisin immédiat de la même section le fait depuis toujours : ce n'est
     // pas une convention inventée ici.
@@ -191,7 +193,7 @@ async fn le_reglage_lrclib_se_lit_et_son_refus_se_dit() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(
         profil.pointer(&format!("/settings/{CLE}")),
-        Some(&json!(false)),
+        Some(&json!(true)),
         "la fiche système publie le même défaut que /system/config"
     );
 
@@ -199,6 +201,11 @@ async fn le_reglage_lrclib_se_lit_et_son_refus_se_dit() {
     //
     // ROUGE avant : les deux routes rendaient `404 no_lyrics` sans une ligne
     // de journal, exactement comme un titre réellement sans paroles.
+    //
+    // rc14 : une base neuve naît avec le réglage activé. Le refus se pose donc ici,
+    // comme l'interface le pose quand on décoche la case.
+    let (st, reponse) = patch(&app, "/api/v1/system/config", json!({ CLE: false })).await;
+    assert_eq!(st, StatusCode::OK, "le PATCH est accepté : {reponse}");
     let tid = inserer_piste(&state);
     let (st, corps) = get(&app, &format!("/api/v1/library/tracks/{tid}/lyrics")).await;
     assert_eq!(st, StatusCode::NOT_FOUND, "réglage éteint : 404 no_lyrics");

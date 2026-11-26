@@ -1462,6 +1462,14 @@ mod update_availability_tests {
 /// once the CI signing step is live; verification then becomes mandatory.
 const UPDATE_PUBLIC_KEY: &str = "RWRjeNGnrhiQYHaMp7e0Cmr6PCC4tEY7UwenBFrbDBoIPDB7T9aBRwUM";
 
+/// La vérification de signature des mises à jour est-elle armée ? Tant que
+/// oui, une installation n'aboutit qu'à une release officielle signée : c'est
+/// la condition pour l'ouvrir au réseau local sans authentification
+/// (`auth::AdminOuReseauLocalPourLaMiseAJour`).
+pub(crate) fn mise_a_jour_signee_exigee() -> bool {
+    !UPDATE_PUBLIC_KEY.is_empty()
+}
+
 /// À qui la faute quand une mise à jour ne peut pas être vérifiée.
 ///
 /// La question n'est pas cosmétique. En v0.9.71 la release est restée douze
@@ -2537,7 +2545,10 @@ pub(super) async fn update_check(State(state): State<AppState>) -> Json<Value> {
 /// directly under the warning that playback will stop. It does NOT override
 /// the restart deferral — see [`defer_restart_until_quiet`].
 pub(super) async fn update_install(
-    _garde: crate::auth::AdminOuCetteMachine,
+    // rc13.1 — sans authentification, le réseau local peut installer la
+    // release OFFICIELLE (aucune URL ni version reçue de l'appelant, signature
+    // minisign vérifiée avant toute installation). Voir la garde.
+    _garde: crate::auth::AdminOuReseauLocalPourLaMiseAJour,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<UpdateInstallParams>,
@@ -3836,16 +3847,13 @@ fn install_unix(
         ));
     }
 
-    // #8955 — les greffons livrés aussi, AVANT de toucher au binaire.
-    if let Err(e) = greffons_livres::preparer(&greffons, controles.copier) {
-        std::fs::remove_file(&staging).ok();
-        installation_sure::abandonner_les_web(&webs_prepares);
-        compagnons::abandonner(&livres);
-        error!(error = %e, "update_new_bundled_plugin_rejected");
-        return Err(format!(
-            "{e} — previous binary, bundled executables, plugins and web/ kept"
-        ));
-    }
+    // #8955 — les greffons livrés aussi, AVANT de toucher au binaire. Fil
+    // 3014 — un greffon qui ne peut pas être posé garde sa version actuelle
+    // et ne bloque pas la mise à jour : seuls les greffons posés basculent.
+    let greffons_livres::Preparation {
+        poses: greffons,
+        gardes: greffons_gardes,
+    } = greffons_livres::preparer(&greffons, controles.copier);
 
     let sauvegarde_en_cours = old_exe == en_cours;
     let sauvegarde_faite = if sauvegarde_en_cours || !binaire.exists() {
@@ -3949,15 +3957,25 @@ fn install_unix(
 
     // #8955 — chaque greffon livré bascule ensuite ; l'ancien reste en
     // `plugins.old/<nom>`, hors du dossier parcouru au démarrage.
+    // Fil 3014 — une bascule ratée laisse le greffon tel qu'il était
+    // (`basculer` remet l'ancien) : il garde sa version, la mise à jour
+    // continue.
     let mut greffons_bascules = Vec::new();
-    for (i, greffon) in greffons.iter().enumerate() {
+    let mut greffons_gardes = greffons_gardes;
+    for greffon in &greffons {
         match greffons_livres::basculer(greffon, controles.renommer) {
             Ok(b) => greffons_bascules.push(b),
             Err(e) => {
-                error!(error = %e, "update_bundled_plugin_failed, rolling back");
-                greffons_livres::abandonner(&greffons[i..]);
-                installation_sure::abandonner_les_web(&webs_prepares);
-                return Err(restaurer(e, &livres_bascules, &greffons_bascules, &[]));
+                warn!(error = %e, "update_greffon_livre_garde_a_sa_version — la mise à jour continue sans lui");
+                greffons_livres::abandonner(std::slice::from_ref(greffon));
+                greffons_gardes.push(format!(
+                    "plugin {} kept at its current version ({e})",
+                    greffon
+                        .cible
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ));
             }
         }
     }
@@ -3986,6 +4004,9 @@ fn install_unix(
     if let Some(servi) = webs_prepares.first() {
         info!(dir = %servi.display(), "web_directory_updated");
     }
+    // Fil 3014 — seulement une fois la mise à jour acquise : le démarrage
+    // suivant dira quels greffons ont gardé leur version.
+    greffons_livres::noter_les_gardes(exe_dir, &greffons_gardes);
 
     Ok(())
 }
@@ -4257,6 +4278,9 @@ impl BasculeWindows {
         }
         compagnons::abandonner(&self.livres_en_attente);
         greffons_livres::abandonner(&self.greffons_en_attente);
+        if let Some(dir) = self.bat.parent() {
+            let _ = std::fs::remove_file(dir.join(greffons_livres::MARQUE_GARDES));
+        }
     }
 }
 
@@ -4323,32 +4347,10 @@ fn preparer_la_bascule_windows(
     // #8955 — les greffons livrés sont posés en `plugins.new/<nom>` ; le
     // script les bascule après `web/` (au mieux, comme les `web/` qui ne sont
     // pas le servi), l'ancien parqué en `plugins.old/<nom>`.
-    let greffons_en_attente = greffons_livres::a_installer(tmp_dir, exe_dir);
-    let preparation_des_greffons =
-        greffons_livres::preparer(&greffons_en_attente, installation_sure::copier_durablement)
-            .and_then(|()| {
-                if greffons_en_attente.is_empty() {
-                    return Ok(());
-                }
-                for dossier in [greffons_livres::DOSSIER, greffons_livres::SAUVEGARDE] {
-                    std::fs::create_dir_all(exe_dir.join(dossier))
-                        .map_err(|e| format!("create {dossier}: {e}"))?;
-                }
-                Ok(())
-            });
-    if let Err(e) = preparation_des_greffons {
-        let _ = std::fs::remove_file(&new_staging);
-        for cible in &web_en_attente {
-            let _ = std::fs::remove_dir_all(cible.with_extension("new"));
-        }
-        compagnons::abandonner(&livres_en_attente);
-        greffons_livres::abandonner(&greffons_en_attente);
-        return Err(e);
-    }
-    info!(
-        greffons = greffons_en_attente.len(),
-        "update_win_bundled_plugins_staged"
-    );
+    // Fil 3014 — un greffon qui ne peut pas être posé garde sa version et ne
+    // bloque JAMAIS la mise à jour : le script ne bascule que les posés.
+    let greffons_en_attente =
+        preparer_les_greffons_windows(tmp_dir, exe_dir, installation_sure::copier_durablement);
 
     // Wait for OUR specific PID to exit, not any process named tune-server.exe.
     // Matching by image name hangs forever whenever a second tune-server.exe is
@@ -4441,6 +4443,41 @@ fn preparer_la_bascule_windows(
 
     // #7750 — pas de lancement ici : voir `lancer_la_bascule_une_fois_libre`.
     Ok(bascule)
+}
+
+/// #8955, fil 3014 — pose les greffons livrés de l'archive pour le script
+/// Windows. Rend ceux qui sont posés ; les autres gardent leur version
+/// actuelle, notés dans le journal et dans le marqueur lu au démarrage
+/// suivant. Ne fait jamais échouer la mise à jour.
+fn preparer_les_greffons_windows(
+    tmp_dir: &std::path::Path,
+    exe_dir: &std::path::Path,
+    copier: fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Vec<greffons_livres::GreffonLivre> {
+    let greffons_livres::Preparation {
+        mut poses,
+        mut gardes,
+    } = greffons_livres::preparer(&greffons_livres::a_installer(tmp_dir, exe_dir), copier);
+    if !poses.is_empty() {
+        for dossier in [greffons_livres::DOSSIER, greffons_livres::SAUVEGARDE] {
+            if let Err(e) = std::fs::create_dir_all(exe_dir.join(dossier)) {
+                warn!(dossier, error = %e, "update_win_bundled_plugins_not_staged");
+                gardes.push(format!(
+                    "bundled plugins kept at their current version (create {dossier}: {e})"
+                ));
+                greffons_livres::abandonner(&poses);
+                poses.clear();
+                break;
+            }
+        }
+    }
+    greffons_livres::noter_les_gardes(exe_dir, &gardes);
+    info!(
+        greffons = poses.len(),
+        gardes = gardes.len(),
+        "update_win_bundled_plugins_staged"
+    );
+    poses
 }
 
 /// Search a file for a byte pattern without loading it all into memory.
@@ -4872,12 +4909,14 @@ pub fn record_post_update_result(state: &AppState) {
         );
         let _ = std::fs::remove_file(&bat_failed);
         let _ = std::fs::remove_file(dir.join("tune-update-expected.txt"));
+        let _ = std::fs::remove_file(dir.join(greffons_livres::MARQUE_GARDES));
         return;
     }
 
     // Marker written by the server just before it exited for the swap: the
     // version we EXPECTED to be running now.
     let expected_marker = dir.join("tune-update-expected.txt");
+    let mut bascule_ratee = false;
     if let Ok(expected) = std::fs::read_to_string(&expected_marker) {
         match swap_took(&expected, current) {
             Some(true) => {
@@ -4894,6 +4933,7 @@ pub fn record_post_update_result(state: &AppState) {
                     actual = current,
                     "update_swap_failed_version_mismatch — restarted on the old binary (swap blocked?)"
                 );
+                bascule_ratee = true;
                 let _ = settings.set(
                     "last_update_result",
                     &json!({
@@ -4908,6 +4948,19 @@ pub fn record_post_update_result(state: &AppState) {
             None => {}
         }
         let _ = std::fs::remove_file(&expected_marker);
+    }
+
+    // Fil 3014 — la mise à jour a pris, mais des greffons livrés ont gardé
+    // leur version : le résultat le dit (journal et écran), une seule fois.
+    let marque_gardes = dir.join(greffons_livres::MARQUE_GARDES);
+    if let Ok(detail) = std::fs::read_to_string(&marque_gardes) {
+        let _ = std::fs::remove_file(&marque_gardes);
+        if !bascule_ratee {
+            if let Some(resultat) = resultat_greffons_gardes(&detail, current) {
+                warn!(detail = %detail.trim(), "update_greffons_livres_gardes_a_leur_version");
+                let _ = settings.set("last_update_result", &resultat.to_string());
+            }
+        }
     }
 
     match homebrew_installation(&exe)
@@ -4940,6 +4993,21 @@ pub fn record_post_update_result(state: &AppState) {
             }
         }
     }
+}
+
+/// Fil 3014 — le `last_update_result` d'une mise à jour réussie dont des
+/// greffons livrés ont gardé leur version (`None` si le marqueur est vide).
+fn resultat_greffons_gardes(detail: &str, current: &str) -> Option<Value> {
+    let detail = detail.trim();
+    (!detail.is_empty()).then(|| {
+        json!({
+            "status": "success",
+            "reason": "plugins_kept",
+            "warning": "Tune was updated, but some bundled plugins could not be replaced and keep their previous version. Reinstall Tune to update them.",
+            "detail": detail,
+            "current_version": current,
+        })
+    })
 }
 
 /// POST /system/update/apply — kept for backward compatibility.

@@ -1062,3 +1062,374 @@ async fn le_meme_album_en_coffret_manuel_sort_de_l_oeuvre_contre_epreuve_8953() 
     assert!(!ids_de_l_oeuvre(&b, b.dsotm).await.contains(&manuel));
     assert_eq!(ids_de_l_oeuvre(&b, manuel).await, vec![manuel]);
 }
+
+// ── Fil 3012 : le master Discogs, une seule liste ──────────────────────────
+
+fn d(mut cand: Candidat, master: &str) -> Candidat {
+    cand.discogs_master = Some(master.to_string());
+    cand
+}
+
+#[test]
+fn discogs_deux_editions_sans_mb_du_meme_master_sont_regroupees_3012() {
+    let albums = [
+        d(c(1, "Physical Graffiti", Some(9), None), "12345"),
+        d(c(2, "フィジカル・グラフィティ", Some(9), None), "12345"),
+        c(3, "Presence", Some(9), None),
+    ];
+    let o = grouper(&albums);
+    assert_eq!(partition(&o), vec![vec![1, 2], vec![3]]);
+    assert_eq!(oeuvre_de(&o, 1).methode, Methode::DiscogsMaster);
+    assert_eq!(oeuvre_de(&o, 1).work_id, "dg:12345");
+}
+
+/// Contre-épreuve : les mêmes albums sans master restent séparés (titres
+/// différents) — c'est bien le master qui les réunit.
+#[test]
+fn sans_master_les_memes_editions_restent_separees_contre_epreuve_3012() {
+    let albums = [
+        c(1, "Physical Graffiti", Some(9), None),
+        c(2, "フィジカル・グラフィティ", Some(9), None),
+        c(3, "Presence", Some(9), None),
+    ];
+    assert_eq!(
+        partition(&grouper(&albums)),
+        vec![vec![1], vec![2], vec![3]]
+    );
+}
+
+#[test]
+fn discogs_deux_masters_differents_restent_separes_meme_au_meme_titre_3012() {
+    let albums = [
+        d(c(1, "Live", Some(9), None), "111"),
+        d(c(2, "Live", Some(9), None), "222"),
+    ];
+    assert_eq!(partition(&grouper(&albums)), vec![vec![1], vec![2]]);
+    // Contre-épreuve : sans master, le titre les réunit.
+    let nus = [c(1, "Live", Some(9), None), c(2, "Live", Some(9), None)];
+    assert_eq!(partition(&grouper(&nus)), vec![vec![1, 2]]);
+}
+
+/// Dimitri (fil 3012, 11 h 17) : UNE liste. A (MB = x, Discogs = y) relie B
+/// (MB = x seulement) et C (Discogs = y seulement), même sous trois titres.
+#[test]
+fn un_album_mb_et_discogs_relie_deux_editions_qui_n_ont_qu_une_cle_3012() {
+    let albums = [
+        d(c(1, "Physical Graffiti", Some(9), Some("rg-pg")), "12345"),
+        c(2, "Physical Graffiti [Deluxe]", Some(9), Some("rg-pg")),
+        d(
+            c(3, "Physical Graffiti (Japan 32XD-566/7)", Some(9), None),
+            "12345",
+        ),
+    ];
+    let o = grouper(&albums);
+    assert_eq!(partition(&o), vec![vec![1, 2, 3]]);
+    assert_eq!(oeuvre_de(&o, 3).work_id, "mb:rg-pg");
+    assert_eq!(oeuvre_de(&o, 3).methode, Methode::MusicBrainz);
+    // L'ordre d'arrivée ne change rien.
+    let inverse = [albums[2].clone(), albums[1].clone(), albums[0].clone()];
+    assert_eq!(partition(&grouper(&inverse)), vec![vec![1, 2, 3]]);
+}
+
+/// Contre-épreuve : sans le pont (A sans master), C reste à part.
+#[test]
+fn sans_l_album_pont_l_edition_discogs_reste_a_part_contre_epreuve_3012() {
+    let albums = [
+        c(1, "Physical Graffiti", Some(9), Some("rg-pg")),
+        c(2, "Physical Graffiti [Deluxe]", Some(9), Some("rg-pg")),
+        d(
+            c(3, "Physical Graffiti (Japan 32XD-566/7)", Some(9), None),
+            "12345",
+        ),
+    ];
+    assert_eq!(partition(&grouper(&albums)), vec![vec![1, 2], vec![3]]);
+}
+
+#[test]
+fn des_groupes_mb_differents_ne_fusionnent_jamais_par_discogs_3012() {
+    let albums = [
+        d(c(1, "Physical Graffiti", Some(9), Some("rg-x")), "12345"),
+        d(c(2, "Physical Graffiti", Some(9), Some("rg-z")), "12345"),
+        d(c(3, "Physical Graffiti (Japan)", Some(9), None), "12345"),
+        c(4, "Physical Graffiti", Some(9), None),
+    ];
+    let o = grouper(&albums);
+    let p = partition(&o);
+    assert!(
+        !p.iter().any(|g| g.contains(&1) && g.contains(&2)),
+        "deux groupes MusicBrainz fusionnés : {p:?}"
+    );
+    // Le master, ambigu, ne relie l'album 3 à aucun des deux ; le titre ne
+    // relie pas l'album 4 (trois clés possibles).
+    assert_eq!(p, vec![vec![1], vec![2], vec![3], vec![4]]);
+}
+
+/// Le repli par le titre ne vaut que pour un album sans clé, et ne fusionne
+/// jamais deux composantes.
+#[test]
+fn le_repli_par_le_titre_ne_fusionne_pas_deux_composantes_3012() {
+    let albums = [
+        c(1, "Physical Graffiti", Some(9), Some("rg-x")),
+        d(c(2, "Physical Graffiti", Some(9), None), "12345"),
+        c(3, "Physical Graffiti (Remaster)", Some(9), None),
+    ];
+    assert_eq!(
+        partition(&grouper(&albums)),
+        vec![vec![1], vec![2], vec![3]]
+    );
+    // Un album sans clé rejoint la SEULE composante de son titre, Discogs
+    // compris.
+    let seule = [
+        d(c(2, "Physical Graffiti", Some(9), None), "12345"),
+        c(3, "Physical Graffiti (Remaster)", Some(9), None),
+    ];
+    let o = grouper(&seule);
+    assert_eq!(partition(&o), vec![vec![2, 3]]);
+    assert_eq!(oeuvre_de(&o, 3).work_id, "dg:12345");
+}
+
+// ── Fil 3012 : les routes ──────────────────────────────────────────────────
+
+async fn fiche(b: &Banc, album: i64) -> Value {
+    let (statut, corps) = appeler(
+        &b.state,
+        "GET",
+        &format!("/api/v1/library/albums/{album}/versions"),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    corps
+}
+
+async fn poser_master_album(b: &Banc, album: i64, valeur: &str) -> (StatusCode, Value) {
+    appeler(
+        &b.state,
+        "PUT",
+        &format!("/api/v1/library/albums/{album}/metadata"),
+        Some(json!({ "discogs_master_id": valeur })),
+    )
+    .await
+}
+
+/// Un greffon pose le master sur l'ALBUM, sous toutes ses formes : deux
+/// éditions sans MusicBrainz, de titres sans rapport, deviennent UNE œuvre —
+/// dans la fiche comme dans la grille. Vide : effacé, elles se séparent.
+#[tokio::test]
+async fn route_un_greffon_pose_le_master_sur_l_album_et_les_editions_se_rejoignent_3012() {
+    let b = banc();
+    let zep = artiste(&b.state, "Led Zeppelin");
+    let pg = album(&b.state, "Physical Graffiti", zep, None, 44_100);
+    let jp = album(&b.state, "フィジカル・グラフィティ", zep, None, 44_100);
+    assert_eq!(ids(&fiche(&b, pg).await), vec![pg], "avant : seul");
+
+    let (s1, r1) = poser_master_album(
+        &b,
+        pg,
+        "https://www.discogs.com/master/12345-Led-Zeppelin-Physical-Graffiti",
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "{r1}");
+    let (s2, r2) = poser_master_album(&b, jp, "m12345").await;
+    assert_eq!(s2, StatusCode::OK, "{r2}");
+
+    let o = fiche(&b, jp).await;
+    let mut attendu = vec![pg, jp];
+    attendu.sort();
+    assert_eq!(ids(&o), attendu, "{o}");
+    assert_eq!(o["method"], json!("discogs_master"), "{o}");
+    assert_eq!(o["work_id"], json!("dg:12345"), "{o}");
+    let (replies, gardes) = membres(&b).await;
+    assert!(
+        (replies.contains(&pg) && gardes.contains(&jp))
+            || (replies.contains(&jp) && gardes.contains(&pg)),
+        "la grille ne les réunit pas : {replies:?} / {gardes:?}"
+    );
+    // Rangé en chiffres.
+    let rangee = b
+        .state
+        .backend
+        .query_one(
+            "SELECT value FROM album_metadata WHERE album_id = ?1 AND key = 'discogs_master_id'",
+            &[&pg as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .unwrap()[0]
+        .as_string();
+    assert_eq!(rangee.as_deref(), Some("12345"));
+
+    // Effacer : valeur vide.
+    let (s3, r3) = poser_master_album(&b, jp, "").await;
+    assert_eq!(s3, StatusCode::OK, "{r3}");
+    assert_eq!(ids(&fiche(&b, jp).await), vec![jp]);
+}
+
+/// Contre-épreuve : une valeur qui n'est pas un master (une RELEASE) est
+/// refusée et rien n'est écrit.
+#[tokio::test]
+async fn route_une_release_n_est_pas_acceptee_comme_master_3012() {
+    let b = banc();
+    let (statut, corps) =
+        poser_master_album(&b, b.abbey, "https://www.discogs.com/release/999-x").await;
+    assert_eq!(statut, StatusCode::BAD_REQUEST, "{corps}");
+    let n = b
+        .state
+        .backend
+        .query_one(
+            "SELECT COUNT(*) FROM album_metadata WHERE key = 'discogs_master_id'",
+            &[],
+        )
+        .unwrap()
+        .unwrap()[0]
+        .as_i64();
+    assert_eq!(n, Some(0));
+}
+
+/// Une piste locale de l'album.
+fn piste(b: &Banc, album: i64, chemin: &str) -> i64 {
+    b.state
+        .backend
+        .execute(
+            "INSERT INTO tracks (title, album_id, file_path, source, track_number, disc_number, \
+             format) VALUES ('piste', ?1, ?2, 'local', 1, 1, 'flac')",
+            &[&album as &dyn ToSqlValue, &chemin],
+        )
+        .unwrap();
+    b.state.backend.last_insert_rowid()
+}
+
+/// La porte de la balise VERSION (`PUT /tracks/{id}/metadata`) porte aussi
+/// le master : l'album prend la valeur commune de ses pistes.
+#[tokio::test]
+async fn route_le_master_pose_sur_les_pistes_regroupe_les_albums_3012() {
+    let b = banc();
+    let zep = artiste(&b.state, "Led Zeppelin");
+    let pg = album(&b.state, "Physical Graffiti", zep, None, 44_100);
+    let jp = album(&b.state, "フィジカル・グラフィティ", zep, None, 44_100);
+    let t1 = piste(&b, pg, "/m/pg/01.flac");
+    let t2 = piste(&b, jp, "/m/jp/01.flac");
+    for t in [t1, t2] {
+        let (statut, corps) = appeler(
+            &b.state,
+            "PUT",
+            &format!("/api/v1/library/tracks/{t}/metadata"),
+            Some(json!({ "discogs_master_id": "[m12345]", "version": "Japan · 1987" })),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{corps}");
+    }
+    let o = fiche(&b, pg).await;
+    let mut attendu = vec![pg, jp];
+    attendu.sort();
+    assert_eq!(ids(&o), attendu, "{o}");
+    // Contre-épreuve : une piste d'un AUTRE master rend la valeur de l'album
+    // ambiguë, il n'en prend aucune.
+    let t3 = piste(&b, jp, "/m/jp/02.flac");
+    let (statut, _) = appeler(
+        &b.state,
+        "PUT",
+        &format!("/api/v1/library/tracks/{t3}/metadata"),
+        Some(json!({ "discogs_master_id": "777" })),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(ids(&fiche(&b, pg).await), vec![pg]);
+}
+
+/// La fiche suit la composante de proche en proche, comme la grille : B
+/// (MB seulement) et C (Discogs seulement, AUTRE artiste) se voient par A.
+#[tokio::test]
+async fn route_la_fiche_suit_la_composante_mb_et_discogs_3012() {
+    let b = banc();
+    let zep = artiste(&b.state, "Led Zeppelin");
+    let autre = artiste(&b.state, "Led Zeppelin (2)");
+    let a = album(&b.state, "Physical Graffiti", zep, Some("rg-pg"), 44_100);
+    let bb = album(
+        &b.state,
+        "Physical Graffiti [Deluxe]",
+        zep,
+        Some("rg-pg"),
+        96_000,
+    );
+    let cc = album(&b.state, "Physical Graffiti (Japan)", autre, None, 44_100);
+    poser_master_album(&b, a, "12345").await;
+    poser_master_album(&b, cc, "12345").await;
+    let mut attendu = vec![a, bb, cc];
+    attendu.sort();
+    for depuis in [a, bb, cc] {
+        let o = fiche(&b, depuis).await;
+        assert_eq!(ids(&o), attendu, "depuis {depuis} : {o}");
+        assert_eq!(o["work_id"], json!("mb:rg-pg"));
+    }
+}
+
+/// Un disque d'une sortie, une piste, sous son dossier.
+fn disque(b: &Banc, titre: &str, artiste: i64, dossier: &str) -> i64 {
+    let id = album(&b.state, titre, artiste, None, 44_100);
+    piste(b, id, &format!("{dossier}/01.flac"));
+    id
+}
+
+async fn composer(b: &Banc, ids_: &[i64], titre: Option<&str>) -> i64 {
+    let (statut, corps) = appeler(
+        &b.state,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        Some(json!({ "album_ids": ids_, "titre": titre })),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    corps["cible"].as_i64().unwrap()
+}
+
+/// Dimitri : « Physical Graffiti (Disc 1) » et « (Disc 2) » réunis à la main
+/// sont UNE édition — elle rejoint les Versions, et compte pour une.
+#[tokio::test]
+async fn un_coffret_manuel_des_disques_d_une_sortie_entre_dans_les_versions_3012() {
+    let b = banc();
+    let zep = artiste(&b.state, "Led Zeppelin");
+    let remaster = album(
+        &b.state,
+        "Physical Graffiti (2015 Remaster)",
+        zep,
+        None,
+        96_000,
+    );
+    let d1 = disque(&b, "Physical Graffiti (Disc 1)", zep, "/m/pg-jp/CD1");
+    let d2 = disque(&b, "Physical Graffiti (Disc 2)", zep, "/m/pg-jp/CD2");
+    let coffret = composer(&b, &[d1, d2], None).await;
+    let o = fiche(&b, coffret).await;
+    let mut attendu = vec![coffret, remaster];
+    attendu.sort();
+    assert_eq!(ids(&o), attendu, "{o}");
+    assert_eq!(
+        o["count"],
+        json!(2),
+        "le coffret compte pour UNE version : {o}"
+    );
+    let o = fiche(&b, remaster).await;
+    assert_eq!(ids(&o), attendu, "{o}");
+}
+
+/// Contre-épreuve : un coffret manuel de DEUX sorties reste sa propre œuvre
+/// (#8953), même sous un titre qui grouperait.
+#[tokio::test]
+async fn un_coffret_manuel_de_deux_sorties_reste_seul_contre_epreuve_3012() {
+    let b = banc();
+    let zep = artiste(&b.state, "Led Zeppelin");
+    let remaster = album(
+        &b.state,
+        "Physical Graffiti (2015 Remaster)",
+        zep,
+        None,
+        96_000,
+    );
+    let d1 = disque(&b, "Physical Graffiti (Disc 1)", zep, "/m/box/CD1");
+    let d2 = disque(&b, "Houses of the Holy", zep, "/m/box/CD2");
+    // Le nom saisi grouperait par le titre avec le remaster : seule la
+    // règle des coffrets l'en tient à l'écart.
+    let coffret = composer(&b, &[d1, d2], Some("Physical Graffiti")).await;
+    let o = fiche(&b, coffret).await;
+    assert_eq!(ids(&o), vec![coffret], "{o}");
+    assert_eq!(ids(&fiche(&b, remaster).await), vec![remaster]);
+}

@@ -44,6 +44,20 @@ pub(crate) fn tranche<T>(items: Vec<T>, limit: i64, offset: i64) -> Vec<T> {
     items.into_iter().skip(debut).take(nombre).collect()
 }
 
+/// [`tranche`] sur une liste empruntée (l'ordre gardé du fil du forum 3013) :
+/// seule la page est copiée.
+pub(crate) fn tranche_empruntee<T: Clone>(items: &[T], limit: i64, offset: i64) -> Vec<T> {
+    let debut = usize::try_from(offset.max(0))
+        .unwrap_or(usize::MAX)
+        .min(items.len());
+    let nombre = if limit < 0 {
+        usize::MAX
+    } else {
+        usize::try_from(limit).unwrap_or(usize::MAX)
+    };
+    items[debut..].iter().take(nombre).cloned().collect()
+}
+
 /// Les identifiants d'une page, par listes SQL de 5 000 au plus : ils sont
 /// inscrits sans marqueur (entiers issus de la base), et une liste bornée
 /// reste loin de la longueur maximale d'une requête SQLite.

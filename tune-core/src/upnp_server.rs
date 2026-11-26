@@ -6849,7 +6849,7 @@ mod ssdp_msearch_tests {
 
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        crate::db::migrations::run_migrations(&db).unwrap();
+        crate::db::migrations::run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
 
         let artiste_id = ArtistRepo::with_backend(backend.clone())

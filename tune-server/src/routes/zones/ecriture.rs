@@ -234,7 +234,7 @@ fn valider_le_patch(
     }
     // #8920 — une zone Devialet AIR : jamais de volume fixe (l'ampli tient
     // le volume, sous les limites de confort et de sécurité), 192 kHz au
-    // plus, DSD en DoP ou en PCM seulement.
+    // plus, DSD converti en PCM seulement (DoP débranché, TESS T12c).
     if tune_core::outputs::devialet_air::reglages::est_air(Some(type_sortie)) {
         use tune_core::outputs::devialet_air::reglages::{FREQUENCE_MAX_AIR, MODES_DSD_AIR};
         if body.fixed_volume == Some(true) {
@@ -263,7 +263,7 @@ fn valider_le_patch(
                 "dsd_mode",
                 mode,
                 &format!(
-                    "Devialet AIR: DSD64 as DoP or PCM only (expected: {})",
+                    "Devialet AIR: DSD is converted to PCM; DoP is disabled until it is tested on an amplifier (expected: {})",
                     MODES_DSD_AIR.join(", ")
                 ),
             ));

@@ -15,6 +15,10 @@ thread_local! {
 
 /// Un adaptateur vient de convertir un bloc en `f32` (sans effet si aucun
 /// banc n'écoute).
+// T09b : plus aucun adaptateur `f32` dans les chaînes locale et réseau (le
+// convolveur était le dernier). La sonde reste, prête pour tout adaptateur
+// futur, et sa contre-épreuve l'appelle directement.
+#[allow(dead_code)]
 pub(crate) fn noter() {
     PASSAGES.with(|p| {
         if let Some(n) = p.get() {

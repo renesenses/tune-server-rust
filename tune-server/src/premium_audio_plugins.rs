@@ -525,6 +525,68 @@ pub(crate) mod tests {
         );
     }
 
+    /// L'état d'un greffon dans `GET /api/v1/tess/catalog`.
+    async fn etat_tess(app: &axum::Router, id: &str) -> Value {
+        let (status, rep) = appel(app, "GET", "/api/v1/tess/catalog").await;
+        assert_eq!(status, StatusCode::OK, "{rep}");
+        tune_core::tess::api::conforme_au_schema("catalog_response", &rep)
+            .unwrap_or_else(|e| panic!("{e} : {rep}"));
+        rep["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .unwrap_or_else(|| panic!("{id} absent du catalogue TESS : {rep}"))
+            .clone()
+    }
+
+    /// rc14 — base neuve : l'égaliseur et la réaffectation des canaux,
+    /// facultatifs depuis la v0.9.156, ne sont pas installés. Le catalogue
+    /// TESS le dit (`plugin_not_installed`, avec le paquet à installer) au lieu
+    /// de `plugin_unavailable`, et la route d'installation que nomme
+    /// `install_package` les rend disponibles sans redémarrage.
+    #[tokio::test]
+    async fn base_neuve_le_catalogue_tess_propose_l_installation_et_l_installation_rend_disponible()
+    {
+        dossier_de_donnees_jetable();
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+        let app = crate::routes::router_with_plugins(state.clone(), routers).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
+        for (id, paquet) in [
+            ("equalizer-graphic", "equalizer"),
+            ("equalizer-headphone", "equalizer"),
+            ("channel-remap", "channel-remap"),
+        ] {
+            let e = etat_tess(&app, id).await;
+            assert_eq!(e["available"], false, "{e}");
+            assert_eq!(e["reason"], "plugin_not_installed", "{e}");
+            assert_eq!(e["install_package"], paquet, "{e}");
+        }
+        // Contre-épreuve : ce que l'hôte ne fait pas tourner reste
+        // indisponible, sans rien à installer.
+        let d = etat_tess(&app, "declick-live").await;
+        assert_eq!(d["reason"], "plugin_unavailable", "{d}");
+        assert!(d.get("install_package").is_none(), "{d}");
+
+        for paquet in ["equalizer", "channel-remap"] {
+            let (status, rep) =
+                appel(&app, "POST", &format!("/api/v1/plugins/{paquet}/install")).await;
+            assert_eq!(status, StatusCode::OK, "{paquet} : {rep}");
+        }
+        for id in ["equalizer-graphic", "equalizer-headphone", "channel-remap"] {
+            let e = etat_tess(&app, id).await;
+            assert_eq!(e["available"], true, "{e}");
+            assert!(e.get("install_package").is_none(), "{e}");
+            assert_ne!(e["reason"], "plugin_not_installed", "{e}");
+            assert_ne!(e["reason"], "plugin_unavailable", "{e}");
+        }
+    }
+
     /// La fiche d'un greffon dans `GET /api/v1/plugins`.
     async fn fiche_du_catalogue(app: &axum::Router, id: &str) -> Value {
         let (status, catalogue) = appel(app, "GET", "/api/v1/plugins").await;
@@ -734,6 +796,12 @@ pub(crate) mod tests {
     /// est `plugin_unavailable` (409), jamais `premium_required` (402) ; après,
     /// les deux routes de l'écran Expert répondent et la barre latérale le
     /// montre.
+    ///
+    /// rc14 (#9517) : les bandes de l'écran Expert sont la grille ISO à 31
+    /// points et son Q (`grille_graphique(31)`), un égaliseur GRAPHIQUE,
+    /// gratuit. Une bande libre (fréquence, Q et type choisis) est un
+    /// égaliseur PARAMÉTRIQUE, Premium par toutes les routes depuis #9517 :
+    /// 402 `premium_required` en Free, 200 en Premium.
     #[tokio::test]
     async fn temoin_6974_l_egaliseur_expert_s_ouvre_par_l_installation_quel_que_soit_le_palier() {
         for premium in [true, false] {
@@ -755,7 +823,20 @@ pub(crate) mod tests {
             );
             let palier = if premium { "Premium" } else { "Free" };
             let resolution = json!({"expert_bands": 31});
+            let (grille, q) = tune_core::tess::migration::grille_graphique(31);
             let bandes = json!({
+                "enabled": true,
+                "bands": grille
+                    .iter()
+                    .map(|f| json!({
+                        "freq": f,
+                        "gain": if *f == 1000.0 { 3.0 } else { 0.0 },
+                        "q": q,
+                        "type": "peak",
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            let parametrique = json!({
                 "enabled": true,
                 "bands": [{"freq": 1000.0, "gain": 3.0, "q": 1.0, "type": "peak"}],
             });
@@ -800,6 +881,19 @@ pub(crate) mod tests {
                 status,
                 StatusCode::OK,
                 "{palier}, égaliseur installé : les bandes Expert refusées — {reponse}"
+            );
+            // #9517 : une bande libre est du paramétrique, Premium.
+            let (status, reponse) =
+                appel_avec_corps(&app, "POST", "/api/v1/zones/1/eq", parametrique.clone()).await;
+            let attendu = if premium {
+                (StatusCode::OK, None)
+            } else {
+                (StatusCode::PAYMENT_REQUIRED, Some("premium_required"))
+            };
+            assert_eq!(
+                (status, reponse["error"].as_str()),
+                attendu,
+                "{palier}, égaliseur installé : bande paramétrique (#9517) — {reponse}"
             );
             assert!(
                 visible_dans_la_barre(&fiche_du_catalogue(&app, "equalizer").await),

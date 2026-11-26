@@ -24,7 +24,7 @@ const LOGO_FICHE: &str = "https://mozaiklabs.fr/storage/radio-logos/radio-metada
 fn mes_radios() -> RadioRepo {
     let db = SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
-    migrations::run_migrations(&db).unwrap();
+    migrations::run_migrations_avec_le_catalogue_de_radios(&db).unwrap();
     RadioRepo::new(db)
 }
 

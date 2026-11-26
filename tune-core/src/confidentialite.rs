@@ -573,20 +573,42 @@ pub fn anonymiser_json_garder_appareils(valeur: &mut Value) {
 /// testeur (titre, description, sujet et corps d'un ticket) y passent seuls,
 /// le diagnostic y passe par [`anonymiser`], qui commence par elle.
 /// Le marqueur de la ligne qui porte le code d'activation de
-/// l'authentification. Le serveur l'écrit sur sa CONSOLE seulement ; toute
-/// ligne qui le porte est retirée de ce qui sort (journal servi par l'API,
-/// rapport de bogue, ticket, assistant) — cas d'une sortie d'erreur
-/// redirigée dans le fichier journal, ou d'un repli sur `journalctl`.
+/// l'authentification. Le serveur l'écrit sur sa CONSOLE et dans son fichier
+/// journal local ; toute ligne qui le porte est retirée de ce qui sort
+/// (journal servi par l'API, rapport de bogue, ticket, assistant, repli sur
+/// `journalctl`).
 pub const MARQUEUR_CODE_ACTIVATION: &str = "TUNE-ACTIVATION-CODE";
 
-/// Retire les lignes qui portent [`MARQUEUR_CODE_ACTIVATION`].
+/// Les phrases fixes de la ligne du code d'activation (`auth.rs`), retirées
+/// comme le marqueur : une ligne recopiée sans lui ne sort pas davantage.
+const PHRASES_CODE_ACTIVATION: &[&str] = &[
+    "code d'activation de l'authentification",
+    "One-time code to enable authentication",
+];
+
+/// Combien de fois le marqueur et les phrases fixes apparaissent.
+fn occurrences_du_code_d_activation(texte: &str) -> usize {
+    texte.matches(MARQUEUR_CODE_ACTIVATION).count()
+        + PHRASES_CODE_ACTIVATION
+            .iter()
+            .map(|p| texte.matches(p).count())
+            .sum::<usize>()
+}
+
+fn porte_un_code_d_activation(ligne: &str) -> bool {
+    ligne.contains(MARQUEUR_CODE_ACTIVATION)
+        || PHRASES_CODE_ACTIVATION.iter().any(|p| ligne.contains(p))
+}
+
+/// Retire les lignes qui portent [`MARQUEUR_CODE_ACTIVATION`] ou la phrase
+/// fixe de la ligne du code.
 pub fn retirer_les_codes_d_activation(texte: &str) -> String {
-    if !texte.contains(MARQUEUR_CODE_ACTIVATION) {
+    if !porte_un_code_d_activation(texte) {
         return texte.to_string();
     }
     texte
         .split_inclusive('\n')
-        .filter(|ligne| !ligne.contains(MARQUEUR_CODE_ACTIVATION))
+        .filter(|ligne| !porte_un_code_d_activation(ligne))
         .collect()
 }
 
@@ -750,6 +772,98 @@ pub fn anonymiser_champ(texte: &str) -> String {
     }
 }
 
+/// Extensions d'une pièce jointe lue comme du texte, et nettoyée comme un
+/// journal avant de quitter la machine.
+pub const PIECES_TEXTE: &[&str] = &["log", "txt", "md", "json", "csv", "xml"];
+
+/// Une pièce jointe texte qu'on ne sait pas lire, donc qu'on ne sait pas
+/// nettoyer : elle ne part pas.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PieceIllisible;
+
+/// Le texte d'une pièce jointe : UTF-16 (marque d'ordre `FF FE` / `FE FF`, ou
+/// forte densité d'octets nuls — ce que PowerShell 5.1 écrit avec `>`), sinon
+/// UTF-8, les octets invalides remplacés. Les octets nuls de FIN de fichier
+/// (journal tronqué par une coupure) ne comptent pas.
+///
+/// Refusé : un UTF-16 mal formé ; un texte qui garde des caractères nuls entre
+/// ses lettres (UTF-32, binaire) ; un fichier lu en UTF-16 dont les octets
+/// bruts portent la ligne du code alors que le texte décodé ne la porte plus
+/// (fichier mixte UTF-8 puis UTF-16).
+fn texte_de_la_piece(octets: &[u8]) -> Result<String, PieceIllisible> {
+    // Sans les nuls de fin, arrondi à un nombre pair d'octets (le dernier
+    // `X\0` d'un UTF-16LE).
+    let sans_nuls_de_fin = |corps: &[u8]| {
+        let utile = corps.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+        corps.len().min(utile + utile % 2)
+    };
+    let utf16 = |petit_boutiste: bool, corps: &[u8]| {
+        let corps = &corps[..sans_nuls_de_fin(corps)];
+        if corps.len() % 2 != 0 {
+            return Err(PieceIllisible);
+        }
+        let unites = corps.chunks_exact(2).map(|p| {
+            if petit_boutiste {
+                u16::from_le_bytes([p[0], p[1]])
+            } else {
+                u16::from_be_bytes([p[0], p[1]])
+            }
+        });
+        char::decode_utf16(unites)
+            .collect::<Result<String, _>>()
+            .map_err(|_| PieceIllisible)
+    };
+    let (texte, lu_en_utf16) = match octets {
+        [0xFF, 0xFE, reste @ ..] => (utf16(true, reste)?, true),
+        [0xFE, 0xFF, reste @ ..] => (utf16(false, reste)?, true),
+        _ => {
+            let utile = &octets[..sans_nuls_de_fin(octets)];
+            let nuls = utile.iter().filter(|b| **b == 0).count();
+            if utile.len() >= 2 && nuls * 4 >= utile.len() {
+                // Les octets nuls d'un texte latin en UTF-16LE sont aux
+                // positions impaires, en UTF-16BE aux positions paires.
+                let impairs = utile.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
+                (utf16(impairs * 2 >= nuls, utile)?, true)
+            } else {
+                let fin = octets.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+                (String::from_utf8_lossy(&octets[..fin]).into_owned(), false)
+            }
+        }
+    };
+    // Lu en UTF-16 : le marqueur et les phrases (ASCII) se comptent pareil
+    // dans les octets bruts sans leurs nuls et dans le texte décodé. Plus
+    // d'occurrences dans les octets bruts : une partie du fichier n'était pas
+    // de l'UTF-16 (UTF-8 avant ou après), et son code serait illisible pour le
+    // nettoyage.
+    if lu_en_utf16 {
+        let brut = String::from_utf8_lossy(octets).replace('\0', "");
+        if occurrences_du_code_d_activation(&brut) > occurrences_du_code_d_activation(&texte) {
+            return Err(PieceIllisible);
+        }
+    }
+    let nuls = texte.chars().filter(|c| *c == '\0').count();
+    if nuls > 0 && nuls * 4 >= texte.chars().count() {
+        return Err(PieceIllisible);
+    }
+    Ok(texte.replace('\0', ""))
+}
+
+/// Une pièce jointe qui part vers le site (ticket, rapport de bogue) : si son
+/// extension est celle d'un texte ([`PIECES_TEXTE`]), elle est lue
+/// ([`texte_de_la_piece`] : UTF-8, UTF-16) puis passe par
+/// [`anonymiser_champ`] et part en UTF-8 ; illisible, elle est refusée.
+/// Sinon (image, archive) elle part telle quelle.
+pub fn piece_texte_nettoyee(nom: &str, octets: Vec<u8>) -> Result<Vec<u8>, PieceIllisible> {
+    let ext = nom
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !PIECES_TEXTE.contains(&ext.as_str()) {
+        return Ok(octets);
+    }
+    Ok(anonymiser_champ(&texte_de_la_piece(&octets)?).into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -768,6 +882,174 @@ mod tests {
             assert!(sortie.contains("ERROR fin"), "{sortie}");
         }
     }
+    #[test]
+    fn la_phrase_du_code_sans_le_marqueur_ne_sort_pas() {
+        let journal = "INFO avant\nK7QXR2MZPA — Tune : code d'activation de l'authentification, usage unique\nX One-time code to enable authentication K7QXR2MZPA\nINFO apres\n";
+        let sortie = retirer_les_codes_d_activation(journal);
+        assert!(!sortie.contains("K7QXR2MZPA"), "{sortie}");
+        assert!(sortie.contains("INFO avant") && sortie.contains("INFO apres"));
+    }
+
+    fn journal_avec_code() -> String {
+        format!("INFO avant\r\n{MARQUEUR_CODE_ACTIVATION} K7QXR2MZPA — Tune\r\nINFO apres\r\n")
+    }
+
+    fn utf16(texte: &str, petit_boutiste: bool, marque: bool) -> Vec<u8> {
+        let mut octets = Vec::new();
+        if marque {
+            octets.extend_from_slice(if petit_boutiste {
+                &[0xFF, 0xFE]
+            } else {
+                &[0xFE, 0xFF]
+            });
+        }
+        for u in texte.encode_utf16() {
+            octets.extend_from_slice(&if petit_boutiste {
+                u.to_le_bytes()
+            } else {
+                u.to_be_bytes()
+            });
+        }
+        octets
+    }
+
+    /// PowerShell 5.1 (`>`) écrit de l'UTF-16LE avec marque d'ordre.
+    #[test]
+    fn une_piece_utf16_est_lue_et_nettoyee() {
+        for (le, marque) in [(true, true), (false, true), (true, false), (false, false)] {
+            let piece =
+                piece_texte_nettoyee("journal.log", utf16(&journal_avec_code(), le, marque))
+                    .unwrap_or_else(|e| panic!("le={le} marque={marque} : {e:?}"));
+            let texte = String::from_utf8(piece).unwrap();
+            assert!(
+                !texte.contains("K7QXR2MZPA"),
+                "le={le} marque={marque} : {texte}"
+            );
+            assert!(
+                texte.contains("INFO avant") && texte.contains("INFO apres"),
+                "{texte}"
+            );
+        }
+    }
+
+    #[test]
+    fn une_piece_texte_illisible_est_refusee() {
+        // UTF-16LE mal formé : demi-paire de substitution seule.
+        let mut mal_forme = vec![0xFF, 0xFE];
+        mal_forme.extend_from_slice(&0xD800u16.to_le_bytes());
+        mal_forme.extend_from_slice(&utf16("abc", true, false));
+        assert_eq!(
+            piece_texte_nettoyee("a.txt", mal_forme),
+            Err(PieceIllisible)
+        );
+        // Longueur impaire après la marque.
+        assert_eq!(
+            piece_texte_nettoyee("a.log", vec![0xFF, 0xFE, b'a']),
+            Err(PieceIllisible)
+        );
+        // UTF-32LE : des caractères nuls resteraient entre les lettres.
+        let mut utf32 = vec![0xFF, 0xFE, 0x00, 0x00];
+        for c in journal_avec_code().chars() {
+            utf32.extend_from_slice(&(c as u32).to_le_bytes());
+        }
+        assert_eq!(piece_texte_nettoyee("a.log", utf32), Err(PieceIllisible));
+        // Une image ne se lit pas : elle part telle quelle.
+        assert_eq!(
+            piece_texte_nettoyee("a.png", vec![0, 0, 0]),
+            Ok(vec![0, 0, 0])
+        );
+    }
+
+    /// UTF-8 de longueur paire qui porte le code, puis un bloc UTF-16LE au
+    /// moins aussi long : lu en UTF-16, le code deviendrait illisible pour le
+    /// nettoyage. Refusé.
+    #[test]
+    fn un_fichier_mixte_utf8_puis_utf16_est_refuse() {
+        let utf8_pair = |t: &str| {
+            let mut o = t.as_bytes().to_vec();
+            if o.len() % 2 != 0 {
+                o.push(b' ');
+            }
+            o
+        };
+        let avec_code = journal_avec_code();
+        let sans_code = "INFO suite en UTF-16 ".repeat(4);
+        let long_avec_code = format!("{avec_code}{}", "INFO suite\r\n".repeat(8));
+        let cas: [(&str, Vec<u8>); 4] = [
+            // UTF-8 avec le code, puis UTF-16LE sans code.
+            ("utf8+utf16le sans code", {
+                let mut o = utf8_pair(&avec_code);
+                o.extend_from_slice(&utf16(&sans_code, true, false));
+                o
+            }),
+            // UTF-8 avec le code, puis UTF-16LE avec le code.
+            ("utf8+utf16le", {
+                let mut o = utf8_pair(&avec_code);
+                o.extend_from_slice(&utf16(&long_avec_code, true, false));
+                o
+            }),
+            // UTF-8 avec le code, puis UTF-16BE avec le code.
+            ("utf8+utf16be", {
+                let mut o = utf8_pair(&avec_code);
+                o.extend_from_slice(&utf16(&long_avec_code, false, false));
+                o
+            }),
+            // `FF FE` + UTF-16LE avec le code, puis une queue UTF-8 avec le
+            // code (`>` puis `Add-Content`).
+            ("bom utf16le+utf8", {
+                let mut o = utf16(&avec_code, true, true);
+                o.extend_from_slice(&utf8_pair(&avec_code));
+                o
+            }),
+        ];
+        for (nom, octets) in cas {
+            assert_eq!(
+                piece_texte_nettoyee("mixte.log", octets),
+                Err(PieceIllisible),
+                "{nom}"
+            );
+        }
+        // Contre-épreuve : un UTF-16 ordinaire qui porte le code n'est pas
+        // refusé, il est nettoyé.
+        for (le, marque) in [(true, true), (false, false)] {
+            let piece = piece_texte_nettoyee("a.log", utf16(&long_avec_code, le, marque)).unwrap();
+            assert!(!String::from_utf8(piece).unwrap().contains("K7QXR2MZPA"));
+        }
+    }
+
+    /// Un journal tronqué par une coupure de courant finit par des octets
+    /// nuls : il reste un texte à nettoyer, pas une pièce refusée.
+    #[test]
+    fn des_nuls_en_fin_de_fichier_ne_font_pas_refuser_la_piece() {
+        let mut utf8 = journal_avec_code().into_bytes();
+        utf8.extend(std::iter::repeat_n(0u8, 4096));
+        let mut utf16le = utf16(&journal_avec_code(), true, true);
+        utf16le.extend(std::iter::repeat_n(0u8, 4095));
+        let mut utf16le_sans_marque = utf16(&journal_avec_code(), true, false);
+        utf16le_sans_marque.extend(std::iter::repeat_n(0u8, 4096));
+        for (cas, octets) in [
+            ("utf8", utf8),
+            ("utf16le", utf16le),
+            ("utf16le sans marque", utf16le_sans_marque),
+        ] {
+            let piece = piece_texte_nettoyee("coupure.log", octets)
+                .unwrap_or_else(|e| panic!("{cas} : {e:?}"));
+            let texte = String::from_utf8(piece).unwrap();
+            assert!(!texte.contains("K7QXR2MZPA"), "{cas} : {texte}");
+            assert!(texte.contains("INFO apres"), "{cas} : {texte}");
+            assert!(!texte.contains('\0'), "{cas}");
+        }
+    }
+
+    #[test]
+    fn une_piece_utf8_invalide_ou_parsemee_de_nuls_est_nettoyee() {
+        let mut octets = journal_avec_code().into_bytes();
+        octets.extend_from_slice(b"\xff\xfe\x00 fin\n");
+        let texte = String::from_utf8(piece_texte_nettoyee("a.log", octets).unwrap()).unwrap();
+        assert!(!texte.contains("K7QXR2MZPA"), "{texte}");
+        assert!(texte.contains("INFO apres"), "{texte}");
+    }
+
     use super::*;
     use serde_json::json;
 

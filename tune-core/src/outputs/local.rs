@@ -434,6 +434,11 @@ const ECHEANCE_FIL_A_LA_DESTRUCTION: std::time::Duration = std::time::Duration::
 /// `stop()`, il n'y a plus ni canal ni fil : rien à faire.
 impl Drop for LocalOutput {
     fn drop(&mut self) {
+        // rc14 — l'ordre TESS posé pour cette sortie part avec elle.
+        OrdreLocal::oublier_la_sortie(&self.pure_bypass);
+        // rc14 — le réglage des enceintes est rangé par l'adresse du drapeau
+        // PURE de la sortie : il part avec elle.
+        enceintes_de_sortie::oublier(&self.pure_bypass);
         let fil = self
             .play_thread
             .get_mut()
@@ -605,6 +610,9 @@ mod sortie_double_locale;
 // #3208 — la période demandée au pilote, et la garde de préchargement qui s'en
 // déduit. `cpal::BufferSize` n'est plus écrit à la main nulle part ailleurs
 // dans ce fichier ni dans ses modules.
+/// rc14 — le réglage des enceintes (greffon TESS `speaker-setup`) de chaque
+/// sortie : délai, gain et phase par voie, juste avant le suréchantillonneur.
+pub(crate) mod enceintes_de_sortie;
 mod periode;
 /// #6044 — la réaffectation des canaux (greffon `channel-remap`).
 mod reaffectation;
@@ -835,6 +843,11 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// Revue #9520 v2 — PURE ou mesure de pièce, SANS « Bypass all »
+    /// (`audiophile::pure_ou_mesure`) : ce que lisent les gardes de niveau
+    /// (#8074). `set_pure_bypass` le pose aussi ; l'orchestrateur le précise
+    /// ensuite par [`Self::set_pure_ou_mesure`].
+    pure_ou_mesure: AtomicBool,
     /// #8074 — vrai dès qu'un volume a été POSÉ sur cette sortie (`set_volume`
     /// ou la sourdine : la graine de zone, un geste, une restauration). Une
     /// sortie naît à pleine échelle (`user_volume` à l'unité) ; tant que ce
@@ -1529,6 +1542,7 @@ impl LocalOutput {
             convolver: Arc::new(std::sync::Mutex::new(None)),
             convolution_autorisee: Arc::new(AtomicBool::new(false)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
+            pure_ou_mesure: AtomicBool::new(false),
             volume_pose: AtomicBool::new(false),
             flux_sans_fin: AtomicBool::new(false),
             volume_avant_egaliseur: AtomicU32::new(u32::MAX),
@@ -1660,10 +1674,19 @@ impl LocalOutput {
         }
     }
 
-    /// #4176 — « Remettre à plat » : le gain gardé d'un égaliseur coupé
+    /// #6524 — « Rendre le niveau » : le gain gardé d'un égaliseur coupé
     /// remonte, progressivement, jusqu'au niveau sans égaliseur, sans la borne
     /// de volume de #6741 (voir `EqProcessor::liberer_le_gain_garde`). Sans
     /// effet si la chaîne ne porte pas d'égaliseur coupé.
+    pub fn rendre_le_sec_vite(&self) {
+        // rc14 (TESS) — voir `EqProcessor::rendre_le_sec_vite`.
+        if let Ok(mut eq) = self.eq.lock()
+            && let Some(p) = eq.as_mut()
+        {
+            p.rendre_le_sec_vite();
+        }
+    }
+
     pub fn liberer_le_preampli_garde(&self) {
         if let Ok(mut eq) = self.eq.lock()
             && let Some(p) = eq.as_mut()
@@ -1926,6 +1949,24 @@ impl LocalOutput {
         }
     }
 
+    /// rc14 (TESS) — fait passer UN bloc entrelacé par la chaîne DSP de la
+    /// sortie (`apply_local_dsp`, au nombre de canaux du format déclaré) et le
+    /// rend traité : les témoins comparent la sortie à l'entrée au bit près.
+    #[cfg(test)]
+    pub(crate) fn traiter_un_bloc_pour_test(&self, pcm: &mut [f32]) {
+        let (_, canaux) = self.current_format().expect("format déclaré");
+        apply_local_dsp(
+            pcm,
+            &self.eq,
+            &self.convolver,
+            &self.crossfeed,
+            &self.pure_bypass,
+            &self.mono_downmix,
+            canaux,
+            false,
+        );
+    }
+
     /// Lecture du drapeau PURE, pour les tests : c'est lui que `apply_local_dsp`
     /// consulte, donc lui qui dit si l'égaliseur installé travaille encore.
     #[cfg(test)]
@@ -1981,6 +2022,7 @@ impl LocalOutput {
         let current_format = self
             .current_format()
             .filter(|_| self.convolution_autorisee.load(Ordering::Relaxed));
+        let fondu = Self::trames_de_fondu(current_format);
         let active = match current_format {
             Some((sample_rate, channels)) => {
                 match config.build_for(1024, sample_rate, channels as usize) {
@@ -1988,15 +2030,16 @@ impl LocalOutput {
                     Err(error) => {
                         // La configuration reste mémorisée pour une prochaine
                         // piste compatible, mais l'ancien moteur ne doit jamais
-                        // continuer à corriger le format courant.
-                        *self.convolver.lock().unwrap() = None;
+                        // continuer à corriger le format courant : il s'éteint
+                        // (en fondu s'il joue, T09b).
+                        self.installer_moteur(None, fondu);
                         return Err(error);
                     }
                 }
             }
             None => None,
         };
-        *self.convolver.lock().unwrap() = active;
+        self.installer_moteur(active, fondu);
         tracing::info!(
             path,
             device = %self.device_name,
@@ -2012,8 +2055,103 @@ impl LocalOutput {
 
     pub fn clear_convolver(&self) {
         *self.convolver_config.lock().unwrap() = None;
-        *self.convolver.lock().unwrap() = None;
+        // T09b — flux en cours, le filtre retiré s'éteint en fondu (le moteur
+        // reste un simple retard jusqu'à la piste suivante, qui ne le
+        // reconstruit pas) : ni clic ni saut de temps.
+        self.installer_moteur(None, Self::trames_de_fondu(self.current_format()));
         tracing::info!(device = %self.device_name, "convolver_cleared");
+    }
+
+    /// T09b — durée des fondus de changement de filtre : 20 ms à la cadence du
+    /// flux en cours ; 0 sans flux (remplacement immédiat, rien ne joue).
+    fn trames_de_fondu(format: Option<(u32, u16)>) -> usize {
+        format
+            .map(|(taux, _)| (taux as usize / 50).max(1))
+            .unwrap_or(0)
+    }
+
+    /// T09b — poser le moteur de convolution SANS discontinuité.
+    ///
+    /// Flux en cours (`fondu > 0`) et moteur en service : un nouveau filtre
+    /// le remplace par [`Convolver::remplacer_en_fondu`] (réchauffe muette,
+    /// puis fondu de 20 ms à latence égale) ; un retrait l'éteint en fondu
+    /// ([`Convolver::eteindre_en_fondu`]). Sinon (rien ne joue, ou moteur
+    /// incompatible : canaux ou bloc), remplacement direct, comme avant.
+    fn installer_moteur(
+        &self,
+        nouveau: Option<super::super::audio::convolver::Convolver>,
+        fondu: usize,
+    ) {
+        // Ce qui est retiré sort du verrou et n'est libéré qu'après : le fil
+        // audio, qui prend ce verrou à chaque bloc, n'attend jamais une
+        // libération.
+        let mut a_liberer: [Option<Box<super::super::audio::convolver::Convolver>>; 2] =
+            [None, None];
+        let mut remplace = None;
+        let mut refuse = None;
+        let joue = fondu > 0;
+        // Le moteur de retard d'une pose en lecture est bâti AVANT le verrou
+        // (allocation et FFT hors du verrou de la boucle de lecture) ; libéré
+        // après s'il ne sert pas.
+        let mut retard = match (&nouveau, joue) {
+            (Some(n), true) => Some(super::super::audio::convolver::Convolver::retard_seul(
+                n.channels(),
+                n.block_size(),
+            )),
+            _ => None,
+        };
+        {
+            let mut actif = self.convolver.lock().unwrap();
+            // Le droit est relu SOUS le verrou : un retrait du Premium
+            // concurrent (`set_convolution_autorisee`) n'est jamais ignoré.
+            let nouveau = match nouveau {
+                Some(n) if !self.convolution_autorisee.load(Ordering::Relaxed) => {
+                    refuse = Some(n);
+                    None
+                }
+                n => n,
+            };
+            match nouveau {
+                Some(n) if joue && actif.is_some() => {
+                    let resultat = match actif.as_mut() {
+                        Some(ancien) => ancien.remplacer_en_fondu_en_rendant(n, fondu),
+                        None => Err(n),
+                    };
+                    match resultat {
+                        Ok(r) => a_liberer = r,
+                        Err(n) => remplace = actif.replace(n),
+                    }
+                }
+                None if joue && actif.is_some() => {
+                    if let Some(ancien) = actif.as_mut() {
+                        a_liberer = ancien.eteindre_en_fondu_en_rendant(fondu);
+                    }
+                }
+                // Flux en cours SANS moteur : d'abord un moteur ÉTEINT, qui
+                // retarde seulement l'entrée de sa latence — le SEUL saut de
+                // temps, un bloc de silence à la pose, sans aucun échantillon
+                // rejoué —, puis le vrai filtre lui succède par réchauffe et
+                // fondu. Radio comprise : rien n'attend une jonction.
+                Some(n) if joue => {
+                    let pose = match retard.take() {
+                        Some(mut r) => match r.remplacer_en_fondu_en_rendant(n, fondu) {
+                            Ok(rendus) => {
+                                a_liberer = rendus;
+                                r
+                            }
+                            Err(n) => n,
+                        },
+                        None => n,
+                    };
+                    remplace = actif.replace(pose);
+                }
+                n => remplace = std::mem::replace(&mut *actif, n),
+            }
+        }
+        drop(retard);
+        drop(refuse);
+        drop(remplace);
+        drop(a_liberer);
     }
 
     /// #7632 — accorder ou retirer le droit de convoluer (Premium
@@ -2032,14 +2170,32 @@ impl LocalOutput {
                 .current_format()
                 .map(|(taux, _)| (taux as usize / 50).max(1))
                 .unwrap_or(0);
+            // Les moteurs retirés sortent du verrou avant d'être libérés.
+            let mut a_liberer = [None, None];
             if let Ok(mut c) = self.convolver.lock()
                 && let Some(conv) = c.as_mut()
             {
-                conv.eteindre_en_fondu(trames);
+                a_liberer = conv.eteindre_en_fondu_en_rendant(trames);
                 tracing::info!(device = %self.device_name, trames, "convolution_eteinte_sans_licence");
             }
+            drop(a_liberer);
         }
         avant != autorisee
+    }
+
+    /// Revue #9520 v2 — PURE ou mesure de pièce de la zone qui joue, sans
+    /// « Bypass all » (`audiophile::pure_ou_mesure`), posé après
+    /// [`Self::set_pure_bypass`].
+    pub fn set_pure_ou_mesure(&self, pure: bool) {
+        self.pure_ou_mesure.store(pure, Ordering::Relaxed);
+    }
+
+    /// rc14 — l'ordre des étages (égaliseurs, convolution, crossfeed, repli
+    /// mono) suit celui de la chaîne TESS de la zone qui joue. Posé par
+    /// l'orchestrateur à chaque lecture et quand la chaîne change ; pris au
+    /// bloc suivant. Une chaîne jamais réordonnée rend l'ordre historique.
+    pub fn set_ordre_tess(&self, chaine: &crate::tess::ChaineTess) {
+        OrdreLocal::poser_pour_la_sortie(&self.pure_bypass, OrdreLocal::depuis_chaine(chaine));
     }
 
     /// Enable/disable PURE (audiophile) bypass of the room-correction convolver
@@ -2065,6 +2221,7 @@ impl LocalOutput {
                 .store(false, Ordering::Relaxed);
         }
         self.pure_bypass.store(bypass, Ordering::Relaxed);
+        self.pure_ou_mesure.store(bypass, Ordering::Relaxed);
         // #4685 — un DSP contourné ne change aucun niveau : sa compensation
         // doit tomber avec lui.
         self.recalculer_la_compensation();
@@ -2181,8 +2338,10 @@ impl LocalOutput {
     /// pas toucher au signal, et leur volume (100 %) est posé par la graine.
     /// Rend vrai quand la garde a abaissé le gain.
     pub(crate) async fn partir_bas_si_aucun_volume_pose(&self) -> bool {
+        // Revue #9520 v2 — PURE (ou mesure), jamais « Bypass all » : la garde
+        // de départ bas (#8074) reste armée sous lui, comme #8813.
         if self.volume_pose.load(Ordering::SeqCst)
-            || self.pure_bypass.load(Ordering::Relaxed)
+            || self.pure_ou_mesure.load(Ordering::Relaxed)
             || self.strict_bitperfect.load(Ordering::Relaxed)
         {
             return false;
@@ -2257,6 +2416,18 @@ impl LocalOutput {
         }
     }
 
+    /// #8616 — endpoint exclusif à sonder hors des verrous de sortie.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn endpoint_pcm_exclusif(&self) -> Option<String> {
+        (enchainement_exclusif::bras_de_cette_plateforme(self.mode_exclusif(), &self.audio_backend)
+            == enchainement_exclusif::BrasDeLecture::WasapiExclusif)
+            .then(|| {
+                self.endpoint_id
+                    .clone()
+                    .unwrap_or_else(|| self.device_name.clone())
+            })
+    }
+
     /// #8248 — de quoi sonder le DSD natif ALSA de cette sortie. `None` hors
     /// Linux : le DSD natif n'y passe que par ASIO.
     pub fn sonde_dsd_alsa(&self) -> Option<SondeDsdAlsa> {
@@ -2289,6 +2460,41 @@ impl LocalOutput {
     /// ne peut pas claquer.
     pub fn set_mono_downmix(&self, mono: bool) {
         self.mono_downmix.store(mono, Ordering::Relaxed);
+    }
+
+    /// rc14 — changer À CHAUD le réglage des enceintes de la zone (greffon
+    /// TESS `speaker-setup`) : fondu de `reglage_enceintes::RAMPE_MS`, ni saut
+    /// de délai ni marche de gain. `None` sous PURE ou « Bypass all »
+    /// (l'orchestrateur ne le charge pas). `dans_la_chaine` : le greffon est
+    /// dans la chaîne de la zone (sinon aucun créneau n'est créé).
+    pub fn set_reglage_enceintes(
+        &self,
+        dans_la_chaine: bool,
+        reglages: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
+    ) {
+        enceintes_de_sortie::poser(&self.pure_bypass, dans_la_chaine, reglages);
+    }
+
+    /// rc14 — une NOUVELLE lecture démarre (lancement, reprise, seek, piste
+    /// hors enchaînement) : l'historique du réglage des enceintes est vidé, et
+    /// le créneau retiré si le greffon n'est pas dans la chaîne de la zone.
+    pub fn demarrer_reglage_enceintes(
+        &self,
+        dans_la_chaine: bool,
+        reglages: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
+    ) {
+        enceintes_de_sortie::nouvelle_lecture(&self.pure_bypass, dans_la_chaine, reglages);
+    }
+
+    /// rc14 — les voies qu'a vues le réglage des enceintes de cette sortie au
+    /// dernier bloc (après adaptation des voies) ; `None` si rien n'a joué.
+    pub fn voies_vues_par_le_reglage_des_enceintes(&self) -> Option<u16> {
+        enceintes_de_sortie::voies_vues(&self.pure_bypass)
+    }
+
+    /// rc14 — le réglage des enceintes touche-t-il le signal de cette sortie ?
+    pub fn reglage_enceintes_actif(&self) -> bool {
+        enceintes_de_sortie::agit(&self.pure_bypass, self.dop_active.load(Ordering::Relaxed))
     }
 
     /// #6044 — poser (ou retirer) la matrice de réaffectation des canaux de
@@ -4038,7 +4244,7 @@ impl LocalPcmProcessor<'_> {
                 self.pure_bypass,
                 self.mono_downmix,
             ),
-            OrdreLocal::HISTORIQUE,
+            OrdreLocal::de_la_sortie(self.pure_bypass),
             spec.canaux(),
             dop,
         );
@@ -4735,18 +4941,24 @@ fn rebuild_local_convolver(
         Some(config) => match config.build_for(1024, sample_rate, channels as usize) {
             Ok(convolver) => Some(convolver),
             Err(error) => {
-                if let Ok(mut current) = active.lock() {
-                    *current = None;
-                }
+                // L'ancien moteur sort du verrou avant d'être libéré.
+                let ancien = active.lock().ok().and_then(|mut c| c.take());
+                drop(ancien);
                 return Err(error);
             }
         },
         None => None,
     };
     let enabled = next.is_some();
-    *active
-        .lock()
-        .map_err(|_| "verrou du convolveur actif empoisonné".to_string())? = next;
+    // Le moteur est bâti AVANT le verrou (ci-dessus) ; sous le verrou, un
+    // simple échange, et l'ancien moteur est libéré après.
+    let ancien = std::mem::replace(
+        &mut *active
+            .lock()
+            .map_err(|_| "verrou du convolveur actif empoisonné".to_string())?,
+        next,
+    );
+    drop(ancien);
     Ok(enabled)
 }
 
@@ -4815,7 +5027,8 @@ fn flush_local_dsp(
         pure_bypass,
         mono_downmix,
     };
-    executeur_tess::vidanger_chaine_locale(&moteurs, OrdreLocal::HISTORIQUE, channels, dop)
+    let ordre = OrdreLocal::de_la_sortie(moteurs.pure_bypass);
+    executeur_tess::vidanger_chaine_locale(&moteurs, ordre, channels, dop)
 }
 
 // Un argument par étage de traitement (EQ, convolution, crossfeed…), chacun
@@ -4836,7 +5049,7 @@ fn apply_local_dsp(
     executeur_tess::executer_chaine_locale_f32(
         samples,
         &moteurs_locaux(eq, convolver, crossfeed, pure_bypass, mono_downmix),
-        OrdreLocal::HISTORIQUE,
+        OrdreLocal::de_la_sortie(pure_bypass),
         channels,
         dop,
     );
@@ -5360,6 +5573,7 @@ fn prepare_windows_native_pcm_a_voies_egales(
         pure_bypass,
         mono_downmix,
         adaptation,
+        44_100,
     )
 }
 
@@ -5392,6 +5606,9 @@ fn prepare_windows_native_pcm(
     pure_bypass: &AtomicBool,
     mono_downmix: &AtomicBool,
     adaptation: Option<AdaptationNative<'_>>,
+    // rc14 — la cadence de la source : le réglage des enceintes y compte ses
+    // délais en échantillons.
+    cadence: u32,
 ) -> Option<PreparedNativePcm> {
     let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
     if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
@@ -5417,6 +5634,7 @@ fn prepare_windows_native_pcm(
     let bit_perfect = dop
         || (volume_units == UNITE_DU_GAIN_DE_RENDU
             && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass, mono_downmix)
+            && !enceintes_de_sortie::agit(pure_bypass, false)
             && !canaux_adaptes);
     if dop && sortie != channels {
         let trames = bytes.len() / (usize::from(channels.max(1)) * usize::from(bit_depth / 8));
@@ -5431,7 +5649,12 @@ fn prepare_windows_native_pcm(
         });
     }
     let samples = if bit_perfect {
-        pcm_bytes_to_native_i32(bytes, bit_depth)
+        let mots = pcm_bytes_to_native_i32(bytes, bit_depth);
+        // rc14 — la ligne à retard du réglage des enceintes est alimentée
+        // même ici (aucun mot n'est touché) : un réglage qui s'allume trouve
+        // un historique plein. Rien sur un porteur DoP.
+        enceintes_de_sortie::alimenter(pure_bypass, &mots, channels, cadence, dop);
+        mots
     } else {
         // TESS T03 — décodé en `f64`, traité par l'exécuteur ; la frontière
         // `f32` reste celle de l'adaptation des voies et du volume d'avant
@@ -5440,7 +5663,7 @@ fn prepare_windows_native_pcm(
             bytes,
             bit_depth,
             &moteurs_locaux(eq, convolver, crossfeed, pure_bypass, mono_downmix),
-            OrdreLocal::HISTORIQUE,
+            OrdreLocal::de_la_sortie(pure_bypass),
             channels,
             false,
         );
@@ -5453,6 +5676,9 @@ fn prepare_windows_native_pcm(
                 declaree.as_deref(),
             );
         }
+        // rc14 — le réglage des enceintes, sur les voies ouvertes, avant le
+        // volume.
+        enceintes_de_sortie::traiter(pure_bypass, &mut float, sortie, cadence, false);
         let volume = volume_units as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
         if volume != 1.0 {
             for sample in &mut float {
@@ -5853,6 +6079,16 @@ impl EtageDeConversion<'_> {
             // gardes #3233 et REF-7 lisent ici, même refus en silence.
             mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
         }
+        // rc14 — le réglage des enceintes : sur les voies qui partent vers les
+        // enceintes (après l'adaptation), avant le suréchantillonneur et le
+        // rééchantillonnage, à la cadence de la source.
+        enceintes_de_sortie::traiter(
+            self.pcm.pure_bypass,
+            &mut mots,
+            self.sortie.canaux,
+            self.spec.cadence(),
+            self.pcm.dop_active.load(Ordering::Relaxed),
+        );
         if let Some(etage) = self
             .surechantillonneur
             .as_mut()
@@ -5894,6 +6130,9 @@ impl EtageDeConversion<'_> {
             self.pcm.convolver,
             self.pcm.crossfeed,
             self.pcm.mono_downmix,
+        ) || enceintes_de_sortie::agit(
+            self.pcm.pure_bypass,
+            self.pcm.dop_active.load(Ordering::Relaxed),
         ) || (!self.pcm.dop_active.load(Ordering::Relaxed)
             && !self.pcm.pure_bypass.load(Ordering::Relaxed)
             && self
@@ -8619,6 +8858,9 @@ impl OutputTarget for LocalOutput {
                     return false;
                 };
                 rupture.journaliser(&device_name);
+                // rc14 — retenu pour la modulation DSD de TESS : ce porteur
+                // ne repartira plus vers ce périphérique (repli PCM dit).
+                crate::tess::modulation_dsd::noter_rupture(&device_name, src_sr, src_ch);
                 if let Ok(mut slot) = open_failure.lock() {
                     *slot = Some(rupture.message_utilisateur(&device_name));
                 }
@@ -9071,6 +9313,11 @@ impl OutputTarget for LocalOutput {
                     LocalOutput::pack_format(sample_rate, channels),
                     Ordering::Relaxed,
                 );
+                // Un format qui change à la jonction : le moteur est rebâti
+                // pour le nouveau format (le rééchantillonnage du filtre est
+                // en cache, préparé en tâche de fond dès la pose du jeu).
+                // S'il n'y avait pas de moteur, le flux prend ici sa latence
+                // (un bloc, 21 ms à 48 kHz), à cette jonction précise.
                 if convolver_format_changed {
                     match rebuild_local_convolver(
                         &convolver_config,
@@ -9419,6 +9666,8 @@ impl OutputTarget for LocalOutput {
         // `current_format()` decrirait encore la piste precedente et on
         // rebatirait un EqProcessor pour un flux mort (#1725).
         self.current_format.store(0, Ordering::Relaxed);
+        // rc14 — l'historique du réglage des enceintes ne survit pas à l'arrêt.
+        enceintes_de_sortie::vider(&self.pure_bypass);
         // Immediately silence the cpal callback so no audio leaks while
         // we wait for the playback thread to exit.  This flag is also
         // checked by the I/O read loop and feed_ring, causing the thread

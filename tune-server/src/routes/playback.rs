@@ -234,6 +234,19 @@ pub(crate) const MOTIF_CD_DISQUE_ABSENT: &str = "aucun disque dans le lecteur";
 /// Le code stable de ce refus, lu par le client web.
 pub(crate) const CODE_CD_DISQUE_ABSENT: &str = "cd_disc_absent";
 
+fn piste_absente_de_la_bibliotheque(lang: &str) -> axum::response::Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(crate::message_api::avec_message_en(
+            json!({"error": "track_missing", "code": "track_missing"}),
+            lang,
+            "api.playback.trackMissing",
+            &[],
+        )),
+    )
+        .into_response()
+}
+
 /// #8913 — le refus « lecture YouTube non activée » : le code stable, la
 /// phrase dans la langue de l'interface, et de quoi agir — l'action
 /// `enable_youtube_playback` et la route qui télécharge yt-dlp. `cause` garde
@@ -256,6 +269,11 @@ pub(crate) fn refus_lecture_youtube_inactive(cause: &str, lang: &str) -> axum::r
 }
 
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
+    // Une synchronisation peut retirer la piste après la vérification initiale.
+    if e == "track not found" {
+        return piste_absente_de_la_bibliotheque(lang);
+    }
+
     if let Some(reponse) = refus_du_bail_parental(&e, lang) {
         return reponse;
     }
@@ -2188,6 +2206,11 @@ pub fn router() -> Router<AppState> {
         )
         .route("/{id}/sleep", get(get_sleep).post(set_sleep))
         .route("/{id}/eq", get(get_eq).post(set_eq))
+        .route("/{id}/eq/retained-preamp", get(get_retained_eq_preamp))
+        .route(
+            "/{id}/eq/retained-preamp/release",
+            post(release_retained_eq_preamp),
+        )
         // DSP route is in zones.rs (/{id}/dsp GET+PUT)
         .route("/{id}/crossfade", get(get_crossfade).post(set_crossfade))
         .route("/{id}/normalization", post(set_normalization))
@@ -2336,6 +2359,16 @@ async fn set_queue_retrying(
     zone_id: i64,
     track_ids: &[i64],
 ) -> Result<tune_core::db::play_queue_repo::SetQueueOutcome, String> {
+    set_queue_retrying_avec_cible(queue_repo, sqlite, zone_id, track_ids, None).await
+}
+
+async fn set_queue_retrying_avec_cible(
+    queue_repo: &PlayQueueRepo,
+    sqlite: bool,
+    zone_id: i64,
+    track_ids: &[i64],
+    cible: Option<i64>,
+) -> Result<tune_core::db::play_queue_repo::SetQueueOutcome, String> {
     let _write_guard = if sqlite {
         Some(crate::sqlite_write_gate::user_queue().await)
     } else {
@@ -2348,7 +2381,7 @@ async fn set_queue_retrying(
         // identifiants absents de `tracks` sont sautes, et l'appelant doit
         // pouvoir journaliser le nombre de lignes REELLEMENT ecrites plutot que
         // le nombre demande.
-        match queue_repo.set_queue(zone_id, track_ids) {
+        match queue_repo.set_queue_avec_cible(zone_id, track_ids, cible) {
             Ok(outcome) => return Ok(outcome),
             Err(e) if e.contains("within a transaction") => {
                 last_err = e;
@@ -4235,6 +4268,29 @@ async fn play_sans_conteneur_de_file(
         return (StatusCode::BAD_REQUEST, "no track source specified").into_response();
     };
 
+    // When a container (album/playlist) is requested alongside a track_id,
+    // infer start_index from the position of that track in the resolved list.
+    let start = body.start_index.unwrap_or_else(|| {
+        body.track_id
+            .and_then(|tid| track_ids.iter().position(|&id| id == tid))
+            .map(|pos| pos as i64)
+            .unwrap_or(0)
+    });
+    // #8832 — une vue périmée ne doit pas remplacer une file encore valide.
+    // Une erreur de lecture SQL reste une panne de base, jamais une absence.
+    let cible_demandee = body
+        .track_id
+        .filter(|_| body.start_index.is_none())
+        .or_else(|| track_ids.get(start as usize).copied())
+        .or_else(|| track_ids.first().copied());
+    if let Some(cible) = cible_demandee {
+        match track_repo.get(cible) {
+            Ok(Some(_)) => {}
+            Ok(None) => return piste_absente_de_la_bibliotheque(&lang),
+            Err(e) => return lecture_base_echouee("play_piste_demandee", zone_id, e.to_string()),
+        }
+    }
+
     if track_ids.is_empty() {
         // #3733 — le refus cesse d'être muet. Le CORPS de la réponse ne bouge
         // pas d'un octet : les clients déjà livrés le comparent tel quel, et
@@ -4275,11 +4331,12 @@ async fn play_sans_conteneur_de_file(
     };
 
     if file_conservee.is_none() {
-        match set_queue_retrying(
+        match set_queue_retrying_avec_cible(
             &queue_repo,
             state.backend.engine() == tune_core::db::engine::Engine::Sqlite,
             zone_id,
             &track_ids,
+            cible_demandee,
         )
         .await
         {
@@ -4300,6 +4357,11 @@ async fn play_sans_conteneur_de_file(
                     info!(zone_id, n = outcome.inserted, "set_queue_ok");
                 }
             }
+            Err(e) if e == "track not found" => {
+                // #8832 — retrait pendant l'attente : la transaction n'a pas
+                // touché à la file. Rendre le refus sans la vider ici.
+                return piste_absente_de_la_bibliotheque(&lang);
+            }
             Err(e) => {
                 // Never proceed on the STALE queue: track 1 would play now and the
                 // natural-end advance would then resurrect whatever the DB still
@@ -4312,14 +4374,6 @@ async fn play_sans_conteneur_de_file(
         }
     }
 
-    // When a container (album/playlist) is requested alongside a track_id,
-    // infer start_index from the position of that track in the resolved list.
-    let start = body.start_index.unwrap_or_else(|| {
-        body.track_id
-            .and_then(|tid| track_ids.iter().position(|&id| id == tid))
-            .map(|pos| pos as i64)
-            .unwrap_or(0)
-    });
     // La position dans la demande nue (0) n'est pas celle de la file
     // conservée, qui peut aussi contenir des pistes de services.
     let queue_position = file_conservee.map_or(start, |(position, _)| position);
@@ -5267,6 +5321,14 @@ async fn previous(
             .lock()
             .unwrap()
             .insert(zone_id, std::time::Instant::now());
+        // Fil 2757 — « revenir au début » donné sur la meneuse vaut pour ses
+        // suiveuses, comme un `seek` (#7759) : c'en est un, à 0. Le relais
+        // n'écoute pas l'événement `seek`, et la suiveuse, déjà sur la même
+        // piste, n'a aucune raison de bouger seule. Ce relais ne démarre
+        // aucune piste : il ne déplace que des suiveuses déjà sur la même.
+        crate::routes::zones::relais_de_groupe_6155::deplacer_les_suiveuses_en_fond(
+            &state, zone_id, 0,
+        );
         return Json(json!({ "status": "restarted" })).into_response();
     }
 
@@ -7180,6 +7242,39 @@ fn eq_bands_json(profile: &tune_core::audio::eq::EqProfile) -> Vec<Value> {
         .collect()
 }
 
+/// #6524 — observation du gain retenu ; aucune déduction depuis la courbe.
+async fn get_retained_eq_preamp(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> Json<Value> {
+    let garde = state.orchestrator.preampli_garde_de_zone(zone_id).await;
+    Json(json!({"db": garde.map(|g| g.db), "returning": garde.is_some_and(|g| g.en_retour)}))
+}
+
+/// Le bouton explicite emprunte la rampe audio existante, sans relance de lecture.
+async fn release_retained_eq_preamp(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if let Err(resp) = crate::premium_guard::require_premium_localise(
+        &state.license,
+        tune_core::license::Feature::DspEq,
+        &headers,
+    )
+    .await
+    {
+        return resp;
+    }
+    let released = state.orchestrator.rendre_le_niveau_garde(zone_id).await;
+    if released {
+        state
+            .event_bus
+            .emit("zone.updated", json!({"zone_id":zone_id}));
+    }
+    Json(json!({"released":released})).into_response()
+}
+
 /// Read the zone's expert-mode EQ (bands stored in `zone_{id}_eq_profile`).
 ///
 /// These two handlers were STUBS until 0.9.48: the web Expert equalizer
@@ -7209,9 +7304,21 @@ async fn get_eq(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     let bands = eq_bands_json(&profile);
+    // rc14 (revue #9520) — avec une série d'égaliseurs TESS, « activé » dit ce
+    // que le moteur applique (tous les égaliseurs cochés), pas le seul
+    // principal que cette route expose.
+    let premium = state.license.is_premium().await;
+    let enabled =
+        match tune_core::tess::egaliseurs_en_serie::egaliseurs_de_zone(&settings, zone_id, premium)
+        {
+            Some(serie) => {
+                serie.is_some_and(|p| !p.bands.is_empty() || p.effective_gains() != (0.0, 0.0, 0.0))
+            }
+            None => profile.enabled && !bands.is_empty(),
+        };
     Json(json!({
         "zone_id": zone_id,
-        "enabled": profile.enabled && !bands.is_empty(),
+        "enabled": enabled,
         "preset": if bands.is_empty() { "flat" } else { "custom" },
         "bands": bands,
         // #5171 — toujours présent : sa présence dit au client que ce serveur
@@ -7314,6 +7421,14 @@ async fn set_eq(
                     .into_response();
             }
         }
+    }
+    // rc14 — l'égaliseur paramétrique est Premium, ici comme par
+    // `PUT /zones/{id}/tess` ; le graphique et le casque restent libres.
+    if let Err(resp) =
+        crate::routes::eq_parametrique_premium::exiger_le_droit(&state, zone_id, &profile, &headers)
+            .await
+    {
+        return resp;
     }
     let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
 
@@ -12061,6 +12176,10 @@ mod echec_transfert_6155_tests;
 #[cfg(test)]
 #[path = "playback/remplacement_volontaire_7247_tests.rs"]
 mod remplacement_volontaire_7247_tests;
+
+#[cfg(test)]
+#[path = "playback/preampli_garde_6524_tests.rs"]
+mod preampli_garde_6524_tests;
 
 #[cfg(test)]
 #[path = "playback/favori_direct_duree_8848_tests.rs"]

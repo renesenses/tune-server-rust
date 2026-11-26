@@ -17,6 +17,7 @@ pub mod choix_de_pressage;
 pub mod coffrets;
 pub mod completude;
 pub mod credits_balises;
+pub mod discogs_master;
 /// Réglage « Balises personnelles → tags Tune » (#9158, Rob).
 pub mod tags_perso;
 // « Joue avec » de la page artiste (#7768).
@@ -45,6 +46,9 @@ pub mod musicbrainz_release;
 mod oeuvre_mouvement_tests_8325;
 // Les réponses `/release/{mbid}` gardées en base (#4805, idée 3 de MetaRust).
 pub mod musicbrainz_release_cache;
+// [rc14] Le code-barres lu dans la balise : témoins sur de vrais fichiers.
+#[cfg(test)]
+mod code_barres_balise_tests;
 // La note d'une piste lue dans ses balises, ramenée sur 0 à 5 (#6123).
 pub mod note;
 #[cfg(test)]
@@ -298,6 +302,12 @@ pub struct TrackMetadata {
 
     pub label: Option<String>,
     pub catalog_number: Option<String>,
+    /// [rc14] Le code-barres du disque lu dans la balise (`BARCODE`, `UPC`,
+    /// `EAN` en Vorbis ; `TXXX:BARCODE` en ID3 ; `----:com.apple.iTunes:
+    /// BARCODE` en MP4), déjà validé par [`code_barres_valide`] : chiffres
+    /// seuls, 8, 12, 13 ou 14. Le scan en remplit `albums.barcode` s'il est
+    /// vide, sans jamais écraser une valeur connue.
+    pub barcode: Option<String>,
     pub musicbrainz_recording_id: Option<String>,
     pub musicbrainz_release_id: Option<String>,
     pub musicbrainz_artist_id: Option<String>,
@@ -2284,6 +2294,12 @@ fn dsf_dff_fallback_complete(
     let mb_release_secondary_types =
         mb_type_brut.and_then(|v| release_type::colonne_des_secondaires([v]));
 
+    // [rc14] Le code-barres (`TXXX:BARCODE`), validé.
+    let barcode = id3_tags
+        .as_ref()
+        .and_then(|tags| tags.get_txxx("BARCODE"))
+        .and_then(code_barres_valide);
+
     // #6474 — le nom de tri de l'interprète (`TSOP`), hors du tuple commun.
     let artist_sort = id3_tags
         .as_ref()
@@ -2336,6 +2352,7 @@ fn dsf_dff_fallback_complete(
         compilation,
         label,
         catalog_number,
+        barcode,
         musicbrainz_recording_id: mb_recording_id,
         musicbrainz_release_id: mb_release_id,
         musicbrainz_artist_id: mb_artist_id,
@@ -2414,6 +2431,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         compilation: None,
         label: None,
         catalog_number: None,
+        barcode: None,
         musicbrainz_recording_id: None,
         musicbrainz_release_id: None,
         musicbrainz_artist_id: None,
@@ -2576,6 +2594,30 @@ fn type_de_sortie_de_la_balise(tag: &lofty::tag::Tag) -> Option<String> {
         tag.get_strings(lofty::tag::ItemKey::MusicBrainzReleaseType),
     )
     .map(|t| t.primaire.as_str().to_string())
+}
+
+/// [rc14] Un code-barres de disque lisible : espaces et tirets retirés, des
+/// chiffres SEULEMENT, et une longueur de code reconnue — 8 (EAN-8), 12
+/// (UPC-A), 13 (EAN-13) ou 14 (GTIN-14). Tout le reste est ignoré : une
+/// balise mal remplie ne doit pas finir dans `albums.barcode`.
+pub fn code_barres_valide(brut: &str) -> Option<String> {
+    let chiffres: String = brut
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-'))
+        .collect();
+    (matches!(chiffres.len(), 8 | 12 | 13 | 14) && chiffres.bytes().all(|b| b.is_ascii_digit()))
+        .then_some(chiffres)
+}
+
+/// [rc14] Le code-barres que porte un tag lofty. lofty range sous
+/// `ItemKey::Barcode` le Vorbis/APE `BARCODE`, l'ID3 `TXXX:BARCODE` et
+/// l'atome MP4 `----:com.apple.iTunes:BARCODE`. La première valeur VALIDE
+/// l'emporte. Les Vorbis `UPC` et `EAN`, que lofty ne connaît pas, sont relus
+/// dans la tête Vorbis par l'appelant.
+fn code_barres_de_la_balise(tag: &lofty::tag::Tag) -> Option<String> {
+    tag.get_strings(lofty::tag::ItemKey::Barcode)
+        .find_map(code_barres_valide)
 }
 
 /// Section « Live » (05/10/2026) — les types SECONDAIRES que porte la même
@@ -2910,6 +2952,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         compilation: None,
         label: None,
         catalog_number: None,
+        barcode: None,
         musicbrainz_recording_id: None,
         musicbrainz_release_id: None,
         musicbrainz_artist_id: None,
@@ -3022,6 +3065,7 @@ fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
         compilation: None,
         label: None,
         catalog_number: None,
+        barcode: None,
         musicbrainz_recording_id: None,
         musicbrainz_release_id: None,
         musicbrainz_artist_id: None,
@@ -3102,6 +3146,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         compilation: None,
         label: None,
         catalog_number: None,
+        barcode: None,
         musicbrainz_recording_id: None,
         musicbrainz_release_id: None,
         musicbrainz_artist_id: None,
@@ -4153,6 +4198,16 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     let original_year = original_date
         .as_deref()
         .and_then(|s| s.get(..4)?.parse::<u32>().ok());
+    // [rc14] Le code-barres : `BARCODE` par lofty, puis les Vorbis `UPC` et
+    // `EAN` dans la même tête (lofty écarte les clés qu'il ne connaît pas).
+    let barcode = code_barres_de_la_balise(tag).or_else(|| {
+        ["UPC", "EAN"].iter().find_map(|cle| {
+            tete()
+                .as_deref()
+                .and_then(|h| find_vorbis_comment(h, cle))
+                .and_then(|v| code_barres_valide(&v))
+        })
+    });
 
     let total_tracks = tag
         .track_total()
@@ -4373,6 +4428,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         compilation,
         label: label_du_tag(&get),
         catalog_number: get(ItemKey::CatalogNumber),
+        barcode,
         musicbrainz_recording_id: get(ItemKey::MusicBrainzRecordingId),
         musicbrainz_release_id: get(ItemKey::MusicBrainzReleaseId),
         musicbrainz_artist_id: get(ItemKey::MusicBrainzArtistId),
@@ -4727,6 +4783,8 @@ pub fn read_extended_metadata_avec(
                 .iter()
                 .chain(balises_brutes::CLES_ANNEE_ORIGINALE.iter())
                 .chain(std::iter::once(&balises_brutes::CLE_VERSION))
+                // Fil 3012 — le master Discogs (`DISCOGS_MASTER_ID`).
+                .chain(discogs_master::CLES_DE_BALISE.iter())
                 .filter_map(|k| find_vorbis_comment(h, k).map(|v| (k.to_string(), v)))
                 // #8026 — TOUTES les trames ENSEMBLE / ORCHESTRA : un fichier
                 // qui cite deux orchestres les crédite tous les deux.
@@ -4761,6 +4819,11 @@ pub fn read_extended_metadata_avec(
         }
         if let Some(v) = balises_brutes::version_parmi(&brutes) {
             meta.insert("version".into(), v);
+        }
+        // Fil 3012 — le master Discogs, rangé en chiffres : il regroupe les
+        // Versions d'un album à côté du groupe MusicBrainz.
+        if let Some(v) = discogs_master::parmi(&brutes) {
+            meta.insert(discogs_master::CLE.into(), v);
         }
         // #9158 — les balises personnelles qui deviennent des tags Tune.
         // Présente, même vide, dès qu'une correspondance existe : une liste

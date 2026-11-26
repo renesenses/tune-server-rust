@@ -25,11 +25,10 @@
 //! - **Étages fixes en `f64` natif** : le ReplayGain (point d'insertion du
 //!   headroom de T07, AVANT l'exécuteur) et la compensation (#5071, APRÈS,
 //!   juste avant la quantification) sont de simples gains, appliqués en `f64`.
-//! - **Moteurs de référence en `f64` natif (T06)** : l'égaliseur et le
-//!   crossfeed reçoivent le tampon `f64` de l'exécuteur tel quel. Seul le
-//!   convolveur garde un adaptateur provisoire `f32` ↔ `f64` (T09b le porte) ;
-//!   un natif tiers `F32` est converti à SA frontière (T05). Aucune AUTRE
-//!   conversion `f32` ni entière n'existe entre deux étages
+//! - **Moteurs de référence en `f64` natif (T06, T09b)** : l'égaliseur, le
+//!   crossfeed et le convolveur reçoivent le tampon `f64` de l'exécuteur tel
+//!   quel ; un natif tiers `F32` est converti à SA frontière (T05). Aucune
+//!   AUTRE conversion `f32` ni entière n'existe entre deux étages
 //!   (`crate::tess::sonde_f32` le vérifie en test).
 //! - **Bit-perfect** : sans étage actif, le porteur ne touche pas un octet
 //!   ([`StreamingDsp::is_active`]) ; avec des étages qui rendent des mots
@@ -47,8 +46,6 @@
 //!   compensée est alors gardée en `f64`, place réservée d'emblée, jusqu'à
 //!   [`SEUIL_STOCKAGE_F64`] échantillons ; au-delà, en `f32` (garde-fou
 //!   mémoire pour les longues pistes en haute résolution).
-
-use std::cell::RefCell;
 
 use crate::audio::convolver::Convolver;
 use crate::audio::crossfeed::CrossfeedProcessor;
@@ -133,46 +130,6 @@ fn rails(bit_depth: u16) -> (f64, f64) {
     (echelle, echelle - 1.0)
 }
 
-thread_local! {
-    /// Tampon de conversion des adaptateurs `f32` : grandit jusqu'à la plus
-    /// grande tranche vue (au plus [`TRANCHE`]), puis n'alloue plus. Le relais
-    /// traite un tampon sans jamais céder la main (aucun `await` au milieu) :
-    /// deux flux du même fil ne s'y croisent pas.
-    static TAMPON_F32: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Fait passer `tampon` par un moteur `f32` : un seul appel par tranche,
-/// converti dans le tampon du fil.
-fn par_tranches_f32(tampon: &mut [f64], canaux: usize, mut moteur: impl FnMut(&mut [f32])) {
-    #[cfg(test)]
-    crate::tess::sonde_f32::noter();
-    let pas = pas_de_tranche(canaux);
-    for morceau in tampon.chunks_mut(pas) {
-        TAMPON_F32.with(|cellule| {
-            let mut secours;
-            let mut emprunt = cellule.try_borrow_mut();
-            let f: &mut Vec<f32> = match emprunt {
-                Ok(ref mut v) => v,
-                Err(_) => {
-                    secours = Vec::new();
-                    &mut secours
-                }
-            };
-            if f.len() < morceau.len() {
-                f.resize(morceau.len(), 0.0);
-            }
-            let f = &mut f[..morceau.len()];
-            for (d, s) in f.iter_mut().zip(morceau.iter()) {
-                *d = *s as f32;
-            }
-            moteur(f);
-            for (d, s) in morceau.iter_mut().zip(f.iter()) {
-                *d = f64::from(*s);
-            }
-        });
-    }
-}
-
 /// Nombre d'échantillons d'une tranche : au plus [`TRANCHE`], en trames
 /// entières.
 fn pas_de_tranche(canaux: usize) -> usize {
@@ -211,7 +168,8 @@ impl EtageTess for AdaptateurEgaliseur<'_> {
     fn definir_bypass(&mut self, _: bool) {}
 }
 
-/// Adaptateur provisoire du convolveur (`f32`) : à porter en `f64` par T09b.
+/// TESS T09b — l'étage de convolution en `f64` natif (le moteur calcule en
+/// double précision et reçoit le tampon de la chaîne sans conversion).
 ///
 /// Le moteur rend la trame `i` à la position `i + latence` : la latence est
 /// DÉCLARÉE à l'exécuteur, l'hôte retire l'amorce en tête de flux, et la queue
@@ -241,9 +199,7 @@ impl EtageTess for AdaptateurConvolution<'_> {
         if let Some(c) = self.moteur.as_mut() {
             self.queue_restante
                 .get_or_insert_with(|| c.latency_frames());
-            par_tranches_f32(&mut t[..trames * self.canaux], self.canaux, |f| {
-                c.process_interleaved(f);
-            });
+            c.process_interleaved_f64(&mut t[..trames * self.canaux]);
         }
         Ok(())
     }
@@ -261,7 +217,7 @@ impl EtageTess for AdaptateurConvolution<'_> {
         }
         let n = trames * canaux;
         sortie[..n].fill(0.0);
-        par_tranches_f32(&mut sortie[..n], canaux, |f| c.process_interleaved(f));
+        c.process_interleaved_f64(&mut sortie[..n]);
         *restant -= trames;
         Ok(trames)
     }
@@ -297,6 +253,41 @@ impl EtageTess for AdaptateurCrossfeed<'_> {
         }
         if let Some(c) = self.moteur.as_mut() {
             c.process_interleaved_f64(&mut t[..trames * 2]);
+        }
+        Ok(())
+    }
+    fn bypass(&self) -> bool {
+        false
+    }
+    fn definir_bypass(&mut self, _: bool) {}
+}
+
+/// rc14 — le réglage des enceintes (`speaker-setup`), dernier greffon de
+/// l'exécuteur. Ses délais sont VOULUS (alignement des voies) : il annonce
+/// une latence nulle à l'exécuteur, pour que l'hôte ne les retire pas comme
+/// l'amorce du convolveur. Le chemin du signal publie le plus grand délai.
+struct AdaptateurEnceintes<'a> {
+    moteur: &'a mut Option<crate::audio::reglage_enceintes::ProcesseurEnceintes>,
+    canaux: usize,
+    cadence: u32,
+}
+
+impl EtageTess for AdaptateurEnceintes<'_> {
+    fn id(&self) -> &str {
+        crate::audio::reglage_enceintes::ID_GREFFON
+    }
+    fn preparer(&mut self, e: FormatFlux, max: usize) -> Result<Disposition, ErreurEtage> {
+        self.canaux = usize::from(e.channels);
+        Ok(Disposition::sur_place(e, max, 0))
+    }
+    fn traiter_sur_place(&mut self, t: &mut [f64], trames: usize) -> Result<(), ErreurEtage> {
+        verifier_tampon(t.len(), trames, self.canaux as u16)?;
+        if let Some(p) = self.moteur.as_mut() {
+            p.traiter(
+                &mut t[..trames * self.canaux],
+                self.canaux as u16,
+                self.cadence,
+            );
         }
         Ok(())
     }
@@ -584,6 +575,8 @@ impl StreamingDsp {
             compensation,
             convolveur_reste_a_jeter,
             tess,
+            enceintes,
+            sample_rate,
             ..
         } = self;
         let EtatTess {
@@ -605,7 +598,12 @@ impl StreamingDsp {
             stereo: *channels == 2,
             canaux,
         };
-        let mut etages: [&mut dyn EtageTess; 3] = [&mut a_eq, &mut a_conv, &mut a_cf];
+        let mut a_enc = AdaptateurEnceintes {
+            moteur: &mut *enceintes,
+            canaux,
+            cadence: *sample_rate,
+        };
+        let mut etages: [&mut dyn EtageTess; 4] = [&mut a_eq, &mut a_conv, &mut a_cf, &mut a_enc];
         if let Err(error) = executeur.preparer(&mut etages, format, max_trames, false) {
             tracing::warn!(%error, canaux, "tess_network_chain_prepare_failed");
             return utiles;
@@ -718,6 +716,10 @@ impl StreamingDsp {
         if passage != Passage::Flux {
             if let Some(c) = convolver.as_mut() {
                 c.reset();
+            }
+            // rc14 — une piste entière ne garde pas la queue de la précédente.
+            if let Some(e) = enceintes.as_mut() {
+                e.reinitialiser();
             }
             *queue_restante = None;
             *convolveur_reste_a_jeter = None;

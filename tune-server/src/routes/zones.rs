@@ -657,6 +657,16 @@ pub fn router() -> Router<AppState> {
             "/{id}/tess",
             get(tess::get_zone_tess).put(tess::put_zone_tess),
         )
+        // rc14 — le greffon « Casque » : une correction OPRA, par la voie du PUT.
+        .route(
+            "/{id}/tess/headphone",
+            get(tess_casque::lire_le_casque).put(tess_casque::regler_le_casque),
+        )
+        // TESS T17 — charger un préréglage sur la zone (même voie que le PUT).
+        .route(
+            "/{id}/tess/presets/{preset_id}/apply",
+            post(tess_prereglages::appliquer_prereglage),
+        )
         .route("/{id}/eq/response", get(eq_response))
         .route("/{id}/convolver/response", get(convolver_response))
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
@@ -758,6 +768,10 @@ pub use dsp::*;
 
 // TESS T08 — `GET/PUT /zones/{id}/tess` et `GET /tess/catalog`.
 pub mod tess;
+// TESS T17 — préréglages de chaîne globaux et mode d'application.
+pub mod tess_prereglages;
+// rc14 — le greffon TESS « Casque » tiré d'OPRA.
+pub mod tess_casque;
 
 mod lecture;
 pub use lecture::*;
@@ -1827,6 +1841,8 @@ pub use signal_path::*;
 // TESS T16 — le bloc `tess` du chemin du signal (maquette A4).
 mod chemin_tess_t16;
 pub use chemin_tess_t16::avec_le_chemin_tess;
+// rc14 (rc13.91) — la raison d'un étage TESS qui ne tourne pas (sortie).
+pub(crate) mod refus_surechantillonnage_tess;
 
 mod ecriture;
 pub use ecriture::*;
@@ -1834,6 +1850,9 @@ pub use ecriture::*;
 // qui précèdent un `mod` pour reconnaître un module de test.
 #[cfg(test)]
 mod chemin_tess_t16_tests;
+// rc14 (rc13.91) — la raison d'un étage TESS qui ne tourne pas.
+#[cfg(test)]
+mod refus_surechantillonnage_tess_tests;
 
 mod peripheriques;
 mod preconfiguration;

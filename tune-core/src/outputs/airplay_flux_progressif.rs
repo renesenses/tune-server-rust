@@ -109,7 +109,7 @@ fn decoder(url: &str, tx: mpsc::Sender<Vec<u8>>) -> Result<(u16, u32), String> {
         }
         Err(raison) => {
             info!(url = %crate::confidentialite::masquer_url(&url), raison = %raison, "airplay_flux_progressif_continu");
-            let reponse = crate::http::client::blocking_builder()
+            let reponse = crate::http::client::blocking_builder_pour(url, "airplay")
                 .timeout(None)
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()

@@ -100,6 +100,10 @@ pub struct Airplay2Output {
     /// #8402 (11/11) — la dernière lecture a ouvert sa session à 0 % parce
     /// que la zone est en PURE verrouillé : l'orchestrateur le dit.
     depart_muet: Arc<AtomicBool>,
+    /// #9379 — le TXT mDNS dit que le récepteur n'accepte qu'un appairage
+    /// unique avec le code qu'il affiche (Apple TV) : un refus le dit ainsi,
+    /// et non comme un code par défaut refusé.
+    code_a_l_ecran: bool,
 }
 
 /// #8060 — une attente de code PIN : depuis quand, et si le récepteur
@@ -243,7 +247,23 @@ impl Airplay2Output {
             connect_par_code: Arc::new(AtomicBool::new(false)),
             volume_tenu_par_la_zone: Arc::new(AtomicBool::new(false)),
             depart_muet: Arc::new(AtomicBool::new(false)),
+            code_a_l_ecran: false,
         }
+    }
+
+    /// #9379 — le récepteur annonce (TXT `flags`, bit 9) un appairage unique
+    /// avec le code qu'il affiche. Voir
+    /// [`crate::discovery::mdns::CAP_AIRPLAY_CODE_A_L_ECRAN`].
+    #[must_use]
+    pub fn avec_code_a_l_ecran(mut self, requis: bool) -> Self {
+        self.code_a_l_ecran = requis;
+        self
+    }
+
+    /// #9379 — vrai quand le récepteur exige le code qu'il affiche.
+    #[must_use]
+    pub fn code_a_l_ecran(&self) -> bool {
+        self.code_a_l_ecran
     }
 
     /// #7972 — le flux que `play_media` vient de remettre au démon commence à
@@ -677,6 +697,7 @@ impl Airplay2Output {
             && self.host == autre.host
             && self.port == autre.port
             && self.ap_device_id == autre.ap_device_id
+            && self.code_a_l_ecran == autre.code_a_l_ecran
     }
 
     /// Begin HomeKit PIN pairing: spawn the daemon (if needed) and ask the
@@ -1309,9 +1330,12 @@ async fn copier_le_flux(
     ));
 
     let copie = async {
-        let mut reponse = crate::http::client::long_timeout()
-            .get(url)
-            .send()
+        let mut reponse = crate::http::client::marquer_si_flux_de_tune(
+            crate::http::client::long_timeout().get(url),
+            url,
+            "airplay2",
+        )
+        .send()
             .await
             .map_err(|e| crate::http::client::decrire_erreur_http(&e))?;
         let statut = reponse.status();
