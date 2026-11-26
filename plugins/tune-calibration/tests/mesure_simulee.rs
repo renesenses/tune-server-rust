@@ -263,6 +263,67 @@ fn le_balayage_sort_pendant_l_ecoute_malgre_le_chemin_de_lecture_9066() {
     assert_eq!(hote.journal().arrets, 1);
 }
 
+/// Calibration sur OAAT (Xavier, 25/11 : « Lecture de « Calibration —
+/// balayage de mesure m4-… » interrompue : fin de flux avant la longueur
+/// annoncée ») — une mesure RÉUSSIE ne doit laisser aucune erreur de lecture
+/// à la zone : la vraie pompe de l'orchestrateur remet toute la longueur
+/// annoncée, ou s'arrête parce que la zone est arrêtée, jamais « interrompue ».
+#[test]
+fn une_mesure_reussie_ne_laisse_aucune_erreur_de_lecture_a_la_zone() {
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let boucle = Boucle::avec_tampon(
+        PieceEnDirect::depuis(&sim, 1.0),
+        VITESSE,
+        2 * FREQUENCE_MESURE as usize,
+    );
+    let fournisseur = FournisseurBalayage::new();
+    let hote = HoteSimule::avec_chemin(
+        fournisseur.clone(),
+        boucle.clone(),
+        Some(50.0),
+        CheminDeLecture::session_de_source_pcm(),
+    );
+    let micro: Arc<dyn Peripheriques> = Arc::new(MicroSimule {
+        nom: MICRO.into(),
+        frequence: FREQUENCE_MESURE,
+        boucle,
+        demarrages: Default::default(),
+    });
+    let dossier = tune_core::test_scratch::scratch_dir("tune-calibration-longueur-annoncee");
+    let controleur = Controleur::new(
+        micro,
+        hote.clone(),
+        fournisseur,
+        dossier.path().to_path_buf(),
+    );
+    let mut d = demande(11);
+    d.duree_s = 1.0;
+    let id = controleur.lancer(d).expect("lancée");
+    let etat = attendre_fin(&controleur, &id, Duration::from_secs(120));
+    assert_eq!(
+        etat,
+        Etat::Terminee,
+        "{:?}",
+        controleur.mesure(&id).unwrap().avancement()
+    );
+    // La pompe finit après l'arrêt de la zone : l'attendre.
+    let t0 = Instant::now();
+    while hote.fins_de_pompe.lock().unwrap().is_empty() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "la pompe ne finit pas"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let fins = hote.fins_de_pompe.lock().unwrap();
+    assert!(
+        !fins
+            .iter()
+            .any(|f| matches!(f, tune_core::source_pcm::FinDePompe::Interrompue { .. })),
+        "erreur de lecture laissée à la zone : {fins:?}"
+    );
+}
+
 /// #9066 (relecture) — le micro se fige pendant le balayage, sans erreur
 /// (USB décroché, veille) : la mesure s'arrête en deux secondes en nommant
 /// le micro, au lieu d'attendre une minute puis « capture trop lente ».
@@ -571,7 +632,9 @@ fn l_etalonnage_du_micro_est_depose_puis_applique() {
     assert!(e.unwrap_err().contains("introuvable"));
 }
 
-/// Une entrée qui ne capte pas à 48 kHz est refusée avant tout.
+/// Une entrée à une fréquence que la mesure ne prend pas en charge (rc14 :
+/// 44,1 à 192 kHz le sont, voir `tests/mesure_frequences.rs`) est refusée
+/// avant tout, avec la liste des fréquences acceptées.
 #[test]
 fn une_entree_a_la_mauvaise_cadence_est_refusee() {
     let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
@@ -580,7 +643,7 @@ fn une_entree_a_la_mauvaise_cadence_est_refusee() {
     let hote = HoteSimule::new(fournisseur.clone(), boucle.clone(), Some(30.0));
     let micro: Arc<dyn Peripheriques> = Arc::new(MicroSimule {
         nom: MICRO.into(),
-        frequence: 44_100,
+        frequence: 32_000,
         boucle,
         demarrages: Default::default(),
     });
@@ -592,7 +655,11 @@ fn une_entree_a_la_mauvaise_cadence_est_refusee() {
         dossier.path().to_path_buf(),
     );
     let e = c.lancer(demande(2)).unwrap_err();
-    assert!(e.contains("44100"), "{e}");
+    assert!(e.contains("32000"), "{e}");
+    assert!(
+        e.contains("44100, 48000, 88200, 96000, 176400, 192000"),
+        "{e}"
+    );
     assert!(hote.journal().volumes.is_empty());
 }
 

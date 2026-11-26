@@ -247,7 +247,24 @@ struct Problem<'a> {
     freqs: Vec<f64>,
     /// mesure lissée − cible (dB), > 0 = pic à couper.
     error: Vec<f64>,
+    /// Coupe maximale d'UNE bande (dB, positif) pendant la recherche
+    /// gloutonne : `max_cut_db` moins [`MARGE_DE_COUPE_DB`]. Voir [`fit`].
+    coupe_par_bande: std::cell::Cell<f64>,
 }
+
+/// Réserve laissée sous le plafond cumulé à chaque bande pendant la
+/// recherche gloutonne (dB).
+///
+/// Retour de Didier (rc13.90) : une seule fréquence corrigée. Un gros pic
+/// (15 dB à 50 Hz) prenait une bande calée EXACTEMENT sur le plafond cumulé
+/// (−12 dB) ; or la réponse d'un biquad n'est nulle nulle part : la plus
+/// petite coupe ajoutée à 120 ou 250 Hz descendait l'empilement de quelques
+/// millièmes de dB sous −12 à 50 Hz, et TOUTE autre bande devenait
+/// infaisable. Chaque bande s'arrête donc à 0,5 dB du plafond pendant la
+/// recherche ; le raffinement conjoint final peut ensuite la rapprocher du
+/// plafond autant que l'empilement le permet. Le plafond cumulé, lui, ne
+/// bouge pas.
+pub const MARGE_DE_COUPE_DB: f64 = 0.5;
 
 /// Lissage 1/N d'octave (moyenne des dB) d'une courbe sur une grille log.
 fn smooth_on_grid(freqs: &[f64], values: &[f64], n: usize) -> Vec<f64> {
@@ -326,7 +343,9 @@ impl Problem<'_> {
     fn clamp(&self, b: &mut Band) {
         b.freq = b.freq.clamp(self.cfg.f_lo, self.cfg.f_hi);
         b.q = b.q.clamp(self.cfg.q_min, self.cfg.q_max);
-        b.gain = b.gain.clamp(-self.cfg.max_cut_db, self.cfg.max_boost_db);
+        b.gain = b
+            .gain
+            .clamp(-self.coupe_par_bande.get(), self.cfg.max_boost_db);
     }
 
     /// Descente de coordonnées sur (f, Q, gain) de la bande `idx`.
@@ -405,7 +424,15 @@ pub fn fit(measured: &LogResponse, target: &TargetCurve, cfg: &AutoEqConfig) -> 
     if freqs.len() < 4 {
         warnings.push("zone de correction trop étroite pour la grille fournie".into());
     }
-    let problem = Problem { cfg, freqs, error };
+    // Pendant la recherche, une bande garde une réserve sous le plafond
+    // cumulé (au plus le quart d'une petite coupe demandée en mode expert).
+    let marge = MARGE_DE_COUPE_DB.min(cfg.max_cut_db * 0.25);
+    let problem = Problem {
+        cfg,
+        freqs,
+        error,
+        coupe_par_bande: std::cell::Cell::new(cfg.max_cut_db - marge),
+    };
     let rms_before = problem.weighted_rms(&problem.error);
     let max_before = problem
         .error
@@ -423,12 +450,17 @@ pub fn fit(measured: &LogResponse, target: &TargetCurve, cfg: &AutoEqConfig) -> 
     while bands.len() < cfg.max_bands && attempts < cfg.max_bands * 3 {
         attempts += 1;
         let residual = problem.residual(&bands);
+        // Là où l'empilement coupe déjà jusqu'à la réserve, plus rien ne
+        // peut être coupé : le résidu y reste, mais ce n'est plus un candidat
+        // (sinon une seconde bande minuscule s'empile sur la première).
+        let deja = bands_response_db(cfg.sample_rate, &bands, &problem.freqs);
+        let sature = |i: usize| deja[i] <= -problem.coupe_par_bande.get() + 1e-6;
         // Pic le plus haut au-dessus de la cible, hors zones exclues.
         let (i_peak, e_peak) = residual
             .iter()
             .cloned()
             .enumerate()
-            .filter(|(i, _)| !is_excluded(problem.freqs[*i], &excluded))
+            .filter(|(i, _)| !is_excluded(problem.freqs[*i], &excluded) && !sature(*i))
             .fold((0usize, f64::NEG_INFINITY), |m, (i, v)| {
                 if v > m.1 {
                     (i, v)
@@ -501,10 +533,34 @@ pub fn fit(measured: &LogResponse, target: &TargetCurve, cfg: &AutoEqConfig) -> 
             excluded.push(f0);
         }
     }
-    // Raffinement conjoint.
+    // Raffinement conjoint : chaque bande peut maintenant aller jusqu'au
+    // plafond, tant que l'EMPILEMENT y reste (`feasible`).
+    problem.coupe_par_bande.set(cfg.max_cut_db);
     for _ in 0..2 {
         for i in 0..bands.len() {
             problem.refine(&mut bands, i, 20);
+        }
+    }
+    // Élagage : une bande dont le retrait ne coûte presque rien (même seuil
+    // qu'à l'insertion) est retirée, les autres réajustées. Typiquement une
+    // petite bande posée sur le flanc d'un pic déjà coupé au plafond, que le
+    // raffinement conjoint a rendue inutile en approfondissant la première.
+    let mut essais = bands.clone();
+    essais.sort_by(|a, b| a.gain.abs().total_cmp(&b.gain.abs()));
+    for b in essais {
+        if bands.len() <= 1 {
+            break;
+        }
+        let Some(idx) = bands.iter().position(|x| *x == b) else {
+            continue;
+        };
+        let mut cand = bands.clone();
+        cand.remove(idx);
+        for i in 0..cand.len() {
+            problem.refine(&mut cand, i, 10);
+        }
+        if problem.cost(&cand) <= problem.cost(&bands) + 0.02 {
+            bands = cand;
         }
     }
     bands.retain(|b| b.gain.abs() >= 0.1);
@@ -691,6 +747,46 @@ mod tests {
             r.warnings.iter().any(|w| w.contains("pic résiduel")),
             "{:?}",
             r.warnings
+        );
+    }
+
+    /// Un pic au-delà du plafond prend une bande au plafond ; les pics
+    /// suivants ont quand même la leur (retour de Didier, rc13.90).
+    #[test]
+    fn un_pic_au_plafond_laisse_les_suivants_se_corriger() {
+        let fs = 48_000.0;
+        let grid = LogResponse::grid(20.0, 1000.0, 48);
+        let pics: Vec<Band> = [(50.0, 15.0, 3.0), (120.0, 6.0, 5.0), (250.0, 5.0, 6.0)]
+            .iter()
+            .map(|(f, g, q)| Band {
+                freq: *f,
+                gain: *g,
+                q: *q,
+                kind: BandType::Peak,
+                channel: None,
+            })
+            .collect();
+        let mags = bands_response_db(fs, &pics, &grid);
+        let measured = LogResponse {
+            freqs: grid,
+            magnitude_db: mags.iter().map(|m| m + 75.0).collect(),
+        };
+        let r = fit(
+            &measured,
+            &TargetCurve::flat(),
+            &AutoEqConfig::spatial_average(fs),
+        );
+        assert_eq!(r.bands.len(), 3, "{:?}", r.bands);
+        let large = LogResponse::grid(10.0, fs * 0.45, 48);
+        let total = bands_response_db(fs, &r.bands, &large);
+        assert!(
+            total.iter().all(|c| *c >= -12.0 - 1e-6),
+            "plafond cumulé dépassé"
+        );
+        assert!(
+            r.bands.iter().any(|b| b.gain < -11.0),
+            "la bande de 50 Hz doit rester proche du plafond : {:?}",
+            r.bands
         );
     }
 }

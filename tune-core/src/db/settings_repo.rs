@@ -138,6 +138,9 @@ impl SettingsRepo {
         if est_un_consentement_journalise(key) {
             self.journaliser_consentement(key, Some(value), lieu);
         }
+        // rc14 — trim, PURE ou verrou du volume : republiés pour la
+        // modulation DSD de TESS (volume juste avant le modulateur).
+        crate::tess::modulation_dsd::reglage_ecrit(&self.db, key);
         Ok(())
     }
 
@@ -150,6 +153,7 @@ impl SettingsRepo {
         if est_un_consentement_journalise(key) {
             self.journaliser_consentement(key, None, lieu);
         }
+        crate::tess::modulation_dsd::reglage_ecrit(&self.db, key);
         Ok(())
     }
 
