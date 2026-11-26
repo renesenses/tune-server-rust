@@ -74,7 +74,9 @@ async fn lancer(state: &AppState, lecteur: LecteurMetadonnees) -> Vec<Value> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn les_lectures_de_credits_ne_tiennent_pas_la_transaction_sqlite_5202() {
-    let _seul = serialiser_les_scans_de_test_sans_bloquer().await;
+    if !tune_core::test_scratch::dans_un_processus_isole() {
+        return;
+    }
     let (_dir, state, _) = fixture();
     let lectures = Arc::new(AtomicUsize::new(0));
     let sous_transaction = Arc::new(AtomicUsize::new(0));
