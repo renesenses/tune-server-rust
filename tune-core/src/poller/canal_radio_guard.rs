@@ -41,7 +41,8 @@ fn le_changement_de_titre_journalise_par_ou_il_passe() {
         position("let canal = crate::http::streamer::canal_radio(np.stream_id.as_deref());");
     let publication = position("crate::http::streamer::publish_radio_now(");
     let ligne = position("radio_refresh_channel — le morceau a changé");
-    let vers_l_interface = position("self.playback.update_now_playing(zone_id, new_np).await;");
+    // Fil 3095 : l'écriture passe par la garde « même flux ».
+    let vers_l_interface = position(".update_now_playing_du_meme_flux(zone_id, np, new_np)");
     assert!(
         verdict < publication && publication < ligne && ligne < vers_l_interface,
         "le canal doit être établi puis journalisé DANS la branche du \

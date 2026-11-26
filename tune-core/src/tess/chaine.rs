@@ -25,7 +25,13 @@ use crate::audio::surechantillonnage::greffon::{DEFAULT_FILTER, OFFERED_FILTERS,
 pub const VERSION_CHAINE: u32 = 1;
 
 /// Headroom automatique dès qu'un greffon ou l'upsampler est actif (T07).
-pub const HEADROOM_AUTO_DB: f64 = -3.0;
+///
+/// rc14 — 0 dB : en Auto, la seule marge est celle que les égaliseurs
+/// réservent sur leur cascade entière (`EqProfile::reserve_db_at`). Le
+/// moteur n'a pas d'étage Headroom séparé ; annoncer −3 dB décrivait une
+/// baisse que rien n'appliquait. Un headroom MANUEL, lui, devient la marge
+/// des égaliseurs (`tess::egaliseurs_en_serie`).
+pub const HEADROOM_AUTO_DB: f64 = 0.0;
 /// Bornes d'un headroom manuel, en dB.
 pub const HEADROOM_MANUEL_MIN_DB: f64 = -24.0;
 pub const HEADROOM_MANUEL_MAX_DB: f64 = 0.0;
@@ -220,6 +226,11 @@ pub enum ErreurChaine {
     HeadroomHorsBornes(f64),
     #[error("réglage d'upsampling refusé : {0}")]
     UpsamplingInvalide(&'static str),
+    /// rc14 — la sortie de la zone ne prend pas la cible DSD demandée (motif
+    /// de `tess::modulation_dsd::MotifDsdRefuse`). La chaîne enregistrée ne
+    /// change pas : le suréchantillonnage en place n'est pas éteint.
+    #[error("la sortie de la zone ne prend pas {rate} : {motif}")]
+    DsdNonPrisParLaSortie { rate: String, motif: String },
 }
 
 impl ErreurChaine {
@@ -236,7 +247,8 @@ impl ErreurChaine {
             | Self::PasEnDernier(_)
             | Self::Exclusifs { .. }
             | Self::HeadroomHorsBornes(_)
-            | Self::UpsamplingInvalide(_) => 409,
+            | Self::UpsamplingInvalide(_)
+            | Self::DsdNonPrisParLaSortie { .. } => 409,
         }
     }
 
@@ -254,6 +266,7 @@ impl ErreurChaine {
             Self::PremiumRequis(_) => "premium_required",
             Self::HeadroomHorsBornes(_) => "headroom_out_of_range",
             Self::UpsamplingInvalide(_) => "invalid_upsampling",
+            Self::DsdNonPrisParLaSortie { .. } => "dsd_not_supported_by_output",
         }
     }
 
@@ -271,6 +284,7 @@ impl ErreurChaine {
             | Self::ValeurInconnue(_)
             | Self::HeadroomHorsBornes(_)
             | Self::UpsamplingInvalide(_) => None,
+            Self::DsdNonPrisParLaSortie { .. } => Some(ID_UPSAMPLING),
         }
     }
 
@@ -300,6 +314,10 @@ impl ErreurChaine {
             Self::PremiumRequis("x".into()),
             Self::HeadroomHorsBornes(3.0),
             Self::UpsamplingInvalide("filter"),
+            Self::DsdNonPrisParLaSortie {
+                rate: "dsd256".into(),
+                motif: "rate_above_zone_max".into(),
+            },
         ]
     }
 
@@ -317,10 +335,11 @@ impl ErreurChaine {
             Self::PremiumRequis(_) => 8,
             Self::HeadroomHorsBornes(_) => 9,
             Self::UpsamplingInvalide(_) => 10,
+            Self::DsdNonPrisParLaSortie { .. } => 11,
         }
     }
 
-    pub const NOMBRE_DE_VARIANTES: usize = 11;
+    pub const NOMBRE_DE_VARIANTES: usize = 12;
 }
 
 /// Le premier chemin présent dans `entree` et absent de `relu` : un champ que
@@ -456,7 +475,18 @@ impl ChaineTess {
         self.verifier_upsampling()?;
 
         let mut actifs_par_groupe: Vec<(String, &str)> = Vec::new();
-        let dernier = self.plugins.len().saturating_sub(1);
+        // rc14 — un greffon placé avant le suréchantillonneur (`speaker-setup`)
+        // s'exécute après tous les autres, où qu'il soit dans la liste : il ne
+        // compte pas pour « dernier des greffons ».
+        let dernier = self
+            .plugins
+            .iter()
+            .rposition(|m| {
+                catalogue
+                    .get(&m.id)
+                    .is_none_or(|d| d.placement.position != Position::BeforeUpsampling)
+            })
+            .unwrap_or(0);
         for (i, m) in self.plugins.iter().enumerate() {
             let d = catalogue
                 .get(&m.id)
@@ -754,38 +784,17 @@ mod tests {
     }
 
     #[test]
-    fn les_facades_de_l_egaliseur_sont_exclusives_rc14() {
-        // GO du 24/11 : deux façades cochées = 409 `mutually_exclusive`.
-        for (a, b) in [
-            ("equalizer-graphic", "equalizer-parametric"),
-            ("equalizer-headphone", "room-correction"),
-            ("room-correction", "equalizer-graphic"),
-        ] {
-            let c = chaine(vec![
-                maillon(a, true),
-                maillon("crossfeed", true),
-                maillon(b, true),
-            ]);
-            let e = valider(&c, PREMIUM).unwrap_err();
-            assert_eq!(
-                e,
-                ErreurChaine::Exclusifs {
-                    premier: a.into(),
-                    second: b.into(),
-                    groupe: "equalizer".into()
-                }
-            );
-            assert_eq!(e.statut_http(), 409);
-            assert_eq!(e.code(), "mutually_exclusive");
-            assert_eq!(e.greffon(), Some(b));
-            // Contre-épreuve : une seule cochée, l'autre décochée, passe.
-            let un_seul = chaine(vec![
-                maillon(a, true),
-                maillon("crossfeed", true),
-                maillon(b, false),
-            ]);
-            valider(&un_seul, PREMIUM).unwrap();
-        }
+    fn les_facades_de_l_egaliseur_sont_combinables_rc14() {
+        // GO du 25/11 : graphique, paramétrique, casque et correction de pièce
+        // cochés ensemble passent (ils s'appliquent en série).
+        let c = chaine(vec![
+            maillon("equalizer-graphic", true),
+            maillon("crossfeed", true),
+            maillon("equalizer-parametric", true),
+            maillon("equalizer-headphone", true),
+            maillon("room-correction", true),
+        ]);
+        valider(&c, PREMIUM).unwrap();
     }
 
     #[test]
@@ -805,6 +814,35 @@ mod tests {
                 Err(ErreurChaine::PasEnDernier("channel-remap".into()))
             );
         }
+    }
+
+    #[test]
+    fn le_reglage_des_enceintes_peut_suivre_la_reaffectation_rc14() {
+        // `speaker-setup` passe après tous les greffons : le placer après la
+        // réaffectation (`last_plugin`) est accepté, sans Premium.
+        let ok = chaine(vec![
+            maillon("equalizer-graphic", true),
+            maillon("channel-remap", true),
+            maillon("speaker-setup", true),
+        ]);
+        valider(&ok, GRATUIT).unwrap();
+        // Ailleurs dans la liste aussi (il s'exécute de toute façon en fin).
+        let ok = chaine(vec![
+            maillon("speaker-setup", true),
+            maillon("channel-remap", true),
+        ]);
+        valider(&ok, GRATUIT).unwrap();
+        // Contre-épreuve : un greffon ordinaire après la réaffectation reste
+        // refusé, même suivi du réglage des enceintes.
+        let ko = chaine(vec![
+            maillon("channel-remap", true),
+            maillon("equalizer-graphic", true),
+            maillon("speaker-setup", true),
+        ]);
+        assert_eq!(
+            valider(&ko, PREMIUM),
+            Err(ErreurChaine::PasEnDernier("channel-remap".into()))
+        );
     }
 
     #[test]

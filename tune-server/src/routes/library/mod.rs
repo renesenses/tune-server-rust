@@ -273,11 +273,13 @@ pub fn artwork_cache_dir() -> std::path::PathBuf {
         return dossier;
     }
 
-    // #5513 — `TUNE_ARTWORK_DIR`, puis le cache qu'impose la configuration
-    // d'un appareil Tune OS déplacé, sinon le défaut historique de chaque
-    // plateforme (règle et défauts dans `crate::chemins_de_donnees`).
+    // #5513 — `TUNE_ARTWORK_DIR`, puis le cache retenu au démarrage : celui
+    // qu'impose la configuration d'un appareil Tune OS déplacé, sinon le
+    // défaut de chaque plateforme, où un relatif ne suit plus le répertoire
+    // courant sur une installation neuve (`cache_de_pochettes_sans_variable`).
+    // Sans démarrage (hôte mobile), le défaut historique.
     use crate::chemins_de_donnees as chemins;
-    chemins::cache_de_pochettes(None, chemins::cache_impose_retenu(), || {
+    chemins::cache_de_pochettes(None, chemins::cache_retenu(), || {
         chemins::cache_de_pochettes_par_defaut(
             chemins::Plateforme::courante(),
             std::env::var_os("HOME").as_deref(),

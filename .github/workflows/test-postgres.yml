@@ -282,6 +282,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_1706 -- --nocapture
 
+      # [rc14] Code-barres de la balise posé seulement si `albums.barcode` est
+      # vide (`poser_code_barres_si_vide`). Sans cette étape, l'épreuve
+      # prendrait son saut annoncé.
+      - name: Code-barres posé si vide sur PostgreSQL (rc14)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_code_barres_si_vide -- --nocapture --test-threads=1
+
       # #5997 — miroir des favoris de service : écriture pour tous les profils,
       # alignement (INSERT … SELECT … ON CONFLICT), retrait au rafraîchissement,
       # panne. Sans cette étape, l'épreuve prendrait son saut annoncé.

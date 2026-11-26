@@ -360,6 +360,11 @@ async fn les_cles_tenues_par_le_serveur_sont_refusees_par_l_ecriture_generique()
         ("room_profile_index", "[\"7\"]"),
         ("zone_7_tess_chain", chaine.as_str()),
         ("zone_7_tess_chain_sync", "{}"),
+        // rc14 : le profil d'égaliseur et les préréglages s'écrivent par
+        // leurs routes, qui en valident le contenu.
+        ("zone_7_eq_profile", PROFIL_EQ.as_str()),
+        ("zone_7_eq_profile_before_tess", PROFIL_EQ.as_str()),
+        ("eq_presets", PREREGLAGES_EQ.as_str()),
     ] {
         let corps = serde_json::json!({ "theme": "ecrase", cle: valeur }).to_string();
         let (statut, v) = patch(&state, &corps, &[]).await;
@@ -383,6 +388,72 @@ async fn les_cles_tenues_par_le_serveur_sont_refusees_par_l_ecriture_generique()
     .await;
     assert!(statut.is_success(), "{statut} {v}");
     assert_eq!(reglage(&state, "theme").as_deref(), Some("clair"));
+}
+
+/// Un égaliseur paramétrique complet, tel que `POST /zones/{id}/eq` l'écrit.
+static PROFIL_EQ: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let mut p = serde_json::to_value(tune_core::audio::eq::EqProfile::default()).unwrap();
+    p["enabled"] = serde_json::json!(true);
+    p["bands"] = serde_json::json!([
+        {"freq": 1234.0, "gain": 4.0, "q": 2.2, "type": "peak"},
+        {"freq": 57.0, "gain": -6.0, "q": 5.0, "type": "peak"},
+    ]);
+    p.to_string()
+});
+
+static PREREGLAGES_EQ: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    serde_json::json!([{
+        "id": "p1", "name": "Casque", "eq_type": "parametric", "source": "autoeq",
+        "bands": [{"freq": 1234.0, "gain": 4.0, "q": 2.2, "type": "peak"}],
+    }])
+    .to_string()
+});
+
+/// rc14 — l'import de configuration sur un compte gratuit : le profil
+/// d'égaliseur d'une zone suit la règle de ses routes. Un paramétrique revient
+/// en égaliseur graphique, et la réponse le dit ; le reste est importé.
+#[tokio::test]
+async fn l_import_gratuit_rend_graphique_un_egaliseur_parametrique() {
+    let state = etat();
+    let corps = serde_json::json!({
+        "format": "tune-config",
+        "format_version": 2,
+        "settings": { "theme": "importe" },
+        "zones": [{
+            "id": 7,
+            "name": "Salon",
+            "output_type": "local",
+            "output_device_id": "local:hw:9",
+            "settings": { "zone_{id}_eq_profile": PROFIL_EQ.as_str() },
+        }],
+    })
+    .to_string();
+    let (statut, _, v) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/system/config/import",
+        &[],
+        Some(&corps),
+    )
+    .await;
+    assert!(statut.is_success(), "{statut} {v}");
+    assert_eq!(reglage(&state, "theme").as_deref(), Some("importe"));
+    assert!(
+        v["warnings"].to_string().contains("requires Premium"),
+        "non signalé : {v}"
+    );
+    let id = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get_by_device_id("local:hw:9")
+        .unwrap()
+        .and_then(|z| z.id)
+        .expect("zone importée");
+    let profil: tune_core::audio::eq::EqProfile =
+        serde_json::from_str(&reglage(&state, &format!("zone_{id}_eq_profile")).unwrap()).unwrap();
+    assert!(
+        tune_core::tess::migration::est_courbe_graphique(&profil.bands),
+        "{:?}",
+        profil.bands
+    );
 }
 
 /// Même règle à l'import de configuration : aucune clé tenue par le serveur

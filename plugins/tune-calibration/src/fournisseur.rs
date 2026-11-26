@@ -15,7 +15,7 @@ use tune_core::source_pcm::{FluxPcm, FournisseurPcm};
 use crate::generateur::{Deroule, Generateur};
 
 /// Le nom de la source, dans la file et dans `NowPlaying`.
-pub const SOURCE: &str = "calibration";
+pub const SOURCE: &str = tune_core::source_pcm::SOURCE_CALIBRATION;
 
 #[derive(Default)]
 pub struct FournisseurBalayage {
@@ -69,6 +69,12 @@ impl FournisseurPcm for FournisseurBalayage {
     /// Jamais pré-armé : ouvrir le balayage, c'est commencer à le jouer.
     fn pre_armable(&self) -> bool {
         false
+    }
+
+    /// Fil 3094 — seul le balayage d'une mesure en cours (armée) peut jouer :
+    /// une ligne restée en file après la fin est écartée par l'orchestrateur.
+    fn encore_jouable(&self, source_id: &str) -> bool {
+        self.verrou().contains_key(source_id)
     }
 }
 

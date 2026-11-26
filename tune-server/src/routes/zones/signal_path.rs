@@ -43,6 +43,24 @@ pub fn local_backend_status_value(_output_type: Option<&str>, _requested: &str) 
     None
 }
 
+thread_local! {
+    /// Revue #9520 — le droit Premium du compte pendant la construction du
+    /// chemin du signal (synchrone), posé par [`avec_le_droit`] depuis
+    /// `state.license`. Faux hors de lui (témoins).
+    static DROIT_PREMIUM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Construit le chemin du signal avec le droit Premium du compte, que
+/// l'appelant lit sur `state.license` à chaque requête : le panneau décrit la
+/// série d'égaliseurs que le moteur applique pour ce droit (une façade Premium
+/// écartée par l'exclusivité du 24/11 n'est recochée qu'en Premium).
+pub fn avec_le_droit<T>(premium: bool, construire: impl FnOnce() -> T) -> T {
+    let avant = DROIT_PREMIUM.replace(premium);
+    let r = construire();
+    DROIT_PREMIUM.set(avant);
+    r
+}
+
 /// Build the `signal_path` object for a zone's current playback.
 /// Returns `None` when the zone is not playing.
 ///
@@ -79,21 +97,19 @@ pub(super) fn active_zone_eq_profile(
     zone_id: i64,
 ) -> Option<tune_core::audio::eq::EqProfile> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
-    if !tune_core::audio::premium_plugins::enabled(&settings, "equalizer") {
+    // PURE, mesure de pièce et (rc14) « Bypass all » : le PCM atteint la
+    // sortie intact, l'égaliseur n'est jamais construit.
+    if tune_core::audio::audiophile::traitements_contournes(backend, zone_id) {
         return None;
     }
-    // PURE : le PCM atteint la sortie intact, l'égaliseur n'est jamais construit.
-    if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
-        return None;
-    }
-    let profile = settings
-        .get(&format!("zone_{zone_id}_eq_profile"))
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str::<tune_core::audio::eq::EqProfile>(&s).ok())?;
-    if !profile.enabled {
-        return None;
-    }
+    // rc14 (revue #9520, règle #1548) — la même lecture que le moteur : tous
+    // les égaliseurs cochés de la série, ou le headroom manuel, avec le droit
+    // Premium du compte ([`avec_le_droit`]).
+    let profile = tune_core::tess::egaliseurs_en_serie::profil_du_moteur(
+        &settings,
+        zone_id,
+        DROIT_PREMIUM.get(),
+    )?;
     // 44100/2 n'est qu'une sonde : is_enabled() dépend des gains, pas du débit.
     tune_core::audio::eq::EqProcessor::new(&profile, 44100, 2)
         .is_enabled()
@@ -142,6 +158,15 @@ impl CorrectionPiece {
             "resampled_to": self.resampled_to,
             "ir_files": self.ir_files,
         })
+    }
+}
+
+/// Une cadence en kHz, lisible : 384000 → « 384 », 44100 → « 44.1 ».
+fn khz_lisible(hz: u32) -> String {
+    if hz.is_multiple_of(1000) {
+        (hz / 1000).to_string()
+    } else {
+        format!("{:.1}", f64::from(hz) / 1000.0)
     }
 }
 
@@ -257,7 +282,8 @@ pub(super) fn zone_correction_piece_lang(
             description: fs(
                 lang,
                 "correction_piece_cadence",
-                &[&ir.to_string(), &fil.to_string()],
+                // Rémi (fil 3097) — « filtre 384 kHz, flux 48 kHz ».
+                &[&khz_lisible(ir), &khz_lisible(fil)],
             ),
             reason: Some(format!("ir_sample_rate {ir} != stream_sample_rate {fil}")),
             ir_sample_rate: ir_sr,
@@ -951,6 +977,40 @@ pub(super) fn zone_mono_downmix_step_lang(
         .then(|| ts(lang, "mono").to_string())
 }
 
+/// rc14 — le réglage des enceintes (greffon TESS `speaker-setup`) touche-t-il
+/// la sortie LOCALE de la zone, et si oui, que dire ? Même règle que
+/// l'orchestrateur (`zone_reglage_enceintes` : armé, hors PURE et « Bypass
+/// all »), jugée sur les voies de la piste. Le texte donne le délai de chaque
+/// voie et la latence ajoutée (le plus grand délai).
+pub(super) fn zone_enceintes_step_lang(
+    lang: &str,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    output_type: &str,
+    canaux: Option<u16>,
+) -> Option<String> {
+    if output_type != "local" {
+        return None;
+    }
+    let r = tune_core::audio::reglage_enceintes::reglages_appliques(backend, zone_id)?;
+    let n = usize::from(canaux.unwrap_or(2).max(1));
+    if r.est_neutre(n) {
+        return None;
+    }
+    let retards = r.retards_ms(n);
+    let latence = retards.iter().copied().fold(0.0, f64::max);
+    let liste = retards
+        .iter()
+        .map(|d| format!("{d:.2}"))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    Some(fs(
+        lang,
+        "speaker_setup",
+        &[&liste, &format!("{latence:.2}")],
+    ))
+}
+
 /// #6044 — la zone réaffecte-t-elle les canaux de la piste en cours, et si
 /// oui, que dire ?
 ///
@@ -1530,6 +1590,17 @@ pub fn build_signal_path_lang(
         runtime_signal_path,
         wire,
     );
+    // rc14 — le réglage des enceintes traite les voies OUVERTES par la sortie
+    // (après adaptation : une source mono sur une sortie stéréo en a 2).
+    traitements.enceintes_step = zone_enceintes_step_lang(
+        lang,
+        backend,
+        zone.id.unwrap_or(0),
+        output_type,
+        transformations_reelles
+            .map(|t| t.ouvert().canaux)
+            .or(np.channels),
+    );
     traitements.reaffectation_step = zone_reaffectation_step_lang(
         lang,
         backend,
@@ -1905,6 +1976,22 @@ pub(super) fn etat_du_surechantillonneur_lang(
 
 /// #8259 — codes observés, sans déduire une cause du seul réglage actuel.
 fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
+    cle_du_refus_selon_la_plateforme(raison, std::env::consts::OS)
+}
+
+/// rc14 (rc13.91) — la clé du texte d'un refus, pour la plateforme `os`
+/// (`std::env::consts::OS`) : le geste n'est pas le même partout. Paramètre
+/// et non `cfg!`, pour que chaque plateforme s'éprouve depuis n'importe où.
+pub(super) fn cle_du_refus_selon_la_plateforme(raison: &str, os: &str) -> &'static str {
+    match (raison, os) {
+        // Sous Windows, aucune sortie `hw:` : la liste n'est jamais mesurée,
+        // et sans cadence de mélangeur connue il n'y a rien à viser.
+        ("rates_not_measured", "windows") => return "upsampling_rates_not_measured_windows",
+        // Sous macOS, le chemin exclusif est le mode hog de CoreAudio : pas
+        // d'ASIO.
+        ("output_path_not_supported", "macos") => return "upsampling_output_path_macos",
+        _ => {}
+    }
     match raison {
         "fixed_rate" => "upsampling_fixed_rate",
         "pure" => "upsampling_pure",
@@ -1914,6 +2001,9 @@ fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
         "premium_required" => "upsampling_premium_required",
         "machine_test_missing" => "upsampling_machine_test_missing",
         "rates_not_measured" => "upsampling_rates_not_measured",
+        // rc14 — WASAPI partagé : le mélangeur n'est pas un multiple de la source.
+        "shared_mixer_rate_not_a_multiple" => "upsampling_shared_mixer_rate",
+        "shared_mixer_rate_not_above_source" => "upsampling_shared_mixer_rate_not_above",
         "no_candidate_rate_accepted_by_device" => "upsampling_device_rates",
         "machine_test_rejects_accepted_rates" => "upsampling_machine_rates",
         "settings_caps_exclude_admitted_rates" => "upsampling_settings_caps",
@@ -1928,6 +2018,17 @@ fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
         "output_rate_open_failed" | "filter_initialization_failed" => "upsampling_opening_failed",
         _ => "upsampling_not_applied",
     }
+}
+
+/// rc14 (rc13.91) — la raison, en clair et dans la langue de la requête,
+/// pour laquelle la sortie locale n'a pas suréchantillonné la piste. Sert à
+/// la page du greffon (`GET /upsampler/zones/{id}`), qui ne voyait que les
+/// refus de réglage (licence, PURE…) et jamais ceux du périphérique.
+pub(crate) fn description_du_refus_surechantillonnage(raison: &str) -> &'static str {
+    ts(
+        super::textes_signal::langue_courante(),
+        texte_du_refus_surechantillonnage(raison),
+    )
 }
 
 /// #6946 — pose la raison du plafond de librespot sur l'étape Source et la
@@ -2146,6 +2247,7 @@ fn assembler_les_etapes_lang(
         mono_downmix_step,
         reaffectation_step,
         reaffectation_ignoree,
+        enceintes_step,
         compensation_reseau_db,
         crossfeed_du_flux,
         ui_volume,
@@ -2909,6 +3011,18 @@ fn assembler_les_etapes_lang(
             "bit_perfect": false,
         }));
     }
+    // rc14 — « Réglage des enceintes » : après l'adaptation des voies, juste
+    // avant le suréchantillonneur, là où l'étage de conversion l'applique.
+    // `bit_perfect: false` : un délai seul garde chaque mot, mais décale les
+    // voies entre elles ; gain et phase réécrivent les échantillons.
+    if let Some(desc) = &enceintes_step {
+        steps.push(json!({
+            "name": "Speaker setup",
+            "code": "speaker_setup",
+            "description": desc,
+            "bit_perfect": false,
+        }));
+    }
     // #6230 — une règle armée que l'étage n'applique pas se DIT, avec la
     // raison : sans cette ligne, l'utilisateur voit tous ses canaux sortir
     // et ne sait pas pourquoi sa grille est restée sans effet. Rien n'est
@@ -3175,6 +3289,7 @@ fn rendre_les_verdicts(
         && !transformation_reelle_declaree
         && !replaygain_altere
         && mono_downmix_step.is_none()
+        && traitements.enceintes_step.is_none()
         && !reaffectation_active
         && !compensation_reseau
         && !crossfeed_du_flux;
@@ -3811,6 +3926,8 @@ struct Traitements {
     eq_step_description: Option<String>,
     replaygain_step: Option<ReplayGainStep>,
     mono_downmix_step: Option<String>,
+    /// rc14 — le réglage des enceintes de la sortie locale, décrit.
+    enceintes_step: Option<String>,
     /// #6044 — la réaffectation des canaux de la sortie locale, décrite.
     /// Posée après `relever_les_traitements`, qui ne voit pas les
     /// transformations déclarées par la sortie.
@@ -3879,6 +3996,7 @@ fn relever_les_traitements_lang(
     // vraie transformation — elle réécrit chaque échantillon — donc elle porte
     // une étape et fait tomber le verdict bit-perfect, comme le ReplayGain.
     let mono_downmix_step = zone_mono_downmix_step_lang(lang, &backend, zid, output_type);
+    let enceintes_step = zone_enceintes_step_lang(lang, backend, zid, output_type, np.channels);
 
     // #5071 — la compensation de niveau d'une zone RÉSEAU multiplie chaque
     // échantillon du flux : une étape, et le verdict en tient compte.
@@ -3932,6 +4050,7 @@ fn relever_les_traitements_lang(
         eq_step_description,
         replaygain_step,
         mono_downmix_step,
+        enceintes_step,
         reaffectation_step: None,
         reaffectation_ignoree: None,
         compensation_reseau_db,

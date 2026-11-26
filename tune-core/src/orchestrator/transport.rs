@@ -389,6 +389,11 @@ impl PlaybackOrchestrator {
         // #8611 — une piste d'un artiste bloqué par la politique parentale
         // du profil : rien ne part.
         self.verifier_l_artiste_bloque(&req).await?;
+        // Fil 3094 — le balayage d'une mesure de calibration finie ne se
+        // rejoue pas : il quitte la file, et le refus le dit une fois.
+        if let Some(refus) = self.refuser_un_balayage_perime(&req).await {
+            return Err(refus);
+        }
 
         // Re-tap dedup (#1271): a controller (Flutter/web) can emit `play` TWICE
         // for the SAME track a few seconds apart. The first play already sent
@@ -2417,6 +2422,7 @@ impl PlaybackOrchestrator {
             .unwrap_or(2);
         self.zone_has_active_eq(zone_id)
             || self.zone_has_active_crossfeed(zone_id)
+            || self.zone_has_active_enceintes(zone_id)
             || self.zone_replaygain_changes_audio(zone_id, req.piste_rg())
             || self.zone_ir_s_appliquerait(zone_id, resolved.sample_rate, canaux)
     }
@@ -2611,6 +2617,16 @@ impl PlaybackOrchestrator {
                     // lecture comme le strict : `play_url` la lit une fois.
                     local_output.set_secondes_sorties(secondes_sorties);
                     local_output.set_retard_de_depart_ms(retard_de_depart_ms);
+                    // Revue #9520 v2 — PURE ou mesure, sans « Bypass all » :
+                    // ce que lit la garde de départ bas (#8074).
+                    local_output.set_pure_ou_mesure(crate::audio::audiophile::pure_ou_mesure(
+                        &self.db, zone_id,
+                    ));
+                    // rc14 — l'ordre des étages suit la chaîne TESS de la zone.
+                    local_output.set_ordre_tess(&crate::tess::egaliseurs_en_serie::chaine_de_zone(
+                        &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+                        zone_id,
+                    ));
                     // #8869 — le silence de verrouillage de la zone, lu à
                     // chaque lecture : `play_url` le lit une fois.
                     local_output.set_silence_de_verrouillage_ms(
@@ -2664,6 +2680,14 @@ impl PlaybackOrchestrator {
                     // `false` en mode PURE, donc la promesse bit-perfect tient
                     // sans garde supplémentaire, exactement comme pour l'EQ.
                     local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+                    // rc14 — le réglage des enceintes de la zone : nouvelle
+                    // lecture, historique vidé (rien d'une écoute précédente
+                    // n'est rejoué) ; aucun créneau si le greffon n'est pas
+                    // dans la chaîne.
+                    local_output.demarrer_reglage_enceintes(
+                        self.zone_enceintes_dans_la_chaine(zone_id),
+                        self.zone_reglage_enceintes(zone_id),
+                    );
                     // #7632 — le droit de convoluer, posé à chaque lecture
                     // comme PURE : sans Premium, l'IR mémorisée ne bâtit
                     // aucun moteur pour la piste qui démarre.
@@ -3453,8 +3477,9 @@ impl PlaybackOrchestrator {
     ) -> u32 {
         use crate::audio::soft_mute::{SOFT_MUTE_DEFAULT_MS, SOFT_MUTE_MAX_MS};
         // PURE : le PCM atteint la sortie intact, aucune rampe n'est appliquée.
-        // #8513 — ni pendant une mesure de pièce.
-        if crate::audio::audiophile::traitements_contournes(db, zone_id) {
+        // #8513 — ni pendant une mesure de pièce. rc14 — mais sous « Bypass
+        // all » la rampe anti-clic reste (`pure_ou_mesure`).
+        if crate::audio::audiophile::pure_ou_mesure(db, zone_id) {
             return 0;
         }
         crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
@@ -3955,8 +3980,23 @@ impl PlaybackOrchestrator {
             }
             // #8813 — une baisse pendant la pause doit recréer le flux en
             // PCM, sans avoir relancé la lecture au moment du réglage.
+            // rc14 (retour de Rémi sur la rc13.90, TESS) — la chaîne de la
+            // zone a changé depuis que ce flux réseau a été fabriqué (réglage
+            // fait en pause, ou « Appliquer : à la prochaine lecture ») : une
+            // reprise compte comme une prochaine lecture. Le flux est refait
+            // avec la nouvelle chaîne, à la position ; une radio reprend le
+            // direct. Une reprise sur place rejouait l'ancien traitement
+            // jusqu'à relancer la station depuis Radios.
+            let chaine_changee = self.flux_reseau_perime(zone_id, np);
+            if chaine_changee {
+                info!(
+                    zone_id,
+                    position_ms, est_radio, "reprise_par_nouveau_flux_chaine_tess_changee"
+                );
+            }
             let peripherique_rendu = peripherique_rendu
                 || memoire_du_lecteur_douteuse
+                || chaine_changee
                 || self.dop_actif_a_proteger(zone_id).await;
             let decision = reprise_de_session(
                 est_radio,

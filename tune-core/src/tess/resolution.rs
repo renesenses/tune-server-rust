@@ -117,6 +117,13 @@ pub enum MotifEtape {
     /// Convolution cochée sans fichier de réponse impulsionnelle choisi :
     /// acceptée, mais elle ne traite rien tant qu'aucun filtre n'est choisi.
     NoFilterSelected,
+    /// rc14 — vers le DSD : la sortie locale ne prend pas la cible, ou la
+    /// piste est repartie en PCM ; `detail` porte le motif précis
+    /// (`tess::modulation_dsd::MotifDsdRefuse`, ex. `dsd_mode_not_enabled`).
+    DsdNotSupportedByOutput,
+    /// rc14 — réglage des enceintes coché, mais neutre pour les voies qui lui
+    /// arrivent (aucun délai, 0 dB, aucune inversion) : il ne touche rien.
+    NeutralSettings,
     #[serde(other)]
     Unknown,
 }
@@ -245,6 +252,12 @@ pub struct ContexteExecution<'a> {
     /// transport hors TESS, il fait passer la piste par le flux traité, comme
     /// l'égaliseur. Faux sans piste.
     pub replaygain_actif: bool,
+    /// rc14 — les voies qui arrivent au réglage des enceintes, vues par la
+    /// sortie APRÈS l'adaptation des voies (une source mono sur une sortie
+    /// stéréo : 2). `None` : inconnues (rien n'a joué, sortie réseau) ; la
+    /// résolution prend alors les sorties d'une réaffectation cochée, sinon
+    /// les voies de la source.
+    pub voies_de_sortie: Option<u16>,
 }
 
 /// Une étape du chemin du signal, résolue.
@@ -347,8 +360,8 @@ fn membres_remplacants(
         .iter()
         .enumerate()
         .filter(|(_, m)| !m.enabled)
-        // rc14 — une façade de l'égaliseur écartée ne reprend jamais la place :
-        // le moteur n'applique que la première façade COCHÉE.
+        // rc14 — les façades de l'égaliseur n'ont pas de groupe : une façade
+        // décochée ne remplace jamais rien (marque de #9512 levée à la lecture).
         .filter(|(_, m)| !super::migration::FACADES_EQ.contains(&m.id.as_str()))
         .filter_map(|(i, m)| {
             let gagnant = m
@@ -454,6 +467,9 @@ impl ChaineTess {
                 ..
             }
         ) && !ctx.pure
+            // rc14 — « Bypass all » coupe aussi l'égaliseur gardé hors TESS
+            // (`audiophile::traitements_contournes` le lit).
+            && !self.bypass_all
             && !ctx.source.is_some_and(|s| s.dsd_hors_traitement());
 
         let mut source = etape(CodeEtape::Source, true);
@@ -527,6 +543,11 @@ impl ChaineTess {
                 greffons[i].params = Some(json!({ "replaced_by": id }));
             }
         }
+
+        // rc14 — le réglage des enceintes s'exécute après TOUS les greffons
+        // (réaffectation comprise), juste avant l'upsampling : il est publié à
+        // cette place, et jugé sur les voies qui lui arrivent réellement.
+        self.placer_le_reglage_des_enceintes(&mut greffons, catalogue, ctx);
 
         if traitements_de_zone_conserves {
             let flux_force = ctx.replaygain_actif
@@ -684,6 +705,98 @@ impl ChaineTess {
         }
     }
 
+    /// rc14 — `speaker-setup` : déplacé après les autres greffons ; éteint
+    /// (`neutral_settings`) s'il ne touche rien ; ses délais (ms), sa réserve
+    /// et sa latence (trames à la cadence de la source) publiés.
+    fn placer_le_reglage_des_enceintes(
+        &self,
+        greffons: &mut Vec<EtapeResolue>,
+        catalogue: &Catalogue,
+        ctx: &ContexteExecution<'_>,
+    ) {
+        use crate::audio::reglage_enceintes::{ID_GREFFON, ReglagesEnceintes};
+        let Some(i) = greffons
+            .iter()
+            .position(|e| e.plugin_id.as_deref() == Some(ID_GREFFON))
+        else {
+            return;
+        };
+        let mut e = greffons.remove(i);
+        // Les voies qui lui arrivent : celles que la sortie a vues (après
+        // adaptation) ; sinon les sorties d'une réaffectation effective ;
+        // sinon celles de la source.
+        let reaffectation = greffons
+            .iter()
+            .find(|g| {
+                g.effective
+                    && g.plugin_id
+                        .as_deref()
+                        .and_then(|id| catalogue.get(id))
+                        .is_some_and(|d| d.placement.channels == Canaux::Remaps)
+            })
+            .and_then(|g| g.plugin_id.clone());
+        let sorties_reaffectees = reaffectation.as_deref().map(|id| {
+            self.plugins
+                .iter()
+                .find(|m| m.id == id)
+                .and_then(|m| {
+                    serde_json::from_value::<
+                        crate::audio::reaffectation_canaux::ChannelRemapSettings,
+                    >(m.settings.clone())
+                    .ok()
+                })
+                .map(|s| usize::from(s.outputs))
+                .filter(|n| *n > 0)
+        });
+        let canaux =
+            ctx.voies_de_sortie
+                .map(usize::from)
+                .filter(|n| *n > 0)
+                .or(match sorties_reaffectees {
+                    Some(sorties) => sorties,
+                    None => ctx.source.and_then(|s| s.canaux()).map(usize::from),
+                });
+        let reglages = self
+            .plugins
+            .iter()
+            .find(|m| m.id == ID_GREFFON)
+            .and_then(|m| ReglagesEnceintes::lire(&m.settings).ok())
+            .unwrap_or_default();
+        if e.effective {
+            let neutre = match canaux {
+                Some(n) => reglages.est_neutre(n),
+                None => reglages.est_neutre_partout(),
+            };
+            if neutre {
+                e.eteindre(MotifEtape::NeutralSettings, Some("Neutral settings".into()));
+            }
+        }
+        if e.effective {
+            let n = canaux.unwrap_or(reglages.channels.len()).max(1);
+            let arrondi = |x: f64| (x * 1000.0).round() / 1000.0;
+            let retards: Vec<f64> = reglages.retards_ms(n).into_iter().map(arrondi).collect();
+            let latence_ms = retards.iter().copied().fold(0.0, f64::max);
+            let mut params = json!({
+                "channels": n,
+                "delays_ms": retards,
+                "latency_ms": latence_ms,
+                "reserve_db": arrondi(reglages.reserve_db(n)),
+            });
+            if let (Some(n), Some(SourceFlux::Pcm { sample_rate_hz, .. })) = (canaux, ctx.source) {
+                let trames = reglages.latence_trames(n, sample_rate_hz);
+                e.latency_frames = Some(u32::try_from(trames).unwrap_or(u32::MAX));
+                params["delays_samples"] =
+                    json!(reglages.retards_en_echantillons(n, sample_rate_hz));
+            }
+            e.params = Some(params);
+        } else if let Some(n) = canaux {
+            // Éteint (neutre, PURE…) : l'écran affiche tout de même une
+            // ligne par voie qui arrive.
+            e.params = Some(json!({ "channels": n }));
+        }
+        greffons.push(e);
+    }
+
     fn resoudre_greffon(
         &self,
         m: &MaillonGreffon,
@@ -784,6 +897,7 @@ mod tests {
                 db: -18.0,
             },
             replaygain_actif: false,
+            voies_de_sortie: None,
         }
     }
 
@@ -802,37 +916,52 @@ mod tests {
     }
 
     #[test]
-    fn une_chaine_ancienne_a_deux_egaliseurs_coches_n_applique_que_le_premier_rc14() {
+    fn deux_egaliseurs_coches_sont_tous_deux_effectifs_rc14() {
+        // GO du 25/11 : les égaliseurs sont combinables, en série.
         let c = ChaineTess {
             plugins: vec![
                 maillon("equalizer-graphic", true),
                 maillon("crossfeed", true),
                 maillon("equalizer-parametric", true),
+                maillon("equalizer-headphone", true),
             ],
             ..ChaineTess::default()
         };
         let r = resoudre(&c, &ctx(TransportZone::Local));
-        assert!(greffon(&r, "equalizer-graphic").effective);
-        assert!(greffon(&r, "crossfeed").effective);
-        let p = greffon(&r, "equalizer-parametric");
-        assert!(p.requested && !p.effective);
-        assert_eq!(p.reason, Some(MotifEtape::ReplacedInGroup));
-        assert_eq!(p.detail.as_deref(), Some("Replaced by equalizer-graphic"));
-        assert_eq!(
-            p.params,
-            Some(json!({ "replaced_by": "equalizer-graphic" }))
-        );
-        // Contre-épreuve : une seule façade cochée traite.
-        let c = ChaineTess {
-            plugins: vec![
-                maillon("equalizer-graphic", false),
-                maillon("equalizer-parametric", true),
-            ],
-            ..ChaineTess::default()
-        };
-        let r = resoudre(&c, &ctx(TransportZone::Local));
-        assert!(greffon(&r, "equalizer-parametric").effective);
-        assert_eq!(greffon(&r, "equalizer-parametric").reason, None);
+        for id in [
+            "equalizer-graphic",
+            "crossfeed",
+            "equalizer-parametric",
+            "equalizer-headphone",
+        ] {
+            let e = greffon(&r, id);
+            assert!(e.effective, "{id}");
+            assert_eq!(e.reason, None, "{id}");
+        }
+    }
+
+    #[test]
+    fn bypass_all_coupe_aussi_l_egaliseur_garde_hors_tess_rc14() {
+        for transport in [TransportZone::HqPlayer, TransportZone::Diretta] {
+            let mut c = ChaineTess {
+                plugins: vec![
+                    maillon("equalizer-parametric", true),
+                    maillon("room-correction", true),
+                ],
+                ..ChaineTess::default()
+            };
+            c.bypass_all = true;
+            let r = resoudre(&c, &ctx(transport));
+            for id in ["equalizer-parametric", "room-correction"] {
+                assert!(!greffon(&r, id).effective, "{transport:?} {id}");
+            }
+            // Contre-épreuve : sans Bypass all, ils sont gardés (T12c).
+            c.bypass_all = false;
+            let r = resoudre(&c, &ctx(transport));
+            for id in ["equalizer-parametric", "room-correction"] {
+                assert!(greffon(&r, id).effective, "{transport:?} {id}");
+            }
+        }
     }
 
     #[test]
@@ -1007,16 +1136,11 @@ mod tests {
     /// headroom, le suréchantillonnage et le volume logiciel.
     #[test]
     fn hors_tess_l_egaliseur_et_la_correction_restent_appliques_t12c() {
-        // rc14 : les façades de l'égaliseur sont exclusives — une à la fois.
-        for (transport, eq) in [
-            (TransportZone::HqPlayer, "room-correction"),
-            (TransportZone::HqPlayer, "equalizer-parametric"),
-            (TransportZone::Diretta, "room-correction"),
-            (TransportZone::Diretta, "equalizer-parametric"),
-        ] {
+        for transport in [TransportZone::HqPlayer, TransportZone::Diretta] {
             let c = ChaineTess {
                 plugins: vec![
-                    maillon(eq, true),
+                    maillon("room-correction", true),
+                    maillon("equalizer-parametric", true),
                     maillon("crossfeed", true),
                     maillon("mono-downmix", true),
                 ],
@@ -1024,7 +1148,7 @@ mod tests {
             };
             let r = resoudre(&c, &ctx(transport));
             assert_eq!(r.badge, Badge::OutsideTess, "{transport:?}");
-            for id in [eq, "crossfeed"] {
+            for id in ["room-correction", "equalizer-parametric", "crossfeed"] {
                 assert!(
                     greffon(&r, id).effective,
                     "{transport:?} : {id} doit être annoncé appliqué"
@@ -1299,5 +1423,141 @@ mod tests {
         let e: EtapeResolue = serde_json::from_value(futur).unwrap();
         assert_eq!(e.code, CodeEtape::Unknown);
         assert_eq!(e.reason, Some(MotifEtape::Unknown));
+    }
+
+    /// rc14 — le réglage des enceintes : publié APRÈS les autres greffons
+    /// (réaffectation comprise), juste avant l'upsampling ; sa latence en
+    /// trames à la cadence de la source ; éteint s'il est neutre pour les
+    /// voies qui lui arrivent ; coupé sous Pure et « Bypass all ».
+    #[test]
+    fn le_reglage_des_enceintes_est_resolu_avant_l_upsampling_rc14() {
+        let enceintes = |reglages: Value| MaillonGreffon {
+            id: "speaker-setup".into(),
+            enabled: true,
+            settings: reglages,
+        };
+        let deux_voies = json!({ "channels": [
+            { "distance_cm": 343 }, { "distance_cm": 0, "gain_db": -3 }
+        ] });
+        let c = ChaineTess {
+            plugins: vec![
+                enceintes(deux_voies.clone()),
+                maillon("equalizer-graphic", true),
+                maillon("crossfeed", true),
+            ],
+            ..ChaineTess::default()
+        };
+        let x = ctx(TransportZone::Local);
+        let r = resoudre(&c, &x);
+        let ordre: Vec<&str> = r
+            .etapes
+            .iter()
+            .filter_map(|e| e.plugin_id.as_deref())
+            .collect();
+        assert_eq!(
+            ordre,
+            vec!["equalizer-graphic", "crossfeed", "speaker-setup"]
+        );
+        let i = codes(&r)
+            .iter()
+            .position(|c| *c == CodeEtape::Upsampling)
+            .unwrap();
+        assert_eq!(r.etapes[i - 1].plugin_id.as_deref(), Some("speaker-setup"));
+        let e = greffon(&r, "speaker-setup");
+        assert!(e.effective, "{e:?}");
+        // 10 ms à 96 kHz : 960 trames.
+        assert_eq!(e.latency_frames, Some(960));
+        let p = e.params.as_ref().unwrap();
+        assert_eq!(p["delays_ms"], json!([0.0, 10.0]));
+        assert_eq!(p["delays_samples"], json!([0, 960]));
+        assert_eq!(p["latency_ms"], json!(10.0));
+        assert_eq!(r.badge, Badge::ProcessedByTess);
+
+        // Neutre pour les deux voies de la source : éteint, et la zone reste
+        // bit-perfect (volume à 0 dB, rien d'autre).
+        let neutre = ChaineTess {
+            plugins: vec![enceintes(json!({ "channels": [
+                { "distance_cm": 280 }, { "distance_cm": 280 }
+            ] }))],
+            ..ChaineTess::default()
+        };
+        let mut x0 = ctx(TransportZone::Local);
+        x0.volume.db = 0.0;
+        let r = resoudre(&neutre, &x0);
+        let e = greffon(&r, "speaker-setup");
+        assert!(e.requested && !e.effective);
+        assert_eq!(e.reason, Some(MotifEtape::NeutralSettings));
+        assert_eq!(r.badge, Badge::BitPerfect);
+
+        // Pure et « Bypass all » : coupé, comme les autres traitements.
+        let seul = ChaineTess {
+            plugins: vec![enceintes(deux_voies)],
+            ..ChaineTess::default()
+        };
+        let mut pure = ctx(TransportZone::Local);
+        pure.pure = true;
+        let e = greffon(&resoudre(&seul, &pure), "speaker-setup").clone();
+        assert!(!e.effective);
+        assert_eq!(e.reason, Some(MotifEtape::PureMode));
+        let contourne = ChaineTess {
+            bypass_all: true,
+            ..seul.clone()
+        };
+        let e = greffon(&resoudre(&contourne, &x), "speaker-setup").clone();
+        assert!(!e.effective);
+        assert_eq!(e.reason, Some(MotifEtape::BypassAll));
+    }
+
+    /// rc14 (relecture de #9523, m1 et m4) — les voies qui arrivent au
+    /// réglage des enceintes sont celles de la SORTIE : une source mono
+    /// ouverte en stéréo en donne 2 (le greffon n'est pas « neutre ») ; sous
+    /// réaffectation, ce sont ses sorties, pas la longueur de la liste.
+    #[test]
+    fn les_voies_du_reglage_des_enceintes_sont_celles_de_la_sortie_rc14() {
+        let enceintes = MaillonGreffon {
+            id: "speaker-setup".into(),
+            enabled: true,
+            settings: json!({ "channels": [{ "distance_cm": 343 }, { "distance_cm": 0 }] }),
+        };
+        let mono = SourceFlux::Pcm {
+            sample_rate_hz: 48_000,
+            bits: 16,
+            channels: 1,
+        };
+        let c = ChaineTess {
+            plugins: vec![enceintes.clone()],
+            ..ChaineTess::default()
+        };
+        let mut x = ctx(TransportZone::Local);
+        x.source = Some(mono);
+        // Sans le savoir : la source (1 voie) — rien à aligner.
+        let e = greffon(&resoudre(&c, &x), "speaker-setup").clone();
+        assert_eq!(e.reason, Some(MotifEtape::NeutralSettings));
+        assert_eq!(e.params, Some(json!({ "channels": 1 })));
+        // La sortie a ouvert 2 voies : le délai agit.
+        x.voies_de_sortie = Some(2);
+        let r = resoudre(&c, &x);
+        let e = greffon(&r, "speaker-setup");
+        assert!(e.effective, "{e:?}");
+        assert_eq!(e.params.as_ref().unwrap()["channels"], json!(2));
+        assert_eq!(e.latency_frames, Some(480));
+        assert_ne!(r.badge, Badge::BitPerfect);
+
+        // Réaffectation 2 → 4 cochée : 4 voies, quelle que soit la liste.
+        let c = ChaineTess {
+            plugins: vec![
+                MaillonGreffon {
+                    id: "channel-remap".into(),
+                    enabled: true,
+                    settings: json!({ "inputs": 2, "outputs": 4,
+                        "gains_db": [[0.0, null], [null, 0.0], [null, null], [null, null]] }),
+                },
+                enceintes,
+            ],
+            ..ChaineTess::default()
+        };
+        let x = ctx(TransportZone::Local);
+        let e = greffon(&resoudre(&c, &x), "speaker-setup").clone();
+        assert_eq!(e.params.as_ref().unwrap()["channels"], json!(4));
     }
 }

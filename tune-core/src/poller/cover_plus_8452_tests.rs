@@ -249,3 +249,82 @@ async fn au_changement_de_titre_l_image_precedente_s_en_va() {
     );
     assert!(!np.cover_plus);
 }
+
+/// Fil 3095 (rc13.90, DLNA) : on passe d'une station A affichée en Cover+ à
+/// une station B. Le tour du sondeur qui avait lu la zone AVANT le
+/// changement (son instantané porte A) rend ses métadonnées APRÈS : elles
+/// ne doivent pas reposer A par-dessus B. L'écran doit montrer B.
+#[tokio::test]
+async fn changement_de_station_le_tour_en_vol_ne_repose_pas_l_ancienne_3095() {
+    let b = banc();
+    let zone_id = 5;
+    let nom_a = "Morow 3095";
+    let url_a = fausse_station_dite("/cp3095a", "Air - Sexy Boy").await;
+    station_en_base(&b.db, nom_a, &url_a);
+    let nom_b = "Radio DY10 3095";
+    let url_b = fausse_station_dite("/cp3095b", "Daft Punk - Da Funk").await;
+    station_en_base(&b.db, nom_b, &url_b);
+    crate::cover_plus::regler_globalement(&b.db, true).unwrap();
+    let pochette_a = "https://is1.mzstatic.example/air/600x600bb.jpg";
+    crate::cover_plus::semer(
+        Some("France"),
+        nom_a,
+        "Air",
+        "Sexy Boy",
+        Some(trouvaille(pochette_a)),
+    );
+
+    // A joue, en Cover+.
+    let np_a = jouer_puis_sonder(&b, zone_id, nom_a, &url_a).await;
+    assert!(np_a.cover_plus, "A s'affiche en Cover+");
+
+    // Le flux de A change de titre ; le tour suivant lit la zone (A)…
+    let mut ancien = b.playback.get_state(zone_id).await;
+    if let Some(np) = ancien.now_playing.as_mut() {
+        // … avec un titre d'avant, pour que le tour ait quelque chose à écrire.
+        np.title = "Titre précédent".into();
+    }
+
+    // … puis l'auditeur passe à B avant que ce tour n'écrive.
+    b.playback
+        .play(
+            zone_id,
+            NowPlaying {
+                title: nom_b.into(),
+                album_title: Some(nom_b.into()),
+                source: "radio".into(),
+                source_id: Some(url_b.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+    // Le tour en vol rend ses métadonnées de A.
+    b.poller.refresh_radio_metadata(zone_id, &ancien).await;
+
+    let np = b
+        .playback
+        .get_state(zone_id)
+        .await
+        .now_playing
+        .expect("la zone joue");
+    assert_eq!(
+        np.source_id.as_deref(),
+        Some(url_b.as_str()),
+        "la zone doit rester sur la station B, pas revenir à A"
+    );
+    assert_ne!(np.title, "Sexy Boy", "le titre de A ne doit pas s'afficher");
+    assert_ne!(
+        np.cover_path.as_deref(),
+        Some(pochette_a),
+        "la pochette Cover+ de A ne doit pas rester"
+    );
+    assert!(!np.cover_plus);
+
+    // Le tour suivant, lui, lit B et l'affiche.
+    let etat = b.playback.get_state(zone_id).await;
+    b.poller.refresh_radio_metadata(zone_id, &etat).await;
+    let np = b.playback.get_state(zone_id).await.now_playing.unwrap();
+    assert_eq!(np.title, "Da Funk");
+    assert_eq!(np.album_title.as_deref(), Some(nom_b));
+}

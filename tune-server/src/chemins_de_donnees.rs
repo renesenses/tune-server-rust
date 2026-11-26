@@ -242,6 +242,176 @@ pub fn recueillir(depuis: &Path, vers: &Path) -> std::io::Result<u64> {
     Ok(n)
 }
 
+/// D'où vient le cache de pochettes retenu au démarrage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrigineDuCache {
+    /// Le défaut historique ABSOLU de la plateforme (macOS, Windows) :
+    /// inchangé.
+    DefautDeLaPlateforme,
+    /// Le cache imposé par la configuration d'un appareil Tune OS (#5513).
+    ImposeParLaConfiguration,
+    /// L'ancien `artwork_cache` RELATIF au répertoire courant, gardé parce
+    /// qu'il a des images ou que l'installation existait déjà.
+    AncienRelatifAuDossierCourant,
+    /// `<dossier de données>/artwork_cache` : installation neuve, ou ancien
+    /// emplacement qui coïncide avec lui.
+    SousLesDonnees,
+}
+
+impl OrigineDuCache {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::DefautDeLaPlateforme => "platform_default",
+            Self::ImposeParLaConfiguration => "appliance_configuration",
+            Self::AncienRelatifAuDossierCourant => "legacy_working_directory",
+            Self::SousLesDonnees => "data_dir",
+        }
+    }
+}
+
+/// « Neuves seulement » (décision de Bertrand, rc14) — le cache par défaut
+/// quand la plateforme n'en donne qu'un chemin RELATIF (Linux, et macOS ou
+/// Windows privés de `HOME` / `LOCALAPPDATA`).
+///
+/// Avant, ce relatif se résolvait contre le répertoire courant du processus,
+/// sans lien avec `TUNE_DATA_DIR` ni la base : relancé d'ailleurs, le serveur
+/// ne trouvait plus aucune pochette. `albums.cover_path` porte un CONDENSAT
+/// (#1444), pas un chemin : l'image n'est retrouvée QUE si le fichier est
+/// dans le cache servi. On ne déplace donc rien de ce qui existe :
+///
+/// 1. un défaut déjà absolu (macOS, Windows) : inchangé ;
+/// 2. l'ancien emplacement (`cwd/artwork_cache`) est celui du dossier de
+///    données (le .deb : `WorkingDirectory=/var/lib/tune`, base relative) :
+///    c'est le même dossier, rendu absolu ;
+/// 3. l'ancien emplacement a des images : il est gardé tel quel ;
+/// 4. le cache sous les données EXISTE, même vide : le choix « neuf » a
+///    déjà été fait (il crée le dossier, voir [`preparer_le_cache_retenu`]).
+///    Installation neuve redémarrée avant sa première pochette, ou relancée
+///    depuis un autre dossier : il est suivi ;
+/// 5. l'installation existait (base présente, ou PostgreSQL) : l'ancien
+///    emplacement est gardé, comme avant — ses pochettes sont peut-être dans
+///    le dossier d'où elle se lance d'habitude, et y revenir doit les rendre ;
+/// 6. sinon, installation neuve : `<données>/artwork_cache`.
+pub fn cache_de_pochettes_sans_variable(
+    par_defaut: &Path,
+    cwd: &Path,
+    donnees: &Path,
+    installation_existante: bool,
+    etat: impl Fn(&Path) -> EtatDuDossier,
+) -> (PathBuf, OrigineDuCache) {
+    if par_defaut.is_absolute() {
+        return (
+            par_defaut.to_path_buf(),
+            OrigineDuCache::DefautDeLaPlateforme,
+        );
+    }
+    let ancien = cwd.join(par_defaut);
+    let neuf = donnees.join("artwork_cache");
+    if ancien == neuf {
+        return (neuf, OrigineDuCache::SousLesDonnees);
+    }
+    if etat(&ancien) == EtatDuDossier::Garni {
+        return (ancien, OrigineDuCache::AncienRelatifAuDossierCourant);
+    }
+    if etat(&neuf) != EtatDuDossier::Absent {
+        return (neuf, OrigineDuCache::SousLesDonnees);
+    }
+    if installation_existante {
+        return (ancien, OrigineDuCache::AncienRelatifAuDossierCourant);
+    }
+    (neuf, OrigineDuCache::SousLesDonnees)
+}
+
+/// L'installation existait-elle avant ce démarrage ? Base SQLite présente
+/// sur le disque, ou base PostgreSQL (dont on ne peut rien affirmer : on la
+/// tient pour existante). Lu AVANT l'ouverture de la base, qui la créerait.
+pub fn installation_existante(db_path: &str, postgres: bool, cwd: &Path) -> bool {
+    if postgres {
+        return true;
+    }
+    if db_path.is_empty() || db_path == ":memory:" {
+        return false;
+    }
+    let base = Path::new(db_path);
+    if base.is_absolute() {
+        base.exists()
+    } else {
+        cwd.join(base).exists()
+    }
+}
+
+/// Un défaut du cache de pochettes que l'utilisateur doit VOIR : l'écran
+/// « État du serveur » (sonde `/system/health/monitor`), `/system/diagnostics`
+/// et le rapport de bogue le portent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvertissementDuCache {
+    /// `artwork_cache_unwritable` ou `artwork_cache_relative_to_working_dir`.
+    pub code: &'static str,
+    pub message: String,
+}
+
+pub const CACHE_INSCRIPTIBLE_IMPOSSIBLE: &str = "artwork_cache_unwritable";
+pub const CACHE_RELATIF_AU_DOSSIER_COURANT: &str = "artwork_cache_relative_to_working_dir";
+
+/// L'avertissement à montrer pour le cache retenu, s'il y en a un :
+/// l'impossibilité d'écrire d'abord (aucune pochette ne sera extraite), puis
+/// le cache qui dépend du dossier de lancement. Pas pour un appareil Tune OS,
+/// dont l'unité fixe `WorkingDirectory=/opt/tune` (#5596 : ses images y sont).
+pub fn avertissement_du_cache(
+    dossier: &Path,
+    origine: OrigineDuCache,
+    appareil: bool,
+    ecriture: Result<(), String>,
+) -> Option<AvertissementDuCache> {
+    if let Err(erreur) = ecriture {
+        return Some(AvertissementDuCache {
+            code: CACHE_INSCRIPTIBLE_IMPOSSIBLE,
+            message: format!(
+                "Le cache des pochettes ({}) ne peut pas être créé ou écrit : {erreur}. \
+                 Aucune pochette ne sera extraite. Donnez à Tune le droit d'écrire dans ce \
+                 dossier, ou posez TUNE_ARTWORK_DIR vers un dossier inscriptible.",
+                dossier.display()
+            ),
+        });
+    }
+    if origine == OrigineDuCache::AncienRelatifAuDossierCourant && !appareil {
+        return Some(AvertissementDuCache {
+            code: CACHE_RELATIF_AU_DOSSIER_COURANT,
+            message: format!(
+                "Le cache des pochettes ({}) dépend du dossier d'où Tune est lancé : lancé \
+                 depuis un autre dossier, les pochettes ne s'affichent plus. Posez \
+                 TUNE_ARTWORK_DIR={} pour le fixer.",
+                dossier.display(),
+                dossier.display()
+            ),
+        });
+    }
+    None
+}
+
+/// Le cache peut-il recevoir des images ? Sans rien créer de durable : s'il
+/// existe, un fichier sonde y est écrit puis retiré ; sinon, le plus proche
+/// parent existant doit être un dossier où l'on peut écrire (sonde aussi).
+/// Ne crée PAS le dossier : un volume externe absent ne doit pas se
+/// retrouver avec un dossier fantôme sur le disque système.
+pub fn sonder_le_cache(dossier: &Path) -> Result<(), String> {
+    let mut cible = dossier;
+    while !cible.exists() {
+        match cible.parent() {
+            Some(p) if !p.as_os_str().is_empty() => cible = p,
+            _ => return Err("aucun dossier parent".into()),
+        }
+    }
+    if !cible.is_dir() {
+        return Err(format!("{} n'est pas un dossier", cible.display()));
+    }
+    tempfile::Builder::new()
+        .prefix(".sonde-pochettes-")
+        .tempfile_in(cible)
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
 /// La règle complète du cache de pochettes (hors isolement des tests) :
 /// `TUNE_ARTWORK_DIR` d'abord, comme avant ; puis le cache imposé par la
 /// configuration d'un appareil déplacé ; sinon le défaut historique.
@@ -269,7 +439,10 @@ pub fn rapport_de_scan(base_retenue: Option<&str>, variable: Option<&str>) -> St
 }
 
 struct Retenus {
-    cache_impose: Option<PathBuf>,
+    /// Le cache retenu au démarrage, hors `TUNE_ARTWORK_DIR`.
+    cache: PathBuf,
+    origine: OrigineDuCache,
+    appareil: bool,
     base: String,
 }
 
@@ -323,16 +496,103 @@ pub fn retenir(config: &TuneConfig) {
             });
         }
     }
+    let (cache, origine) = match choix.and_then(|c| c.impose) {
+        Some(impose) => (impose, OrigineDuCache::ImposeParLaConfiguration),
+        None => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let donnees = crate::gel_executeur::dossier_de_donnees(
+                std::env::var("TUNE_DATA_DIR").ok().as_deref(),
+                &config.db_path,
+                &cwd,
+            );
+            cache_de_pochettes_sans_variable(
+                &cache_de_pochettes_par_defaut(
+                    Plateforme::courante(),
+                    std::env::var_os("HOME").as_deref(),
+                    std::env::var("LOCALAPPDATA").ok().as_deref(),
+                ),
+                &cwd,
+                &donnees,
+                installation_existante(&config.db_path, config.database_url.is_some(), &cwd),
+                etat_du_dossier,
+            )
+        }
+    };
+    tracing::info!(
+        dossier = %cache.display(),
+        origine = origine.id(),
+        variable = std::env::var_os("TUNE_ARTWORK_DIR").is_some(),
+        "artwork_cache_retenu"
+    );
     let retenus = Retenus {
-        cache_impose: choix.and_then(|c| c.impose),
+        cache,
+        origine,
+        appareil,
         base: config.db_path.clone(),
     };
     let _ = RETENUS.set(retenus);
 }
 
-/// Le cache imposé retenu au démarrage (`None` avant, ou hors appareil).
-pub(crate) fn cache_impose_retenu() -> Option<&'static Path> {
-    RETENUS.get().and_then(|r| r.cache_impose.as_deref())
+/// Après l'attente du disque de données (`wait_for_data_volume`) : crée le
+/// cache « sous les données » retenu (le choix est alors durable, même
+/// avant la première pochette), puis sonde l'écriture du cache servi et
+/// établit l'avertissement. Sonder plus tôt, sur un Tune OS dont le disque
+/// externe se monte en retard, testerait un point de montage vide.
+pub fn preparer_le_cache_retenu() {
+    let _ = AVERTISSEMENT.get_or_init(etablir_l_avertissement);
+}
+
+/// Crée `dossier` quand c'est un choix « sous les données » ; ne touche à
+/// rien d'autre.
+pub fn creer_le_cache_choisi(dossier: &Path, origine: OrigineDuCache) -> std::io::Result<()> {
+    if origine == OrigineDuCache::SousLesDonnees {
+        std::fs::create_dir_all(dossier)?;
+    }
+    Ok(())
+}
+
+fn etablir_l_avertissement() -> Option<AvertissementDuCache> {
+    let r = RETENUS.get()?;
+    let variable = std::env::var_os("TUNE_ARTWORK_DIR");
+    // `TUNE_ARTWORK_DIR` tranche (Docker) : c'est lui qu'on sonde alors,
+    // et posée par l'exploitant elle n'est jamais « relative au dossier
+    // courant » au sens de l'avertissement.
+    let (servi, origine) = match &variable {
+        Some(v) => (PathBuf::from(v), OrigineDuCache::DefautDeLaPlateforme),
+        None => {
+            if let Err(e) = creer_le_cache_choisi(&r.cache, r.origine) {
+                tracing::warn!(dossier = %r.cache.display(), error = %e, "artwork_cache_creation_echouee");
+            }
+            (r.cache.clone(), r.origine)
+        }
+    };
+    let avertissement =
+        avertissement_du_cache(&servi, origine, r.appareil, sonder_le_cache(&servi));
+    if let Some(a) = &avertissement {
+        tracing::warn!(dossier = %servi.display(), code = a.code, "{}", a.message);
+    }
+    avertissement
+}
+
+static AVERTISSEMENT: OnceLock<Option<AvertissementDuCache>> = OnceLock::new();
+
+/// Le cache retenu au démarrage, hors `TUNE_ARTWORK_DIR` (`None` avant
+/// `retenir`, et dans l'hôte mobile qui ne l'appelle pas).
+pub(crate) fn cache_retenu() -> Option<&'static Path> {
+    RETENUS.get().map(|r| r.cache.as_path())
+}
+
+/// D'où vient le cache retenu (`None` avant `retenir`).
+pub fn origine_du_cache_retenu() -> Option<OrigineDuCache> {
+    RETENUS.get().map(|r| r.origine)
+}
+
+/// L'avertissement du cache de pochettes, s'il y en a un. Établi par
+/// [`preparer_le_cache_retenu`] ; à défaut (aucun démarrage), au premier
+/// appel.
+pub fn avertissement_du_cache_retenu() -> Option<&'static AvertissementDuCache> {
+    RETENUS.get()?;
+    AVERTISSEMENT.get_or_init(etablir_l_avertissement).as_ref()
 }
 
 /// La base retenue au démarrage (`None` avant `retenir`).
@@ -656,6 +916,360 @@ mod tests {
         // La source est intacte, et un second passage ne fait rien.
         assert!(configure.join("bb.jpg").exists());
         assert_eq!(recueillir(&configure, &historique).unwrap(), 0);
+    }
+
+    // ── rc14 : « neuves seulement » ─────────────────────────────────────
+
+    /// La règle « neuves seulement » sur une sonde simulée : `garnis` dit
+    /// quels dossiers ont des images.
+    fn neuves(
+        cwd: &str,
+        donnees: &str,
+        existante: bool,
+        garnis: &[&str],
+    ) -> (PathBuf, OrigineDuCache) {
+        let garnis: Vec<PathBuf> = garnis.iter().map(PathBuf::from).collect();
+        cache_de_pochettes_sans_variable(
+            Path::new("artwork_cache"),
+            Path::new(cwd),
+            Path::new(donnees),
+            existante,
+            |p| {
+                if garnis.iter().any(|g| g == p) {
+                    EtatDuDossier::Garni
+                } else {
+                    EtatDuDossier::Absent
+                }
+            },
+        )
+    }
+
+    /// Installation neuve, sans variable : le cache va sous le dossier de
+    /// données, plus sous le répertoire courant.
+    #[test]
+    fn installation_neuve_sans_variable_cache_sous_les_donnees() {
+        assert_eq!(
+            neuves("/home/a", "/srv/tune", false, &[]),
+            (
+                PathBuf::from("/srv/tune/artwork_cache"),
+                OrigineDuCache::SousLesDonnees
+            )
+        );
+    }
+
+    /// Installation neuve relancée depuis un autre dossier : base présente,
+    /// rien dans le nouveau répertoire courant, les images déjà sous les
+    /// données — c'est là qu'on les sert (le défaut (a) de l'analyse).
+    #[test]
+    fn installation_neuve_relancee_d_ailleurs_retrouve_ses_pochettes() {
+        assert_eq!(
+            neuves(
+                "/tmp/ailleurs",
+                "/srv/tune",
+                true,
+                &["/srv/tune/artwork_cache"]
+            ),
+            (
+                PathBuf::from("/srv/tune/artwork_cache"),
+                OrigineDuCache::SousLesDonnees
+            )
+        );
+    }
+
+    /// Un ancien cache garni est gardé tel quel, installation existante ou
+    /// non, même si le dossier de données a aussi des images.
+    #[test]
+    fn ancien_cache_present_garde() {
+        for existante in [false, true] {
+            for garnis in [
+                &["/home/a/artwork_cache"][..],
+                &["/home/a/artwork_cache", "/srv/tune/artwork_cache"][..],
+            ] {
+                assert_eq!(
+                    neuves("/home/a", "/srv/tune", existante, garnis),
+                    (
+                        PathBuf::from("/home/a/artwork_cache"),
+                        OrigineDuCache::AncienRelatifAuDossierCourant
+                    ),
+                    "existante {existante}, garnis {garnis:?}"
+                );
+            }
+        }
+    }
+
+    /// Installation existante dont le cache relatif est vide (lancée depuis
+    /// un autre dossier que d'habitude) : l'ancien emplacement est gardé,
+    /// comme avant. Le serveur n'est pas « fixé » sous les données, et
+    /// revenir au dossier habituel rend les images.
+    #[test]
+    fn installation_existante_cache_relatif_vide_garde_l_ancien_emplacement() {
+        assert_eq!(
+            neuves("/tmp/ailleurs", "/srv/tune", true, &[]),
+            (
+                PathBuf::from("/tmp/ailleurs/artwork_cache"),
+                OrigineDuCache::AncienRelatifAuDossierCourant
+            )
+        );
+    }
+
+    /// .deb (`WorkingDirectory=/var/lib/tune`, base relative) et archive
+    /// lancée là où est sa base : l'ancien emplacement EST celui des données.
+    /// Même dossier qu'avant, rendu absolu, sans avertissement.
+    #[test]
+    fn deb_meme_dossier_qu_avant() {
+        for existante in [false, true] {
+            let (dossier, origine) = neuves("/var/lib/tune", "/var/lib/tune", existante, &[]);
+            assert_eq!(dossier, PathBuf::from("/var/lib/tune/artwork_cache"));
+            assert_eq!(origine, OrigineDuCache::SousLesDonnees);
+            assert_eq!(
+                avertissement_du_cache(&dossier, origine, false, Ok(())),
+                None
+            );
+        }
+        // `./tune.db` : même dossier, au `.` près.
+        assert_eq!(
+            neuves("/var/lib/tune", "/var/lib/tune/.", false, &[]).1,
+            OrigineDuCache::SousLesDonnees
+        );
+    }
+
+    /// macOS et Windows : leur défaut est déjà absolu, rien ne change.
+    #[test]
+    fn defaut_absolu_de_la_plateforme_inchange() {
+        for par_defaut in [
+            "/Users/a/Library/Application Support/Tune/artwork_cache",
+            "C:\\Users\\a\\AppData\\Local\\TuneServer\\artwork_cache",
+        ] {
+            let par_defaut = PathBuf::from(par_defaut);
+            if !par_defaut.is_absolute() {
+                continue; // un chemin Windows n'est pas absolu sous Unix
+            }
+            let (dossier, origine) = cache_de_pochettes_sans_variable(
+                &par_defaut,
+                Path::new("/"),
+                Path::new("/ailleurs"),
+                false,
+                |_| EtatDuDossier::Absent,
+            );
+            assert_eq!(
+                (dossier, origine),
+                (par_defaut.clone(), OrigineDuCache::DefautDeLaPlateforme)
+            );
+        }
+    }
+
+    /// `TUNE_ARTWORK_DIR` posée : respectée, devant le cache retenu.
+    #[test]
+    fn variable_tune_artwork_dir_respectee() {
+        let retenu = PathBuf::from("/srv/tune/artwork_cache");
+        assert_eq!(
+            cache_de_pochettes(Some("/data/artwork_cache"), Some(&retenu), || {
+                panic!("pas de défaut quand la variable est posée")
+            }),
+            PathBuf::from("/data/artwork_cache")
+        );
+        assert_eq!(
+            cache_de_pochettes(None, Some(&retenu), || panic!("le retenu suffit")),
+            retenu
+        );
+    }
+
+    /// Dossier impossible à créer : la sonde échoue et l'avertissement le
+    /// dit, quelle que soit l'origine (un appareil Tune OS compris).
+    #[test]
+    fn dossier_impossible_a_creer_avertit() {
+        let racine = tempfile::tempdir().unwrap();
+        let fichier = racine.path().join("pas-un-dossier");
+        std::fs::write(&fichier, b"x").unwrap();
+        let cache = fichier.join("artwork_cache");
+        let sonde = sonder_le_cache(&cache);
+        assert!(sonde.is_err(), "{sonde:?}");
+        // Rien n'a été créé.
+        assert!(!cache.exists());
+        for (origine, appareil) in [
+            (OrigineDuCache::SousLesDonnees, false),
+            (OrigineDuCache::AncienRelatifAuDossierCourant, true),
+        ] {
+            let a = avertissement_du_cache(&cache, origine, appareil, sonde.clone()).unwrap();
+            assert_eq!(a.code, CACHE_INSCRIPTIBLE_IMPOSSIBLE);
+            assert!(a.message.contains("TUNE_ARTWORK_DIR"), "{}", a.message);
+        }
+        // Un dossier inscriptible, absent ou présent : la sonde passe sans
+        // laisser de trace.
+        let absent = racine.path().join("donnees/artwork_cache");
+        assert_eq!(sonder_le_cache(&absent), Ok(()));
+        assert!(!absent.exists());
+        assert_eq!(sonder_le_cache(racine.path()), Ok(()));
+        assert_eq!(std::fs::read_dir(racine.path()).unwrap().count(), 1);
+    }
+
+    /// Le cache qui dépend du dossier de lancement avertit — sauf sur un
+    /// appareil Tune OS, dont l'unité fixe le répertoire courant (#5596).
+    #[test]
+    fn cache_relatif_au_dossier_courant_avertit_hors_appareil() {
+        let d = Path::new("/home/a/artwork_cache");
+        let a = avertissement_du_cache(
+            d,
+            OrigineDuCache::AncienRelatifAuDossierCourant,
+            false,
+            Ok(()),
+        )
+        .unwrap();
+        assert_eq!(a.code, CACHE_RELATIF_AU_DOSSIER_COURANT);
+        assert!(a.message.contains("TUNE_ARTWORK_DIR=/home/a/artwork_cache"));
+        assert_eq!(
+            avertissement_du_cache(
+                d,
+                OrigineDuCache::AncienRelatifAuDossierCourant,
+                true,
+                Ok(())
+            ),
+            None
+        );
+        for origine in [
+            OrigineDuCache::SousLesDonnees,
+            OrigineDuCache::DefautDeLaPlateforme,
+            OrigineDuCache::ImposeParLaConfiguration,
+        ] {
+            assert_eq!(avertissement_du_cache(d, origine, false, Ok(())), None);
+        }
+    }
+
+    /// Témoin sur le disque : une installation existante (base SQLite
+    /// présente, `TUNE_DB_PATH` absolu) dont les pochettes sont dans
+    /// `<dossier habituel>/artwork_cache`. Le serveur les sert depuis là ;
+    /// lancé une fois d'ailleurs, il ne se fixe pas sous les données ; de
+    /// retour au dossier habituel, chaque condensat de la base est retrouvé.
+    #[test]
+    fn temoin_une_installation_existante_retrouve_ses_pochettes() {
+        let racine = tempfile::tempdir().unwrap();
+        let (habituel, ailleurs, donnees) = (
+            racine.path().join("habituel"),
+            racine.path().join("ailleurs"),
+            racine.path().join("donnees"),
+        );
+        for d in [&habituel, &ailleurs, &donnees] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let base = donnees.join("tune.db");
+        std::fs::write(&base, b"SQLite format 3\0").unwrap();
+        // Ce que la base référence : des condensats (#1444), pas des chemins.
+        let condensats = [
+            "0123456789abcdef0123456789abcdef",
+            "fedcba9876543210fedcba9876543210",
+        ];
+        std::fs::create_dir_all(habituel.join("artwork_cache")).unwrap();
+        for c in condensats {
+            std::fs::write(habituel.join(format!("artwork_cache/{c}.jpg")), b"jpg").unwrap();
+        }
+        let base = base.to_str().unwrap();
+        let retenu = |cwd: &Path| {
+            let donnees = crate::gel_executeur::dossier_de_donnees(None, base, cwd);
+            cache_de_pochettes_sans_variable(
+                Path::new("artwork_cache"),
+                cwd,
+                &donnees,
+                installation_existante(base, false, cwd),
+                etat_du_dossier,
+            )
+        };
+        let trouvees = |dossier: &Path| {
+            condensats
+                .iter()
+                .filter(|c| dossier.join(format!("{c}.jpg")).is_file())
+                .count()
+        };
+
+        let (dossier, origine) = retenu(&habituel);
+        assert_eq!(dossier, habituel.join("artwork_cache"));
+        assert_eq!(origine, OrigineDuCache::AncienRelatifAuDossierCourant);
+        assert_eq!(trouvees(&dossier), condensats.len());
+
+        let (dossier, _) = retenu(&ailleurs);
+        assert_eq!(dossier, ailleurs.join("artwork_cache"));
+        assert_ne!(dossier, donnees.join("artwork_cache"));
+
+        let (dossier, _) = retenu(&habituel);
+        assert_eq!(trouvees(&dossier), condensats.len());
+
+        // Contre-épreuve : sans base (installation neuve), le même lancement
+        // d'ailleurs part sous les données.
+        std::fs::remove_file(base).unwrap();
+        assert_eq!(retenu(&ailleurs).0, donnees.join("artwork_cache"));
+    }
+
+    /// M1 — installation NEUVE (base hors du dossier courant) arrêtée
+    /// avant sa première pochette : au redémarrage, la base existe et le
+    /// cache sous les données est encore vide. Il reste choisi, puisque le
+    /// premier démarrage l'a créé.
+    #[test]
+    fn installation_neuve_relancee_avant_sa_premiere_pochette_reste_sous_les_donnees() {
+        let racine = tempfile::tempdir().unwrap();
+        let (cwd, donnees) = (
+            racine.path().join("lance-ici"),
+            racine.path().join("donnees"),
+        );
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&donnees).unwrap();
+        let base = donnees.join("tune.db");
+        let base = base.to_str().unwrap();
+        let demarrer = || {
+            let donnees = crate::gel_executeur::dossier_de_donnees(None, base, &cwd);
+            let (dossier, origine) = cache_de_pochettes_sans_variable(
+                Path::new("artwork_cache"),
+                &cwd,
+                &donnees,
+                installation_existante(base, false, &cwd),
+                etat_du_dossier,
+            );
+            creer_le_cache_choisi(&dossier, origine).unwrap();
+            (dossier, origine)
+        };
+        let attendu = (
+            donnees.join("artwork_cache"),
+            OrigineDuCache::SousLesDonnees,
+        );
+        // 1er démarrage : installation neuve ; l'ouverture crée la base.
+        assert_eq!(demarrer(), attendu);
+        std::fs::write(base, b"SQLite format 3\0").unwrap();
+        assert_eq!(etat_du_dossier(&attendu.0), EtatDuDossier::Vide);
+        // Arrêt, puis 2e et 3e démarrages : toujours sous les données.
+        assert_eq!(demarrer(), attendu);
+        assert_eq!(demarrer(), attendu);
+        assert!(!cwd.join("artwork_cache").exists());
+    }
+
+    /// Seul le choix « sous les données » crée son dossier.
+    #[test]
+    fn seul_le_choix_sous_les_donnees_cree_son_dossier() {
+        let racine = tempfile::tempdir().unwrap();
+        for origine in [
+            OrigineDuCache::AncienRelatifAuDossierCourant,
+            OrigineDuCache::DefautDeLaPlateforme,
+            OrigineDuCache::ImposeParLaConfiguration,
+        ] {
+            let d = racine.path().join(origine.id());
+            creer_le_cache_choisi(&d, origine).unwrap();
+            assert!(!d.exists(), "{origine:?}");
+        }
+    }
+
+    /// L'installation existe si sa base est sur le disque ; PostgreSQL est
+    /// tenu pour existant.
+    #[test]
+    fn installation_existante_selon_la_base() {
+        let racine = tempfile::tempdir().unwrap();
+        assert!(!installation_existante("tune.db", false, racine.path()));
+        std::fs::write(racine.path().join("tune.db"), b"").unwrap();
+        assert!(installation_existante("tune.db", false, racine.path()));
+        let absolue = racine.path().join("tune.db");
+        assert!(installation_existante(
+            absolue.to_str().unwrap(),
+            false,
+            Path::new("/")
+        ));
+        assert!(installation_existante("absente.db", true, racine.path()));
+        assert!(!installation_existante(":memory:", false, racine.path()));
     }
 
     /// Le rapport de scan suit la base retenue ; sans elle, l'ancienne
