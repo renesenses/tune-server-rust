@@ -312,7 +312,8 @@ struct EtatRadio {
     // l'ancien.
     eq_de_depart_pose: bool,
     /// Fil 3107 — le sinc à état qui amène la station à la cadence servie,
-    /// gardé d'un paquet à l'autre et à travers les reconnexions compatibles.
+    /// gardé d'un paquet à l'autre pendant UNE connexion, neuf (avec son
+    /// fondu) à chaque connexion.
     reechantillonneur: Option<super::radio_cadence_f3107::ReechantillonneurRadio>,
 }
 
@@ -1086,8 +1087,9 @@ fn preparer_la_sortie(
         return Err(SuiteRadio::Rendre(Err(refus.sentinelle())));
     }
     let needs_resample = output_sample_rate != source_sample_rate;
-    super::radio_cadence_f3107::tenir_le_reechantillonneur(
-        &mut etat.reechantillonneur,
+    // Neuf à chaque connexion : garder l'ancien collerait deux flux dans le
+    // filtre (dépassement de Gibbs, relecture du fil 3107).
+    etat.reechantillonneur = super::radio_cadence_f3107::reechantillonneur_de_connexion(
         source_sample_rate,
         output_sample_rate,
         source_channels,

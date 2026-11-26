@@ -20,8 +20,8 @@
 //!   (192 → 48 kHz, 88,2 → 44,1 kHz) : un rapport entier, le plus simple et le
 //!   plus propre à filtrer.
 //! - [`ReechantillonneurRadio`] : le sinc de rubato, AVEC ÉTAT, gardé d'un
-//!   paquet à l'autre pendant tout le flux (reconnexions compatibles
-//!   comprises). Il remplace `simple_resample` (interpolation linéaire à deux
+//!   paquet à l'autre pendant UNE connexion (passage Ogg chaîné compris : il
+//!   ne rouvre pas la connexion). Il remplace `simple_resample` (interpolation linéaire à deux
 //!   points, sans filtre anti-repliement, remise à zéro à chaque paquet) sur
 //!   TOUT changement de cadence de la radio : descente, fréquence fixe et
 //!   relèvement des HE-AAC à 22,05 kHz.
@@ -33,6 +33,15 @@
 //! 9 % AU-DESSUS de la source (mesuré : 0,5436 pour une source à 0,5). Les
 //! 10 premières millisecondes d'un rééchantillonneur neuf montent donc en
 //! cosinus surélevé (gain ≤ 1 partout) : plus de marche, plus de dépassement.
+//!
+//! ## Une reconnexion : un rééchantillonneur NEUF
+//!
+//! Relecture du correctif : garder le filtre à travers une reconnexion
+//! collait dans sa ligne à retard la fin de l'ancien flux et le début du
+//! nouveau, pris ailleurs dans l'onde — la même marche, et le même
+//! dépassement (+7,7 %, crête 0,538 pour 0,5). Chaque connexion
+//! (`preparer_la_sortie`) part donc d'un rééchantillonneur neuf, avec son
+//! fondu.
 //!
 //! `simple_resample` ne reste qu'en repli, si rubato refuse de construire
 //! son noyau (cadence nulle ou aberrante) : c'est dit au journal
@@ -118,11 +127,6 @@ impl ReechantillonneurRadio {
         }
     }
 
-    /// Convient-il encore à ce format ? Sinon il faut en bâtir un autre.
-    pub(crate) fn convient(&self, de: u32, vers: u32, canaux: u16) -> bool {
-        (self.de, self.vers, self.canaux) == (de, vers, canaux)
-    }
-
     /// Le nom du noyau, pour le journal.
     pub(crate) fn noyau(&self) -> &'static str {
         if self.sinc.is_some() {
@@ -193,23 +197,15 @@ impl ReechantillonneurRadio {
     }
 }
 
-/// Tient le rééchantillonneur de la radio à jour pour une connexion : aucun
-/// quand la cadence ne change pas, le MÊME (état gardé) quand le format est
-/// inchangé, un neuf sinon.
-pub(crate) fn tenir_le_reechantillonneur(
-    place: &mut Option<ReechantillonneurRadio>,
+/// Le rééchantillonneur d'UNE connexion : aucun quand la cadence ne change
+/// pas, sinon un NEUF, avec son fondu d'entrée — jamais celui de la connexion
+/// précédente (voir l'en-tête du module).
+pub(crate) fn reechantillonneur_de_connexion(
     de: u32,
     vers: u32,
     canaux: u16,
-) {
-    if de == vers {
-        *place = None;
-        return;
-    }
-    if place.as_ref().is_some_and(|r| r.convient(de, vers, canaux)) {
-        return;
-    }
-    *place = Some(ReechantillonneurRadio::nouveau(de, vers, canaux));
+) -> Option<ReechantillonneurRadio> {
+    (de != vers).then(|| ReechantillonneurRadio::nouveau(de, vers, canaux))
 }
 
 #[cfg(test)]
