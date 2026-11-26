@@ -1343,10 +1343,14 @@ fn parse_timestamp(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     }
     // Naive `...Z`, the shape we persist in settings ourselves, then the naive
     // shapes without any zone, read as UTC.
-    ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"]
-        .iter()
-        .find_map(|f| chrono::NaiveDateTime::parse_from_str(timestamp, f).ok())
-        .map(|n| n.and_utc())
+    [
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    .iter()
+    .find_map(|f| chrono::NaiveDateTime::parse_from_str(timestamp, f).ok())
+    .map(|n| n.and_utc())
 }
 
 fn is_expired(timestamp: &str, days: i64) -> bool {
@@ -2565,7 +2569,12 @@ mod tests {
 
     #[test]
     fn date_illisible_ne_revoque_pas() {
-        for illisible in ["pas-une-date", "", "01/09/2026", "2026-13-45T99:00:00+02:00"] {
+        for illisible in [
+            "pas-une-date",
+            "",
+            "01/09/2026",
+            "2026-13-45T99:00:00+02:00",
+        ] {
             assert!(!is_timestamp_past(illisible), "{illisible:?}");
             for champ in ["license_expires_at", "expired_at"] {
                 assert_eq!(
