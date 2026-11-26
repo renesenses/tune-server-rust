@@ -14,11 +14,10 @@
 //! nombre. Les fichiers REW `.cal` suivent la même convention. La réponse
 //! corrigée vaut `mesure − écart`.
 //!
-//! Le « Sens Factor » est la déviation de sensibilité par rapport au nominal
-//! de l'UMIK-1 ; REW l'emploie pour afficher des dB SPL absolus. Convention
-//! retenue ici, À CONFIRMER sur un micro réel (question au relecteur) :
-//! `SPL = dBFS + 94 + 18 − sens_factor`, le nominal UMIK-1 étant −18 dBFS
-//! à 94 dB SPL (1 kHz).
+//! Pour le niveau acoustique, « Sens Factor » donne le niveau efficace
+//! numérique à 94 dB SPL et au gain de référence du fichier. La capture
+//! doit avoir un gain connu par rapport à cette référence. Les anciennes
+//! demandes sans ce gain conservent leur estimation de crête historique.
 
 use crate::analysis::interp_log;
 
@@ -130,7 +129,8 @@ impl MicCalibration {
     }
 
     /// Niveau SPL (dB) estimé pour un niveau crête ou efficace `dbfs`, si le
-    /// fichier porte un facteur de sensibilité. Voir la convention en tête de module.
+    /// fichier porte un facteur de sensibilité. Convention historique de la veille
+    /// sans gain renseigné : nominal de −18 dBFS à 94 dB SPL.
     pub fn spl_from_dbfs(&self, dbfs: f64) -> Option<f64> {
         self.sens_factor_db.map(|s| dbfs + 94.0 + 18.0 - s)
     }
@@ -157,6 +157,7 @@ impl MicCalibration {
         if palier.len() < 2
             || fs == 0
             || self.freqs.is_empty()
+            || self.freqs.len() != self.deviation_db.len()
             || self.freqs.iter().any(|f| !f.is_finite() || *f <= 0.0)
             || self.deviation_db.iter().any(|v| !v.is_finite())
         {
@@ -201,13 +202,11 @@ fn reponse_c(f: f64) -> f64 {
 
 fn extract_number_after(lower: &str, key: &str) -> Option<f64> {
     let pos = lower.find(key)? + key.len();
-    let rest = &lower[pos..];
-    let start = rest.find(|c: char| c.is_ascii_digit() || c == '-' || c == '+')?;
-    let num: String = rest[start..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
-        .collect();
-    num.parse().ok()
+    let rest =
+        lower[pos..].trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '=' || c == ':');
+    let champ = rest.split([',', ';', '"']).next()?.trim();
+    let valeur = champ.strip_suffix("db").unwrap_or(champ).trim();
+    valeur.parse::<f64>().ok().filter(|s| s.is_finite())
 }
 
 #[cfg(test)]
@@ -247,6 +246,9 @@ mod tests {
         assert_eq!(cal.niveau_c(&[0.1, -0.1], 48000, None), None);
         assert_eq!(cal.niveau_c(&[0.0; 8], 48000, Some(0.0)), None);
         assert_eq!(cal.reference_spl(Some(1.0)), None);
+        let sans_facteur =
+            MicCalibration::parse("Sens Factor = , SERNO: 7001234\n63 0\n1000 0").unwrap();
+        assert_eq!(sans_facteur.reference_spl(Some(0.0)), None);
     }
 
     const UMIK: &str = "\"Sens Factor =-1.021dB, SERNO: 7001234\"\n10.058\t-5.2\n20.0\t-1.0\n1000\t0.0\n10000\t1.5\n20000\t3.0\n";
