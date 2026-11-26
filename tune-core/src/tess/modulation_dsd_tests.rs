@@ -493,6 +493,7 @@ fn en_service() -> ModulationEnService {
         channels: 2,
         plugins_in_stream: false,
         headroom_db: -3.0,
+        modulator_margin_db: MARGE_DU_MODULATEUR_DB,
         continued: false,
     }
 }
@@ -892,11 +893,17 @@ fn la_longueur_dop_annoncee_est_alignee_sur_une_paire_de_trames() {
 }
 
 /// La marge du modulateur ne dépend PAS du headroom automatique de la chaîne
-/// PCM (qui peut valoir 0 dB) : −3 dB au moins, un manuel plus fort gardé.
+/// PCM (qui peut valoir 0 dB) : elle s'ajoute, une fois, au headroom de la
+/// chaîne ; le modulateur n'applique le manuel que si le flux ne l'a pas
+/// déjà fait (revue rc14, #9518 × #9520).
 #[test]
 fn la_marge_du_modulateur_est_la_sienne() {
     assert_eq!(headroom_avant_le_modulateur(0.0), -3.0);
-    assert_eq!(headroom_avant_le_modulateur(-1.0), -3.0);
-    assert_eq!(headroom_avant_le_modulateur(-6.0), -6.0);
+    assert_eq!(headroom_avant_le_modulateur(-1.0), -4.0);
+    assert_eq!(headroom_avant_le_modulateur(-12.0), -15.0);
+    assert_eq!(headroom_avant_le_modulateur(2.0), -3.0);
     assert_eq!(headroom_avant_le_modulateur(f64::NAN), -3.0);
+    assert_eq!(gain_fixe_du_modulateur_db(-12.0, true), -3.0);
+    assert_eq!(gain_fixe_du_modulateur_db(-12.0, false), -15.0);
+    assert_eq!(gain_fixe_du_modulateur_db(0.0, false), -3.0);
 }

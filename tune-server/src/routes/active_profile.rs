@@ -19,7 +19,7 @@ use crate::state::AppState;
 ///    model that `/profiles/switch`, the orchestrator (history tagging) and the
 ///    per-profile metadata fields already use. Keeping this as the fallback
 ///    means every current client keeps working unchanged.
-/// 3. `1` — the built-in "Default" profile.
+/// 3. `1` — the built-in administrator profile (`admin`, `default` before rc14).
 ///
 /// # Convention: header = action identity, query param = view scope
 ///

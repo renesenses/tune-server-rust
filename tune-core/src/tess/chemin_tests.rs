@@ -779,7 +779,8 @@ fn rc14_modulateur_en_service_ou_repli_dit() {
         source_channels: 2,
         channels: 2,
         plugins_in_stream: false,
-        headroom_db: 0.0,
+        headroom_db: -3.0,
+        modulator_margin_db: -3.0,
         continued: false,
     }));
     let c = chemin(&chaine, &ctx(TransportZone::Local, false, 0.0), &s, None);
@@ -792,6 +793,8 @@ fn rc14_modulateur_en_service_ou_repli_dit() {
     assert_eq!(p["rate"], "dsd128");
     assert_eq!(p["zero_dbfs_modulation"], 0.5);
     assert_eq!(p["reference_level"], "0 dB SACD");
+    // Décision de Bertrand du 26/11 : la marge du modulateur, à part.
+    assert_eq!(p["modulator_margin_db"], -3.0);
     assert!(etape(&c, CodeEtape::Upsampling).etape.effective);
     assert!(
         c.steps

@@ -675,7 +675,8 @@ jobs:
             os: windows-latest
             artifact: tune-server-windows-x86_64
 
-    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
+    # cross exige Docker, absent de Hulk (26/11) : les entrées cross restent sur GitHub.
+    runs-on: ${{ (matrix.cross && matrix.os) || (startsWith(matrix.os, 'ubuntu-') && fromJSON(vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
     timeout-minutes: 60  # build — 18 min au pire observe
     steps:
       - uses: actions/checkout@v4
@@ -1164,7 +1165,8 @@ jobs:
           - {target: x86_64-apple-darwin, os: macos-15-intel, cross: false}
           - {target: aarch64-apple-darwin, os: macos-latest, cross: false}
           - {target: x86_64-pc-windows-msvc, os: windows-latest, cross: false}
-    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
+    # cross exige Docker, absent de Hulk (26/11) : les entrées cross restent sur GitHub.
+    runs-on: ${{ (matrix.cross && matrix.os) || (startsWith(matrix.os, 'ubuntu-') && fromJSON(vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

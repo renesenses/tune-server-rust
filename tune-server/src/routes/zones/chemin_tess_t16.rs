@@ -123,7 +123,11 @@ pub(crate) fn avec_la_modulation_dsd(
             hors_service: vec![tune_core::tess::migration::ID_REAFFECTATION.to_owned()],
         };
         en_service.upsampling = true;
-        en_service.headroom_db = (m.headroom_db != 0.0).then_some(m.headroom_db);
+        // Décision de Bertrand du 26/11 : l'étage headroom affiche la marge
+        // de l'utilisateur telle quelle ; celle du modulateur (−3 dB) est
+        // publiée à part, à l'étape `dsd_modulator` (`modulator_margin_db`).
+        let de_la_chaine = m.headroom_de_la_chaine_db();
+        en_service.headroom_db = (de_la_chaine != 0.0).then_some(de_la_chaine);
         en_service.volume_logiciel = volume.control == ControleVolume::Software && volume.db < 0.0;
     }
     en_service.modulation_dsd = etat;

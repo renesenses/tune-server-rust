@@ -153,6 +153,12 @@ impl ReponseTessZone {
                             "zero_dbfs_modulation".into(),
                             json!(super::modulation_dsd::MODULATION_A_0_DBFS),
                         );
+                        // Décision de Bertrand du 26/11 : la marge propre du
+                        // modulateur, publiée à part du headroom de la chaîne.
+                        p.insert(
+                            "modulator_margin_db".into(),
+                            json!(super::modulation_dsd::MARGE_DU_MODULATEUR_DB),
+                        );
                         e.params = Some(Value::Object(p));
                     }
                 } else {

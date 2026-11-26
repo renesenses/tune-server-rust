@@ -271,6 +271,10 @@ pub fn params_du_modulateur(m: &ModulationEnService) -> Map<String, Value> {
     p.insert("source_channels".into(), json!(m.source_channels));
     p.insert("channels".into(), json!(m.channels));
     p.insert("continued".into(), json!(m.continued));
+    // Décision de Bertrand du 26/11 : la marge propre du modulateur, sur une
+    // ligne à part (« Marge du modulateur DSD : −3 dB »), jamais fondue dans
+    // le headroom de l'utilisateur.
+    p.insert("modulator_margin_db".into(), json!(m.modulator_margin_db));
     // Niveau de référence de T11b : 0 dBFS PCM = 50 % de modulation.
     p.insert(
         "zero_dbfs_modulation".into(),
