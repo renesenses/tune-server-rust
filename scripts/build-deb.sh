@@ -147,6 +147,7 @@ done
 ln -s /opt/tune/tune-server "${STAGE}/usr/bin/tune-server"
 
 install -m 0644 "${DEB_SRC}/tune-server.service" "${STAGE}/lib/systemd/system/tune-server.service"
+install -D -m 0755 "${DEB_SRC}/tune-lxc-generator" "${STAGE}/lib/systemd/system-generators/tune-lxc-generator"
 install -m 0644 "${DEB_SRC}/default"             "${STAGE}/etc/default/tune-server"
 install -m 0644 "${DEB_SRC}/copyright"           "${STAGE}/usr/share/doc/tune-server/copyright"
 install -m 0644 "${DEB_SRC}/README.Debian"       "${STAGE}/usr/share/doc/tune-server/README.Debian"

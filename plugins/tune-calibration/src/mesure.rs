@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tune_calibration::analysis::BandRt60;
 use tune_calibration::deconv;
 use tune_calibration::fft;
-use tune_calibration::level::{LevelDecision, LevelPolicy, ProbeResult, peak_dbfs};
+use tune_calibration::level::{LevelDecision, LevelPolicy, ProbeResult};
 use tune_calibration::mic_cal::MicCalibration;
 use tune_calibration::{MeasurementSpec, analyse_capture};
 use tune_entree_audio::peripheriques::Peripheriques;
@@ -45,8 +45,9 @@ use crate::fournisseur::FournisseurBalayage;
 use crate::generateur::{Consigne, Deroule, Emission, Plan, Voies};
 use crate::hote::{ElementBalayage, HoteZone, TraitementsDeZone};
 
-/// Cadence imposée pendant la mesure (note §5 risque 2) : le balayage est
-/// servi à 48 kHz, la sortie suit ; la capture doit être à la même cadence.
+/// Cadence de la mesure (note §5 risque 2) : le balayage est servi à 48 kHz,
+/// la sortie suit ; l'analyse tourne à 48 kHz. rc14 : la capture se fait à
+/// la fréquence native du micro et y est ramenée (`cadence.rs`).
 pub const FREQUENCE_MESURE: u32 = 48_000;
 
 /// #8491 — en dessous, la réponse impulsionnelle est noyée dans le bruit :
@@ -136,6 +137,11 @@ pub struct Demande {
     pub voies: Voies,
     /// Politique de niveau ; les plafonds ne peuvent être que resserrés.
     pub politique: LevelPolicy,
+    /// Mesure de VÉRIFICATION (« Mesurer avec la correction ») : la zone
+    /// joue AVEC ses traitements (égaliseur, FIR…), pour entendre l'effet de
+    /// la correction appliquée. Faux par défaut : une mesure ordinaire
+    /// entend la pièce nue (#8513).
+    pub avec_correction: bool,
 }
 
 impl Demande {
@@ -149,6 +155,7 @@ impl Demande {
             volume_mesure_pct: 40.0,
             voies: Voies::LesDeux,
             politique: LevelPolicy::default(),
+            avec_correction: false,
         }
     }
 
@@ -519,13 +526,18 @@ impl Controleur {
                     .into(),
             );
         }
-        let (nom_entree, format) = self.peripheriques.format_natif(&demande.entree)?;
-        if format.frequence != FREQUENCE_MESURE {
-            return Err(format!(
-                "l'entrée « {nom_entree} » capte à {} Hz : la mesure exige {FREQUENCE_MESURE} Hz (régler le périphérique)",
-                format.frequence
-            ));
+        // En PURE, aucune correction ne s'entend : une vérification y
+        // mesurerait la pièce nue et dirait à tort « sans effet ».
+        if demande.avec_correction && traitements.pure {
+            return Err(
+                "la zone est en PURE : la correction ne s'y entend pas, la mesure de vérification n'aurait pas de sens (quitter PURE pour vérifier)"
+                    .into(),
+            );
         }
+        let (nom_entree, format) = self.peripheriques.format_natif(&demande.entree)?;
+        // rc14 — la capture se fait à la fréquence native du micro (44,1 à
+        // 192 kHz), ramenée à 48 kHz pour l'analyse (`cadence.rs`).
+        crate::cadence::verifier(&nom_entree, format.frequence)?;
         if demande.voie_micro >= format.canaux as usize {
             return Err(format!(
                 "voie {} demandée, l'entrée n'en a que {}",
@@ -562,18 +574,30 @@ impl Controleur {
                 ri: None,
             }),
         });
-        // #8513 — les traitements ne colorent plus la mesure : ils sont
-        // contournés le temps du balayage (`ZoneTenue`), et le résultat le dit.
-        if traitements.egaliseur {
-            mesure.avertir("égaliseur de la zone contourné pendant la mesure, rétabli ensuite");
-        }
-        if traitements.correction_ir {
-            mesure.avertir(
-                "correction de pièce (IR) de la zone contournée pendant la mesure, rétablie ensuite",
-            );
-        }
-        if traitements.pure {
-            mesure.avertir("mode PURE actif : le volume forcé peut être refusé par le verrou PURE");
+        if demande.avec_correction {
+            // Vérification : la zone joue avec ses traitements, la mesure
+            // les entend — c'est ce qu'on veut voir.
+            if !traitements.egaliseur && !traitements.correction_ir {
+                mesure.avertir(
+                    "mesure de vérification : aucune correction n'est active sur la zone (égaliseur et FIR inactifs)",
+                );
+            }
+        } else {
+            // #8513 — les traitements ne colorent plus la mesure : ils sont
+            // contournés le temps du balayage (`ZoneTenue`), et le résultat le dit.
+            if traitements.egaliseur {
+                mesure.avertir("égaliseur de la zone contourné pendant la mesure, rétabli ensuite");
+            }
+            if traitements.correction_ir {
+                mesure.avertir(
+                    "correction de pièce (IR) de la zone contournée pendant la mesure, rétablie ensuite",
+                );
+            }
+            if traitements.pure {
+                mesure.avertir(
+                    "mode PURE de la zone contourné pendant la mesure (volume de mesure compris), rétabli ensuite",
+                );
+            }
         }
         if let Some(t) = self.hote.type_de_sortie(demande.zone_id)
             && sortie_a_latence_propre(Some(&t))
@@ -643,6 +667,7 @@ impl Controleur {
             d.zone_id,
             volume_initial,
             d.volume_mesure_pct,
+            !d.avec_correction,
         )
         .inspect_err(|_| capture.arreter())?;
         let r = self.jouer_et_mesurer(mesure, &capture, &zone, etalonnage.as_ref(), &traitements);
@@ -677,8 +702,10 @@ impl Controleur {
         // tout le silence que le chemin de lecture aurait pu tirer d'avance.
         {
             let t = tampon.clone();
+            // rc14 — l'écoute est comptée en trames d'analyse (48 kHz), celles du générateur.
+            let cadence = crate::cadence::Cadence::de(tampon.format().frequence);
             deroule.cadencer_sur_l_ecoute(
-                Arc::new(move || t.trames()),
+                cadence.horloge(move || t.trames()),
                 (AVANCE_SUR_L_ECOUTE_S * FREQUENCE_MESURE as f64) as u64,
             );
         }
@@ -722,7 +749,9 @@ impl Controleur {
             let em = self.attendre_emission(mesure, &tampon, &deroule, emissions)?;
             emissions += 1;
             let capte = self.capter_segment(mesure, &tampon, voie, depart, &em)?;
-            let crete = peak_dbfs(&capte);
+            // rc14 (#9538) — la crête se lit sur la capture NATIVE, avant le
+            // rééchantillonnage : c'est elle qui dit l'écrêtage du micro.
+            let crete = fft::to_db(tampon.crete_depuis(voie, depart));
             // Déconvolution de la salve : le RSB sur la RI, comme pour la
             // mesure finale.
             let ri = deconv::deconvolve(
@@ -902,7 +931,11 @@ impl Controleur {
     ) -> Result<Vec<f64>, Sortie> {
         let entree = mesure.demande.entree.as_str();
         let garde = (self.garde_trames() as f64).max(0.0) as u64;
-        let besoin = depart + em.trames + garde;
+        // rc14 — `em` et la garde sont en trames d'analyse (48 kHz) ; `depart`
+        // et le tampon, en trames du micro.
+        let cadence = crate::cadence::Cadence::de(tampon.format().frequence);
+        let a_capter = cadence.vers_capture(em.trames + garde);
+        let besoin = depart + a_capter;
         // Attente par tranches, pour voir passer une annulation.
         let echeance = Instant::now() + self.delai_capture;
         let mut vu = tampon.trames();
@@ -925,7 +958,8 @@ impl Controleur {
                 }
             }
         }
-        Ok(tampon.extraire(voie, depart, (em.trames + garde) as usize))
+        let capte = tampon.extraire(voie, depart, a_capter as usize);
+        Ok(cadence.a_l_analyse(capte, (em.trames + garde) as usize))
     }
 
     fn garde_trames(&self) -> u64 {
@@ -969,7 +1003,8 @@ struct ZoneTenue {
     hote: Arc<dyn HoteZone>,
     zone_id: i64,
     volume_initial: f64,
-    contournement: tune_core::audio::mesure_nue::Contournement,
+    /// `None` : mesure de vérification, la zone garde ses traitements.
+    contournement: Option<tune_core::audio::mesure_nue::Contournement>,
 }
 
 impl ZoneTenue {
@@ -978,10 +1013,15 @@ impl ZoneTenue {
         zone_id: i64,
         volume_initial: f64,
         volume_mesure: f64,
+        contourner: bool,
     ) -> Result<Self, Sortie> {
         // Posée AVANT le volume et le balayage : la lecture lit le
         // contournement à son démarrage. Un refus du volume la rend aussitôt.
-        let contournement = tune_core::audio::mesure_nue::Contournement::poser(zone_id);
+        // Une mesure de vérification ne la pose pas : elle doit entendre la
+        // correction appliquée (retour de Didier, rc13.90 : sans cela,
+        // « avant » et « après » étaient deux mesures de la pièce nue).
+        let contournement =
+            contourner.then(|| tune_core::audio::mesure_nue::Contournement::poser(zone_id));
         hote.regler_volume(zone_id, volume_mesure)
             .map_err(|e| Sortie::Erreur(format!("volume de mesure refusé : {e}")))?;
         Ok(Self {

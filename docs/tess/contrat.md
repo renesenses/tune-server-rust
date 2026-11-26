@@ -379,8 +379,10 @@ ordre et tous leurs réglages.
 ```
 
 - **`apply_mode`** :
-  - `immediately` : pause, puis reprise à la position (#8422) ;
-  - `at_next_playback` : le changement attend la prochaine lecture ;
+  - `immediately` : le changement s'applique pendant la lecture (à chaud en
+    local ; flux réseau relevé en vol, ou relancé à la position, #8422) ;
+  - `at_next_playback` : le changement attend la prochaine lecture — un
+    démarrage OU une reprise après pause (rc14) ;
   - une valeur inconnue est lue comme `unknown` et traitée comme
     `at_next_playback`, pour ne jamais interrompre la lecture sans le vouloir.
 - **Préréglage Pure** (« Pure — no processing ») : fourni par le serveur.
@@ -465,17 +467,25 @@ ordre et tous leurs réglages.
 - **Mode d'application**, suivi par le `PUT` comme par le chargement :
   - `immediately` : la sortie vivante est rafraîchie tout de suite par les
     chemins des anciennes routes. En local : à chaud. Sur une zone réseau qui
-    joue : SEUL l'égaliseur relance le flux à la position (#8422 :
-    anti-rebond, plancher et verrou de relance, donc une seule relance par
-    rafale) ; le crossfeed réseau prend effet à la piste suivante ; mono,
-    réaffectation, suréchantillonnage et convolution n'agissent qu'en local
-    (le prochain flux réseau les porte) ;
+    joue : l'égaliseur est relevé en vol ou relance le flux à la position
+    (#8422 : anti-rebond, plancher et verrou de relance, donc une seule
+    relance par rafale) ; depuis la rc14, tout autre changement qui modifie
+    les octets du flux (convolution, crossfeed, greffon natif) relance aussi
+    le flux qui joue (une radio reprend le direct). Mono, réaffectation et
+    suréchantillonnage n'agissent qu'en local. Une relance demandée sous le
+    plancher est DIFFÉRÉE à sa fin, jamais abandonnée (rc14) : la dernière
+    demande l'emporte ;
   - `at_next_playback` (ou valeur inconnue) : les anciennes clés sont écrites
     (le prochain flux réseau part avec), la sortie vivante n'est pas touchée ;
     ce qui reste à rafraîchir sur une sortie locale l'est au prochain
-    démarrage de lecture de la zone (événement `started`). Sur une sortie
-    réseau, rien n'est relancé au démarrage : le flux vient d'être fabriqué
-    avec les nouvelles clés.
+    démarrage de lecture de la zone (`started`) ou à sa REPRISE après pause
+    (`resumed`, rc14). Sur une sortie réseau, rien n'est relancé au
+    démarrage : le flux vient d'être fabriqué avec les nouvelles clés ; à la
+    reprise, un flux fabriqué avec une autre chaîne est refait à la position
+    (une radio reprend le direct).
+- **Décocher un égaliseur** (rc14) : le préampli que garde un égaliseur coupé
+  (décision du 10/10, #6741) remonte jusqu'au signal sec, par rampe ; la
+  sortie redevient l'entrée au bit près.
 - **Export / import** : `tess_presets` part avec les réglages globaux et se
   réimporte avec la MÊME tolérance que la lecture de la base : toutes les
   entrées, même celles que les règles d'entrée refuseraient aujourd'hui. Sont

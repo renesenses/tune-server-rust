@@ -1272,7 +1272,10 @@ struct ZoneTenuePourLeTest<'a> {
     zone_id: i64,
     volume_initial: f64,
     signal: Option<String>,
-    _contournement: tune_core::audio::mesure_nue::Contournement,
+    /// Rendue dans `drop` AVANT le volume, comme `ZoneTenue::rendre` : tant
+    /// qu'elle vit, le verrou de volume PURE est levé (#9537), et le volume
+    /// d'avant serait rendu sans lui.
+    contournement: Option<tune_core::audio::mesure_nue::Contournement>,
 }
 
 impl Drop for ZoneTenuePourLeTest<'_> {
@@ -1281,6 +1284,10 @@ impl Drop for ZoneTenuePourLeTest<'_> {
             self.zone.arreter_signal(self.zone_id, &id);
             self.controleur.niveaux.fournisseur.desarmer(&id);
         }
+        // Relecture m1 (#9529 avec #9537) — signal arrêté : la garde tombe
+        // d'abord, le verrou PURE revient, PUIS le volume d'avant est rendu
+        // (sous le verrou, « Forcer à 100 % » le tient de nouveau).
+        drop(self.contournement.take());
         if let Err(e) = self
             .controleur
             .hote
@@ -1366,11 +1373,10 @@ impl Controleur {
             None => None,
         };
         let mut avertissements = Vec::new();
-        if format.frequence != FREQUENCE_MESURE {
-            avertissements.push(format!(
-                "l'entrée « {nom} » capte à {} Hz : la mesure exigera {FREQUENCE_MESURE} Hz",
-                format.frequence
-            ));
+        // rc14 (#9538) — la mesure capte à la fréquence native du micro :
+        // seule une fréquence hors de la liste est signalée.
+        if let Err(motif) = crate::cadence::verifier(&nom, format.frequence) {
+            avertissements.push(motif);
         }
         // Fil de Didier : une zone en ASIO peut couper l'entrée Windows de la
         // même interface. Dit dès le départ, en mode signal comme en écoute
@@ -1595,11 +1601,12 @@ impl Controleur {
             zone_id,
             volume_initial,
             signal: None,
-            _contournement: contournement,
+            contournement: Some(contournement),
         };
         let horloge: HorlogeDEcoute = {
             let t = tampon.clone();
-            Arc::new(move || t.trames())
+            // rc14 (#9538) — l'écoute comptée en trames du générateur (48 kHz).
+            crate::cadence::Cadence::de(tampon.format().frequence).horloge(move || t.trames())
         };
         let arme = SignalArme::new(
             signal_de_test(FREQUENCE_MESURE, politique.max_play_dbfs),

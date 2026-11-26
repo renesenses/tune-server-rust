@@ -59,6 +59,9 @@ pub(crate) struct EqEnVol {
     /// volume de #6741, pour que la chaîne se vide et rende les octets
     /// décodés tels quels.
     vers_le_sec: std::sync::atomic::AtomicBool,
+    /// rc14 (TESS) — le retour au sec demandé est RAPIDE
+    /// (`EqProcessor::rendre_le_sec_vite`, A/B), et non la remontée de PURE.
+    sec_rapide: std::sync::atomic::AtomicBool,
     /// #6741 — volume de la zone (millièmes, sans trim), tenu à jour par
     /// l'orchestrateur à chaque consigne ; `u32::MAX` : inconnu.
     volume_zone: AtomicU32,
@@ -81,6 +84,7 @@ impl Default for EqEnVol {
             flux_sans_fin: false,
             format_independant_du_traitement: false,
             vers_le_sec: std::sync::atomic::AtomicBool::new(false),
+            sec_rapide: std::sync::atomic::AtomicBool::new(false),
             volume_zone: AtomicU32::new(VOLUME_INCONNU),
             volume_avant: AtomicU32::new(VOLUME_INCONNU),
         }
@@ -202,8 +206,20 @@ impl EqEnVol {
     /// marche), sans la borne de volume ; revenu à 0 dB, le neutre quitte la
     /// chaîne et le flux redevient les octets décodés, à l'échantillon près.
     pub(crate) fn poser_vers_le_sec(&self) {
+        self.poser_vers_le_sec_avec(false);
+    }
+
+    /// rc14 (TESS) — [`Self::poser_vers_le_sec`], retour RAPIDE (moins de
+    /// 0,5 s, `EqProcessor::rendre_le_sec_vite`) et BORNÉ : vers le niveau
+    /// d'avant l'égaliseur (#6741), pas au-delà, contrairement à PURE.
+    pub(crate) fn poser_vers_le_sec_rapide(&self) {
+        self.poser_vers_le_sec_avec(true);
+    }
+
+    fn poser_vers_le_sec_avec(&self, rapide: bool) {
         let mut attente = self.attente.lock().unwrap_or_else(|e| e.into_inner());
         self.vers_le_sec.store(true, Ordering::SeqCst);
+        self.sec_rapide.store(rapide, Ordering::SeqCst);
         *attente = Some(None);
         self.poses.fetch_add(1, Ordering::Relaxed);
     }
@@ -244,7 +260,11 @@ impl EqEnVol {
         *courant = EqProcessor::prendre_la_releve(neuf, courant.take());
         if vers_le_sec && let Some(eq) = courant.as_mut() {
             // Avant l'extinction ci-dessous : sa cible est alors le sec.
-            eq.liberer_le_gain_garde();
+            if self.sec_rapide.swap(false, Ordering::SeqCst) {
+                eq.rendre_le_sec_vite();
+            } else {
+                eq.liberer_le_gain_garde();
+            }
         }
         self.suivre_le_niveau_d_avant(courant);
         if self.flux_sans_fin
@@ -254,6 +274,13 @@ impl EqEnVol {
         }
         self.releves.fetch_add(1, Ordering::Relaxed);
         tracing::info!(sample_rate, channels, actif, "eq_en_vol_releve");
+    }
+
+    /// rc14 (TESS) — le dernier dépôt rend-il le signal SEC (préampli gardé
+    /// libéré) ? Témoins seulement.
+    #[cfg(test)]
+    pub(crate) fn vers_le_sec_en_attente(&self) -> bool {
+        self.vers_le_sec.load(Ordering::SeqCst)
     }
 
     /// Combien de profils ont été déposés.

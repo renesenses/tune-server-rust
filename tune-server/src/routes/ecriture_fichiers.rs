@@ -121,6 +121,11 @@ mod garde_ecriture_fichiers {
              fichier audio",
         ),
         (
+            "tune-core/src/audio/opra_base.rs",
+            "homonyme : `ecrire_atomiquement` y écrit la copie locale de la base OPRA \
+             (`database_v1.jsonl`, dans le dossier de données de Tune), pas un fichier audio",
+        ),
+        (
             "tune-core/src/audio/iso9660/epreuves_5299.rs",
             "module d'essai (`#[cfg(test)] mod epreuves_5299;`)",
         ),
@@ -134,6 +139,8 @@ mod garde_ecriture_fichiers {
     const RECENSEMENT: &[(&str, usize)] = &[
         ("tune-core/src/audio/autoeq_base.rs", 2),
         ("tune-core/src/audio/iso9660/epreuves_5299.rs", 2),
+        // #9519 — copie locale de la base OPRA (cache, hors bibliothèque).
+        ("tune-core/src/audio/opra_base.rs", 2),
         ("tune-core/src/library/lyrics_pass.rs", 2),
         ("tune-core/src/metadata/lyrics.rs", 1),
         ("tune-core/src/metadata/mod.rs", 2),

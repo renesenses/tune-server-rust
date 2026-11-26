@@ -204,3 +204,22 @@ async fn zone_reseau_le_reglage_n_agit_jamais() {
     let Json(v) = lire_zone(State(state), Path(id)).await;
     assert_eq!(v["applies_at"], "never");
 }
+
+/// rc14 (rc13.91) — la page du greffon ne voyait que les refus de réglage ;
+/// celui du périphérique (Windows partagé, Xavier) lui est désormais remis.
+#[tokio::test]
+async fn la_page_recoit_le_refus_observe_de_la_sortie() {
+    let state = etat();
+    let Json(v) = lire_zone(State(state), Path(1)).await;
+    assert!(
+        v.as_object().unwrap().contains_key("observed_refusal"),
+        "champ publié : {v}"
+    );
+    assert!(v["observed_refusal"].is_null(), "rien ne joue : {v}");
+
+    let r = forme_du_refus(Some("shared_mixer_rate_not_a_multiple"));
+    assert_eq!(r["reason"], "shared_mixer_rate_not_a_multiple");
+    let d = r["description"].as_str().unwrap();
+    assert!(d.contains("Windows"), "le geste est nommé : {d}");
+    assert!(forme_du_refus(None).is_null());
+}
