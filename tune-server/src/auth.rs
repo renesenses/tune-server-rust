@@ -2610,26 +2610,33 @@ impl VeilleDuSecret {
     /// Retient le secret et la génération de fermeture du moment.
     pub fn new(state: &AppState) -> Self {
         Self {
-            secret: Self::lire(state),
+            secret: Self::lire(state).ok().flatten(),
             generation: *state.fermeture_websockets.borrow(),
         }
     }
 
-    fn lire(state: &AppState) -> Option<String> {
+    /// `Err` : lecture impossible POUR CE PASSAGE (SQLite occupé, coupure
+    /// PostgreSQL). Ce n'est pas un secret changé.
+    fn lire(state: &AppState) -> Result<Option<String>, String> {
         // `get` lit par l'écrivain quand il est libre, par le pool sinon :
         // jamais d'attente derrière un scan.
-        SettingsRepo::with_backend(state.backend.clone())
-            .get("jwt_secret")
-            .ok()
-            .flatten()
+        SettingsRepo::with_backend(state.backend.clone()).get("jwt_secret")
     }
 
     /// Un passage : `true` si le secret a changé ailleurs et que les
     /// WebSocket viennent d'être fermées. Un changement déjà suivi d'une
     /// fermeture par ce processus (activation, réinitialisation par la
-    /// route) n'en provoque pas une seconde.
+    /// route) n'en provoque pas une seconde. Une lecture en erreur est
+    /// ignorée : l'ancien secret est gardé, le passage suivant réessaie, et
+    /// aucune WebSocket (celles du pont comprises) n'est fermée.
     pub fn verifier(&mut self, state: &AppState) -> bool {
-        let secret = Self::lire(state);
+        let secret = match Self::lire(state) {
+            Ok(secret) => secret,
+            Err(e) => {
+                tracing::debug!(error = %e, "veille_du_secret_lecture_impossible_passage_ignore");
+                return false;
+            }
+        };
         let generation = *state.fermeture_websockets.borrow();
         let change = secret != self.secret;
         let deja_fermees = generation != self.generation;

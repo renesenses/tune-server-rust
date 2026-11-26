@@ -619,3 +619,44 @@ fn installeur_windows_a_son_lanceur_et_son_entree() {
         "entrée du menu Démarrer"
     );
 }
+
+/// Une lecture du secret en ERREUR (base occupée, coupure PostgreSQL) n'est
+/// pas un secret changé : aucune WebSocket n'est fermée, celles du pont
+/// comprises, et le passage suivant réessaie.
+#[tokio::test]
+async fn veille_du_secret_erreur_de_lecture_aucune_fermeture() {
+    let _env = ENVIRONNEMENT.lock().await;
+    let state = etat(":memory:");
+    let mut veille = tune_server::auth::VeilleDuSecret::new(&state);
+    let avant = *state.fermeture_websockets.borrow();
+    // La table des réglages devient illisible : `get` rend `Err`.
+    state
+        .backend
+        .execute_batch("ALTER TABLE settings RENAME TO settings_hors_ligne")
+        .unwrap();
+    assert!(
+        SettingsRepo::with_backend(state.backend.clone())
+            .get("jwt_secret")
+            .is_err(),
+        "la lecture doit échouer pour que l'épreuve porte"
+    );
+    for _ in 0..3 {
+        assert!(!veille.verifier(&state));
+    }
+    assert_eq!(
+        *state.fermeture_websockets.borrow(),
+        avant,
+        "aucune fermeture"
+    );
+    // La base revient, secret inchangé : toujours rien.
+    state
+        .backend
+        .execute_batch("ALTER TABLE settings_hors_ligne RENAME TO settings")
+        .unwrap();
+    assert!(!veille.verifier(&state));
+    assert_eq!(*state.fermeture_websockets.borrow(), avant);
+    // Contre-épreuve : un vrai changement ferme toujours.
+    ra::poser_le_mot_de_passe(&state.backend, 1, "pose-dans-le-terminal").unwrap();
+    assert!(veille.verifier(&state));
+    assert_eq!(*state.fermeture_websockets.borrow(), avant + 1);
+}
