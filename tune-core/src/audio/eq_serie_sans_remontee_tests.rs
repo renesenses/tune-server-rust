@@ -361,3 +361,27 @@ fn les_autres_baisses_de_marge_ne_font_pas_sauter_le_niveau() {
         "recocher A seul : le gain monte à {pire:.2} dB (série gardée {p_serie:.2} dB)"
     );
 }
+
+/// Relecture du 26/11 : volume INCHANGÉ, la retenue revient entière en
+/// 450 ms — le voyant « niveau réduit » ne s'allume pas pendant cette rampe
+/// ordinaire. Volume monté, le surplus qui demeure le rallume, dès la rampe.
+#[test]
+fn decocher_un_maillon_volume_inchange_pas_de_voyant_pendant_la_rampe() {
+    let (mut banc, mut eq, ..) = decocher_b(5000.0, 1.0);
+    assert!(eq.en_extinction(), "la retenue doit être en train de revenir");
+    assert!(
+        eq.preampli_garde().is_none(),
+        "rampe ordinaire : pas de « niveau réduit »"
+    );
+    banc.jouer(&mut eq, 10);
+    assert!(eq.en_extinction() && eq.preampli_garde().is_none());
+
+    let (_, _, _, p_serie, p_seul) = decocher_b(5000.0, 1.0);
+    let borne_db = (p_serie + p_seul) / 2.0;
+    let (mut banc, mut eq, ..) = decocher_b(5000.0, db_en_lineaire(borne_db));
+    banc.jouer(&mut eq, 10);
+    assert!(
+        eq.preampli_garde().is_some(),
+        "volume monté : le surplus gardé se voit dès la rampe"
+    );
+}

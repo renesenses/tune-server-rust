@@ -847,6 +847,16 @@ impl EqProcessor {
         if !self.est_neutre() && !self.retient() {
             return None;
         }
+        // rc14 (série TESS, relecture du 26/11) — une retenue qui revient
+        // ENTIÈRE (volume inchangé, rampe de `REMONTEE_RAPIDE_TESS_MS`) n'est
+        // pas un « niveau réduit » : rien ne restera gardé à la fin. Seul un
+        // surplus qui demeure (volume monté) allume le voyant.
+        if !self.est_neutre()
+            && let Some(ext) = &self.extinction
+            && ext.vers.iter().all(|v| (v - 1.0).abs() < 1e-6)
+        {
+            return None;
+        }
         let gains: Vec<f32> = match &self.extinction {
             Some(ext) => {
                 let coefs = ext.depart.len().max(1);
