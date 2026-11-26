@@ -1708,6 +1708,14 @@ pub struct PlaybackOrchestrator {
     eq_en_vol_des_flux: std::sync::Mutex<
         std::collections::HashMap<i64, Vec<(String, std::sync::Arc<eq_en_vol::EqEnVol>)>>,
     >,
+    /// rc14 (sécurité auditive, flux réseau REFAIT) — le niveau gardé que le
+    /// prochain flux d'une zone doit reprendre (voir
+    /// [`eq_en_vol::NiveauAReporter`]). Verrou std, accès courts.
+    niveaux_reseau_a_reporter:
+        std::sync::Mutex<std::collections::HashMap<i64, eq_en_vol::NiveauAReporter>>,
+    /// rc14 — le volume de la zone (millièmes) à la création du dernier flux
+    /// traité, par `stream_id` : la référence d'un flux sans poste de relève.
+    volume_a_la_creation_des_flux: std::sync::Mutex<std::collections::HashMap<i64, (String, u32)>>,
     /// Per-zone record of the last track pushed to a NETWORK renderer:
     /// `zone_id → (source, source_id, when)`. Used in `play_inner` to coalesce a
     /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
@@ -2368,6 +2376,8 @@ impl PlaybackOrchestrator {
             verrous_de_relance: std::sync::Mutex::new(std::collections::HashMap::new()),
             traitement_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_en_vol_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
+            niveaux_reseau_a_reporter: std::sync::Mutex::new(std::collections::HashMap::new()),
+            volume_a_la_creation_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
@@ -2587,6 +2597,9 @@ mod convolveur_en_flux_7642_tests;
 // rc14 — égaliseurs en série, « Bypass all » complet (retours de Rémi).
 #[cfg(test)]
 mod egaliseurs_en_serie_rc14_tests;
+// rc14 — sécurité auditive : un flux réseau refait reprend le niveau gardé.
+#[cfg(test)]
+mod flux_refait_niveau_garde_rc14_tests;
 
 // #4354 — repli à 176,4 kHz d'un DSD décimé qui manque son pré-tampon.
 #[cfg(test)]
