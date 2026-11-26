@@ -768,3 +768,66 @@ async fn reinitialisation_refuse_l_ancien_jeton_d_acces_et_de_renouvellement() {
         );
     }
 }
+
+/// Relecture de #9576 : le mode terminal sur une base que le serveur rc14 n'a
+/// pas encore migrée (pas de `jetons_de_renouvellement`) pose quand même le
+/// mot de passe et désinscrit les sessions longues.
+#[tokio::test]
+async fn mode_terminal_sur_une_base_sans_table_des_jetons() {
+    let state = etat(":memory:");
+    settings(&state)
+        .set("auth_session_token:abc", "{}")
+        .unwrap();
+    state
+        .backend
+        .execute_batch("DROP TABLE jetons_de_renouvellement")
+        .unwrap();
+    ra::poser_le_mot_de_passe(&state.backend, 1, "pose-dans-le-terminal").unwrap();
+    assert!(mot_de_passe_est(&state, "pose-dans-le-terminal"));
+    assert_ne!(
+        settings(&state).get("jwt_secret").unwrap().as_deref(),
+        Some(ANCIEN_SECRET)
+    );
+    assert_eq!(
+        settings(&state).get("auth_session_token:abc").unwrap(),
+        None
+    );
+}
+
+/// Relecture de #9576 : avec la table des jetons, la révocation reste DANS la
+/// transaction du mot de passe. Une écriture refusée pendant la révocation
+/// (déclencheur sur `jetons_de_renouvellement`) annule aussi le mot de passe,
+/// le secret et la désinscription des sessions longues.
+#[tokio::test]
+async fn refus_pendant_la_revocation_annule_toute_la_recuperation() {
+    let state = etat(":memory:");
+    settings(&state)
+        .set("auth_session_token:abc", "{}")
+        .unwrap();
+    state
+        .backend
+        .execute_batch(
+            "INSERT INTO jetons_de_renouvellement (jeton_id, famille, profile_id, empreinte_sha256, \
+             empreinte_mot_de_passe, cree_le, expire_le, session_creee_le) \
+             VALUES ('j1', 'abc', 1, 'e1', 'm', 1, 9999999999, 1); \
+             CREATE TRIGGER refus_de_revocation BEFORE UPDATE ON jetons_de_renouvellement \
+             BEGIN SELECT RAISE(ABORT, 'refus'); END;",
+        )
+        .unwrap();
+    let avant = hachage_admin(&state);
+    let r = ra::poser_le_mot_de_passe(&state.backend, 1, "pose-refusee");
+    assert!(r.is_err(), "la révocation refusée doit faire échouer la pose");
+    assert_eq!(hachage_admin(&state), avant, "mot de passe inchangé");
+    assert_eq!(
+        settings(&state).get("jwt_secret").unwrap().as_deref(),
+        Some(ANCIEN_SECRET),
+        "secret inchangé"
+    );
+    assert!(
+        settings(&state)
+            .get("auth_session_token:abc")
+            .unwrap()
+            .is_some(),
+        "désinscription des sessions annulée"
+    );
+}

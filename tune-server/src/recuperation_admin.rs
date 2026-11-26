@@ -227,6 +227,18 @@ pub fn poser_le_mot_de_passe(
     let hachage = crate::auth::hash_password(mot_de_passe)?;
     let secret = uuid::Uuid::new_v4().to_string();
     let maintenant = horodatage();
+    // Relecture de #9576 : le mode terminal ouvre la base SANS la migrer.
+    // Lancé sur une base rc13.91 (157) qu'aucun serveur rc14 n'a encore
+    // ouverte, il ne trouve pas `jetons_de_renouvellement` (migration 159) :
+    // l'UPDATE de la révocation échouerait, et toute la récupération avec.
+    // Sans la table, aucun jeton de renouvellement n'existe : seules les
+    // sessions longues inscrites sont désinscrites.
+    let avec_jetons = backend
+        .query_one(
+            "SELECT COUNT(*) FROM jetons_de_renouvellement WHERE 1 = 0",
+            &[],
+        )
+        .is_ok();
     backend.write_tx(&mut |tx| {
         let n = tx.execute(
             "UPDATE profiles SET password_hash_v2 = ?, password_hash = NULL WHERE id = ?",
@@ -247,10 +259,17 @@ pub fn poser_le_mot_de_passe(
         // révoquées DANS LA MÊME TRANSACTION que le mot de passe et le
         // secret — un ancien jeton de renouvellement ne doit jamais frapper
         // un jeton d'accès signé du nouveau secret.
-        tune_core::db::jetons_de_renouvellement::revoquer_toutes_les_sessions_tx(
-            tx,
-            crate::session_renouvelee::maintenant(),
-        )?;
+        if avec_jetons {
+            tune_core::db::jetons_de_renouvellement::revoquer_toutes_les_sessions_tx(
+                tx,
+                crate::session_renouvelee::maintenant(),
+            )?;
+        } else {
+            tx.execute(
+                tune_core::db::jetons_de_renouvellement::SQL_REVOCATION_GLOBALE[0],
+                &[],
+            )?;
+        }
         Ok(())
     })?;
     // Les WebSocket ouvertes avec une session revérifient la leur.
