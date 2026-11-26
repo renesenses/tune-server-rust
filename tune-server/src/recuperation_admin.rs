@@ -101,7 +101,8 @@ pub fn oublier_le_code(settings: &SettingsRepo) {
 /// Ce que vaut un code saisi.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// Juste : le code est consommé.
+    /// Juste. Le code n'est consommé qu'avec le changement de mot de passe,
+    /// dans la même transaction (voir [`reinitialiser_avec_code`]).
     Juste,
     /// Faux ; il reste `restants` essais sur ce code.
     Faux { restants: u32 },
@@ -111,16 +112,15 @@ pub enum Verdict {
     Bloque,
 }
 
-/// Un seul contrôle à la fois dans ce processus : lire, comparer, compter.
+/// Un seul contrôle à la fois dans ce processus : lire, comparer, compter,
+/// et, si le code est juste, changer le mot de passe.
 static VERROU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Vérifie `saisi` contre le code en cours. La comparaison est celle
-/// d'Argon2 (`verify_password`), en temps constant sur l'empreinte ; le code
-/// saisi n'est ni journalisé ni stocké.
-pub fn verifier_et_consommer(settings: &SettingsRepo, saisi: &str) -> Verdict {
-    let _verrou = VERROU
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+/// Vérifie `saisi` contre le code en cours, sans le consommer s'il est juste.
+/// La comparaison est celle d'Argon2 (`verify_password`), en temps constant
+/// sur l'empreinte ; le code saisi n'est ni journalisé ni stocké. L'appelant
+/// tient [`VERROU`].
+fn verifier(settings: &SettingsRepo, saisi: &str) -> Verdict {
     let lire = |cle| settings.get(cle).ok().flatten().filter(|v| !v.is_empty());
     let (Some(empreinte), Some(emis)) = (lire(CLE_EMPREINTE), lire(CLE_EMIS)) else {
         return Verdict::AucunOuExpire;
@@ -139,7 +139,6 @@ pub fn verifier_et_consommer(settings: &SettingsRepo, saisi: &str) -> Verdict {
     }
     let saisi = crate::auth::normaliser_code(saisi);
     if crate::auth::verify_password(&saisi, &empreinte) {
-        oublier_le_code(settings);
         return Verdict::Juste;
     }
     let essais = essais + 1;
@@ -151,6 +150,27 @@ pub fn verifier_et_consommer(settings: &SettingsRepo, saisi: &str) -> Verdict {
     Verdict::Faux {
         restants: ESSAIS_CODE - essais,
     }
+}
+
+/// Vérifie le code et, s'il est juste, pose le nouveau mot de passe du compte
+/// `id`, consomme le code et révoque les sessions, en UNE transaction
+/// ([`poser_le_mot_de_passe`]). `Ok(Verdict::Juste)` n'est rendu que si tout
+/// cela est écrit ; une écriture refusée rend `Err` et le code reste valable.
+pub fn reinitialiser_avec_code(
+    backend: &Arc<dyn DbBackend>,
+    id: i64,
+    saisi: &str,
+    mot_de_passe: &str,
+) -> Result<Verdict, String> {
+    let _verrou = VERROU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let verdict = verifier(&settings, saisi);
+    if verdict == Verdict::Juste {
+        poser_le_mot_de_passe(backend, id, mot_de_passe)?;
+    }
+    Ok(verdict)
 }
 
 /// Le compte administrateur : le premier profil administrateur, le profil 1
@@ -171,8 +191,33 @@ pub fn compte_administrateur(backend: &Arc<dyn DbBackend>) -> Option<(i64, Strin
         })
 }
 
-/// Pose le mot de passe du compte `id` et révoque les sessions : nouveau
-/// secret de signature, clé d'API effacée (même logique que l'activation).
+/// Les réglages effacés avec le changement de mot de passe : la clé d'API,
+/// les connexions SSO en attente (comme `renouveler_les_secrets` de
+/// l'activation) et le code de réinitialisation. Le jeton du pont (écoute à
+/// distance) n'en fait pas partie.
+const SQL_EFFACER: &str = "DELETE FROM settings WHERE key IN \
+     ('api_key', 'admin_reinit_code_empreinte', 'admin_reinit_code_emis', \
+     'admin_reinit_code_essais') \
+     OR key LIKE 'mozaik_pkce_pending%' OR key LIKE 'mozaik_redirect_uri_pending%'";
+
+fn horodatage() -> String {
+    let t = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
+}
+
+/// Pose le mot de passe du compte `id` et révoque les sessions, en UNE
+/// transaction : mot de passe, nouveau secret de signature, clé d'API et
+/// code effacés. Tout ou rien : si une écriture échoue (base occupée au-delà
+/// du délai d'attente), rien n'est changé et l'erreur remonte. Le secret est
+/// relu après la validation : sans révocation constatée, pas de succès.
 pub fn poser_le_mot_de_passe(
     backend: &Arc<dyn DbBackend>,
     id: i64,
@@ -180,13 +225,29 @@ pub fn poser_le_mot_de_passe(
 ) -> Result<(), String> {
     use tune_core::db::backend::ToSqlValue;
     let hachage = crate::auth::hash_password(mot_de_passe)?;
-    backend.execute(
-        "UPDATE profiles SET password_hash_v2 = ?, password_hash = NULL WHERE id = ?",
-        &[&hachage as &dyn ToSqlValue, &id as &dyn ToSqlValue],
-    )?;
-    let settings = SettingsRepo::with_backend(backend.clone());
-    crate::auth::renouveler_les_secrets(&settings);
-    oublier_le_code(&settings);
+    let secret = uuid::Uuid::new_v4().to_string();
+    let maintenant = horodatage();
+    backend.write_tx(&mut |tx| {
+        let n = tx.execute(
+            "UPDATE profiles SET password_hash_v2 = ?, password_hash = NULL WHERE id = ?",
+            &[&hachage as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        )?;
+        if n != 1 {
+            return Err(format!("compte {id} introuvable"));
+        }
+        tx.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES ('jwt_secret', ?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+             updated_at = excluded.updated_at",
+            &[&secret as &dyn ToSqlValue, &maintenant as &dyn ToSqlValue],
+        )?;
+        tx.execute(SQL_EFFACER, &[])?;
+        Ok(())
+    })?;
+    let relu = SettingsRepo::with_backend(backend.clone()).get("jwt_secret")?;
+    if relu.as_deref() != Some(secret.as_str()) {
+        return Err("révocation des sessions non constatée".into());
+    }
     Ok(())
 }
 
@@ -265,8 +326,11 @@ fn refus_root_sur_la_base_d_un_autre(chemin: &std::path::Path) -> Option<String>
     let proprietaire = std::fs::metadata(chemin).ok()?.uid();
     (proprietaire != 0).then(|| {
         format!(
-            "La base appartient au compte d'UID {proprietaire}, pas à root : relancez sous ce              compte (par exemple « sudo -u tune … »), sinon le service ne pourrait plus ouvrir              sa base.
-The database belongs to UID {proprietaire}, not root: run again as that              user (e.g. \"sudo -u tune …\"), otherwise the service could no longer open it."
+            "La base appartient au compte d'UID {proprietaire}, pas à root : relancez sous ce \
+             compte (par exemple « sudo -u tune … »), sinon le service ne pourrait plus \
+             ouvrir sa base.\n\
+             The database belongs to UID {proprietaire}, not root: run again as that user \
+             (e.g. \"sudo -u tune …\"), otherwise the service could no longer open it."
         )
     })
 }
@@ -341,12 +405,14 @@ pub async fn executer(config: &TuneConfig) -> i32 {
     let settings = SettingsRepo::with_backend(backend.clone());
 
     if par_stdin {
-        let mut mot_de_passe = String::new();
-        if std::io::stdin().read_line(&mut mot_de_passe).is_err() {
-            eprintln!("Entrée standard illisible. / Cannot read standard input.");
-            return 4;
-        }
-        let mot_de_passe = mot_de_passe.trim_end_matches(['\r', '\n']);
+        let mot_de_passe = match lire_le_mot_de_passe() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("{e}");
+                return 4;
+            }
+        };
+        let mot_de_passe = mot_de_passe.as_str();
         if mot_de_passe.chars().count() < LONGUEUR_MIN_MOT_DE_PASSE {
             eprintln!(
                 "Mot de passe trop court ({LONGUEUR_MIN_MOT_DE_PASSE} caractères au moins). / \
@@ -359,8 +425,10 @@ pub async fn executer(config: &TuneConfig) -> i32 {
             return 1;
         }
         eprintln!(
-            "Mot de passe du compte « {nom} » remplacé ; les sessions ouvertes sont révoquées.\n\
-             Password of account \"{nom}\" replaced; existing sessions are revoked."
+            "Mot de passe du compte « {nom} » remplacé ; les sessions ouvertes sont révoquées \
+             (le serveur en marche ferme ses WebSocket dans les secondes qui suivent).\n\
+             Password of account \"{nom}\" replaced; existing sessions are revoked (the running \
+             server closes its WebSockets within seconds)."
         );
         return 0;
     }
@@ -394,6 +462,132 @@ pub async fn executer(config: &TuneConfig) -> i32 {
     );
     tracing::info!(admin = %nom, "reinitialisation_admin_code_emis");
     0
+}
+
+// ---------------------------------------------------------------------------
+// Lecture du mot de passe sur l'entrée standard
+// ---------------------------------------------------------------------------
+
+/// Le nouveau mot de passe. Dans un terminal : saisie masquée, demandée deux
+/// fois. Sinon (tube, `docker exec -i`) : la première ligne.
+fn lire_le_mot_de_passe() -> Result<String, String> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        let mut ligne = String::new();
+        std::io::stdin()
+            .read_line(&mut ligne)
+            .map_err(|_| "Entrée standard illisible. / Cannot read standard input.".to_string())?;
+        return Ok(ligne.trim_end_matches(['\r', '\n']).to_string());
+    }
+    let premier = lire_masque("Nouveau mot de passe / New password : ")?;
+    let second = lire_masque("Confirmez / Confirm : ")?;
+    if premier != second {
+        return Err("Les deux saisies diffèrent. / The two entries differ.".into());
+    }
+    Ok(premier)
+}
+
+fn lire_masque(invite: &str) -> Result<String, String> {
+    use std::io::Write;
+    eprint!("{invite}");
+    std::io::stderr().flush().ok();
+    let echo = EchoCoupe::couper()?;
+    let mut ligne = String::new();
+    let lu = std::io::stdin().read_line(&mut ligne);
+    drop(echo);
+    eprintln!();
+    lu.map_err(|_| "Entrée standard illisible. / Cannot read standard input.".to_string())?;
+    Ok(ligne.trim_end_matches(['\r', '\n']).to_string())
+}
+
+const MASQUAGE_IMPOSSIBLE: &str =
+    "Impossible de masquer la saisie dans ce terminal. / Cannot hide input in this terminal.";
+
+/// L'écho du terminal coupé tant que la valeur vit ; rétabli à sa
+/// destruction, erreur comprise.
+#[cfg(unix)]
+struct EchoCoupe(libc::termios);
+
+#[cfg(unix)]
+impl EchoCoupe {
+    fn couper() -> Result<Self, String> {
+        // SAFETY : `termios` est une structure C simple, remplie par
+        // `tcgetattr` avant tout usage ; descripteur 0 = entrée standard.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut t) != 0 {
+                return Err(MASQUAGE_IMPOSSIBLE.into());
+            }
+            let ancien = t;
+            t.c_lflag &= !libc::ECHO;
+            if libc::tcsetattr(0, libc::TCSANOW, &t) != 0 {
+                return Err(MASQUAGE_IMPOSSIBLE.into());
+            }
+            Ok(Self(ancien))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoCoupe {
+    fn drop(&mut self) {
+        // SAFETY : réglages lus par `tcgetattr` sur le même descripteur.
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(n_std_handle: u32) -> *mut core::ffi::c_void;
+    fn GetConsoleMode(h_console: *mut core::ffi::c_void, lp_mode: *mut u32) -> i32;
+    fn SetConsoleMode(h_console: *mut core::ffi::c_void, dw_mode: u32) -> i32;
+}
+
+#[cfg(windows)]
+struct EchoCoupe(*mut core::ffi::c_void, u32);
+
+#[cfg(windows)]
+impl EchoCoupe {
+    fn couper() -> Result<Self, String> {
+        const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+        const ENABLE_ECHO_INPUT: u32 = 0x0004;
+        // SAFETY : poignée de la console d'entrée du processus ; le mode est
+        // lu avant d'être modifié.
+        unsafe {
+            let h = GetStdHandle(STD_INPUT_HANDLE);
+            let mut mode = 0u32;
+            if h.is_null() || GetConsoleMode(h, &mut mode) == 0 {
+                return Err(MASQUAGE_IMPOSSIBLE.into());
+            }
+            if SetConsoleMode(h, mode & !ENABLE_ECHO_INPUT) == 0 {
+                return Err(MASQUAGE_IMPOSSIBLE.into());
+            }
+            Ok(Self(h, mode))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EchoCoupe {
+    fn drop(&mut self) {
+        // SAFETY : même poignée, mode d'origine.
+        unsafe {
+            SetConsoleMode(self.0, self.1);
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct EchoCoupe;
+
+#[cfg(not(any(unix, windows)))]
+impl EchoCoupe {
+    fn couper() -> Result<Self, String> {
+        Err(MASQUAGE_IMPOSSIBLE.into())
+    }
 }
 
 #[cfg(test)]

@@ -171,17 +171,22 @@ Deux façons de finir :
   mot de passe. Depuis un autre appareil, derrière un mandataire ou par le
   relais distant, c'est refusé ;
 - **sans navigateur sur la machine** : ajouter `--mot-de-passe-stdin` (ou
-  `--password-stdin`) et taper le nouveau mot de passe, puis Entrée.
+  `--password-stdin`) et taper le nouveau mot de passe, deux fois, sans qu'il
+  s'affiche (ou le passer par un tube : la première ligne est lue).
 
-Dans les deux cas, les sessions ouvertes sont révoquées : il faut se
-reconnecter partout.
+Dans les deux cas, en une seule opération : les sessions ouvertes sont
+révoquées (il faut se reconnecter partout, et les WebSocket du serveur en
+marche se ferment dans les secondes qui suivent) et la **clé d'API est
+effacée** (à régénérer pour les scripts qui s'en servaient). Le **jeton du
+pont** (écoute à distance) ne change pas : les apps appairées le restent.
+Si l'écriture échoue, rien n'est changé et la commande le dit.
 
 | Système | Commande |
 |---|---|
-| Windows | Menu Démarrer → *Tune Server* → **Mot de passe administrateur oublie** (lance `reinitialiser-admin.bat` à côté de `tune-server.exe`) |
+| Windows | Menu Démarrer → *Tune Server* → **Mot de passe administrateur oublié** (lance `reinitialiser-admin.bat` à côté de `tune-server.exe`) |
 | macOS | dans le Terminal, sous votre compte : `tune-server --reinitialiser-admin` (Homebrew) |
 | Debian / Ubuntu | `sudo -u tune sh -c 'cd /var/lib/tune && set -a && . /etc/default/tune-server && exec /opt/tune/tune-server --reinitialiser-admin'` |
-| Docker | `docker exec -it -u tune tune /app/tune-server --reinitialiser-admin --mot-de-passe-stdin` (le navigateur de l'hôte n'est pas « cette machine » pour le conteneur) |
+| Docker (conteneur `tune-server` du docker-compose) | `docker exec -it -u tune tune-server /app/tune-server --reinitialiser-admin --mot-de-passe-stdin` (le navigateur de l'hôte n'est pas « cette machine » pour le conteneur) |
 | Tune OS | en SSH : `sudo sh -c 'cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server --reinitialiser-admin --mot-de-passe-stdin'` |
 
 > Le mot de passe du **compte système** `tune` de Tune OS (SSH, console) est

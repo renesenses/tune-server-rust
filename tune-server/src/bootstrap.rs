@@ -600,6 +600,9 @@ pub async fn run_with(opts: RunOptions) {
     // Background tasks: squeezebox poller, session GC, position poller,
     // token refresh, UPnP advertiser, Deezer proxy, alarms, notifications, memory diag
     crate::background::spawn_background_tasks(&state, &config).await;
+    // rc14 — un secret de signature changé hors du processus (mot de passe
+    // administrateur réinitialisé dans le terminal) ferme les WebSocket.
+    let _ = crate::auth::surveiller_le_secret(state.clone(), crate::auth::PERIODE_VEILLE_DU_SECRET);
 
     // Auto-resume network zones (waits for device.reconnected events)
     crate::auto_resume::spawn_auto_resume_listener(&state);

@@ -495,7 +495,7 @@ mod installeur_tests {
             "la case « Démarrer Tune avec Windows » doit être visible"
         );
         assert!(
-            instruction(&yml, "Section \"Demarrer Tune avec Windows\" SecDemarrage"),
+            instruction(&yml, "Section \"Démarrer Tune avec Windows\" SecDemarrage"),
             "section dédiée, cochée par défaut (ni /o ni RO)"
         );
     }

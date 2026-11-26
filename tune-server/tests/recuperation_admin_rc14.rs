@@ -76,8 +76,14 @@ async fn appel(
     let pair: SocketAddr = adresse.parse().unwrap();
     let app: Router = tune_server::routes::router(state.clone()).layer(MockConnectInfo(pair));
     let mut req = Request::builder().method(methode).uri(chemin);
+    // Un navigateur envoie toujours `Host` ; `("host", "")` l'omet.
+    if !entetes.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        req = req.header(header::HOST, "localhost:8888");
+    }
     for (k, v) in entetes {
-        req = req.header(*k, *v);
+        if !v.is_empty() {
+            req = req.header(*k, *v);
+        }
     }
     let body = match corps {
         Some(c) => {
@@ -193,7 +199,8 @@ async fn code_valide_change_le_mot_de_passe_et_revoque_les_sessions() {
     assert_eq!(st, StatusCode::OK);
     // Le code est consommé : il ne sert pas deux fois.
     let (st, v) = reinitialiser(&state, CETTE_MACHINE, &[], &code, "encore-un-autre").await;
-    assert_eq!(st, StatusCode::GONE, "{v}");
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["error"], "reset_code_invalid");
     assert!(mot_de_passe_est(&state, "nouveau-mot-de-passe"));
 }
 
@@ -222,14 +229,20 @@ async fn code_faux_puis_cinq_essais_bloque() {
             reinitialiser(&state, CETTE_MACHINE, &[], &faux, "nouveau-mot-de-passe").await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert_eq!(v["error"], "reset_code_invalid");
-        assert_eq!(v["remaining_attempts"], restants);
+        // Rien ne distingue un code faux d'une absence de code.
+        assert!(v.get("remaining_attempts").is_none(), "{v}");
+        assert_eq!(
+            settings(&state).get(ra::CLE_ESSAIS).unwrap().as_deref(),
+            Some((ra::ESSAIS_CODE - restants).to_string().as_str())
+        );
     }
     let (st, v) = reinitialiser(&state, CETTE_MACHINE, &[], &faux, "nouveau-mot-de-passe").await;
     assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "5e essai : {v}");
     assert_eq!(v["error"], "reset_attempts_exceeded");
     // Le code est détruit : même juste, il ne passe plus.
     let (st, v) = reinitialiser(&state, CETTE_MACHINE, &[], &code, "nouveau-mot-de-passe").await;
-    assert_eq!(st, StatusCode::GONE, "{v}");
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["error"], "reset_code_invalid");
     assert!(mot_de_passe_est(&state, "ancien-mot-de-passe"));
     assert_eq!(
         settings(&state).get(ra::CLE_EMPREINTE).unwrap(),
@@ -252,8 +265,8 @@ async fn code_expire_refuse() {
         .set(ra::CLE_EMIS, &il_y_a_16_min.to_string())
         .unwrap();
     let (st, v) = reinitialiser(&state, CETTE_MACHINE, &[], &code, "nouveau-mot-de-passe").await;
-    assert_eq!(st, StatusCode::GONE, "{v}");
-    assert_eq!(v["error"], "reset_code_expired");
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["error"], "reset_code_invalid");
     assert!(mot_de_passe_est(&state, "ancien-mot-de-passe"));
 }
 
@@ -269,8 +282,19 @@ async fn sans_code_emis_refuse() {
         "nouveau-mot-de-passe",
     )
     .await;
-    assert_eq!(st, StatusCode::GONE, "{v}");
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
     assert!(mot_de_passe_est(&state, "ancien-mot-de-passe"));
+    // La même réponse, mot pour mot, que pour un code faux.
+    let code = ra::emettre_un_code(&settings(&state)).unwrap();
+    let (st_faux, v_faux) = reinitialiser(
+        &state,
+        CETTE_MACHINE,
+        &[],
+        &code_faux(&code),
+        "nouveau-mot-de-passe",
+    )
+    .await;
+    assert_eq!((st, &v), (st_faux, &v_faux));
 }
 
 #[tokio::test]
@@ -383,7 +407,7 @@ async fn la_route_est_publique_mais_seulement_en_post() {
     let _env = ENVIRONNEMENT.lock().await;
     let state = etat(":memory:");
     // Sans jeton, authentification active : la couche laisse passer, le
-    // gestionnaire décide (ici : pas de code, 410).
+    // gestionnaire décide (ici : pas de code, 403 du gestionnaire).
     let (st, _) = reinitialiser(
         &state,
         CETTE_MACHINE,
@@ -392,7 +416,7 @@ async fn la_route_est_publique_mais_seulement_en_post() {
         "nouveau-mot-de-passe",
     )
     .await;
-    assert_eq!(st, StatusCode::GONE);
+    assert_eq!(st, StatusCode::FORBIDDEN);
     let (st, _) = appel(&state, CETTE_MACHINE, Method::GET, ROUTE, &[], None).await;
     assert_ne!(st, StatusCode::OK);
 }
@@ -440,6 +464,12 @@ async fn sous_commande_emet_un_code_que_la_route_accepte() {
 async fn mode_terminal_pose_le_mot_de_passe_et_revoque() {
     let state = etat(":memory:");
     ra::emettre_un_code(&settings(&state)).unwrap();
+    settings(&state)
+        .set("api_key", "cle-d-api-d-avant")
+        .unwrap();
+    settings(&state)
+        .set("bridge_token", "jeton-du-pont")
+        .unwrap();
     ra::poser_le_mot_de_passe(&state.backend, 1, "pose-dans-le-terminal").unwrap();
     assert!(mot_de_passe_est(&state, "pose-dans-le-terminal"));
     assert_ne!(
@@ -447,6 +477,130 @@ async fn mode_terminal_pose_le_mot_de_passe_et_revoque() {
         Some(ANCIEN_SECRET)
     );
     assert_eq!(settings(&state).get(ra::CLE_EMPREINTE).unwrap(), None);
+    // Comme annoncé dans le guide : clé d'API effacée, jeton du pont gardé.
+    assert_eq!(settings(&state).get("api_key").unwrap(), None);
+    assert_eq!(
+        settings(&state).get("bridge_token").unwrap().as_deref(),
+        Some("jeton-du-pont")
+    );
+}
+
+/// Base occupée (ici : un déclencheur refuse l'écriture du secret) : la
+/// transaction est annulée en entier. Ni mot de passe changé, ni succès
+/// annoncé, et le code reste valable.
+#[tokio::test]
+async fn secret_non_ecrit_aucun_succes_et_rien_ne_change() {
+    let _env = ENVIRONNEMENT.lock().await;
+    let state = etat(":memory:");
+    let code = ra::emettre_un_code(&settings(&state)).unwrap();
+    state
+        .backend
+        .execute_batch(
+            "CREATE TRIGGER secret_refuse_i BEFORE INSERT ON settings \
+             WHEN NEW.key = 'jwt_secret' BEGIN SELECT RAISE(ABORT, 'base occupee'); END; \
+             CREATE TRIGGER secret_refuse_u BEFORE UPDATE ON settings \
+             WHEN NEW.key = 'jwt_secret' BEGIN SELECT RAISE(ABORT, 'base occupee'); END;",
+        )
+        .unwrap();
+    let (st, v) = reinitialiser(&state, CETTE_MACHINE, &[], &code, "nouveau-mot-de-passe").await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert_eq!(v["error"], "reset_failed");
+    assert!(v.get("token").is_none(), "{v}");
+    assert!(
+        mot_de_passe_est(&state, "ancien-mot-de-passe"),
+        "annulé en entier"
+    );
+    assert_eq!(
+        settings(&state).get("jwt_secret").unwrap().as_deref(),
+        Some(ANCIEN_SECRET)
+    );
+    assert!(
+        ra::poser_le_mot_de_passe(&state.backend, 1, "autre-mot-de-passe").is_err(),
+        "le mode terminal ne s'annonce pas réussi non plus"
+    );
+    assert!(mot_de_passe_est(&state, "ancien-mot-de-passe"));
+    // La base libérée, le même code passe.
+    state
+        .backend
+        .execute_batch("DROP TRIGGER secret_refuse_i; DROP TRIGGER secret_refuse_u;")
+        .unwrap();
+    let (st, v) = reinitialiser(&state, CETTE_MACHINE, &[], &code, "nouveau-mot-de-passe").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(mot_de_passe_est(&state, "nouveau-mot-de-passe"));
+}
+
+#[tokio::test]
+async fn requete_sans_host_refusee() {
+    let _env = ENVIRONNEMENT.lock().await;
+    let state = etat(":memory:");
+    let code = ra::emettre_un_code(&settings(&state)).unwrap();
+    let (st, v) = reinitialiser(
+        &state,
+        CETTE_MACHINE,
+        &[("host", "")],
+        &code,
+        "nouveau-mot-de-passe",
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["error"], "reset_not_local");
+    assert!(mot_de_passe_est(&state, "ancien-mot-de-passe"));
+}
+
+/// M1 — le mode terminal change le secret depuis un AUTRE processus : la
+/// veille du service le voit et ferme les WebSocket ouvertes.
+#[tokio::test]
+async fn veille_du_secret_ferme_les_websockets_apres_le_mode_terminal() {
+    let _env = ENVIRONNEMENT.lock().await;
+    let dossier = tempfile::tempdir().unwrap();
+    let base = dossier.path().join("tune.db");
+    let state = etat(base.to_str().unwrap());
+    let mut abonne = state.fermeture_websockets.subscribe();
+    abonne.borrow_and_update();
+    let veille = tune_server::auth::surveiller_le_secret(
+        state.clone(),
+        std::time::Duration::from_millis(50),
+    );
+    // Rien ne change : aucune fermeture.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), abonne.changed())
+            .await
+            .is_err(),
+        "aucune fermeture sans changement de secret"
+    );
+    // La commande, comme un second processus : sa propre connexion.
+    let config = tune_server::config::TuneConfig {
+        db_path: base.to_str().unwrap().to_string(),
+        database_url: None,
+        ..Default::default()
+    };
+    let autre = ra::ouvrir_la_base(&config).await.unwrap();
+    ra::poser_le_mot_de_passe(&autre, 1, "pose-dans-le-terminal").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), abonne.changed())
+        .await
+        .expect("les WebSocket doivent être fermées")
+        .unwrap();
+    veille.abort();
+}
+
+/// La route ferme elle-même les WebSocket : la veille n'en ajoute pas une
+/// seconde.
+#[tokio::test]
+async fn veille_du_secret_ne_double_pas_la_fermeture_de_la_route() {
+    let _env = ENVIRONNEMENT.lock().await;
+    let state = etat(":memory:");
+    let mut veille = tune_server::auth::VeilleDuSecret::new(&state);
+    let code = ra::emettre_un_code(&settings(&state)).unwrap();
+    let avant = *state.fermeture_websockets.borrow();
+    let (st, _) = reinitialiser(&state, CETTE_MACHINE, &[], &code, "nouveau-mot-de-passe").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(*state.fermeture_websockets.borrow(), avant + 1);
+    assert!(!veille.verifier(&state));
+    assert_eq!(*state.fermeture_websockets.borrow(), avant + 1);
+    // Un changement venu d'ailleurs, lui, ferme.
+    ra::poser_le_mot_de_passe(&state.backend, 1, "pose-dans-le-terminal").unwrap();
+    assert!(veille.verifier(&state));
+    assert_eq!(*state.fermeture_websockets.borrow(), avant + 2);
 }
 
 #[test]
@@ -460,7 +614,7 @@ fn installeur_windows_a_son_lanceur_et_son_entree() {
     assert!(yml.contains("'pause$\\r$\\n'"), "la fenêtre reste ouverte");
     assert!(
         yml.lines().any(|l| l.trim().starts_with("CreateShortcut")
-            && l.contains("Mot de passe administrateur oublie.lnk")
+            && l.contains("Mot de passe administrateur oublié.lnk")
             && l.contains("reinitialiser-admin.bat")),
         "entrée du menu Démarrer"
     );
