@@ -14,11 +14,10 @@
 //! nombre. Les fichiers REW `.cal` suivent la même convention. La réponse
 //! corrigée vaut `mesure − écart`.
 //!
-//! Le « Sens Factor » est la déviation de sensibilité par rapport au nominal
-//! de l'UMIK-1 ; REW l'emploie pour afficher des dB SPL absolus. Convention
-//! retenue ici, À CONFIRMER sur un micro réel (question au relecteur) :
-//! `SPL = dBFS + 94 + 18 − sens_factor`, le nominal UMIK-1 étant −18 dBFS
-//! à 94 dB SPL (1 kHz).
+//! Pour le niveau acoustique, « Sens Factor » donne le niveau efficace
+//! numérique à 94 dB SPL et au gain de référence du fichier. La capture
+//! doit avoir un gain connu par rapport à cette référence. Les anciennes
+//! demandes sans ce gain conservent leur estimation de crête historique.
 
 use crate::analysis::interp_log;
 
@@ -130,9 +129,85 @@ impl MicCalibration {
     }
 
     /// Niveau SPL (dB) estimé pour un niveau crête ou efficace `dbfs`, si le
-    /// fichier porte un facteur de sensibilité. Voir la convention en tête de module.
+    /// fichier porte un facteur de sensibilité. Convention historique de la veille
+    /// sans gain renseigné : nominal de −18 dBFS à 94 dB SPL.
     pub fn spl_from_dbfs(&self, dbfs: f64) -> Option<f64> {
         self.sens_factor_db.map(|s| dbfs + 94.0 + 18.0 - s)
+    }
+
+    /// Sens Factor est le niveau RMS numérique à 94 dB SPL, au gain
+    /// d'étalonnage du micro. Une atténuation de capture est négative.
+    /// Le carré moyen est référencé au pic numérique pleine échelle.
+    pub fn reference_spl(&self, gain_relatif_db: Option<f64>) -> Option<f64> {
+        let gain = gain_relatif_db.filter(|g| g.is_finite() && *g <= 0.0)?;
+        let sens = self.sens_factor_db.filter(|s| s.is_finite())?;
+        Some(94.0 - sens - gain)
+    }
+
+    /// La veille existante reste disponible aux clients sans gain de référence.
+    pub fn crete_spl(&self, dbfs: f64, gain_relatif_db: Option<f64>) -> Option<f64> {
+        self.reference_spl(gain_relatif_db)
+            .map(|reference| dbfs + reference)
+            .or_else(|| self.spl_from_dbfs(dbfs))
+    }
+
+    /// rc14 (version prudente, 26/11) — écart, en dB, entre l'ancienne
+    /// conversion (`dBFS + 112 − Sens`) et la nouvelle (`dBFS + 94 − Sens −
+    /// gain`). Positif quand l'ancienne estime plus haut. `None` sans les deux.
+    /// La nouvelle n'a été confirmée par aucun calibrateur physique (rc15).
+    pub fn ecart_conversion_db(&self, gain_relatif_db: Option<f64>) -> Option<f64> {
+        let nouvelle = self.reference_spl(gain_relatif_db)?;
+        let ancienne = self.spl_from_dbfs(0.0)?;
+        Some(ancienne - nouvelle)
+    }
+
+    /// rc14 (version prudente) — la plus haute des deux estimations de crête.
+    /// C'est elle, et elle seule, qui commande la coupure à 90 dB SPL et
+    /// borne toute consigne de hausse : on ne peut couper que trop tôt,
+    /// jamais trop tard, tant que la nouvelle conversion n'est pas vérifiée.
+    pub fn crete_spl_prudente(&self, dbfs: f64, gain_relatif_db: Option<f64>) -> Option<f64> {
+        let nouvelle = self.crete_spl(dbfs, gain_relatif_db);
+        let ancienne = self.spl_from_dbfs(dbfs);
+        match (nouvelle, ancienne) {
+            (Some(n), Some(a)) => Some(n.max(a)),
+            (n, a) => n.or(a),
+        }
+    }
+
+    /// Niveau continu équivalent pondéré C sur le palier capté, à sa cadence native.
+    pub fn niveau_c(&self, palier: &[f64], fs: u32, gain_relatif_db: Option<f64>) -> Option<f64> {
+        let reference = self.reference_spl(gain_relatif_db)?;
+        if palier.len() < 2
+            || fs == 0
+            || self.freqs.is_empty()
+            || self.freqs.len() != self.deviation_db.len()
+            || self.freqs.iter().any(|f| !f.is_finite() || *f <= 0.0)
+            || self.deviation_db.iter().any(|v| !v.is_finite())
+        {
+            return None;
+        }
+        let nfft = crate::fft::next_pow2(palier.len());
+        let moyenne = palier.iter().sum::<f64>() / palier.len() as f64;
+        let centre: Vec<_> = palier.iter().map(|s| s - moyenne).collect();
+        let spectre = crate::fft::rfft(&centre, nfft);
+        let dev_ref = self.deviation_at(1000.0);
+        let c_ref = reponse_c(1000.0);
+        // Parseval, spectre réel unilatéral. Nyquist n'a pas de bin miroir.
+        let energie: f64 = spectre
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(k, bin)| {
+                let f = k as f64 * f64::from(fs) / nfft as f64;
+                let gain =
+                    reponse_c(f) / c_ref * crate::fft::from_db(dev_ref - self.deviation_at(f));
+                let multiplicite = if k == nfft / 2 { 1.0 } else { 2.0 };
+                multiplicite * bin.norm_sqr() * gain * gain
+            })
+            .sum();
+        let puissance = energie / (palier.len() as f64 * nfft as f64);
+        let niveau = reference + 10.0 * puissance.log10();
+        niveau.is_finite().then_some(niveau)
     }
 
     /// Plage de fréquences couverte par le fichier.
@@ -141,20 +216,80 @@ impl MicCalibration {
     }
 }
 
+/// Réponse en amplitude C de la CEI 61672, normalisée à 1 kHz par l'appelant.
+fn reponse_c(f: f64) -> f64 {
+    let f2 = f * f;
+    let haut = 12_194.217_f64.powi(2);
+    haut * f2 / ((f2 + 20.598_997_f64.powi(2)) * (f2 + haut))
+}
+
 fn extract_number_after(lower: &str, key: &str) -> Option<f64> {
     let pos = lower.find(key)? + key.len();
-    let rest = &lower[pos..];
-    let start = rest.find(|c: char| c.is_ascii_digit() || c == '-' || c == '+')?;
-    let num: String = rest[start..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
-        .collect();
-    num.parse().ok()
+    let rest =
+        lower[pos..].trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '=' || c == ':');
+    let champ = rest.split([',', ';', '"']).next()?.trim();
+    let valeur = champ.strip_suffix("db").unwrap_or(champ).trim();
+    valeur.parse::<f64>().ok().filter(|s| s.is_finite())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pression_c_du_signal_a_63_1000_et_8000_hz() {
+        // À 94 dB SPL, -12 dBFS RMS dans le fichier et -6 dB de gain
+        // relatif donnent -18 dBFS dans la capture. À 75 dB : -37 dBFS.
+        let cal = MicCalibration::parse("Sens Factor =-12dB\n63 -3\n1000 0\n8000 2").unwrap();
+        for fs in [44_100, 48_000] {
+            for (hz, deviation, poids_c) in
+                [(63.0, -3.0, -0.8), (1000.0, 0.0, 0.0), (8000.0, 2.0, -3.0)]
+            {
+                let amplitude = 2.0_f64.sqrt() * crate::fft::from_db(-37.0 + deviation);
+                let signal: Vec<_> = (0..fs)
+                    .map(|i| {
+                        0.04 + amplitude
+                            * (std::f64::consts::TAU * hz * f64::from(i) / f64::from(fs)).sin()
+                    })
+                    .collect();
+                let dbc = cal.niveau_c(&signal, fs, Some(-6.0)).unwrap();
+                assert!(
+                    (dbc - (75.0 + poids_c)).abs() < 0.1,
+                    "{fs} Hz, {hz} Hz: {dbc}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sans_sensibilite_gain_ou_signal_aucune_pression_absolue() {
+        let courbe = MicCalibration::parse("63 0\n1000 0").unwrap();
+        let cal = MicCalibration::parse(UMIK).unwrap();
+        assert_eq!(courbe.niveau_c(&[0.1, -0.1], 48000, Some(0.0)), None);
+        assert_eq!(cal.niveau_c(&[0.1, -0.1], 48000, None), None);
+        assert_eq!(cal.niveau_c(&[0.0; 8], 48000, Some(0.0)), None);
+        assert_eq!(cal.reference_spl(Some(1.0)), None);
+        let sans_facteur =
+            MicCalibration::parse("Sens Factor = , SERNO: 7001234\n63 0\n1000 0").unwrap();
+        assert_eq!(sans_facteur.reference_spl(Some(0.0)), None);
+    }
+
+    #[test]
+    fn la_prudence_retient_la_plus_haute_des_deux_conversions() {
+        // Sens −12, gain 0 : l'ancienne dit 18 dB de plus que la nouvelle.
+        let cal = MicCalibration::parse("Sens Factor =-12dB\n63 0\n1000 0").unwrap();
+        assert_eq!(cal.crete_spl(-40.0, Some(0.0)), Some(66.0));
+        assert_eq!(cal.spl_from_dbfs(-40.0), Some(84.0));
+        assert_eq!(cal.crete_spl_prudente(-40.0, Some(0.0)), Some(84.0));
+        assert_eq!(cal.ecart_conversion_db(Some(0.0)), Some(18.0));
+        // Gain −18 : les deux conversions se rejoignent.
+        assert_eq!(cal.ecart_conversion_db(Some(-18.0)), Some(0.0));
+        // Gain −24 : la nouvelle est la plus haute, c'est elle qui compte.
+        assert_eq!(cal.crete_spl_prudente(-40.0, Some(-24.0)), Some(90.0));
+        // Sans gain, seule l'ancienne existe.
+        assert_eq!(cal.crete_spl_prudente(-40.0, None), Some(84.0));
+        assert_eq!(cal.ecart_conversion_db(None), None);
+    }
 
     const UMIK: &str = "\"Sens Factor =-1.021dB, SERNO: 7001234\"\n10.058\t-5.2\n20.0\t-1.0\n1000\t0.0\n10000\t1.5\n20000\t3.0\n";
 

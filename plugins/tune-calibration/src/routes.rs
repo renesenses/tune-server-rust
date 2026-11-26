@@ -282,6 +282,7 @@ struct DemandeMesure {
     #[serde(default)]
     voie_micro: usize,
     etalonnage: Option<String>,
+    gain_relatif_db: Option<f64>,
     duree_s: Option<f64>,
     volume: Option<f64>,
     /// `gauche`, `droite` ou `deux` (défaut).
@@ -318,6 +319,14 @@ fn demande_de(zone: i64, d: DemandeMesure) -> Result<Demande, Response> {
         },
     };
     let mut demande = Demande::defaut(zone, d.entree.trim());
+    if d.gain_relatif_db.is_some_and(|g| g > 0.0) {
+        return Err(refus(
+            StatusCode::BAD_REQUEST,
+            "gain_invalide",
+            "le gain relatif au maximum doit être nul ou négatif".into(),
+        ));
+    }
+    demande.gain_relatif_db = d.gain_relatif_db;
     demande.voie_micro = d.voie_micro;
     demande.etalonnage = d.etalonnage.filter(|s| !s.trim().is_empty());
     if let Some(s) = d.duree_s {

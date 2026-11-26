@@ -130,6 +130,7 @@ pub struct Demande {
     pub voie_micro: usize,
     /// Nom d'un fichier d'étalonnage déposé, ou `None`.
     pub etalonnage: Option<String>,
+    pub gain_relatif_db: Option<f64>,
     /// Durée du balayage complet (s), bornée [1, 20].
     pub duree_s: f64,
     /// Volume de zone forcé pendant la mesure (0–100).
@@ -151,6 +152,7 @@ impl Demande {
             entree: entree.to_string(),
             voie_micro: 0,
             etalonnage: None,
+            gain_relatif_db: None,
             duree_s: 8.0,
             volume_mesure_pct: 40.0,
             voies: Voies::LesDeux,
@@ -763,7 +765,9 @@ impl Controleur {
                 },
             );
             let rsb = ri.snr_db();
-            let spl = etalonnage.and_then(|c| c.spl_from_dbfs(crete));
+            // Version prudente (rc14) : la plus haute des deux conversions borne
+            // la montée des salves et le plafond SPL.
+            let spl = etalonnage.and_then(|c| c.crete_spl_prudente(crete, d.gain_relatif_db));
             let sonde = ProbeResult {
                 played_dbfs: em.niveau_dbfs,
                 captured_peak_dbfs: crete,
