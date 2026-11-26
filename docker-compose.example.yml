@@ -4,6 +4,8 @@ services:
   tune:
     image: renesenses/tune:latest
     container_name: tune
+    # Reseau de l'hote : Tune voit l'adresse reelle des appareils du reseau
+    # local (indispensable a la decouverte UPnP et AirPlay).
     network_mode: host
     restart: unless-stopped
     volumes:
@@ -46,6 +48,29 @@ services:
       - TUNE_PORT=8888
       - TUNE_AUTO_SCAN=true
       - TUNE_LOG=info
+      # Premiere configuration : dans un conteneur, le mot de passe
+      # administrateur se cree par defaut avec le code d'activation du journal
+      # (`docker logs tune | grep TUNE-ACTIVATION-CODE`). Avec le reseau de
+      # l'hote (`network_mode: host` ci-dessus) ET sans mandataire inverse
+      # devant Tune, cette variable permet de le creer dans l'assistant, sans
+      # code, depuis le reseau local, dans les 45 minutes qui suivent le
+      # premier demarrage. A NE PAS poser en mode pont, sous Docker Desktop,
+      # derriere un mandataire ou dans une VM en NAT.
+      # - TUNE_FIRST_SETUP_IN_CONTAINER=1
+      # Administration sans authentification (redemarrer, mettre a jour,
+      # greffons...) : dans un conteneur, seulement avec l'authentification
+      # par defaut. Avec le reseau de l'hote (`network_mode: host`) ET sans
+      # mandataire inverse devant Tune, cette variable l'ouvre aux appareils
+      # du reseau local (jamais a la passerelle du conteneur). Memes reserves
+      # que ci-dessus : pas en mode pont, ni sous Docker Desktop, ni derriere
+      # un mandataire, ni dans une VM en NAT, ni sous Podman sans root (son
+      # reseau par defaut fait voir toutes les connexions comme venant de
+      # 10.0.2.100). Un relais TCP pose sur une autre machine du reseau n'est
+      # pas detectable : dans ce cas, allumer le reglage « Administration
+      # depuis cette machine seulement ». Les plages d'un reseau superpose
+      # peuvent etre retirees du reseau local par
+      # TUNE_ADMIN_LAN_EXCLUDED_RANGES (ex. `fd12:3456:789a::/48`).
+      # - TUNE_ADMIN_LAN_IN_CONTAINER=1
       # Spotify Connect (librespot)
       # - LIBRESPOT_NAME=Tune
       # - LIBRESPOT_BITRATE=320
