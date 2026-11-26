@@ -246,6 +246,7 @@ fn le_verdict_annonce_la_mesure() {
     );
     let a = b.controleur.test_niveau(&id).unwrap().avancement();
     let v = a.verdict.clone().expect("verdict");
+    assert_eq!(v.niveau_dbc, None);
     assert_eq!(v.jugement, Jugement::Bon, "{v:?}");
     assert!(v.rsb_db >= RSB_MIN_DB, "{v:?}");
     let bruit = a.bruit.expect("bruit de fond");
@@ -342,8 +343,10 @@ fn le_plafond_spl_coupe_le_signal() {
         "{v:?}"
     );
     assert!(v.coupe && v.spl_db.is_some_and(|s| s > 90.0), "{v:?}");
+    assert_eq!(v.niveau_dbc, None);
     let mut d = DemandeNiveau::signal(ZONE, MICRO);
     d.etalonnage = Some("doux".into());
+    d.gain_relatif_db = Some(-18.0);
     let id = b.controleur.tester_niveau(d).unwrap();
     assert_eq!(
         attendre_fin(&b.controleur, &id, Duration::from_secs(30)),
@@ -352,6 +355,10 @@ fn le_plafond_spl_coupe_le_signal() {
     let v = b.controleur.test_niveau(&id).unwrap().verdict().unwrap();
     assert_eq!(v.jugement, Jugement::Bon, "{v:?}");
     assert!(!v.coupe && v.spl_db.is_some_and(|s| s < 90.0), "{v:?}");
+    assert!(
+        v.niveau_dbc
+            .is_some_and(|c| c.is_finite() && c < v.spl_db.unwrap())
+    );
     // Un étalonnage inconnu est refusé avant tout.
     let mut d = DemandeNiveau::signal(ZONE, MICRO);
     d.etalonnage = Some("absent".into());

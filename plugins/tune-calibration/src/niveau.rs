@@ -286,6 +286,8 @@ pub struct Verdict {
     pub rsb_db: f64,
     /// Pression de crête au micro (dB SPL), avec un étalonnage seulement.
     pub spl_db: Option<f64>,
+    /// Niveau efficace pondéré C du palier de référence.
+    pub niveau_dbc: Option<f64>,
     /// La veille a coupé le signal pendant la montée (saturation ou SPL).
     pub coupe: bool,
     pub plage: Plage,
@@ -372,6 +374,7 @@ pub fn juger(bruit: Niveaux, signal: Niveaux, spl_db: Option<f64>, coupe: bool) 
         bruit,
         rsb_db,
         spl_db,
+        niveau_dbc: None,
         coupe,
         plage: PLAGE,
         message,
@@ -963,6 +966,7 @@ pub struct DemandeNiveau {
     /// Relecture m1 — l'étalonnage du micro : avec lui, la pression au micro
     /// est connue et plafonnée à [`SPL_MAX_DB`], comme pour la mesure.
     pub etalonnage: Option<String>,
+    pub gain_relatif_db: Option<f64>,
 }
 
 impl DemandeNiveau {
@@ -976,6 +980,7 @@ impl DemandeNiveau {
             voies: Voies::LesDeux,
             duree_s: ECOUTE_MAX_S,
             etalonnage: None,
+            gain_relatif_db: None,
         }
     }
 
@@ -1641,7 +1646,7 @@ impl Controleur {
             let Some(m) = test.verrou().vumetre else {
                 return false;
             };
-            let spl = etalonnage.and_then(|c| c.spl_from_dbfs(m.crete_max_dbfs));
+            let spl = etalonnage.and_then(|c| c.crete_spl(m.crete_max_dbfs, d.gain_relatif_db));
             let danger =
                 m.crete_max_dbfs >= CRETE_SATURATION_DBFS || spl.is_some_and(|s| s > SPL_MAX_DB);
             if danger && !arme.coupe.load(Ordering::SeqCst) {
@@ -1678,8 +1683,34 @@ impl Controleur {
         }
         let bloc = trames(0.1) as usize;
         let signal = niveaux_du_signal(&capte, bloc, (DUREE_RETENUE_S / 0.1).round() as usize);
-        let spl = etalonnage.and_then(|c| c.spl_from_dbfs(signal.crete_dbfs));
-        let verdict = juger(bruit, signal, spl, coupe);
+        let spl = etalonnage.and_then(|c| c.crete_spl(signal.crete_dbfs, d.gain_relatif_db));
+        let mut verdict = juger(bruit, signal, spl, coupe);
+        if complet
+            && !coupe
+            && matches!(verdict.jugement, Jugement::Bon | Jugement::Faible)
+            && let Some(cal) = etalonnage
+            && d.gain_relatif_db.is_some()
+        {
+            // Le plateau de référence dure 3,5 s après la rampe. Chercher
+            // 3 s contiguës pour écarter la latence et conserver le spectre.
+            let n = (DUREE_RETENUE_S / 0.1).round() as usize;
+            let energies: Vec<_> = capte
+                .chunks_exact(bloc)
+                .map(energie_sans_continue)
+                .collect();
+            if let Some((i, _)) = energies
+                .windows(n)
+                .enumerate()
+                .map(|(i, w)| (i, w.iter().sum::<f64>()))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+            {
+                verdict.niveau_dbc = cal.niveau_c(
+                    &capte[i * bloc..(i + n) * bloc],
+                    tampon.format().frequence,
+                    d.gain_relatif_db,
+                );
+            }
+        }
         tracing::info!(
             test = %test.id,
             jugement = ?verdict.jugement,
@@ -1725,6 +1756,7 @@ pub(crate) mod http {
         voies: Option<String>,
         duree_s: Option<f64>,
         etalonnage: Option<String>,
+        gain_relatif_db: Option<f64>,
     }
 
     /// `POST /niveaux` — `{ mode: "signal" | "ecoute", entree, voie_micro,
@@ -1759,6 +1791,14 @@ pub(crate) mod http {
                 ..DemandeNiveau::ecoute(&c.entree)
             },
         };
+        if c.gain_relatif_db.is_some_and(|g| g > 0.0) {
+            return refus(
+                StatusCode::BAD_REQUEST,
+                "gain_invalide",
+                "le gain relatif au maximum doit être nul ou négatif".into(),
+            );
+        }
+        d.gain_relatif_db = c.gain_relatif_db;
         d.voie_micro = c.voie_micro;
         d.etalonnage = c.etalonnage.filter(|s| !s.trim().is_empty());
         if let Some(v) = c.volume {
