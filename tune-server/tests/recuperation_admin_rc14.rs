@@ -660,3 +660,106 @@ async fn veille_du_secret_erreur_de_lecture_aucune_fermeture() {
     assert!(veille.verifier(&state));
     assert_eq!(*state.fermeture_websockets.borrow(), avant + 1);
 }
+
+// ---------------------------------------------------------------------------
+// Condition de la revue de sécurité (#9564 × #9445/#9569) : la récupération
+// de l'accès administrateur révoque aussi les sessions longues et les jetons
+// de renouvellement, dans la même transaction que le mot de passe.
+// ---------------------------------------------------------------------------
+
+/// Un hôte distant : la session longue (`remember`) et son jeton de
+/// renouvellement y sont rendus, et rien n'y est dispensé de jeton.
+const DISTANT: &str = "203.0.113.7:44444";
+
+fn compter(state: &AppState, sql: &str) -> i64 {
+    state
+        .backend
+        .query_one(sql, &[])
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(-1)
+}
+
+const FAMILLES_OUVERTES: &str =
+    "SELECT COUNT(*) FROM jetons_de_renouvellement WHERE revoque_le IS NULL";
+const SESSIONS_INSCRITES: &str =
+    "SELECT COUNT(*) FROM settings WHERE key LIKE 'auth_session_token:%'";
+
+#[tokio::test]
+async fn reinitialisation_refuse_l_ancien_jeton_d_acces_et_de_renouvellement() {
+    let _env = ENVIRONNEMENT.lock().await;
+    for par_la_route in [true, false] {
+        let state = etat(":memory:");
+        let (_, nom) = ra::compte_administrateur(&state.backend).unwrap();
+        let connexion = serde_json::json!({
+            "username": nom,
+            "password": "ancien-mot-de-passe",
+            "remember": true,
+        })
+        .to_string();
+        let (st, v) = appel(
+            &state,
+            DISTANT,
+            Method::POST,
+            "/api/v1/auth/login",
+            &[("host", "")],
+            Some(connexion),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "connexion : {v}");
+        let acces = v["token"].as_str().expect("jeton d'accès").to_string();
+        let renouvellement = v["refresh_token"]
+            .as_str()
+            .expect("jeton de renouvellement")
+            .to_string();
+        let bearer = format!("Bearer {acces}");
+        let moi = |state: AppState, bearer: String| async move {
+            appel(
+                &state,
+                DISTANT,
+                Method::GET,
+                "/api/v1/auth/me",
+                &[("host", ""), ("authorization", bearer.as_str())],
+                None,
+            )
+            .await
+            .0
+        };
+        // Contre-épreuve : avant la réinitialisation, la session vit.
+        assert_eq!(moi(state.clone(), bearer.clone()).await, StatusCode::OK);
+        assert!(compter(&state, FAMILLES_OUVERTES) >= 1);
+        assert!(compter(&state, SESSIONS_INSCRITES) >= 1);
+
+        if par_la_route {
+            let code = ra::emettre_un_code(&settings(&state)).unwrap();
+            let (st, v) =
+                reinitialiser(&state, CETTE_MACHINE, &[], &code, "nouveau-mot-de-passe").await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+        } else {
+            ra::poser_le_mot_de_passe(&state.backend, 1, "pose-dans-le-terminal").unwrap();
+        }
+
+        // La révocation est écrite, pas seulement déduite du mot de passe.
+        assert_eq!(compter(&state, FAMILLES_OUVERTES), 0, "familles révoquées");
+        assert_eq!(compter(&state, SESSIONS_INSCRITES), 0, "sessions désinscrites");
+        assert_eq!(
+            moi(state.clone(), bearer.clone()).await,
+            StatusCode::UNAUTHORIZED,
+            "ancien jeton d'accès refusé (route : {par_la_route})"
+        );
+        let (st, v) = appel(
+            &state,
+            DISTANT,
+            Method::POST,
+            "/api/v1/auth/refresh",
+            &[("host", "")],
+            Some(serde_json::json!({ "refresh_token": renouvellement }).to_string()),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "ancien jeton de renouvellement refusé (route : {par_la_route}) : {v}"
+        );
+    }
+}

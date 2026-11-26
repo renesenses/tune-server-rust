@@ -215,7 +215,7 @@ fn horodatage() -> String {
 
 /// Pose le mot de passe du compte `id` et révoque les sessions, en UNE
 /// transaction : mot de passe, nouveau secret de signature, clé d'API et
-/// code effacés. Tout ou rien : si une écriture échoue (base occupée au-delà
+/// code effacés, sessions longues et jetons de renouvellement révoqués. Tout ou rien : si une écriture échoue (base occupée au-delà
 /// du délai d'attente), rien n'est changé et l'erreur remonte. Le secret est
 /// relu après la validation : sans révocation constatée, pas de succès.
 pub fn poser_le_mot_de_passe(
@@ -242,8 +242,19 @@ pub fn poser_le_mot_de_passe(
             &[&secret as &dyn ToSqlValue, &maintenant as &dyn ToSqlValue],
         )?;
         tx.execute(SQL_EFFACER, &[])?;
+        // Condition de la revue de sécurité (#9564 × #9569) : sessions
+        // longues inscrites (#9445) et familles de jetons de renouvellement
+        // révoquées DANS LA MÊME TRANSACTION que le mot de passe et le
+        // secret — un ancien jeton de renouvellement ne doit jamais frapper
+        // un jeton d'accès signé du nouveau secret.
+        tune_core::db::jetons_de_renouvellement::revoquer_toutes_les_sessions_tx(
+            tx,
+            crate::session_renouvelee::maintenant(),
+        )?;
         Ok(())
     })?;
+    // Les WebSocket ouvertes avec une session revérifient la leur.
+    crate::session_renouvelee::signaler_revocation();
     let relu = SettingsRepo::with_backend(backend.clone()).get("jwt_secret")?;
     if relu.as_deref() != Some(secret.as_str()) {
         return Err("révocation des sessions non constatée".into());

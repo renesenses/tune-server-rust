@@ -242,7 +242,7 @@ fn effacer_sessions_longues(settings: &SettingsRepo) {
 /// récupération de l'accès administrateur (#9564, `poser_le_mot_de_passe`),
 /// qui change le secret en SQL direct : elle doit exécuter
 /// `tune_core::db::jetons_de_renouvellement::revoquer_toutes_les_sessions_tx`
-/// DANS SA TRANSACTION (la PR fusionnée en second branche l'appel).
+/// DANS SA TRANSACTION (branché à l'intégration rc14 vague 4, #9576).
 pub fn revoquer_toutes_les_sessions(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
 ) {
