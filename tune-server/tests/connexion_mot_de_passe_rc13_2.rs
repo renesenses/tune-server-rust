@@ -11,6 +11,11 @@
 //! Le refus porte `error` (inchangé, comparé par les clients) et un `message`
 //! lisible, dans la langue de la requête.
 //!
+//! rc14 : le profil 1 s'appelle `admin` après la migration 158 (PG 124), et
+//! `default` en reste l'alias à la connexion. Les scénarios saisissent
+//! toujours `default` : ils prouvent l'alias ; `alias_default_du_profil_admin`
+//! couvre `admin` et les bords.
+//!
 //! SQLite toujours ; PostgreSQL en plus quand `TUNE_TEST_PG_URL` est posée
 //! (feature `postgres`).
 
@@ -41,7 +46,7 @@ fn hachages(state: &AppState) -> (Option<String>, Option<String>) {
     let r = state
         .backend
         .query_one(
-            "SELECT password_hash, password_hash_v2 FROM profiles WHERE username = 'default'",
+            "SELECT password_hash, password_hash_v2 FROM profiles WHERE id = 1",
             &[],
         )
         .unwrap()
@@ -58,7 +63,7 @@ fn poser_hachages(state: &AppState, ancien: Option<&str>, nouveau: Option<&str>)
     state
         .backend
         .execute(
-            "UPDATE profiles SET password_hash = ?, password_hash_v2 = ? WHERE username = 'default'",
+            "UPDATE profiles SET password_hash = ?, password_hash_v2 = ? WHERE id = 1",
             &[&ancien as &dyn ToSqlValue, &nouveau as &dyn ToSqlValue],
         )
         .unwrap();
@@ -82,10 +87,21 @@ async fn appel(
     corps: &str,
     langue: Option<&str>,
 ) -> (StatusCode, Value) {
+    appel_methode(state, Method::POST, adresse, chemin, corps, langue).await
+}
+
+async fn appel_methode(
+    state: &AppState,
+    methode: Method,
+    adresse: &str,
+    chemin: &str,
+    corps: &str,
+    langue: Option<&str>,
+) -> (StatusCode, Value) {
     let pair: SocketAddr = adresse.parse().unwrap();
     let app: Router = tune_server::routes::router(state.clone()).layer(MockConnectInfo(pair));
     let mut req = Request::builder()
-        .method(Method::POST)
+        .method(methode)
         .uri(chemin)
         .header(header::CONTENT_TYPE, "application/json");
     if let Some(l) = langue {
@@ -347,6 +363,184 @@ async fn sqlite_autre_profil_sans_mot_de_passe() {
     autre_profil_sans_mot_de_passe(&etat_sqlite(), "192.168.1.66:50000").await;
 }
 
+/// rc14 — le profil 1 s'appelle `admin` ; `default` en reste l'alias.
+async fn alias_default_du_profil_admin(state: &AppState, lan: &str) {
+    let nom_du_profil_1 = |state: &AppState| -> String {
+        state
+            .backend
+            .query_one("SELECT username FROM profiles WHERE id = 1", &[])
+            .unwrap()
+            .unwrap()[0]
+            .as_string()
+            .unwrap()
+    };
+    assert_eq!(
+        nom_du_profil_1(state),
+        "admin",
+        "base migrée : profil 1 = admin"
+    );
+    assert_eq!(hachages(state), (None, None));
+
+    // Première connexion sous `admin`, sur cette machine : revendiquée.
+    let (st, v) = connexion(state, CETTE_MACHINE, "admin", "premier-1234").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["user_id"], 1);
+    assert_eq!(v["username"], "admin");
+    assert_eq!(v["role"], "admin");
+    assert!(mot_de_passe_enregistre(state, "premier-1234"));
+
+    // `default` ouvre le même compte, ici et depuis le LAN, et la réponse
+    // porte le vrai nom.
+    for adresse in [CETTE_MACHINE, lan] {
+        let (st, v) = connexion(state, adresse, "default", "premier-1234").await;
+        assert_eq!(st, StatusCode::OK, "{adresse} : {v}");
+        assert_eq!(v["user_id"], 1, "{v}");
+        assert_eq!(v["username"], "admin", "{v}");
+        assert_eq!(v["role"], "admin", "{v}");
+    }
+    let (st, v) = connexion(state, lan, "default", MAUVAIS).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    assert!(mot_de_passe_enregistre(state, "premier-1234"));
+
+    // Un nouveau compte ne capte pas l'alias.
+    let (st, v) = appel(
+        state,
+        CETTE_MACHINE,
+        "/api/v1/auth/register",
+        r#"{"username":"default","password":"capteur-1234"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+
+    // Profil 1 renommé par l'utilisateur : son nom est gardé, `default` reste
+    // son alias (mot de passe exigé)…
+    state
+        .backend
+        .execute(
+            "UPDATE profiles SET username = 'bertrand' WHERE id = 1",
+            &[],
+        )
+        .unwrap();
+    let (st, v) = connexion(state, lan, "default", "premier-1234").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["user_id"], 1, "{v}");
+    assert_eq!(v["username"], "bertrand", "{v}");
+    // … mais il n'est plus revendicable sans mot de passe, comme avant la rc14.
+    poser_hachages(state, None, None);
+    let (st, v) = connexion(state, CETTE_MACHINE, "default", "autre-1234").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    assert_eq!(hachages(state), (None, None));
+
+    // Profil 1 resté `default` (nom `admin` déjà pris ailleurs) : revendicable
+    // comme avant.
+    state
+        .backend
+        .execute("UPDATE profiles SET username = 'default' WHERE id = 1", &[])
+        .unwrap();
+    let (st, v) = connexion(state, CETTE_MACHINE, "default", "second-1234").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["username"], "default", "{v}");
+    assert!(mot_de_passe_enregistre(state, "second-1234"));
+
+    state
+        .backend
+        .execute(
+            "UPDATE profiles SET username = 'admin', display_name = 'Admin' WHERE id = 1",
+            &[],
+        )
+        .unwrap();
+}
+
+/// rc14 (relecture) — `admin` / `default` n'appartiennent qu'au profil 1 :
+/// aucun autre profil ne les prend (création, renommage, inscription, toute
+/// casse), et un profil `default` qui ne serait pas le 1 (base copiée) n'est
+/// jamais revendicable sans mot de passe.
+async fn noms_reserves_au_profil_1(state: &AppState, lan: &str) {
+    for nom in ["default", "Default", "DEFAULT", "admin", "Admin"] {
+        let corps = serde_json::json!({ "username": nom, "password": "capteur-1234" }).to_string();
+        let (st, v) = appel(state, CETTE_MACHINE, "/api/v1/auth/register", &corps, None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "inscription {nom:?} : {v}");
+        let corps = serde_json::json!({ "name": nom }).to_string();
+        let (st, v) = appel(state, CETTE_MACHINE, "/api/v1/profiles", &corps, None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "création {nom:?} : {v}");
+    }
+    let autre = state
+        .backend
+        .execute_returning_id(
+            "INSERT INTO profiles (username, display_name) VALUES ('salon', 'Salon')",
+            &[],
+        )
+        .unwrap();
+    for nom in ["default", "Default", "Admin"] {
+        let corps = serde_json::json!({ "name": nom }).to_string();
+        let (st, v) = appel_methode(
+            state,
+            Method::PUT,
+            CETTE_MACHINE,
+            &format!("/api/v1/profiles/{autre}"),
+            &corps,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "renommage {nom:?} : {v}");
+    }
+    // Le profil 1 garde le droit de porter ses noms.
+    let (st, v) = appel_methode(
+        state,
+        Method::PUT,
+        CETTE_MACHINE,
+        "/api/v1/profiles/1",
+        r#"{"name":"admin"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // Un profil `default` qui n'est pas le 1 (posé en base, hors API) : il
+    // capte le nom saisi, mais jamais sans mot de passe, même sur cette
+    // machine, authentification coupée.
+    state
+        .backend
+        .execute(
+            "UPDATE profiles SET username = 'default' WHERE id = ?",
+            &[&autre as &dyn ToSqlValue],
+        )
+        .unwrap();
+    for adresse in [CETTE_MACHINE, lan] {
+        let (st, v) = connexion(state, adresse, "default", "revendique-1234").await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{adresse} : {v}");
+    }
+    let hachage_de_l_autre = state
+        .backend
+        .query_one(
+            "SELECT password_hash_v2 FROM profiles WHERE id = ?",
+            &[&autre as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .unwrap()
+        .first()
+        .and_then(|v| v.as_string());
+    assert_eq!(hachage_de_l_autre, None, "rien n'est enregistré");
+    state
+        .backend
+        .execute(
+            "DELETE FROM profiles WHERE id = ?",
+            &[&autre as &dyn ToSqlValue],
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_noms_reserves_au_profil_1() {
+    noms_reserves_au_profil_1(&etat_sqlite(), "192.168.1.69:50000").await;
+}
+
+#[tokio::test]
+async fn sqlite_alias_default_du_profil_admin() {
+    alias_default_du_profil_admin(&etat_sqlite(), "192.168.1.68:50000").await;
+}
+
 /// Le message suit la langue de la requête.
 #[tokio::test]
 async fn le_refus_parle_la_langue_de_la_requete() {
@@ -375,7 +569,14 @@ async fn le_refus_parle_la_langue_de_la_requete() {
 fn remettre_a_zero(state: &AppState) {
     state
         .backend
-        .execute("DELETE FROM profiles WHERE username <> 'default'", &[])
+        .execute("DELETE FROM profiles WHERE id <> 1", &[])
+        .unwrap();
+    state
+        .backend
+        .execute(
+            "UPDATE profiles SET username = 'admin', display_name = 'Admin' WHERE id = 1",
+            &[],
+        )
         .unwrap();
     poser_hachages(state, None, None);
     poser_authentification(state, false);
@@ -408,5 +609,9 @@ async fn postgres_memes_scenarios() {
     autre_profil_sans_mot_de_passe(&state, "10.0.0.76:50000").await;
     remettre_a_zero(&state);
     hachages_illisibles(&state, "10.0.0.77:50000").await;
+    remettre_a_zero(&state);
+    alias_default_du_profil_admin(&state, "10.0.0.78:50000").await;
+    remettre_a_zero(&state);
+    noms_reserves_au_profil_1(&state, "10.0.0.79:50000").await;
     remettre_a_zero(&state);
 }

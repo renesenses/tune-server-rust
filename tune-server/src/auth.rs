@@ -1651,6 +1651,14 @@ async fn register(
     }
     let cree_par_un_administrateur = appelant.is_some();
     let username = body.username.trim().to_string();
+    // rc14 : `admin` / `default`, toute casse, n'appartiennent qu'au profil 1.
+    if tune_core::db::profil_administrateur::nom_reserve(&username) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "username already exists"})),
+        )
+            .into_response();
+    }
     if username.is_empty() || body.password.len() < 8 {
         return (
             StatusCode::BAD_REQUEST,
@@ -1663,8 +1671,16 @@ async fn register(
     let exists = state
         .backend
         .query_one(
-            "SELECT COUNT(*) FROM profiles WHERE username = ?",
-            &[&username as &dyn tune_core::db::backend::ToSqlValue],
+            // rc14 : `default`, alias du profil 1 renommé `admin`, compte
+            // comme pris — sinon un nouveau compte le capterait.
+            &format!(
+                "SELECT COUNT(*) FROM profiles WHERE {}",
+                tune_core::db::profil_administrateur::SQL_PROFIL_PAR_NOM_DE_CONNEXION
+            ),
+            &[
+                &username as &dyn tune_core::db::backend::ToSqlValue,
+                &username as &dyn tune_core::db::backend::ToSqlValue,
+            ],
         )
         .ok()
         .flatten()
@@ -1881,13 +1897,21 @@ async fn login(
     }
     let settings = SettingsRepo::with_backend(state.backend.clone());
 
-    // Look up profile
+    // Look up profile. rc14 : `default` reste accepté — alias du profil 1
+    // quand celui-ci s'appelle désormais `admin` (ou a été renommé).
     use tune_core::db::backend::ToSqlValue;
-    let row: Option<(i64, Option<String>, Option<String>, bool)> = state
+    use tune_core::db::profil_administrateur as profil_admin;
+    let row: Option<(i64, Option<String>, Option<String>, bool, String)> = state
         .backend
         .query_one(
-            "SELECT id, password_hash, password_hash_v2, is_admin FROM profiles WHERE username = ?",
-            &[&body.username as &dyn ToSqlValue],
+            &format!(
+                "SELECT id, password_hash, password_hash_v2, is_admin, username FROM profiles WHERE {}",
+                profil_admin::SQL_PROFIL_PAR_NOM_DE_CONNEXION
+            ),
+            &[
+                &body.username as &dyn ToSqlValue,
+                &body.username as &dyn ToSqlValue,
+            ],
         )
         .ok()
         .flatten()
@@ -1897,10 +1921,13 @@ async fn login(
                 r.get(1).and_then(|v| v.as_string()),
                 r.get(2).and_then(|v| v.as_string()),
                 r.get(3).and_then(|v| v.as_bool()).unwrap_or(false),
+                r.get(4)
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_else(|| body.username.clone()),
             )
         });
 
-    let (profile_id, old_hash, new_hash, is_admin) = match row {
+    let (profile_id, old_hash, new_hash, is_admin, nom_du_profil) = match row {
         Some(r) => r,
         None => {
             record_login_failure(ip, operateur);
@@ -1929,8 +1956,17 @@ async fn login(
         .map(|v| v == "true")
         .unwrap_or(false);
     let passwordless_default_allowed = !auth_enabled || operateur;
-    let premiere_connexion =
-        sans_mot_de_passe && body.username == "default" && passwordless_default_allowed;
+    // Le compte revendicable est le profil administrateur d'origine : `default`
+    // (nom d'avant la rc14, ou gardé faute de pouvoir prendre `admin`), ou le
+    // profil 1 renommé `admin` par la migration 158 — saisi sous l'un ou
+    // l'autre nom. Un profil 1 renommé par l'utilisateur ne l'est pas, comme
+    // avant.
+    // Toujours le profil 1 : un autre profil nommé `default` (base ancienne,
+    // copie) n'est jamais revendicable sans mot de passe.
+    let profil_d_origine = profile_id == profil_admin::ID_PROFIL_D_ORIGINE
+        && (nom_du_profil == profil_admin::ANCIEN_NOM_ADMINISTRATEUR
+            || nom_du_profil == profil_admin::NOM_ADMINISTRATEUR);
+    let premiere_connexion = sans_mot_de_passe && profil_d_origine && passwordless_default_allowed;
 
     // Try argon2 hash first (password_hash_v2), then fall back to SHA-256 (password_hash)
     let valid_v2 = nouveau_hachage.is_some_and(|h| verify_password(&body.password, h));
@@ -1980,7 +2016,7 @@ async fn login(
         "token": token,
         "token_type": "Bearer",
         "expires_in": 86400,
-        "username": body.username,
+        "username": nom_du_profil,
         "user_id": profile_id,
         "role": role,
     }))
