@@ -2077,6 +2077,40 @@ impl LocalOutput {
         Ok(())
     }
 
+    /// Revue de #9561 — la chaîne a changé (headroom Auto ↔ manuel, marge
+    /// manuelle, égaliseur qui la porte) : `config` est retenue pour les
+    /// pistes suivantes, et le moteur n'est RECONSTRUIT que si la marge qu'il
+    /// appliquerait au flux en cours n'est plus celle qu'il applique (un
+    /// réglage d'égaliseur ne refait pas la FFT du filtre). Rend vrai s'il a
+    /// été reconstruit.
+    pub fn reposer_la_convolution_si_la_marge_change(
+        &self,
+        config: super::super::audio::convolver::ConvolverConfig,
+    ) -> Result<bool, String> {
+        let en_service = self.convolver.lock().ok().and_then(|c| {
+            c.as_ref()
+                .filter(|c| !c.est_eteint())
+                .map(|c| c.reserve_db())
+        });
+        let format = self
+            .current_format()
+            .filter(|_| self.convolution_autorisee.load(Ordering::Relaxed));
+        if let (Some(r), Some((cadence, _))) = (en_service, format)
+            && let Ok(m) = config.marge_pour(cadence)
+            && (m.appliquee_db - r).abs() < 1e-9
+        {
+            *self.convolver_config.lock().unwrap() = Some(config);
+            return Ok(false);
+        }
+        self.set_convolver_config(config).map(|()| true)
+    }
+
+    /// Le jeu de convolution retenu (celui des pistes suivantes), marge
+    /// comprise : diagnostic et témoins.
+    pub fn config_de_convolution(&self) -> Option<super::super::audio::convolver::ConvolverConfig> {
+        self.convolver_config.lock().ok().and_then(|c| c.clone())
+    }
+
     pub fn clear_convolver(&self) {
         *self.convolver_config.lock().unwrap() = None;
         // T09b — flux en cours, le filtre retiré s'éteint en fondu (le moteur
@@ -2139,6 +2173,13 @@ impl LocalOutput {
             }
             if let Some(a) = actif.as_mut() {
                 a.borner_la_remontee(borne);
+            }
+            // Revue de #9561 — un filtre moins atténué que celui qui joue
+            // (marge Auto retirée au passage en manuel) part du niveau
+            // entendu et remonte en ~0,5 s, borné au niveau d'avant.
+            let mut nouveau = nouveau;
+            if joue && let (Some(n), Some(a)) = (nouveau.as_mut(), actif.as_ref()) {
+                n.raccorder_le_niveau(a.niveau_en_service(), borne);
             }
             // Le droit est relu SOUS le verrou : un retrait du Premium
             // concurrent (`set_convolution_autorisee`) n'est jamais ignoré.
@@ -10328,6 +10369,9 @@ mod tests;
 // #7632 — la convolution par RI est un droit Premium, éteinte sans clic.
 #[cfg(test)]
 mod convolution_sous_licence_7632;
+// Revue de #9561 — la marge du filtre suit le headroom, flux en cours.
+#[cfg(test)]
+mod marge_convolution_9561;
 
 #[cfg(test)]
 mod open_failure_tests;
