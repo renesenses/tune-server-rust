@@ -52,6 +52,8 @@ impl Environnement {
             std::env::set_var("TUNE_WEB80_RELAIS", if relais_80 { "1" } else { "0" });
             std::env::remove_var("TUNE_ALLOWED_ORIGINS");
             std::env::remove_var("TUNE_ALLOWED_HOSTS");
+            // Machine ordinaire, même quand l'épreuve tourne en conteneur.
+            std::env::set_var("TUNE_TEST_HORS_CONTENEUR", "1");
         }
         Environnement
     }
@@ -62,6 +64,7 @@ impl Drop for Environnement {
         unsafe {
             std::env::remove_var("TUNE_APPLIANCE");
             std::env::remove_var("TUNE_WEB80_RELAIS");
+            std::env::remove_var("TUNE_TEST_HORS_CONTENEUR");
         }
     }
 }
@@ -297,8 +300,11 @@ async fn authentification_active_un_non_administrateur_est_refuse() {
     );
 }
 
-/// 4. Les autres actions de machine ne s'ouvrent PAS au réseau local. Le
-/// refus est une phrase traduite qui nomme l'action et dit comment faire.
+/// 4. rc14 : les autres actions de machine s'ouvrent aussi au réseau local
+/// (voir `administration_reseau_local_rc14.rs`), sauf quand le réglage
+/// « Administration depuis cette machine seulement » est allumé : elles sont
+/// alors refusées, avec une phrase traduite qui nomme l'action et dit
+/// comment faire. La mise à jour, elle, reste ouverte au réseau local.
 ///
 /// Hors appliance, `/appliance/reboot` rend 404 APRÈS la garde : un 403 prouve
 /// donc que la garde a refusé, et rien ne redémarre.
@@ -307,6 +313,30 @@ async fn redemarrage_depuis_le_reseau_local_reste_refuse() {
     let _verrou = crate::lock_environment();
     let _env = Environnement::poser(false, false);
     let state = serveur_avec_maj_en_cours();
+    // Réglage strict éteint (par défaut) : la garde laisse passer (404).
+    let (status, corps) = post(
+        &state,
+        LAN,
+        REDEMARRER_LA_MACHINE,
+        &[("host", "192.168.1.10:8888")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "rc14, réseau local — {corps}"
+    );
+    SettingsRepo::with_backend(state.backend.clone())
+        .set(
+            tune_server::auth::CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT,
+            "true",
+        )
+        .unwrap();
+    let (status, corps) = post(&state, LAN, INSTALLER, &[("host", "192.168.1.10:8888")]).await;
+    assert!(
+        garde_passee(status, &corps),
+        "réglage strict : la mise à jour reste ouverte au réseau local — {status} {corps}"
+    );
     let (status, corps) = post(
         &state,
         LAN,
@@ -345,7 +375,7 @@ async fn redemarrage_depuis_le_reseau_local_reste_refuse() {
         "phrase anglaise attendue : {message}"
     );
 
-    // Le canal de mise à jour reste réservé, lui aussi.
+    // Le canal de mise à jour aussi, sous le réglage strict.
     let pair: std::net::SocketAddr = LAN.parse().unwrap();
     let app = tune_server::routes::router(state.clone())
         .layer(axum::extract::connect_info::MockConnectInfo(pair));

@@ -280,20 +280,6 @@ async fn la_passerelle_sert_des_plages_au_porteur_du_jeton() {
     assert_eq!(s, StatusCode::FORBIDDEN);
 }
 
-/// Lance un scan, en attendant au besoin qu'un autre scan du processus (une
-/// autre épreuve qui tourne en parallèle) rende le droit.
-async fn lancer_un_scan(state: &AppState, cible: Option<String>) {
-    for _ in 0..1200 {
-        if crate::routes::system::scan::spawn_library_scan(state.clone(), false, cible.clone())
-            .await
-        {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    panic!("aucun scan n'a pu être lancé en 120 s");
-}
-
 async fn attendre_pistes(state: &AppState, prefixe: &str, n: usize) -> Vec<(i64, String)> {
     let fin = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
@@ -323,7 +309,14 @@ async fn attendre_pistes(state: &AppState, prefixe: &str, n: usize) -> Vec<(i64,
 /// la piste se lit par sa route de lecture, et une source coupée garde ses
 /// pistes (indisponibles, pas supprimées).
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn une_source_distante_s_indexe_se_lit_et_survit_a_une_coupure() {
+    use crate::routes::system::scan::{
+        attendre_que_le_droit_de_scanner_soit_libre, serialiser_les_scans_de_test_sans_bloquer,
+        spawn_library_scan,
+    };
+    let _seul = serialiser_les_scans_de_test_sans_bloquer().await;
+    attendre_que_le_droit_de_scanner_soit_libre().await;
     let (state, _d) = etat(false);
     let m = faux_nas("nas-scan");
     m.ajouter(
@@ -360,10 +353,11 @@ async fn une_source_distante_s_indexe_se_lit_et_survit_a_une_coupure() {
     )
     .await;
     assert_eq!(s, StatusCode::ACCEPTED);
-    if json_de(&o)["lance"] != true {
-        // Un autre scan du processus (autre épreuve) tenait le droit.
-        lancer_un_scan(&state, json_de(&o)["racine"].as_str().map(str::to_string)).await;
-    }
+    assert_eq!(
+        json_de(&o)["lance"],
+        true,
+        "la route doit lancer le scan ciblé"
+    );
     let pistes = attendre_pistes(&state, &prefixe, 2).await;
     assert_eq!(
         pistes.iter().map(|(_, f)| f.as_str()).collect::<Vec<_>>(),
@@ -405,7 +399,9 @@ async fn une_source_distante_s_indexe_se_lit_et_survit_a_une_coupure() {
 
     // Coupure : un scan complet ne supprime rien, la source est dite injoignable.
     m.couper(true);
-    lancer_un_scan(&state, None).await;
+    attendre_que_le_droit_de_scanner_soit_libre().await;
+    assert!(spawn_library_scan(state.clone(), false, None).await);
+    attendre_que_le_droit_de_scanner_soit_libre().await;
     let apres = attendre_pistes(&state, &prefixe, 2).await;
     assert_eq!(
         apres.len(),

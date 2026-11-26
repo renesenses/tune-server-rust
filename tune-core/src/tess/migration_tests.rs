@@ -2583,17 +2583,48 @@ fn d1_les_cles_tenues_par_le_serveur() {
         "room_profile_index",
         "zone_7_tess_chain",
         "zone_12_tess_chain_sync",
+        // rc14 : les profils d'égaliseur et les préréglages.
+        "zone_7_eq_profile",
+        "zone_7_eq_profile_before_tess",
+        "eq_presets",
     ] {
         assert!(cle_tenue_par_le_serveur(cle), "{cle}");
     }
     for cle in [
-        "zone_7_eq_profile",
+        "zone_7_eq_profilette",
+        "zone_x_eq_profile",
+        "eq_presets_index",
+        "eq_active_preset",
+        "eq_expert_bands",
         "zone_7_tess_chainette",
         "zone_x_tess_chain",
         "room_correction_enabled",
         "theme",
     ] {
         assert!(!cle_tenue_par_le_serveur(cle), "{cle}");
+    }
+}
+
+/// rc14 : un import ne réécrit jamais tels quels le profil de pièce ni la
+/// chaîne ; les profils d'égaliseur, eux, passent par la règle de leurs
+/// routes (`config_export::egaliseurs`).
+#[test]
+fn rc14_les_profils_d_egaliseur_s_importent_selon_leur_regle() {
+    for cle in [
+        "zone_7_eq_profile",
+        "zone_7_eq_profile_before_tess",
+        "eq_presets",
+    ] {
+        assert!(cle_de_profil_d_egaliseur(cle), "{cle}");
+        assert!(!cle_jamais_importee(cle), "{cle}");
+    }
+    for cle in [
+        "room_profile_7",
+        "zone_7_tess_chain",
+        "zone_7_tess_chain_sync",
+    ] {
+        assert!(cle_jamais_importee(cle), "{cle}");
+        assert!(!cle_de_profil_d_egaliseur(cle), "{cle}");
     }
 }
 
