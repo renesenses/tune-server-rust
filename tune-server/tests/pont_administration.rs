@@ -199,12 +199,20 @@ async fn sans_authentification_activer_et_eteindre_restent_ouverts() {
     assert_eq!(pont_enregistre(&state).as_deref(), Some("false"));
 }
 
-/// Sans authentification, ouvrir, éteindre ou renouveler l'accès à distance
+/// Sans authentification, sous le réglage « Administration depuis cette
+/// machine seulement », ouvrir, éteindre ou renouveler l'accès à distance
 /// depuis un autre hôte du réseau local est refusé (`not_local`) ; depuis
-/// cette machine, éteindre passe.
+/// cette machine, éteindre passe. Réglage éteint (défaut rc14), le réseau
+/// local administre : voir `administration_reseau_local_rc14.rs`.
 #[tokio::test]
 async fn sans_authentification_activer_depuis_le_reseau_local_est_refuse() {
     let state = new_state();
+    reglages(&state)
+        .set(
+            tune_server::auth::CLE_ADMINISTRATION_CETTE_MACHINE_SEULEMENT,
+            "true",
+        )
+        .unwrap();
     state.license.set_account_premium(true, None).await;
 
     let r = appel_depuis(&state, AUTRE_HOTE_DU_LAN, Method::POST, ACTIVER, None).await;
