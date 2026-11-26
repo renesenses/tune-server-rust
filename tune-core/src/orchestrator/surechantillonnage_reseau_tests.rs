@@ -784,10 +784,10 @@ async fn le_relais_progressif_sert_le_flux_surechantillonne_complet() {
     assert_eq!(h, crate::audio::wav::build_wav_header(2, 176_400, 24));
     assert_eq!(pcm.len(), 4 * n * 6, "exactement 4·n trames");
     assert_eq!(pcm.len(), piste.len());
-    let mot = |o: &[u8]| f64::from(i32::from_le_bytes([0, o[0], o[1], o[2]]) >> 8) / 8_388_608.0;
+    let mot = |o: &[u8; 3]| f64::from(i32::from_le_bytes([0, o[0], o[1], o[2]]) >> 8) / 8_388_608.0;
     let mut crete = 0.0f64;
     let mut ecart = 0.0f64;
-    for (a, b) in pcm.chunks_exact(3).zip(piste.chunks_exact(3)) {
+    for (a, b) in pcm.as_chunks::<3>().0.iter().zip(piste.as_chunks::<3>().0) {
         crete = crete.max(mot(a).abs());
         ecart = ecart.max((mot(a) - mot(b)).abs());
     }

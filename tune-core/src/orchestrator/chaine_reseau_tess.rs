@@ -638,11 +638,7 @@ impl StreamingDsp {
         };
         let mut entree = std::mem::take(&mut s.reste);
         entree.extend_from_slice(pcm);
-        let utiles = if trame == 0 {
-            0
-        } else {
-            entree.len() / trame * trame
-        };
+        let utiles = entree.len().checked_div(trame).map_or(0, |n| n * trame);
         s.reste = entree.split_off(utiles);
         if !entree.is_empty() {
             self.traiter_par_tess(&mut entree, bit_depth, Passage::Flux);
