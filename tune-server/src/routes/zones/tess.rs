@@ -463,18 +463,45 @@ pub(super) async fn reponse_de_zone(
                 .map(|l| l.get(p).is_some())
                 .unwrap_or(true)
         });
-    let mut reponse = ReponseTessZone::depuis_avec_le_lecteur(
+    // rc14 — le suréchantillonnage PCM que la lecture a décidé pour la
+    // dernière piste de la bibliothèque servie à ce lecteur.
+    let surech_reseau = state
+        .orchestrator
+        .surechantillonnage_reseau_de_la_zone(zone_id);
+    let mut reponse = ReponseTessZone::depuis_avec_le_lecteur_et_surech(
         zone_id,
         lecture.chaine,
         actif,
         catalogue,
         &ctx,
         lecteur.as_ref(),
+        surech_reseau.as_ref(),
     )
     // rc14 — ce que la sortie fait de chaque cible DSD (sans sonder le
     // pilote), reporté sur le chemin résolu.
     .avec_capacites_dsd(capacites_dsd);
     preciser_les_paquets_a_installer(&mut reponse, &settings);
+    // rc14 — un refus du suréchantillonnage réseau porte sa phrase, comme
+    // ceux de la sortie locale (`refusal_text`).
+    for e in reponse.signal_path.iter_mut().filter(|e| {
+        e.code == CodeEtape::Upsampling
+            && !e.effective
+            && e.reason == Some(MotifEtape::NotInService)
+    }) {
+        let code = e
+            .params
+            .as_ref()
+            .and_then(|p| p.get("refusal"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(code) = code {
+            super::refus_surechantillonnage_tess::eteindre_avec_la_raison(
+                e,
+                &code,
+                super::description_du_refus_surechantillonnage(&code),
+            );
+        }
+    }
 
     // rc14 (rc13.91) — la sortie locale a refusé de suréchantillonner la
     // piste en cours : l'étape ne se dit plus active, et dit pourquoi.

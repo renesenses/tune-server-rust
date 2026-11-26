@@ -134,12 +134,15 @@ pub enum MotifDeVoie {
     /// progressif traité (`cible_wav_pour_traitement`), la chaîne est cuite
     /// dans la conversion.
     DsdConvertedToPcm,
+    /// rc14 — la piste est suréchantillonnée : elle part par le fichier
+    /// refait, le relais progressif ne porte pas encore l'étage.
+    UpsamplingFileTranscode,
     #[serde(other)]
     Unknown,
 }
 
 /// L'acheminement publié (`delivery` de `GET /zones/{id}/tess`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AcheminementUpnp {
     pub route: VoieUpnp,
     /// `None` sur le relais progressif.
@@ -148,6 +151,75 @@ pub struct AcheminementUpnp {
     /// Ce que le lecteur dit du LPCM, à `lpcm_bits`.
     pub renderer_lpcm: LpcmDuLecteur,
     pub lpcm_bits: u8,
+    /// rc14 — le suréchantillonnage PCM vers ce lecteur, quand la chaîne le
+    /// demande (`fixed.upsampling.mode = pcm`) : appliqué (cadences source et
+    /// cible, filtre, réserve) ou refusé (code), avec les cadences que le
+    /// lecteur annonce. Absent sinon ; un client ancien l'ignore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upsampling: Option<SurechantillonnageUpnp>,
+}
+
+/// rc14 — l'état du suréchantillonnage PCM d'une zone de la famille UPnP,
+/// tel que la LECTURE l'a décidé pour la dernière piste de la bibliothèque
+/// (`orchestrator::surechantillonnage_reseau`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SurechantillonnageUpnp {
+    /// Vrai : la piste servie est suréchantillonnée.
+    pub active: bool,
+    /// Code du refus quand `active` est faux
+    /// (`audio::surechantillonnage::refus_reseau`, ou un écart du réglage :
+    /// `premium_required`, `machine_test_missing`…).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_hz: Option<u32>,
+    /// La cadence CIBLE servie au lecteur.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_hz: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// La réserve fixe du filtre, en dB (≤ 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headroom_db: Option<f64>,
+    /// Les cadences PCM que le lecteur annonce pour le format servi (vide :
+    /// rien d'exploitable). Jamais de cadence DSD.
+    #[serde(default)]
+    pub offered_rates_hz: Vec<u32>,
+}
+
+impl SurechantillonnageUpnp {
+    pub fn refuse(code: &str, proposees: Vec<u32>) -> Self {
+        Self {
+            active: false,
+            reason: Some(code.to_owned()),
+            from_hz: None,
+            to_hz: None,
+            filter: None,
+            headroom_db: None,
+            offered_rates_hz: proposees,
+        }
+    }
+}
+
+/// rc14 — la piste n'a pas encore été résolue vers ce lecteur depuis que le
+/// suréchantillonnage est demandé : la décision se prend à la prochaine
+/// piste.
+pub const SURECH_NON_EVALUE: &str = "not_evaluated_yet";
+/// rc14 — service ou radio : pas encore porté sur UPnP.
+pub const SURECH_SOURCE_NON_PORTEE: &str = "source_not_supported_on_network";
+
+/// La chaîne demande-t-elle un suréchantillonnage PCM EFFECTIF (au sens de
+/// la résolution : ni PURE, ni « Bypass all », ni licence manquante) ?
+fn surech_pcm_demande(r: &Resolution) -> bool {
+    r.etapes.iter().any(|e| {
+        e.code == CodeEtape::Upsampling
+            && e.effective
+            && e.params
+                .as_ref()
+                .and_then(|p| p.get("target"))
+                .and_then(|t| t.as_str())
+                == Some("pcm")
+    })
 }
 
 /// Détail de l'étage casque éteint faute de LPCM.
@@ -197,6 +269,47 @@ fn greffons_effectifs(r: &Resolution) -> impl Iterator<Item = &EtapeResolue> {
 /// La voie de la chaîne résolue vers ce lecteur. Pure : la matrice se teste
 /// sans orchestrateur.
 pub fn acheminer(r: &Resolution, f: &FaitsUpnp) -> AcheminementUpnp {
+    acheminer_avec(r, f, None)
+}
+
+/// rc14 — [`acheminer`], avec la décision de la LECTURE sur le
+/// suréchantillonnage PCM (`surech` : celle de la dernière piste de la
+/// bibliothèque résolue vers ce lecteur, `None` : aucune encore).
+///
+/// Un suréchantillonnage appliqué est un traitement qui impose le fichier
+/// refait (motif `upsampling_file_transcode`) ; refusé, il ne change pas la
+/// voie. Il ne vaut que pour une piste de la bibliothèque : un service ou une
+/// radio le refusent (`source_not_supported_on_network`).
+pub fn acheminer_avec(
+    r: &Resolution,
+    f: &FaitsUpnp,
+    surech: Option<&SurechantillonnageUpnp>,
+) -> AcheminementUpnp {
+    let upsampling = surech_pcm_demande(r).then(|| match f.origine {
+        OrigineDuFlux::Service | OrigineDuFlux::Radio => {
+            SurechantillonnageUpnp::refuse(SURECH_SOURCE_NON_PORTEE, Vec::new())
+        }
+        _ => surech
+            .cloned()
+            .unwrap_or_else(|| SurechantillonnageUpnp::refuse(SURECH_NON_EVALUE, Vec::new())),
+    });
+    let surech_actif = upsampling.as_ref().is_some_and(|u| u.active);
+    let mut a = acheminer_sans_surech(r, f, surech_actif);
+    a.upsampling = upsampling;
+    a
+}
+
+fn acheminer_sans_surech(r: &Resolution, f: &FaitsUpnp, surech_actif: bool) -> AcheminementUpnp {
+    if surech_actif && !source_dsd(r) {
+        return AcheminementUpnp {
+            route: VoieUpnp::FileTranscode,
+            reason: Some(MotifDeVoie::UpsamplingFileTranscode),
+            detail: Some(DETAIL_SURECH_FICHIER.into()),
+            renderer_lpcm: f.lpcm,
+            lpcm_bits: f.lpcm_bits,
+            upsampling: None,
+        };
+    }
     let reencodage = f.replaygain_actif
         || greffons_effectifs(r)
             .any(|e| famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::Reencodage);
@@ -218,6 +331,7 @@ pub fn acheminer(r: &Resolution, f: &FaitsUpnp) -> AcheminementUpnp {
         detail: None,
         renderer_lpcm: f.lpcm,
         lpcm_bits: f.lpcm_bits,
+        upsampling: None,
     };
     // Une radio est toujours décodée et servie en LPCM au fil de l'eau : le
     // relais progressif, chaîne vide comprise. Jamais « Bit-perfect », jamais
@@ -300,6 +414,10 @@ fn source_dsd(r: &Resolution) -> bool {
     champ("kind") == Some("dsd") && champ("played_as") == Some("converted_to_pcm")
 }
 
+/// rc14 — détail de la voie d'une piste suréchantillonnée.
+pub const DETAIL_SURECH_FICHIER: &str =
+    "Upsampled: the track is converted to the target rate before the first note";
+
 /// Détail de la voie d'une radio.
 pub const DETAIL_RADIO: &str = "Radio streams are decoded and served to this renderer as LPCM";
 
@@ -322,10 +440,44 @@ pub const DETAIL_NON_APPLIQUE: &str =
 ///   `altered_outside_tess`.
 pub fn appliquer(r: &mut Resolution, a: &AcheminementUpnp) {
     let mut non_appliques = false;
+    // rc14 — le suréchantillonnage PCM que la lecture a décidé : appliqué, il
+    // reste effectif et publie ses cadences ; refusé, il s'éteint avec son
+    // code (`not_in_service`, `detail` = code, `params.refusal`).
+    let surech_applique = a.upsampling.as_ref().is_some_and(|u| u.active);
+    if let Some(u) = a.upsampling.as_ref() {
+        for e in r
+            .etapes
+            .iter_mut()
+            .filter(|e| e.code == CodeEtape::Upsampling && e.effective)
+        {
+            let mut p = match e.params.take() {
+                Some(serde_json::Value::Object(m)) => m,
+                _ => serde_json::Map::new(),
+            };
+            p.insert(
+                "offered_rates_hz".into(),
+                serde_json::json!(u.offered_rates_hz),
+            );
+            if u.active {
+                p.insert("source_rate_hz".into(), serde_json::json!(u.from_hz));
+                p.insert("target_rate_hz".into(), serde_json::json!(u.to_hz));
+                p.insert("headroom_db".into(), serde_json::json!(u.headroom_db));
+            } else {
+                let code = u.reason.clone().unwrap_or_default();
+                p.insert("refusal".into(), serde_json::json!(code));
+                e.effective = false;
+                e.reason = Some(MotifEtape::NotInService);
+                e.detail = Some(code);
+                non_appliques = true;
+            }
+            e.params = Some(serde_json::Value::Object(p));
+        }
+    }
     for e in r.etapes.iter_mut().filter(|e| {
         e.effective
             && match e.code {
-                CodeEtape::Upsampling | CodeEtape::Headroom | CodeEtape::DsdModulator => true,
+                CodeEtape::Upsampling => !surech_applique,
+                CodeEtape::Headroom | CodeEtape::DsdModulator => true,
                 CodeEtape::Plugin => match famille(e.plugin_id.as_deref().unwrap_or("")) {
                     Famille::HorsRelais => true,
                     Famille::RelaisSeulement => a.route != VoieUpnp::ProgressiveLpcm,
@@ -887,6 +1039,138 @@ mod tests {
         }
     }
 
+    fn chaine_surech() -> ChaineTess {
+        let mut c = chaine(&[]);
+        c.fixed.upsampling = crate::tess::chaine::Upsampling::Pcm {
+            filter: "polyvalent".into(),
+            max_ratio: None,
+            max_rate_hz: None,
+        };
+        c
+    }
+
+    fn surech_applique() -> SurechantillonnageUpnp {
+        SurechantillonnageUpnp {
+            active: true,
+            reason: None,
+            from_hz: Some(44_100),
+            to_hz: Some(176_400),
+            filter: Some("polyvalent".into()),
+            headroom_db: Some(-3.0),
+            offered_rates_hz: vec![44_100, 88_200, 176_400, 192_000],
+        }
+    }
+
+    fn resoudre_chaine(c: &ChaineTess, pure: bool) -> Resolution {
+        c.resoudre(&catalogue_de_reference(), &ctx(pure, PCM44))
+    }
+
+    const PCM44: SourceFlux = SourceFlux::Pcm {
+        sample_rate_hz: 44_100,
+        bits: 16,
+        channels: 2,
+    };
+
+    /// rc14 — la lecture a suréchantillonné la piste : l'étage est EFFECTIF
+    /// sur la sortie réseau, publie ses cadences, la voie est le fichier
+    /// refait, et le badge n'est jamais « Bit-perfect ».
+    #[test]
+    fn le_surechantillonnage_applique_est_effectif_sur_upnp() {
+        let mut r = resoudre_chaine(&chaine_surech(), false);
+        let u = surech_applique();
+        let a = acheminer_avec(&r, &faits(Refused, false, Library), Some(&u));
+        assert_eq!(a.route, VoieUpnp::FileTranscode);
+        assert_eq!(a.reason, Some(MotifDeVoie::UpsamplingFileTranscode));
+        assert_eq!(a.upsampling.as_ref(), Some(&u));
+        appliquer(&mut r, &a);
+        let e = r
+            .etapes
+            .iter()
+            .find(|e| e.code == CodeEtape::Upsampling)
+            .unwrap();
+        assert!(e.effective, "l'étage agit sur la sortie réseau");
+        let p = e.params.as_ref().unwrap();
+        assert_eq!(p["target_rate_hz"], 176_400);
+        assert_eq!(p["source_rate_hz"], 44_100);
+        assert_eq!(p["target"], "pcm");
+        assert_eq!(
+            p["offered_rates_hz"],
+            serde_json::json!([44_100, 88_200, 176_400, 192_000])
+        );
+        assert_ne!(r.badge, Badge::BitPerfect, "jamais bit-perfect");
+        assert_eq!(r.badge, Badge::ProcessedByTess);
+        // Le modulateur DSD et le headroom restent non appliqués.
+        assert!(
+            !r.etapes
+                .iter()
+                .any(|e| e.effective && matches!(e.code, CodeEtape::DsdModulator))
+        );
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["reason"], "upsampling_file_transcode");
+        assert_eq!(v["upsampling"]["to_hz"], 176_400);
+    }
+
+    /// PURE prime : l'étage n'est pas demandé, la voie reste intacte et le
+    /// badge « Bit-perfect », même si la lecture se souvient d'un
+    /// suréchantillonnage appliqué avant PURE.
+    #[test]
+    fn pure_prime_sur_le_surechantillonnage_reseau() {
+        let mut r = resoudre_chaine(&chaine_surech(), true);
+        let u = surech_applique();
+        let a = acheminer_avec(&r, &faits(Refused, false, Library), Some(&u));
+        assert_eq!(a.route, VoieUpnp::Untouched);
+        assert!(a.upsampling.is_none());
+        appliquer(&mut r, &a);
+        let e = r
+            .etapes
+            .iter()
+            .find(|e| e.code == CodeEtape::Upsampling)
+            .unwrap();
+        assert!(!e.effective);
+        assert_eq!(e.reason, Some(MotifEtape::PureMode), "le refus dit PURE");
+        assert_eq!(r.badge, Badge::BitPerfect);
+    }
+
+    /// Un refus de la lecture (lecteur muet sur ses cadences) éteint l'étage
+    /// avec son code ; un service ou une radio le refusent.
+    #[test]
+    fn les_refus_du_surechantillonnage_reseau_sont_motives() {
+        for (origine, memoire, attendu) in [
+            (
+                Library,
+                Some(SurechantillonnageUpnp::refuse(
+                    "renderer_rate_unknown",
+                    Vec::new(),
+                )),
+                "renderer_rate_unknown",
+            ),
+            (Library, None, SURECH_NON_EVALUE),
+            (Service, Some(surech_applique()), SURECH_SOURCE_NON_PORTEE),
+            (
+                OrigineDuFlux::Radio,
+                Some(surech_applique()),
+                SURECH_SOURCE_NON_PORTEE,
+            ),
+        ] {
+            let mut r = resoudre_chaine(&chaine_surech(), false);
+            let a = acheminer_avec(&r, &faits(Refused, false, origine), memoire.as_ref());
+            assert_eq!(
+                a.upsampling.as_ref().and_then(|u| u.reason.as_deref()),
+                Some(attendu)
+            );
+            appliquer(&mut r, &a);
+            let e = r
+                .etapes
+                .iter()
+                .find(|e| e.code == CodeEtape::Upsampling)
+                .unwrap();
+            assert!(!e.effective, "{attendu}");
+            assert_eq!(e.reason, Some(MotifEtape::NotInService));
+            assert_eq!(e.detail.as_deref(), Some(attendu));
+            assert_eq!(e.params.as_ref().unwrap()["refusal"], attendu);
+        }
+    }
+
     #[test]
     fn la_famille_upnp_est_celle_du_plan() {
         let dedans: Vec<_> = TransportZone::ALL
@@ -913,6 +1197,7 @@ mod tests {
             detail: None,
             renderer_lpcm: Accepted,
             lpcm_bits: 24,
+            upsampling: None,
         };
         let v = serde_json::to_value(&a).unwrap();
         assert_eq!(v["route"], "progressive_lpcm");

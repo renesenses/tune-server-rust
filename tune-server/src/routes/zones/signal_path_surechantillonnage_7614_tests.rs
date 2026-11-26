@@ -259,6 +259,7 @@ fn diagnostic_8259_machine_absente_expliquee_dans_toutes_les_langues() {
             false,
             "local",
             None,
+            Default::default(),
         )
         .unwrap();
         let texte = etape["description"].as_str().unwrap();

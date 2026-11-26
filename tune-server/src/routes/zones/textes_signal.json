@@ -68,7 +68,7 @@
     "correction_piece_sans_licence": "Correction de pièce réglée mais NON appliquée : licence Premium requise",
     "upsampling": "Suréchantillonnage {0}, filtre {1}, réserve de niveau {2} dB (greffon)",
     "upsampling_pure": "Suréchantillonnage inactif (mode PURE)",
-    "upsampling_zone_not_supported": "Le suréchantillonnage ne s'applique pas à cette zone : seule la sortie locale de la machine le prend en charge",
+    "upsampling_zone_not_supported": "Le suréchantillonnage ne s'applique pas à cette zone : seules la sortie locale et les lecteurs DLNA/OpenHome le prennent en charge",
     "upsampling_not_applied": "Suréchantillonnage non appliqué à cette piste",
     "upsampling_premium_required": "Suréchantillonnage inactif : Premium requis",
     "upsampling_machine_test_missing": "Suréchantillonnage inactif : test de la machine absent. Lancez-le depuis la page du greffon Suréchantillonnage",
@@ -107,7 +107,12 @@
     "upsampling_level_partial": "réserve compensée en partie : {0} dB sous la lecture sans suréchantillonnage, volume trop haut pour tout compenser",
     "upsampling_level_full_volume": "réserve non compensée : volume à 100 %, {0} dB sous la lecture sans suréchantillonnage ; pour comparer à niveau égal, baissez le volume de Tune d'au moins {1} dB et réglez le niveau au DAC ou au préampli",
     "wasapi_rate_fallback": "Conversion {0} → {1} kHz : le périphérique ne prend pas {0} kHz en mode WASAPI exclusif",
-    "speaker_setup": "Réglage des enceintes : délais {0} ms (latence {1} ms), gain et phase par voie"
+    "speaker_setup": "Réglage des enceintes : délais {0} ms (latence {1} ms), gain et phase par voie",
+    "upsampling_network_rate_unknown": "Suréchantillonnage inactif : ce lecteur n'annonce pas les cadences qu'il accepte",
+    "upsampling_network_rate_not_higher": "Suréchantillonnage inactif : ce lecteur n'annonce aucune cadence plus haute multiple entière de la source",
+    "upsampling_network_source": "Suréchantillonnage inactif : sur un lecteur réseau, il ne s'applique pour l'instant qu'aux pistes de la bibliothèque",
+    "upsampling_network_no_probe": "Suréchantillonnage inactif : ce type de lecteur ne dit pas quelles cadences il accepte",
+    "upsampling_network_file_only": "Suréchantillonnage inactif pour cette piste : elle part en flux progressif ou est trop longue pour être convertie d'avance"
   },
   "en": {
     "pregain": "auto pre-gain {0} dB",
@@ -178,7 +183,7 @@
     "correction_piece_sans_licence": "Room correction set but NOT applied: Premium license required",
     "upsampling": "Upsampling {0}, filter {1}, level headroom {2} dB (plugin)",
     "upsampling_pure": "Upsampling inactive (PURE mode)",
-    "upsampling_zone_not_supported": "Upsampling does not apply to this zone: only the machine's local output supports it",
+    "upsampling_zone_not_supported": "Upsampling does not apply to this zone: only the local output and DLNA/OpenHome renderers support it",
     "upsampling_not_applied": "Upsampling not applied to this track",
     "upsampling_premium_required": "Upsampling inactive: Premium required",
     "upsampling_machine_test_missing": "Upsampling inactive: machine test missing. Run it from the Upsampling plugin page",
@@ -217,7 +222,12 @@
     "upsampling_level_partial": "headroom partly compensated: {0} dB below playback without upsampling, volume too high to compensate fully",
     "upsampling_level_full_volume": "headroom not compensated: volume at 100%, {0} dB below playback without upsampling; for a level-matched comparison, lower Tune's volume by at least {1} dB and set the level on the DAC or preamp",
     "wasapi_rate_fallback": "Conversion {0} → {1} kHz: the device does not support {0} kHz in WASAPI exclusive mode",
-    "speaker_setup": "Speaker setup: delays {0} ms (latency {1} ms), gain and polarity per channel"
+    "speaker_setup": "Speaker setup: delays {0} ms (latency {1} ms), gain and polarity per channel",
+    "upsampling_network_rate_unknown": "Upsampling inactive: this renderer does not announce the sample rates it accepts",
+    "upsampling_network_rate_not_higher": "Upsampling inactive: this renderer announces no higher rate that is an integer multiple of the source",
+    "upsampling_network_source": "Upsampling inactive: on a network renderer it currently applies to library tracks only",
+    "upsampling_network_no_probe": "Upsampling inactive: this type of renderer does not report the sample rates it accepts",
+    "upsampling_network_file_only": "Upsampling inactive for this track: it is streamed progressively or is too long to be converted in advance"
   },
   "de": {
     "pregain": "automatische Vorverstärkung {0} dB",
@@ -288,7 +298,7 @@
     "correction_piece_sans_licence": "Raumkorrektur eingestellt, aber NICHT angewendet: Premium-Lizenz erforderlich",
     "upsampling": "Upsampling {0}, Filter {1}, Pegelreserve {2} dB (Plugin)",
     "upsampling_pure": "Upsampling inaktiv (PURE-Modus)",
-    "upsampling_zone_not_supported": "Upsampling gilt nicht für diese Zone: nur der lokale Ausgang des Rechners unterstützt es",
+    "upsampling_zone_not_supported": "Upsampling gilt nicht für diese Zone: nur der lokale Ausgang und DLNA/OpenHome-Renderer unterstützen es",
     "upsampling_not_applied": "Upsampling auf diesen Titel nicht angewendet",
     "upsampling_premium_required": "Upsampling inaktiv: Premium erforderlich",
     "upsampling_machine_test_missing": "Upsampling inaktiv: Gerätetest fehlt. Starten Sie ihn auf der Seite des Upsampling-Plugins",
@@ -327,7 +337,12 @@
     "upsampling_level_partial": "Reserve teilweise ausgeglichen: {0} dB unter der Wiedergabe ohne Upsampling, Lautstärke zu hoch für vollen Ausgleich",
     "upsampling_level_full_volume": "Reserve nicht ausgeglichen: Lautstärke bei 100 %, {0} dB unter der Wiedergabe ohne Upsampling; für einen pegelgleichen Vergleich die Lautstärke von Tune um mindestens {1} dB senken und den Pegel am DAC oder Vorverstärker einstellen",
     "wasapi_rate_fallback": "Wandlung {0} → {1} kHz: Das Gerät unterstützt {0} kHz im exklusiven WASAPI-Modus nicht",
-    "speaker_setup": "Lautsprecher-Einrichtung: Verzögerungen {0} ms (Latenz {1} ms), Pegel und Polarität je Kanal"
+    "speaker_setup": "Lautsprecher-Einrichtung: Verzögerungen {0} ms (Latenz {1} ms), Pegel und Polarität je Kanal",
+    "upsampling_network_rate_unknown": "Upsampling inaktiv: dieser Renderer gibt die akzeptierten Abtastraten nicht an",
+    "upsampling_network_rate_not_higher": "Upsampling inaktiv: dieser Renderer gibt keine höhere Rate an, die ein ganzzahliges Vielfaches der Quelle ist",
+    "upsampling_network_source": "Upsampling inaktiv: an einem Netzwerk-Renderer gilt es derzeit nur für Titel der Bibliothek",
+    "upsampling_network_no_probe": "Upsampling inaktiv: dieser Renderer-Typ meldet die akzeptierten Abtastraten nicht",
+    "upsampling_network_file_only": "Upsampling für diesen Titel inaktiv: er wird progressiv gestreamt oder ist zu lang für eine Vorab-Konvertierung"
   },
   "es": {
     "pregain": "preganancia automática {0} dB",
@@ -398,7 +413,7 @@
     "correction_piece_sans_licence": "Corrección de sala configurada pero NO aplicada: se requiere licencia Premium",
     "upsampling": "Sobremuestreo {0}, filtro {1}, margen de nivel {2} dB (complemento)",
     "upsampling_pure": "Sobremuestreo inactivo (modo PURE)",
-    "upsampling_zone_not_supported": "El sobremuestreo no se aplica a esta zona: solo la salida local del equipo lo admite",
+    "upsampling_zone_not_supported": "El sobremuestreo no se aplica a esta zona: solo la salida local y los reproductores DLNA/OpenHome lo admiten",
     "upsampling_not_applied": "Sobremuestreo no aplicado a esta pista",
     "upsampling_premium_required": "Sobremuestreo inactivo: se requiere Premium",
     "upsampling_machine_test_missing": "Sobremuestreo inactivo: falta la prueba de la máquina. Iníciela desde la página del complemento Sobremuestreo",
@@ -437,7 +452,12 @@
     "upsampling_level_partial": "reserva compensada en parte: {0} dB por debajo de la reproducción sin sobremuestreo, volumen demasiado alto para compensarla del todo",
     "upsampling_level_full_volume": "reserva no compensada: volumen al 100 %, {0} dB por debajo de la reproducción sin sobremuestreo; para comparar al mismo nivel, baje el volumen de Tune al menos {1} dB y ajuste el nivel en el DAC o el preamplificador",
     "wasapi_rate_fallback": "Conversión {0} → {1} kHz: el dispositivo no admite {0} kHz en modo WASAPI exclusivo",
-    "speaker_setup": "Configuración de altavoces: retardos {0} ms (latencia {1} ms), ganancia y polaridad por canal"
+    "speaker_setup": "Configuración de altavoces: retardos {0} ms (latencia {1} ms), ganancia y polaridad por canal",
+    "upsampling_network_rate_unknown": "Sobremuestreo inactivo: este reproductor no anuncia las frecuencias que acepta",
+    "upsampling_network_rate_not_higher": "Sobremuestreo inactivo: este reproductor no anuncia ninguna frecuencia superior múltiplo entero de la fuente",
+    "upsampling_network_source": "Sobremuestreo inactivo: en un reproductor de red, por ahora solo se aplica a las pistas de la biblioteca",
+    "upsampling_network_no_probe": "Sobremuestreo inactivo: este tipo de reproductor no indica qué frecuencias acepta",
+    "upsampling_network_file_only": "Sobremuestreo inactivo para esta pista: se transmite de forma progresiva o es demasiado larga para convertirla de antemano"
   },
   "it": {
     "pregain": "pre-guadagno automatico {0} dB",
@@ -508,7 +528,7 @@
     "correction_piece_sans_licence": "Correzione ambientale impostata ma NON applicata: licenza Premium richiesta",
     "upsampling": "Sovracampionamento {0}, filtro {1}, margine di livello {2} dB (plugin)",
     "upsampling_pure": "Sovracampionamento inattivo (modalità PURE)",
-    "upsampling_zone_not_supported": "Il sovracampionamento non si applica a questa zona: solo l'uscita locale della macchina lo supporta",
+    "upsampling_zone_not_supported": "Il sovracampionamento non si applica a questa zona: lo supportano solo l'uscita locale e i renderer DLNA/OpenHome",
     "upsampling_not_applied": "Sovracampionamento non applicato a questa traccia",
     "upsampling_premium_required": "Sovracampionamento inattivo: richiede Premium",
     "upsampling_machine_test_missing": "Sovracampionamento inattivo: test della macchina assente. Avviatelo dalla pagina del plugin Sovracampionamento",
@@ -547,7 +567,12 @@
     "upsampling_level_partial": "riserva compensata in parte: {0} dB sotto la riproduzione senza sovracampionamento, volume troppo alto per compensarla del tutto",
     "upsampling_level_full_volume": "riserva non compensata: volume al 100%, {0} dB sotto la riproduzione senza sovracampionamento; per confrontare a pari livello, abbassa il volume di Tune di almeno {1} dB e regola il livello sul DAC o sul preamplificatore",
     "wasapi_rate_fallback": "Conversione {0} → {1} kHz: il dispositivo non supporta {0} kHz in modalità WASAPI esclusiva",
-    "speaker_setup": "Configurazione diffusori: ritardi {0} ms (latenza {1} ms), guadagno e polarità per canale"
+    "speaker_setup": "Configurazione diffusori: ritardi {0} ms (latenza {1} ms), guadagno e polarità per canale",
+    "upsampling_network_rate_unknown": "Sovracampionamento inattivo: questo renderer non dichiara le frequenze che accetta",
+    "upsampling_network_rate_not_higher": "Sovracampionamento inattivo: questo renderer non dichiara alcuna frequenza superiore multipla intera della sorgente",
+    "upsampling_network_source": "Sovracampionamento inattivo: su un renderer di rete per ora si applica solo ai brani della libreria",
+    "upsampling_network_no_probe": "Sovracampionamento inattivo: questo tipo di renderer non indica le frequenze che accetta",
+    "upsampling_network_file_only": "Sovracampionamento inattivo per questo brano: è trasmesso in modo progressivo o è troppo lungo per essere convertito in anticipo"
   },
   "zh": {
     "pregain": "自动预增益 {0} dB",
@@ -618,7 +643,7 @@
     "correction_piece_sans_licence": "Room correction set but NOT applied: Premium license required",
     "upsampling": "升频 {0}，滤波器 {1}，电平余量 {2} dB（插件）",
     "upsampling_pure": "升频未启用（PURE 模式）",
-    "upsampling_zone_not_supported": "升频不适用于此区域：仅本机的本地输出支持升频",
+    "upsampling_zone_not_supported": "升频不适用于此区域：仅本地输出和 DLNA/OpenHome 播放器支持升频",
     "upsampling_not_applied": "此曲目未应用升采样",
     "upsampling_premium_required": "升采样未启用：需要 Premium",
     "upsampling_machine_test_missing": "升采样未启用：尚未进行本机测试。请在“升采样”插件页面运行测试",
@@ -657,7 +682,12 @@
     "upsampling_level_partial": "余量仅部分补偿：比不升频播放低 {0} dB，音量过高，无法完全补偿",
     "upsampling_level_full_volume": "余量未补偿：音量为 100%，比不升频播放低 {0} dB；如需等电平比较，请将 Tune 音量至少降低 {1} dB，并在 DAC 或前级上调节电平",
     "wasapi_rate_fallback": "转换 {0} → {1} kHz：设备在 WASAPI 独占模式下不支持 {0} kHz",
-    "speaker_setup": "扬声器设置：延迟 {0} 毫秒（总延迟 {1} 毫秒），逐声道增益与极性"
+    "speaker_setup": "扬声器设置：延迟 {0} 毫秒（总延迟 {1} 毫秒），逐声道增益与极性",
+    "upsampling_network_rate_unknown": "升采样未启用：该播放器未声明其接受的采样率",
+    "upsampling_network_rate_not_higher": "升采样未启用：该播放器未声明任何高于音源且为其整数倍的采样率",
+    "upsampling_network_source": "升采样未启用：在网络播放器上，目前仅适用于音乐库中的曲目",
+    "upsampling_network_no_probe": "升采样未启用：此类播放器不报告其接受的采样率",
+    "upsampling_network_file_only": "此曲目未启用升采样：它以渐进流方式传输，或过长而无法预先转换"
   },
   "ja": {
     "pregain": "自動プリアンプ {0} dB",
@@ -728,7 +758,7 @@
     "correction_piece_sans_licence": "Room correction set but NOT applied: Premium license required",
     "upsampling": "アップサンプリング {0}、フィルター {1}、レベル余裕 {2} dB（プラグイン）",
     "upsampling_pure": "アップサンプリング無効（PURE モード）",
-    "upsampling_zone_not_supported": "アップサンプリングはこのゾーンには適用されません。対応しているのはこのマシンのローカル出力のみです",
+    "upsampling_zone_not_supported": "アップサンプリングはこのゾーンには適用されません。対応しているのはローカル出力と DLNA/OpenHome レンダラーのみです",
     "upsampling_not_applied": "この曲にはアップサンプリングが適用されていません",
     "upsampling_premium_required": "アップサンプリング無効：Premium が必要です",
     "upsampling_machine_test_missing": "アップサンプリング無効：マシンテスト未実施。アップサンプリング プラグインのページから実行してください",
@@ -767,7 +797,12 @@
     "upsampling_level_partial": "ヘッドルームは一部のみ補正：アップサンプリングなしの再生より {0} dB 低く、音量が高すぎて完全には補正できません",
     "upsampling_level_full_volume": "ヘッドルーム未補正：音量 100%、アップサンプリングなしの再生より {0} dB 低い状態です。同じレベルで比較するには、Tune の音量を {1} dB 以上下げ、DAC またはプリアンプでレベルを調整してください",
     "wasapi_rate_fallback": "{0} → {1} kHz に変換：デバイスは WASAPI 排他モードで {0} kHz に対応していません",
-    "speaker_setup": "スピーカー設定：遅延 {0} ms（レイテンシー {1} ms）、チャンネルごとのゲインと極性"
+    "speaker_setup": "スピーカー設定：遅延 {0} ms（レイテンシー {1} ms）、チャンネルごとのゲインと極性",
+    "upsampling_network_rate_unknown": "アップサンプリング無効：このレンダラーは受け付けるサンプルレートを通知していません",
+    "upsampling_network_rate_not_higher": "アップサンプリング無効：このレンダラーはソースの整数倍となる高いレートを通知していません",
+    "upsampling_network_source": "アップサンプリング無効：ネットワークレンダラーでは現在、ライブラリの曲にのみ適用されます",
+    "upsampling_network_no_probe": "アップサンプリング無効：この種類のレンダラーは受け付けるサンプルレートを報告しません",
+    "upsampling_network_file_only": "この曲ではアップサンプリング無効：プログレッシブ配信されるか、事前変換するには長すぎます"
   },
   "ko": {
     "pregain": "자동 프리게인 {0} dB",
@@ -838,7 +873,7 @@
     "correction_piece_sans_licence": "Room correction set but NOT applied: Premium license required",
     "upsampling": "업샘플링 {0}, 필터 {1}, 레벨 여유 {2} dB (플러그인)",
     "upsampling_pure": "업샘플링 비활성 (PURE 모드)",
-    "upsampling_zone_not_supported": "업샘플링은 이 존에 적용되지 않습니다. 이 기기의 로컬 출력만 지원합니다",
+    "upsampling_zone_not_supported": "업샘플링은 이 존에 적용되지 않습니다. 로컬 출력과 DLNA/OpenHome 렌더러만 지원합니다",
     "upsampling_not_applied": "이 트랙에 업샘플링이 적용되지 않음",
     "upsampling_premium_required": "업샘플링 비활성: Premium 필요",
     "upsampling_machine_test_missing": "업샘플링 비활성: 머신 테스트가 없습니다. 업샘플링 플러그인 페이지에서 실행하세요",
@@ -877,7 +912,12 @@
     "upsampling_level_partial": "헤드룸 일부만 보정됨: 업샘플링 없는 재생보다 {0} dB 낮음, 볼륨이 너무 높아 완전히 보정할 수 없음",
     "upsampling_level_full_volume": "헤드룸 보정 안 됨: 볼륨 100%, 업샘플링 없는 재생보다 {0} dB 낮음. 같은 레벨로 비교하려면 Tune 볼륨을 {1} dB 이상 낮추고 DAC 또는 프리앰프에서 레벨을 맞추세요",
     "wasapi_rate_fallback": "{0} → {1} kHz 변환: 장치가 WASAPI 독점 모드에서 {0} kHz를 지원하지 않습니다",
-    "speaker_setup": "스피커 설정: 지연 {0} ms (레이턴시 {1} ms), 채널별 게인 및 극성"
+    "speaker_setup": "스피커 설정: 지연 {0} ms (레이턴시 {1} ms), 채널별 게인 및 극성",
+    "upsampling_network_rate_unknown": "업샘플링 비활성: 이 렌더러가 허용하는 샘플 레이트를 알리지 않습니다",
+    "upsampling_network_rate_not_higher": "업샘플링 비활성: 이 렌더러는 소스의 정수배인 더 높은 레이트를 알리지 않습니다",
+    "upsampling_network_source": "업샘플링 비활성: 네트워크 렌더러에서는 현재 라이브러리 트랙에만 적용됩니다",
+    "upsampling_network_no_probe": "업샘플링 비활성: 이 유형의 렌더러는 허용하는 샘플 레이트를 보고하지 않습니다",
+    "upsampling_network_file_only": "이 트랙은 업샘플링 비활성: 점진적 스트림으로 전송되거나 미리 변환하기에 너무 깁니다"
   },
   "ro": {
     "pregain": "pre-amplificare automată {0} dB",
@@ -948,7 +988,7 @@
     "correction_piece_sans_licence": "Room correction set but NOT applied: Premium license required",
     "upsampling": "Supraeșantionare {0}, filtru {1}, rezervă de nivel {2} dB (plugin)",
     "upsampling_pure": "Supraeșantionare inactivă (mod PURE)",
-    "upsampling_zone_not_supported": "Supraeșantionarea nu se aplică acestei zone: doar ieșirea locală a mașinii o acceptă",
+    "upsampling_zone_not_supported": "Supraeșantionarea nu se aplică acestei zone: doar ieșirea locală și redarea DLNA/OpenHome o acceptă",
     "upsampling_not_applied": "Supraeșantionarea nu este aplicată acestei piese",
     "upsampling_premium_required": "Supraeșantionare inactivă: necesită Premium",
     "upsampling_machine_test_missing": "Supraeșantionare inactivă: lipsește testul mașinii. Rulați-l din pagina pluginului Supraeșantionare",
@@ -987,7 +1027,12 @@
     "upsampling_level_partial": "rezervă compensată parțial: cu {0} dB sub redarea fără supraeșantionare, volum prea mare pentru compensare completă",
     "upsampling_level_full_volume": "rezervă necompensată: volum la 100%, cu {0} dB sub redarea fără supraeșantionare; pentru o comparație la nivel egal, coborâți volumul Tune cu cel puțin {1} dB și reglați nivelul din DAC sau preamplificator",
     "wasapi_rate_fallback": "Conversie {0} → {1} kHz: dispozitivul nu acceptă {0} kHz în modul WASAPI exclusiv",
-    "speaker_setup": "Configurarea difuzoarelor: întârzieri {0} ms (latență {1} ms), câștig și polaritate pe canal"
+    "speaker_setup": "Configurarea difuzoarelor: întârzieri {0} ms (latență {1} ms), câștig și polaritate pe canal",
+    "upsampling_network_rate_unknown": "Supraeșantionare inactivă: acest dispozitiv de redare nu anunță frecvențele pe care le acceptă",
+    "upsampling_network_rate_not_higher": "Supraeșantionare inactivă: acest dispozitiv nu anunță nicio frecvență mai mare, multiplu întreg al sursei",
+    "upsampling_network_source": "Supraeșantionare inactivă: pe un dispozitiv de rețea se aplică deocamdată doar pieselor din bibliotecă",
+    "upsampling_network_no_probe": "Supraeșantionare inactivă: acest tip de dispozitiv nu raportează frecvențele pe care le acceptă",
+    "upsampling_network_file_only": "Supraeșantionare inactivă pentru această piesă: este transmisă progresiv sau e prea lungă pentru conversie în avans"
   },
   "sv": {
     "pregain": "automatisk förförstärkning {0} dB",
@@ -1058,7 +1103,7 @@
     "correction_piece_sans_licence": "Room correction set but NOT applied: Premium license required",
     "upsampling": "Uppsampling {0}, filter {1}, nivåmarginal {2} dB (tillägg)",
     "upsampling_pure": "Uppsampling inaktiv (PURE-läge)",
-    "upsampling_zone_not_supported": "Uppsampling gäller inte för den här zonen: endast datorns lokala utgång stöder det",
+    "upsampling_zone_not_supported": "Uppsampling gäller inte för den här zonen: endast den lokala utgången och DLNA/OpenHome-spelare stöder det",
     "upsampling_not_applied": "Uppsampling används inte för detta spår",
     "upsampling_premium_required": "Uppsampling inaktiv: Premium krävs",
     "upsampling_machine_test_missing": "Uppsampling inaktiv: maskintest saknas. Kör det från sidan för insticksprogrammet Uppsampling",
@@ -1097,7 +1142,12 @@
     "upsampling_level_partial": "marginalen delvis kompenserad: {0} dB under uppspelning utan uppsampling, volymen är för hög för full kompensation",
     "upsampling_level_full_volume": "marginalen inte kompenserad: volym på 100 %, {0} dB under uppspelning utan uppsampling; för en jämförelse på samma nivå, sänk Tunes volym med minst {1} dB och ställ in nivån på DAC:n eller förförstärkaren",
     "wasapi_rate_fallback": "Omvandling {0} → {1} kHz: enheten stöder inte {0} kHz i exklusivt WASAPI-läge",
-    "speaker_setup": "Högtalarinställning: fördröjningar {0} ms (latens {1} ms), förstärkning och polaritet per kanal"
+    "speaker_setup": "Högtalarinställning: fördröjningar {0} ms (latens {1} ms), förstärkning och polaritet per kanal",
+    "upsampling_network_rate_unknown": "Uppsampling inaktiv: spelaren anger inte vilka frekvenser den accepterar",
+    "upsampling_network_rate_not_higher": "Uppsampling inaktiv: spelaren anger ingen högre frekvens som är en heltalsmultipel av källan",
+    "upsampling_network_source": "Uppsampling inaktiv: på en nätverksspelare gäller det än så länge bara spår i biblioteket",
+    "upsampling_network_no_probe": "Uppsampling inaktiv: den här typen av spelare rapporterar inte vilka frekvenser den accepterar",
+    "upsampling_network_file_only": "Uppsampling inaktiv för det här spåret: det strömmas progressivt eller är för långt för att konverteras i förväg"
   },
   "vi": {
     "pregain": "tiền khuếch đại tự động {0} dB",
@@ -1168,7 +1218,7 @@
     "correction_piece_sans_licence": "Room correction set but NOT applied: Premium license required",
     "upsampling": "Tăng tần số lấy mẫu {0}, bộ lọc {1}, dự trữ mức {2} dB (tiện ích)",
     "upsampling_pure": "Tăng tần số lấy mẫu không hoạt động (chế độ PURE)",
-    "upsampling_zone_not_supported": "Tăng tần số lấy mẫu không áp dụng cho vùng này: chỉ đầu ra cục bộ của máy hỗ trợ",
+    "upsampling_zone_not_supported": "Tăng tần số lấy mẫu không áp dụng cho vùng này: chỉ đầu ra cục bộ và trình phát DLNA/OpenHome hỗ trợ",
     "upsampling_not_applied": "Không áp dụng lấy mẫu tăng cho bản nhạc này",
     "upsampling_premium_required": "Lấy mẫu tăng không hoạt động: cần Premium",
     "upsampling_machine_test_missing": "Lấy mẫu tăng không hoạt động: chưa kiểm tra máy. Hãy chạy kiểm tra từ trang plugin Lấy mẫu tăng",
@@ -1207,7 +1257,12 @@
     "upsampling_level_partial": "khoảng dự trữ chỉ được bù một phần: thấp hơn {0} dB so với khi phát không nâng tần số lấy mẫu, âm lượng quá cao để bù hết",
     "upsampling_level_full_volume": "khoảng dự trữ không được bù: âm lượng 100%, thấp hơn {0} dB so với khi phát không nâng tần số lấy mẫu; để so sánh cùng mức âm, hãy giảm âm lượng Tune ít nhất {1} dB và chỉnh mức trên DAC hoặc tiền khuếch đại",
     "wasapi_rate_fallback": "Chuyển đổi {0} → {1} kHz: thiết bị không hỗ trợ {0} kHz ở chế độ WASAPI độc quyền",
-    "speaker_setup": "Thiết lập loa: độ trễ {0} ms (tổng độ trễ {1} ms), mức khuếch đại và cực tính theo từng kênh"
+    "speaker_setup": "Thiết lập loa: độ trễ {0} ms (tổng độ trễ {1} ms), mức khuếch đại và cực tính theo từng kênh",
+    "upsampling_network_rate_unknown": "Lấy mẫu tăng không hoạt động: trình phát này không thông báo các tần số nó chấp nhận",
+    "upsampling_network_rate_not_higher": "Lấy mẫu tăng không hoạt động: trình phát không thông báo tần số cao hơn là bội số nguyên của nguồn",
+    "upsampling_network_source": "Lấy mẫu tăng không hoạt động: trên trình phát mạng, hiện chỉ áp dụng cho bài hát trong thư viện",
+    "upsampling_network_no_probe": "Lấy mẫu tăng không hoạt động: loại trình phát này không báo các tần số nó chấp nhận",
+    "upsampling_network_file_only": "Lấy mẫu tăng không hoạt động cho bài này: bài được phát dạng luồng liên tục hoặc quá dài để chuyển đổi trước"
   },
   "hu": {
     "pregain": "automatikus előerősítés {0} dB",
@@ -1278,7 +1333,7 @@
     "correction_piece_sans_licence": "Room correction set but NOT applied: Premium license required",
     "upsampling": "Felülmintavételezés {0}, szűrő {1}, szinttartalék {2} dB (bővítmény)",
     "upsampling_pure": "Felülmintavételezés inaktív (PURE mód)",
-    "upsampling_zone_not_supported": "A felülmintavételezés nem vonatkozik erre a zónára: csak a gép helyi kimenete támogatja",
+    "upsampling_zone_not_supported": "A felülmintavételezés nem vonatkozik erre a zónára: csak a helyi kimenet és a DLNA/OpenHome lejátszók támogatják",
     "upsampling_not_applied": "Felülmintavételezés nincs alkalmazva erre a számra",
     "upsampling_premium_required": "Felülmintavételezés inaktív: Premium szükséges",
     "upsampling_machine_test_missing": "Felülmintavételezés inaktív: hiányzik a gépteszt. Indítsa el a Felülmintavételezés bővítmény oldaláról",
@@ -1317,7 +1372,12 @@
     "upsampling_level_partial": "a tartalék csak részben kompenzált: {0} dB-lel a felülmintavételezés nélküli lejátszás alatt, a hangerő túl magas a teljes kompenzációhoz",
     "upsampling_level_full_volume": "a tartalék nincs kompenzálva: hangerő 100%, {0} dB-lel a felülmintavételezés nélküli lejátszás alatt; azonos szintű összehasonlításhoz csökkentse a Tune hangerejét legalább {1} dB-lel, és a szintet a DAC-on vagy az előerősítőn állítsa be",
     "wasapi_rate_fallback": "Átalakítás {0} → {1} kHz: az eszköz nem támogatja a {0} kHz-et kizárólagos WASAPI módban",
-    "speaker_setup": "Hangszóró-beállítás: késleltetések {0} ms (késleltetés összesen {1} ms), csatornánkénti erősítés és polaritás"
+    "speaker_setup": "Hangszóró-beállítás: késleltetések {0} ms (késleltetés összesen {1} ms), csatornánkénti erősítés és polaritás",
+    "upsampling_network_rate_unknown": "Felülmintavételezés inaktív: ez a lejátszó nem jelzi, milyen frekvenciákat fogad el",
+    "upsampling_network_rate_not_higher": "Felülmintavételezés inaktív: a lejátszó nem jelez a forrás egész számú többszörösét jelentő magasabb frekvenciát",
+    "upsampling_network_source": "Felülmintavételezés inaktív: hálózati lejátszón egyelőre csak a könyvtár számaira vonatkozik",
+    "upsampling_network_no_probe": "Felülmintavételezés inaktív: ez a lejátszótípus nem jelzi, milyen frekvenciákat fogad el",
+    "upsampling_network_file_only": "Felülmintavételezés inaktív ennél a számnál: folyamatosan streamelődik, vagy túl hosszú az előzetes átalakításhoz"
   },
   "nb": {
     "pregain": "automatisk forsterkning før behandling {0} dB",
@@ -1388,7 +1448,7 @@
     "correction_piece_sans_licence": "Room correction set but NOT applied: Premium license required",
     "upsampling": "Oppsampling {0}, filter {1}, nivåmargin {2} dB (programtillegg)",
     "upsampling_pure": "Oppsampling inaktiv (PURE-modus)",
-    "upsampling_zone_not_supported": "Oppsampling gjelder ikke for denne sonen: bare maskinens lokale utgang støtter det",
+    "upsampling_zone_not_supported": "Oppsampling gjelder ikke for denne sonen: bare den lokale utgangen og DLNA/OpenHome-spillere støtter det",
     "upsampling_not_applied": "Oppsampling brukes ikke på dette sporet",
     "upsampling_premium_required": "Oppsampling inaktiv: Premium kreves",
     "upsampling_machine_test_missing": "Oppsampling inaktiv: maskintest mangler. Kjør den fra siden for tillegget Oppsampling",
@@ -1427,7 +1487,12 @@
     "upsampling_level_partial": "reserven delvis kompensert: {0} dB under avspilling uten oppsampling, volumet er for høyt til full kompensasjon",
     "upsampling_level_full_volume": "reserven ikke kompensert: volum på 100 %, {0} dB under avspilling uten oppsampling; for en sammenligning på samme nivå, senk Tunes volum med minst {1} dB og still inn nivået på DAC-en eller forforsterkeren",
     "wasapi_rate_fallback": "Konvertering {0} → {1} kHz: enheten støtter ikke {0} kHz i eksklusiv WASAPI-modus",
-    "speaker_setup": "Høyttaleroppsett: forsinkelser {0} ms (latens {1} ms), forsterkning og polaritet per kanal"
+    "speaker_setup": "Høyttaleroppsett: forsinkelser {0} ms (latens {1} ms), forsterkning og polaritet per kanal",
+    "upsampling_network_rate_unknown": "Oppsampling inaktiv: spilleren oppgir ikke hvilke frekvenser den godtar",
+    "upsampling_network_rate_not_higher": "Oppsampling inaktiv: spilleren oppgir ingen høyere frekvens som er et heltallsmultiplum av kilden",
+    "upsampling_network_source": "Oppsampling inaktiv: på en nettverksspiller gjelder det foreløpig bare spor i biblioteket",
+    "upsampling_network_no_probe": "Oppsampling inaktiv: denne spillertypen rapporterer ikke hvilke frekvenser den godtar",
+    "upsampling_network_file_only": "Oppsampling inaktiv for dette sporet: det strømmes progressivt eller er for langt til å konverteres på forhånd"
   },
   "pl": {
     "pregain": "automatyczne wzmocnienie wstępne {0} dB",
@@ -1498,7 +1563,7 @@
     "correction_piece_sans_licence": "Room correction set but NOT applied: Premium license required",
     "upsampling": "Nadpróbkowanie {0}, filtr {1}, zapas poziomu {2} dB (wtyczka)",
     "upsampling_pure": "Nadpróbkowanie nieaktywne (tryb PURE)",
-    "upsampling_zone_not_supported": "Nadpróbkowanie nie dotyczy tej strefy: obsługuje je tylko lokalne wyjście komputera",
+    "upsampling_zone_not_supported": "Nadpróbkowanie nie dotyczy tej strefy: obsługują je tylko wyjście lokalne i odtwarzacze DLNA/OpenHome",
     "upsampling_not_applied": "Nadpróbkowanie nie jest stosowane do tego utworu",
     "upsampling_premium_required": "Nadpróbkowanie nieaktywne: wymagane Premium",
     "upsampling_machine_test_missing": "Nadpróbkowanie nieaktywne: brak testu komputera. Uruchom go na stronie wtyczki Nadpróbkowanie",
@@ -1537,7 +1602,12 @@
     "upsampling_level_partial": "zapas skompensowany częściowo: {0} dB poniżej odtwarzania bez nadpróbkowania, głośność zbyt wysoka na pełną kompensację",
     "upsampling_level_full_volume": "zapas nieskompensowany: głośność 100%, {0} dB poniżej odtwarzania bez nadpróbkowania; aby porównać przy równym poziomie, zmniejsz głośność Tune o co najmniej {1} dB i ustaw poziom na DAC-u lub przedwzmacniaczu",
     "wasapi_rate_fallback": "Konwersja {0} → {1} kHz: urządzenie nie obsługuje {0} kHz w trybie wyłącznym WASAPI",
-    "speaker_setup": "Ustawienia głośników: opóźnienia {0} ms (latencja {1} ms), wzmocnienie i polaryzacja dla każdego kanału"
+    "speaker_setup": "Ustawienia głośników: opóźnienia {0} ms (latencja {1} ms), wzmocnienie i polaryzacja dla każdego kanału",
+    "upsampling_network_rate_unknown": "Nadpróbkowanie nieaktywne: ten odtwarzacz nie podaje akceptowanych częstotliwości",
+    "upsampling_network_rate_not_higher": "Nadpróbkowanie nieaktywne: odtwarzacz nie podaje wyższej częstotliwości będącej całkowitą wielokrotnością źródła",
+    "upsampling_network_source": "Nadpróbkowanie nieaktywne: na odtwarzaczu sieciowym dotyczy na razie tylko utworów z biblioteki",
+    "upsampling_network_no_probe": "Nadpróbkowanie nieaktywne: ten typ odtwarzacza nie zgłasza akceptowanych częstotliwości",
+    "upsampling_network_file_only": "Nadpróbkowanie nieaktywne dla tego utworu: jest przesyłany progresywnie lub jest zbyt długi do wcześniejszej konwersji"
   },
   "el": {
     "pregain": "αυτόματη προ-ενίσχυση {0} dB",
@@ -1608,7 +1678,7 @@
     "correction_piece_sans_licence": "Room correction set but NOT applied: Premium license required",
     "upsampling": "Υπερδειγματοληψία {0}, φίλτρο {1}, περιθώριο στάθμης {2} dB (πρόσθετο)",
     "upsampling_pure": "Υπερδειγματοληψία ανενεργή (λειτουργία PURE)",
-    "upsampling_zone_not_supported": "Η υπερδειγματοληψία δεν ισχύει σε αυτή τη ζώνη: μόνο η τοπική έξοδος του μηχανήματος την υποστηρίζει",
+    "upsampling_zone_not_supported": "Η υπερδειγματοληψία δεν ισχύει σε αυτή τη ζώνη: την υποστηρίζουν μόνο η τοπική έξοδος και οι αναπαραγωγείς DLNA/OpenHome",
     "upsampling_not_applied": "Δεν εφαρμόζεται υπερδειγματοληψία σε αυτό το κομμάτι",
     "upsampling_premium_required": "Υπερδειγματοληψία ανενεργή: απαιτείται Premium",
     "upsampling_machine_test_missing": "Υπερδειγματοληψία ανενεργή: λείπει η δοκιμή του μηχανήματος. Εκτελέστε την από τη σελίδα του πρόσθετου Υπερδειγματοληψία",
@@ -1647,7 +1717,12 @@
     "upsampling_level_partial": "το περιθώριο αντισταθμίστηκε εν μέρει: {0} dB κάτω από την αναπαραγωγή χωρίς υπερδειγματοληψία, η ένταση είναι πολύ υψηλή για πλήρη αντιστάθμιση",
     "upsampling_level_full_volume": "το περιθώριο δεν αντισταθμίστηκε: ένταση στο 100%, {0} dB κάτω από την αναπαραγωγή χωρίς υπερδειγματοληψία· για σύγκριση στην ίδια στάθμη, χαμηλώστε την ένταση του Tune τουλάχιστον {1} dB και ρυθμίστε τη στάθμη στο DAC ή στον προενισχυτή",
     "wasapi_rate_fallback": "Μετατροπή {0} → {1} kHz: η συσκευή δεν υποστηρίζει {0} kHz σε αποκλειστική λειτουργία WASAPI",
-    "speaker_setup": "Ρύθμιση ηχείων: καθυστερήσεις {0} ms (λανθάνων χρόνος {1} ms), απολαβή και πολικότητα ανά κανάλι"
+    "speaker_setup": "Ρύθμιση ηχείων: καθυστερήσεις {0} ms (λανθάνων χρόνος {1} ms), απολαβή και πολικότητα ανά κανάλι",
+    "upsampling_network_rate_unknown": "Υπερδειγματοληψία ανενεργή: ο αναπαραγωγέας δεν δηλώνει τις συχνότητες που δέχεται",
+    "upsampling_network_rate_not_higher": "Υπερδειγματοληψία ανενεργή: ο αναπαραγωγέας δεν δηλώνει υψηλότερη συχνότητα, ακέραιο πολλαπλάσιο της πηγής",
+    "upsampling_network_source": "Υπερδειγματοληψία ανενεργή: σε αναπαραγωγέα δικτύου ισχύει προς το παρόν μόνο για κομμάτια της βιβλιοθήκης",
+    "upsampling_network_no_probe": "Υπερδειγματοληψία ανενεργή: αυτός ο τύπος αναπαραγωγέα δεν αναφέρει τις συχνότητες που δέχεται",
+    "upsampling_network_file_only": "Υπερδειγματοληψία ανενεργή για αυτό το κομμάτι: μεταδίδεται προοδευτικά ή είναι πολύ μεγάλο για μετατροπή εκ των προτέρων"
   },
   "tr": {
     "pregain": "otomatik ön kazanç {0} dB",
@@ -1718,7 +1793,7 @@
     "correction_piece_sans_licence": "Oda düzeltmesi ayarlandı ancak UYGULANMADI: Premium lisansı gerekir",
     "upsampling": "Upsampling {0}, filtre {1}, seviye payı {2} dB (eklenti)",
     "upsampling_pure": "Upsampling devre dışı (PURE modu)",
-    "upsampling_zone_not_supported": "Upsampling bu bölgede uygulanmaz: yalnızca makinenin yerel çıkışı bunu destekler",
+    "upsampling_zone_not_supported": "Upsampling bu bölgede uygulanmaz: yalnızca yerel çıkış ve DLNA/OpenHome oynatıcılar bunu destekler",
     "upsampling_not_applied": "Bu parçaya upsampling uygulanmadı",
     "upsampling_premium_required": "Upsampling devre dışı: Premium gerekir",
     "upsampling_machine_test_missing": "Upsampling devre dışı: makine testi yapılmamış. Upsampling eklentisi sayfasından çalıştırın",
@@ -1757,7 +1832,12 @@
     "upsampling_level_partial": "pay kısmen telafi edildi: üst örneklemesiz çalmadan {0} dB düşük, ses düzeyi tam telafi için çok yüksek",
     "upsampling_level_full_volume": "pay telafi edilmedi: ses düzeyi %100, üst örneklemesiz çalmadan {0} dB düşük; eşit seviyede karşılaştırmak için Tune ses düzeyini en az {1} dB düşürün ve seviyeyi DAC'ta veya ön amfide ayarlayın",
     "wasapi_rate_fallback": "{0} → {1} kHz dönüşümü: cihaz, WASAPI özel modunda {0} kHz desteklemiyor",
-    "speaker_setup": "Hoparlör kurulumu: gecikmeler {0} ms (toplam gecikme {1} ms), kanal başına kazanç ve polarite"
+    "speaker_setup": "Hoparlör kurulumu: gecikmeler {0} ms (toplam gecikme {1} ms), kanal başına kazanç ve polarite",
+    "upsampling_network_rate_unknown": "Upsampling devre dışı: bu oynatıcı kabul ettiği örnekleme hızlarını bildirmiyor",
+    "upsampling_network_rate_not_higher": "Upsampling devre dışı: bu oynatıcı kaynağın tam katı olan daha yüksek bir hız bildirmiyor",
+    "upsampling_network_source": "Upsampling devre dışı: ağ oynatıcısında şimdilik yalnızca kitaplık parçalarına uygulanır",
+    "upsampling_network_no_probe": "Upsampling devre dışı: bu oynatıcı türü kabul ettiği örnekleme hızlarını bildirmiyor",
+    "upsampling_network_file_only": "Bu parça için upsampling devre dışı: aşamalı akışla gönderiliyor ya da önceden dönüştürülemeyecek kadar uzun"
   },
   "nl": {
     "pregain": "automatische pre-gain {0} dB",
@@ -1828,7 +1908,7 @@
     "correction_piece_sans_licence": "Ruimtecorrectie ingesteld maar NIET toegepast: Premium-licentie vereist",
     "upsampling": "Upsampling {0}, filter {1}, niveau-headroom {2} dB (plug-in)",
     "upsampling_pure": "Upsampling inactief (PURE-modus)",
-    "upsampling_zone_not_supported": "Upsampling geldt niet voor deze zone: alleen de lokale uitvoer van de computer ondersteunt het",
+    "upsampling_zone_not_supported": "Upsampling geldt niet voor deze zone: alleen de lokale uitvoer en DLNA/OpenHome-spelers ondersteunen het",
     "upsampling_not_applied": "Upsampling niet toegepast op dit nummer",
     "upsampling_premium_required": "Upsampling inactief: Premium vereist",
     "upsampling_machine_test_missing": "Upsampling inactief: machinetest ontbreekt. Start die vanaf de pagina van de plug-in Upsampling",
@@ -1867,7 +1947,12 @@
     "upsampling_level_partial": "headroom deels gecompenseerd: {0} dB onder afspelen zonder upsampling, volume te hoog om volledig te compenseren",
     "upsampling_level_full_volume": "headroom niet gecompenseerd: volume op 100%, {0} dB onder afspelen zonder upsampling; zet voor een vergelijking op gelijk niveau het volume van Tune minstens {1} dB lager en stel het niveau in op de DAC of voorversterker",
     "wasapi_rate_fallback": "Conversie {0} → {1} kHz: het apparaat ondersteunt geen {0} kHz in exclusieve WASAPI-modus",
-    "speaker_setup": "Luidsprekerinstelling: vertragingen {0} ms (latentie {1} ms), versterking en polariteit per kanaal"
+    "speaker_setup": "Luidsprekerinstelling: vertragingen {0} ms (latentie {1} ms), versterking en polariteit per kanaal",
+    "upsampling_network_rate_unknown": "Upsampling inactief: deze speler geeft niet aan welke samplefrequenties hij accepteert",
+    "upsampling_network_rate_not_higher": "Upsampling inactief: deze speler geeft geen hogere frequentie op die een geheel veelvoud van de bron is",
+    "upsampling_network_source": "Upsampling inactief: op een netwerkspeler geldt het voorlopig alleen voor nummers uit de bibliotheek",
+    "upsampling_network_no_probe": "Upsampling inactief: dit type speler meldt niet welke samplefrequenties het accepteert",
+    "upsampling_network_file_only": "Upsampling inactief voor dit nummer: het wordt progressief gestreamd of is te lang om vooraf te converteren"
   },
   "zh-Hant": {
     "pregain": "自動前置增益 {0} dB",
@@ -1938,7 +2023,7 @@
     "correction_piece_sans_licence": "房間校正已設定但「未」套用：需要 Premium 授權",
     "upsampling": "升頻 {0}，濾波器 {1}，電平餘裕 {2} dB（外掛程式）",
     "upsampling_pure": "升頻未啟用（PURE 模式）",
-    "upsampling_zone_not_supported": "升頻不適用於此區域：僅此電腦的本機輸出支援升頻",
+    "upsampling_zone_not_supported": "升頻不適用於此區域：僅本機輸出與 DLNA/OpenHome 播放器支援升頻",
     "upsampling_not_applied": "此曲目未套用升頻",
     "upsampling_premium_required": "升頻未啟用：需要 Premium",
     "upsampling_machine_test_missing": "升頻未啟用：尚未進行本機測試。請在「升頻」外掛頁面執行測試",
@@ -1977,7 +2062,12 @@
     "upsampling_level_partial": "餘裕僅部分補償：比未升頻播放低 {0} dB，音量過高而無法完全補償",
     "upsampling_level_full_volume": "餘裕未補償：音量為 100%，比未升頻播放低 {0} dB；若要在相同電平下比較，請將 Tune 的音量至少調低 {1} dB，並在 DAC 或前級上調整電平",
     "wasapi_rate_fallback": "轉換 {0} → {1} kHz：此裝置在 WASAPI 獨佔模式下不支援 {0} kHz",
-    "speaker_setup": "揚聲器設定：延遲 {0} 毫秒（總延遲 {1} 毫秒），逐聲道增益與極性"
+    "speaker_setup": "揚聲器設定：延遲 {0} 毫秒（總延遲 {1} 毫秒），逐聲道增益與極性",
+    "upsampling_network_rate_unknown": "升頻未啟用：此播放器未宣告其接受的取樣率",
+    "upsampling_network_rate_not_higher": "升頻未啟用：此播放器未宣告任何高於音源且為其整數倍的取樣率",
+    "upsampling_network_source": "升頻未啟用：在網路播放器上，目前僅適用於音樂庫中的曲目",
+    "upsampling_network_no_probe": "升頻未啟用：此類播放器不回報其接受的取樣率",
+    "upsampling_network_file_only": "此曲目未啟用升頻：它以漸進串流傳輸，或過長而無法預先轉換"
   },
   "ru": {
     "pregain": "автоматическое предусиление {0} dB",
@@ -2048,7 +2138,7 @@
     "correction_piece_sans_licence": "Коррекция помещения настроена, но НЕ применена: нужна лицензия Premium",
     "upsampling": "Передискретизация {0}, фильтр {1}, запас по уровню {2} dB (плагин)",
     "upsampling_pure": "Передискретизация неактивна (режим PURE)",
-    "upsampling_zone_not_supported": "Передискретизация к этой зоне не применяется: ее поддерживает только локальный выход компьютера",
+    "upsampling_zone_not_supported": "Передискретизация к этой зоне не применяется: ее поддерживают только локальный выход и плееры DLNA/OpenHome",
     "upsampling_not_applied": "Передискретизация к этому треку не применена",
     "upsampling_premium_required": "Передискретизация неактивна: нужен Premium",
     "upsampling_machine_test_missing": "Передискретизация неактивна: нет теста машины. Запустите его на странице модуля «Передискретизация»",
@@ -2087,7 +2177,12 @@
     "upsampling_level_partial": "запас компенсирован частично: на {0} dB ниже воспроизведения без передискретизации, громкость слишком высока для полной компенсации",
     "upsampling_level_full_volume": "запас не компенсирован: громкость 100%, на {0} dB ниже воспроизведения без передискретизации; для сравнения на равном уровне уменьшите громкость Tune хотя бы на {1} dB и выставьте уровень на ЦАП или предусилителе",
     "wasapi_rate_fallback": "Преобразование {0} → {1} кГц: устройство не поддерживает {0} кГц в монопольном режиме WASAPI",
-    "speaker_setup": "Настройка акустики: задержки {0} мс (латентность {1} мс), усиление и полярность по каналам"
+    "speaker_setup": "Настройка акустики: задержки {0} мс (латентность {1} мс), усиление и полярность по каналам",
+    "upsampling_network_rate_unknown": "Передискретизация неактивна: плеер не сообщает, какие частоты он принимает",
+    "upsampling_network_rate_not_higher": "Передискретизация неактивна: плеер не сообщает более высокой частоты, кратной частоте источника",
+    "upsampling_network_source": "Передискретизация неактивна: на сетевом плеере она пока применяется только к трекам библиотеки",
+    "upsampling_network_no_probe": "Передискретизация неактивна: этот тип плеера не сообщает, какие частоты он принимает",
+    "upsampling_network_file_only": "Передискретизация неактивна для этого трека: он передается потоком или слишком длинный для предварительного преобразования"
   },
   "uk": {
     "pregain": "автоматичне попереднє підсилення {0} dB",
@@ -2158,7 +2253,7 @@
     "correction_piece_sans_licence": "Корекцію приміщення налаштовано, але НЕ застосовано: потрібна ліцензія Premium",
     "upsampling": "Передискретизація {0}, фільтр {1}, запас рівня {2} dB (плагін)",
     "upsampling_pure": "Передискретизація неактивна (режим PURE)",
-    "upsampling_zone_not_supported": "Передискретизація не застосовується до цієї зони: її підтримує лише локальний вихід комп’ютера",
+    "upsampling_zone_not_supported": "Передискретизація не застосовується до цієї зони: її підтримують лише локальний вихід і плеєри DLNA/OpenHome",
     "upsampling_not_applied": "Передискретизацію не застосовано до цього треку",
     "upsampling_premium_required": "Передискретизація неактивна: потрібен Premium",
     "upsampling_machine_test_missing": "Передискретизація неактивна: немає тесту машини. Запустіть його на сторінці модуля «Передискретизація»",
@@ -2197,6 +2292,11 @@
     "upsampling_level_partial": "запас компенсовано частково: на {0} dB нижче, ніж відтворення без передискретизації, гучність зависока для повної компенсації",
     "upsampling_level_full_volume": "запас не компенсовано: гучність 100 %, на {0} dB нижче, ніж відтворення без передискретизації; для порівняння на однаковому рівні знизьте гучність Tune щонайменше на {1} dB і налаштуйте рівень на ЦАП або попередньому підсилювачі",
     "wasapi_rate_fallback": "Перетворення {0} → {1} кГц: пристрій не підтримує {0} кГц в монопольному режимі WASAPI",
-    "speaker_setup": "Налаштування акустики: затримки {0} мс (загальна затримка {1} мс), підсилення й полярність для кожного каналу"
+    "speaker_setup": "Налаштування акустики: затримки {0} мс (загальна затримка {1} мс), підсилення й полярність для кожного каналу",
+    "upsampling_network_rate_unknown": "Передискретизація неактивна: плеєр не повідомляє, які частоти він приймає",
+    "upsampling_network_rate_not_higher": "Передискретизація неактивна: плеєр не повідомляє вищої частоти, кратної частоті джерела",
+    "upsampling_network_source": "Передискретизація неактивна: на мережевому плеєрі вона поки застосовується лише до треків бібліотеки",
+    "upsampling_network_no_probe": "Передискретизація неактивна: цей тип плеєра не повідомляє, які частоти він приймає",
+    "upsampling_network_file_only": "Передискретизація неактивна для цього треку: він передається потоком або задовгий для попереднього перетворення"
   }
 }

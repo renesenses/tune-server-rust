@@ -126,7 +126,7 @@ fn contrainte(state: &AppState, premium: bool, zone_id: i64) -> Option<&'static 
     if let Err(ecarte) = su::choix_de_la_zone(&settings(state), premium, pure, zone_id) {
         return Some(ecarte.code());
     }
-    if sortie_non_locale(state, zone_id) {
+    if sortie_non_locale(state, zone_id) && !sortie_upnp(state, zone_id) {
         return Some("output_not_supported");
     }
     if tune_core::audio::bitperfect_strict::zone_enabled(&state.backend, zone_id) {
@@ -145,6 +145,20 @@ fn sortie_non_locale(state: &AppState, zone_id: i64) -> bool {
         .and_then(|z| z.output_device_id)
         .filter(|d| !d.is_empty())
         .is_some_and(|d| !d.starts_with("local:"))
+}
+
+/// rc14 — la zone joue sur un lecteur de la famille UPnP (DLNA, OpenHome…) :
+/// le suréchantillonnage y est porté par le fichier refait, à la piste
+/// suivante.
+fn sortie_upnp(state: &AppState, zone_id: i64) -> bool {
+    let type_de_sortie = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_type);
+    tune_core::tess::reseau_upnp::famille_upnp(
+        tune_core::tess::TransportZone::depuis_type_de_sortie(type_de_sortie.as_deref()),
+    )
 }
 
 /// Quand le réglage atteint le son, pour le client.
@@ -169,7 +183,11 @@ async fn forme_de_zone(
     let contrainte = contrainte(state, premium, zone_id);
     // 19/11/2026 — sur une zone réseau le réglage n'agit pas : ni « now » ni
     // « next_track », la contrainte dit pourquoi.
-    let quand = if sortie_non_locale(state, zone_id) {
+    let quand = if sortie_upnp(state, zone_id) {
+        // rc14 — le fichier de la piste suivante est refait à la cible :
+        // jamais de changement de niveau en cours de piste.
+        "next_track"
+    } else if sortie_non_locale(state, zone_id) {
         "never"
     } else {
         portee.map_or("now", applies_at)
@@ -197,6 +215,15 @@ async fn forme_de_zone(
 /// mesurées, mélangeur de Windows, mode exclusif…) ne se sait qu'à
 /// l'ouverture : la page restait muette (Xavier, Windows, 25/11).
 async fn refus_observe(state: &AppState, zone_id: i64) -> Value {
+    // rc14 — un lecteur UPnP : le refus que la lecture a noté.
+    if sortie_upnp(state, zone_id) {
+        let refus = state
+            .orchestrator
+            .surechantillonnage_reseau_de_la_zone(zone_id)
+            .filter(|e| !e.active)
+            .and_then(|e| e.reason);
+        return forme_du_refus(refus.as_deref());
+    }
     let etat = state.playback.get_state(zone_id).await;
     let type_de_sortie = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(zone_id)

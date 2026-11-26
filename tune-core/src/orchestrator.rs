@@ -1637,6 +1637,9 @@ pub struct PlaybackOrchestrator {
     /// LAT-F1 (phase 1) : réponses CONCLUANTES de `dlna_accepte_lpcm`, par
     /// `device_id|profondeur`. Les sondes inconcluantes n'y entrent pas.
     dlna_lpcm_accepte: Mutex<HashMap<String, bool>>,
+    /// rc14 — la décision de suréchantillonnage réseau de la dernière piste
+    /// de la bibliothèque résolue, par zone (`surechantillonnage_reseau`).
+    surech_reseau: std::sync::Mutex<HashMap<i64, crate::tess::reseau_upnp::SurechantillonnageUpnp>>,
     /// #4573 — ce que le Sink du renderer ANNONCE en nombre de canaux, par
     /// `(device_id, mime)`. `Some(None)` veut dire « le Sink a été lu, il ne porte
     /// aucun `channels=` » : une ignorance MESURÉE, qui ne fait rien réduire
@@ -2085,6 +2088,11 @@ struct StreamingDsp {
     /// TESS T04 — l'exécuteur de la chaîne, la quantification finale et leurs
     /// tampons ([`chaine_reseau_tess`]).
     tess: chaine_reseau_tess::EtatTess,
+    /// rc14 — le suréchantillonnage PCM d'une zone de la famille UPnP, posé
+    /// par le transcodage de fichier (`transcodage`) : dernier étage avant la
+    /// quantification, voir [`chaine_reseau_tess::SurechReseau`]. `None` :
+    /// la cadence du flux ne change pas.
+    surechantillonneur: Option<chaine_reseau_tess::SurechReseau>,
 }
 
 impl StreamingDsp {
@@ -2097,6 +2105,7 @@ impl StreamingDsp {
             || self.crossfeed.is_some()
             || self.compensation.is_some()
             || self.enceintes.is_some()
+            || self.surechantillonneur.is_some()
     }
 
     /// Le crossfeed de ce porteur sera-t-il réellement EXÉCUTÉ ?
@@ -2150,13 +2159,23 @@ impl StreamingDsp {
         if let Some(c) = self.compensation.as_ref() {
             etages.push(format!("compensation:{:+.2}dB@{flux}", c.cible_db()));
         }
-        if etages.is_empty() {
+
+        if etages.is_empty() && self.surechantillonneur.is_none() {
             return format!("aucun_etage canaux={}", self.channels);
         }
         let etages: Vec<String> = etages
             .into_iter()
             .map(|e| format!("{e}[{flux}->{flux}]"))
             .collect();
+        // rc14 — le seul étage qui change la cadence, en dernier.
+        let mut etages = etages;
+        if let Some(s) = self.surechantillonneur.as_ref() {
+            etages.push(format!(
+                "surechantillonnage:{}[{flux}->{}]",
+                s.etage.filtre(),
+                s.etage.cadence_sortie()
+            ));
+        }
         format!(
             "{} canaux={}{}",
             etages.join(" > "),
@@ -2357,6 +2376,7 @@ impl PlaybackOrchestrator {
             appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
+            surech_reseau: std::sync::Mutex::new(HashMap::new()),
             dlna_canaux_max: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashMap::new()),
             transferts_en_pause: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -2488,6 +2508,8 @@ mod acheminement_upnp_t12b;
 #[cfg(test)]
 mod acheminement_upnp_t12b_tests;
 pub use acheminement_upnp_t12b::{PisteEnCours, volume_reglable_retenu};
+// rc14 — le suréchantillonnage PCM sur une sortie réseau de la famille UPnP.
+pub mod surechantillonnage_reseau;
 // #7965 — radios (au nom de la station) et podcasts dans l'historique.
 mod historique_radio_podcast_7965;
 #[cfg(test)]
