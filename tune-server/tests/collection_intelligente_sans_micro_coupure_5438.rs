@@ -119,50 +119,78 @@ const GENRES: [&str; 8] = [
     "Pop",
 ];
 
+/// SQLite prépare le programme des déclencheurs à chaque INSERT. Grouper les
+/// valeurs amortit cette préparation ; chaque ligne traverse les mêmes index
+/// et déclencheurs, dans le même ordre et la même transaction.
+fn ajouter_les_lignes(
+    sql: &mut String,
+    table_et_colonnes: &str,
+    nombre: i64,
+    valeurs: impl Fn(i64) -> String,
+) {
+    for debut in (1..=nombre).step_by(256) {
+        sql.push_str("INSERT INTO ");
+        sql.push_str(table_et_colonnes);
+        sql.push_str(" VALUES ");
+        for id in debut..=(debut + 255).min(nombre) {
+            if id > debut {
+                sql.push(',');
+            }
+            sql.push_str(&valeurs(id));
+        }
+        sql.push_str(";\n");
+    }
+}
+
 fn remplir_au_profil_du_testeur(state: &AppState) -> i64 {
     let albums = (PISTES + PISTES_PAR_ALBUM - 1) / PISTES_PAR_ALBUM;
     let mut sql = String::from("BEGIN;\n");
-    for a in 1..=ARTISTES {
-        sql.push_str(&format!(
-            "INSERT INTO artists (id, name) VALUES ({a}, 'Artiste {a}');\n"
-        ));
-    }
-    for al in 1..=albums {
-        let genre = GENRES[(al % GENRES.len() as i64) as usize];
-        sql.push_str(&format!(
-            "INSERT INTO albums (id, title, artist_id, source, genre, year, cover_path) \
-             VALUES ({al}, 'Album {al}', {}, 'local', '{genre}', {}, {});\n",
-            al % ARTISTES + 1,
-            1950 + al % 70,
+    ajouter_les_lignes(&mut sql, "artists (id, name)", ARTISTES, |a| {
+        format!("({a}, 'Artiste {a}')")
+    });
+    ajouter_les_lignes(
+        &mut sql,
+        "albums (id, title, artist_id, source, genre, year, cover_path)",
+        albums,
+        |al| {
+            let genre = GENRES[(al % GENRES.len() as i64) as usize];
             // Un album sur cinq sans pochette : la mosaïque doit les sauter.
-            if al % 5 == 0 {
-                "NULL".to_string()
+            let pochette = if al % 5 == 0 {
+                "NULL".to_owned()
             } else {
                 format!("'/pochettes/{al}.jpg'")
-            },
-        ));
-    }
-    for id in 1..=PISTES {
-        let al = (id - 1) / PISTES_PAR_ALBUM + 1;
-        let n = (id - 1) % PISTES_PAR_ALBUM + 1;
-        let genre = GENRES[(al % GENRES.len() as i64) as usize];
-        let (format, cadence) = if id % 7 == 0 {
-            ("dsf", 2_822_400)
-        } else {
-            ("flac", if id % 3 == 0 { 192_000 } else { 44_100 })
-        };
-        sql.push_str(&format!(
-            "INSERT INTO tracks (id, title, album_id, artist_id, disc_number, track_number, \
-             file_path, format, sample_rate, bit_depth, source, album_artist, genre, year, \
-             label, duration_ms) \
-             VALUES ({id}, 'Piste {n}', {al}, {artiste}, 1, {n}, \
+            };
+            format!(
+                "({al}, 'Album {al}', {}, 'local', '{genre}', {}, {pochette})",
+                al % ARTISTES + 1,
+                1950 + al % 70
+            )
+        },
+    );
+    ajouter_les_lignes(
+        &mut sql,
+        "tracks (id, title, album_id, artist_id, disc_number, track_number, \
+        file_path, format, sample_rate, bit_depth, source, album_artist, genre, year, label, duration_ms)",
+        PISTES,
+        |id| {
+            let al = (id - 1) / PISTES_PAR_ALBUM + 1;
+            let n = (id - 1) % PISTES_PAR_ALBUM + 1;
+            let genre = GENRES[(al % GENRES.len() as i64) as usize];
+            let (format, cadence) = if id % 7 == 0 {
+                ("dsf", 2_822_400)
+            } else {
+                ("flac", if id % 3 == 0 { 192_000 } else { 44_100 })
+            };
+            format!(
+                "({id}, 'Piste {n}', {al}, {artiste}, 1, {n}, \
              '/musique/Artiste {artiste}/Album {al}/{n:02}.{format}', '{format}', {cadence}, 24, \
-             'local', 'Artiste {artiste}', '{genre}', {annee}, 'Label {label}', 240000);\n",
-            artiste = al % ARTISTES + 1,
-            annee = 1950 + al % 70,
-            label = al % 150,
-        ));
-    }
+             'local', 'Artiste {artiste}', '{genre}', {annee}, 'Label {label}', 240000)",
+                artiste = al % ARTISTES + 1,
+                annee = 1950 + al % 70,
+                label = al % 150,
+            )
+        },
+    );
     sql.push_str("COMMIT;");
     state.backend.execute_batch(&sql).unwrap();
     albums
