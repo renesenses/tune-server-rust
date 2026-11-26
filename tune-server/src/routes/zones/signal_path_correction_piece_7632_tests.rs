@@ -420,3 +420,104 @@ fn sans_premium_la_ri_est_dite_non_appliquee_7632() {
         .unwrap();
     assert_eq!(sp["room_correction"]["status"], "applied", "{sp}");
 }
+
+/// Rémi (rc14, Sonos Play:1 en DLNA) — une source à 192 kHz servie à 48 kHz :
+/// le chemin suit l'ordre RÉEL du flux converti. Le décodeur rend déjà le PCM
+/// à 48 kHz, la convolution tourne à 48 kHz, puis l'encodage pour le lecteur,
+/// puis le volume du lecteur, en dernier avant le transport. L'étape
+/// s'intitule « Convolution », `code` et `kind` inchangés.
+#[test]
+fn chemin_reseau_dans_l_ordre_reel_et_convolution_nommee_rc14() {
+    let (backend, mut zone, mut ps) = zone_en_lecture();
+    zone.volume = 40.0;
+    if let Some(np) = ps.now_playing.as_mut() {
+        np.sample_rate = Some(192_000);
+    }
+    let ri = tune_core::test_scratch::scratch_file("ri-rc14-remi", ".wav");
+    ecrire_ri(ri.path(), 48_000, 256);
+    regler(
+        &backend,
+        &format!("ir_path_{}", zone.id.unwrap()),
+        &ri.as_str(),
+    );
+    let fil = StreamInfo {
+        format: "wav".into(),
+        sample_rate: 48_000,
+        bit_depth: 24,
+        ..Default::default()
+    };
+    let sp = build_signal_path(&ps, &zone, &backend, Some("Sonos"), "none", Some(&fil)).unwrap();
+    let steps = sp["steps"].as_array().expect("steps");
+    let rang = |f: &dyn Fn(&Value) -> bool| steps.iter().position(f);
+    let conv = rang(&|e| e["code"] == "room_correction").expect("étape de convolution");
+    let e = &steps[conv];
+    assert_eq!(e["name"], "Convolution", "{e}");
+    assert_eq!(e["kind"], "ir", "{e}");
+    assert!(
+        e["description"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("Convolution")),
+        "{e}"
+    );
+    assert_eq!(
+        e["sample_rate_hz"], 48_000,
+        "la convolution tourne à 48 kHz : {e}"
+    );
+    let transport = rang(&|e| e["name"] == "Transport").expect("transport");
+    let volume = rang(&|e| e["name"] == "Volume").expect("volume du lecteur");
+    assert!(conv < volume, "volume avant la convolution : {steps:?}");
+    assert_eq!(
+        volume + 1,
+        transport,
+        "le volume du lecteur est le dernier : {steps:?}"
+    );
+    if let Some(cadence) = rang(&|e| e["code"] == "rate_conversion") {
+        assert!(
+            cadence < conv,
+            "conversion après la convolution : {steps:?}"
+        );
+        assert_eq!(steps[cadence]["sample_rate_hz"], 48_000);
+    }
+    if let Some(encodage) = rang(&|e| e["name"] == "Transcoder") {
+        assert!(conv < encodage && encodage < volume, "{steps:?}");
+    }
+    assert_eq!(steps[0]["name"], "Source");
+    assert_eq!(steps[0]["sample_rate_hz"], 192_000, "{}", steps[0]);
+}
+
+/// Contre-épreuve : le même réordonnancement laisse une liste sans
+/// `Transport` intacte, et ne touche ni aux noms ni aux codes.
+#[test]
+fn ordonner_le_chemin_reseau_deplace_volume_et_encodage_rc14() {
+    let mut steps = vec![
+        json!({"name": "Source"}),
+        json!({"name": "Transcoder", "description": "FLAC → WAV"}),
+        json!({"name": "Resampler", "code": "rate_conversion", "to_hz": 48_000}),
+        json!({"name": "Volume"}),
+        json!({"name": "Convolution", "code": "room_correction"}),
+        json!({"name": "Transport"}),
+        json!({"name": "Renderer"}),
+    ];
+    ordonner_le_chemin_reseau(&mut steps, Some(192_000), Some(48_000));
+    let noms: Vec<&str> = steps.iter().map(|e| e["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        noms,
+        [
+            "Source",
+            "Resampler",
+            "Convolution",
+            "Transcoder",
+            "Volume",
+            "Transport",
+            "Renderer"
+        ]
+    );
+    assert_eq!(steps[0]["sample_rate_hz"], 192_000);
+    assert!(
+        steps[1..].iter().all(|e| e["sample_rate_hz"] == 48_000),
+        "{steps:?}"
+    );
+    let mut sans_transport = vec![json!({"name": "Volume"}), json!({"name": "Convolution"})];
+    ordonner_le_chemin_reseau(&mut sans_transport, Some(1), Some(2));
+    assert_eq!(sans_transport[0]["name"], "Volume");
+}

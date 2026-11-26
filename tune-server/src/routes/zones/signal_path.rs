@@ -217,7 +217,7 @@ pub(super) fn zone_correction_piece_lang(
             kind: "ir",
             status: "bypassed_pure",
             applied: false,
-            description: ts(lang, "correction_piece_pure").to_string(),
+            description: ts(lang, "convolution_pure").to_string(),
             reason: Some("pure".into()),
             ir_sample_rate: ir_sr,
             taps,
@@ -2931,8 +2931,12 @@ fn assembler_les_etapes_lang(
     if let Some(cp) = correction_piece
         && !flux_servi_tel_quel
     {
+        // Rémi (rc14) — une réponse impulsionnelle est une CONVOLUTION :
+        // l'étape le dit (« Convolution: … »). `code` et `kind` ne changent
+        // pas, les clients s'y fient ; le profil de pièce par l'égaliseur
+        // (`kind: "eq"`) garde son nom.
         steps.push(json!({
-            "name": "Correction de pièce",
+            "name": if cp.kind == "ir" { "Convolution" } else { "Correction de pièce" },
             "code": "room_correction",
             "kind": cp.kind,
             "status": cp.status,
@@ -3175,6 +3179,19 @@ fn assembler_les_etapes_lang(
         "bit_perfect": transport_bit_perfect,
     }));
 
+    // Rémi (rc14, Sonos Play:1 en DLNA) — une sortie RÉSEAU : le chemin suit
+    // l'ordre réel du flux converti, et chaque étape dit la cadence où elle
+    // opère (voir `ordonner_le_chemin_reseau`).
+    if tune_core::orchestrator::is_network_output_type(Some(output_type)) && !is_dsd {
+        let source_hz = u32::try_from(sample_rate).ok().filter(|r| *r > 0);
+        let servie_hz = rate_conversion
+            .map(|(_, vers)| vers)
+            .or(wire_sample_rate)
+            .or(cadence_pcm_servie)
+            .or(source_hz);
+        ordonner_le_chemin_reseau(&mut steps, source_hz, servie_hz);
+    }
+
     // Build summary
     let bp_label = if bit_perfect { " (bit-perfect)" } else { "" };
     let summary = if transcode_active {
@@ -3190,6 +3207,79 @@ fn assembler_les_etapes_lang(
         dsp_metrics,
         rate_conversion,
         correction_piece: correction_piece_resume,
+    }
+}
+
+/// Rémi (rc14) — l'ordre RÉEL du flux converti vers une sortie réseau
+/// (`transcodage.rs`, `resolve_direct.rs`) : le décodeur rend le PCM DÉJÀ à
+/// la cadence servie (`decode_to_pcm_routee(.., Some(out_sr), ..)`), la
+/// chaîne (ReplayGain, égaliseur, convolution, crossfeed, compensation) est
+/// bâtie à cette cadence (`load_convolver(.., out_sr, ..)`) et tourne sur ce
+/// PCM, puis l'encodeur écrit le format servi ; le volume est une commande
+/// au lecteur (SetVolume), appliquée par lui, en dernier.
+///
+/// Le chemin publié mettait la conversion de format (`Transcoder`) en tête
+/// et le volume du lecteur AVANT la convolution. Ici :
+///
+/// - `Volume` passe juste avant `Transport` (le lecteur, en dernier) ;
+/// - `Transcoder` (l'encodage pour le lecteur) passe après les traitements,
+///   avant le volume ; la conversion de cadence (`rate_conversion`) reste où
+///   elle a lieu, AVANT les traitements ;
+/// - chaque étape porte `sample_rate_hz`, la cadence où elle opère : celle de
+///   la source jusqu'au décodeur, puis la cadence servie.
+///
+/// Ni les noms ni les codes ne changent : seul l'ordre et ce champ additif.
+pub(super) fn ordonner_le_chemin_reseau(
+    steps: &mut Vec<Value>,
+    source_hz: Option<u32>,
+    servie_hz: Option<u32>,
+) {
+    let nom = |e: &Value| {
+        e.get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    let Some(transport) = steps.iter().position(|e| nom(e) == "Transport") else {
+        return;
+    };
+    let mut volumes = Vec::new();
+    let mut encodage = Vec::new();
+    let mut gardees = Vec::with_capacity(steps.len());
+    for (i, e) in steps.drain(..).enumerate() {
+        let n = nom(&e);
+        if i < transport && n == "Volume" {
+            volumes.push(e);
+        } else if i < transport && n == "Transcoder" && e.get("code").is_none() {
+            encodage.push(e);
+        } else {
+            gardees.push(e);
+        }
+    }
+    let transport = gardees
+        .iter()
+        .position(|e| nom(e) == "Transport")
+        .unwrap_or(gardees.len());
+    let tete: Vec<Value> = gardees.drain(..transport).collect();
+    steps.extend(tete);
+    steps.extend(encodage);
+    steps.extend(volumes);
+    steps.extend(gardees);
+    // La cadence où chaque étape opère.
+    for e in steps.iter_mut() {
+        let n = nom(e);
+        let hz = match n.as_str() {
+            "Source" | "Decoder" => source_hz,
+            _ if e.get("code").and_then(Value::as_str) == Some("rate_conversion") => e
+                .get("to_hz")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .or(servie_hz),
+            _ => servie_hz,
+        };
+        if let (Some(hz), Some(o)) = (hz, e.as_object_mut()) {
+            o.entry("sample_rate_hz").or_insert(json!(hz));
+        }
     }
 }
 
