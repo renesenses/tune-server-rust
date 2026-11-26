@@ -670,3 +670,44 @@ async fn la_marge_manuelle_ne_s_applique_qu_une_fois_sous_modulation() {
         assert_eq!(bilan.ecretages, 0, "{quoi} : {bilan:?}");
     }
 }
+
+/// Relecture de #9575 (sécurité auditive) — une piste modulée n'est relancée
+/// que si elle RESTERAIT modulée : une relance qui repartirait en PCM perdrait
+/// la marge du modulateur (−3 dB) en cours de piste. Cible éteinte ou PCM,
+/// DSD256 que la machine ne tient pas : pas de relance (piste suivante).
+/// Contre-épreuve : DSD64 → DSD128, que la sortie et la machine prennent,
+/// relance.
+#[tokio::test]
+async fn une_relance_qui_repartirait_en_pcm_n_a_pas_lieu() {
+    let b = banc(true, "dop").await;
+    let id = piste(&b, FLAC, "flac", 2);
+    ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd64)));
+    let j = jouer(&b, id).await;
+    let Some(EtatModulation::EnService(m)) = j.etat(&b) else {
+        panic!("piste non modulée : {:?}", j.etat(&b));
+    };
+    assert_eq!(m.headroom_db, -3.0, "la marge que le PCM n'aurait pas");
+
+    ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd128)));
+    assert!(b.orch.la_relance_resterait_modulee(b.zone_id, &m).await);
+
+    ecrire_chaine(&b, Some(Upsampling::Off {}));
+    assert!(!b.orch.la_relance_resterait_modulee(b.zone_id, &m).await);
+    ecrire_chaine(
+        &b,
+        Some(Upsampling::Pcm {
+            filter: crate::audio::surechantillonnage::greffon::DEFAULT_FILTER.into(),
+            max_ratio: None,
+            max_rate_hz: None,
+        }),
+    );
+    assert!(!b.orch.la_relance_resterait_modulee(b.zone_id, &m).await);
+
+    // DSD256 refusé (machine trop lente) : le repli serait en PCM.
+    crate::tess::modulation_dsd::retenir_mesure_de_la_machine([50.0, 25.0, 0.2]);
+    ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd256)));
+    let refusee = b.orch.la_relance_resterait_modulee(b.zone_id, &m).await;
+    crate::tess::modulation_dsd::retenir_mesure_de_la_machine([50.0, 25.0, 12.0]);
+    assert!(!refusee);
+    assert!(b.orch.la_relance_resterait_modulee(b.zone_id, &m).await);
+}

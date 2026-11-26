@@ -875,6 +875,37 @@ pub(super) fn cle_mode_pure(zone_id: i64) -> String {
 /// Chaque ancienne clé réécrite atteint la sortie vivante, comme par son
 /// ancienne route (`REGLAGES_A_RAFRAICHIR`).
 pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
+    rafraichir_avec(state, zone, cles, true).await;
+}
+
+/// Les relances d'un flux modulé vers le DSD que TESS a DEMANDÉES pour la
+/// zone (banc et diagnostic) : une demande, pas une relance (l'orchestrateur
+/// décide encore : piste modulée, relance qui resterait modulée, plancher).
+pub fn relances_dsd_demandees(zone_id: i64) -> usize {
+    relances_dsd()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&zone_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn relances_dsd() -> &'static std::sync::Mutex<std::collections::HashMap<i64, usize>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i64, usize>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// [`rafraichir`], en disant si un flux modulé vers le DSD peut être relancé.
+/// Non au DÉMARRAGE d'une piste (mode `at_next_playback`, `started`) : la
+/// piste vient d'être décidée avec la chaîne écrite, la relancer rouvrirait
+/// le DAC une demi-seconde après son début (relecture de #9575).
+pub(super) async fn rafraichir_avec(
+    state: &AppState,
+    zone: &Zone,
+    cles: &[String],
+    relance_dsd: bool,
+) {
     let id = zone.id.unwrap_or_default();
     let est = |p: Partie| cles.contains(&p.cle(id));
     let natif = cles
@@ -917,14 +948,23 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     // cadence fixe ; une cadence fixe réglée relance le flux (v2). Aucune voie
     // réseau n'applique le suréchantillonneur, le repli mono ni la
     // réaffectation.
-    if bypass && !est(Partie::Surechantillonnage) {
+    // Relecture de #9575 — la clé du suréchantillonneur (rendue aussi pour un
+    // changement de la seule cible DSD) n'annule plus la bascule : elle ne
+    // fait que reposer le choix (`refresh_zone_upsampler`, que la bascule
+    // refait elle-même).
+    if bypass {
         let _ = state.orchestrator.apply_bypass_all_portee(id).await;
     }
     // rc14 — piste modulée vers le DSD : les greffons et l'étage fixe vivent
     // dans le flux du producteur, pas dans la sortie. Tout changement de la
     // chaîne relance la piste à sa position (anti-rebond partagé avec
     // l'égaliseur).
-    if !cles.is_empty() {
+    if relance_dsd && !cles.is_empty() {
+        *relances_dsd()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id)
+            .or_default() += 1;
         state.orchestrator.relancer_si_flux_dsd_module(id).await;
     }
 }

@@ -294,6 +294,25 @@ pub fn cible_dsd_a_venir(chaine: &ChaineTess, m: &ModulationEnService) -> Option
     }
 }
 
+/// Ce que la chaîne demande au lieu du flux modulé qui joue, publié tant
+/// que la piste continue : `None` quand elle demande exactement ce qui joue
+/// (même cadence DSD).
+pub fn detail_de_la_suite(chaine: &ChaineTess, m: &ModulationEnService) -> Option<String> {
+    match &chaine.fixed.upsampling {
+        Upsampling::Dsd { .. } => cible_dsd_a_venir(chaine, m).map(detail_cible_a_venir),
+        Upsampling::Pcm { .. } => Some("PCM upsampling at the next track".into()),
+        Upsampling::Off {} | Upsampling::Unknown => Some("Off at the next track".into()),
+    }
+}
+
+fn chaine_cible(chaine: &ChaineTess) -> &'static str {
+    match &chaine.fixed.upsampling {
+        Upsampling::Dsd { .. } => "dsd",
+        Upsampling::Pcm { .. } => "pcm",
+        Upsampling::Off {} | Upsampling::Unknown => "off",
+    }
+}
+
 /// « DSD256 at the next track » : le détail publié sur l'upsampling et le
 /// modulateur tant que la nouvelle cible attend.
 pub fn detail_cible_a_venir(cible: TauxDsd) -> String {
@@ -532,20 +551,36 @@ pub fn chemin_du_signal(
         }
         _ => {}
     }
-    // rc14 (fil 3103) — la cible DSD a changé pendant une piste modulée
-    // (préréglage ou panneau, zone en pause, relance pas encore faite) : le
-    // chemin dit la cadence EN COURS, et la nouvelle « à la piste suivante ».
-    let cible_a_venir = match modulation {
-        Some(EtatModulation::EnService(m)) => cible_dsd_a_venir(chaine, m),
+    // rc14 (fil 3103) — la cible a changé pendant une piste modulée
+    // (préréglage ou panneau, zone en pause, relance écartée parce qu'elle
+    // repartirait en PCM) : le chemin dit ce qui JOUE, et la suite « à la
+    // piste suivante ».
+    let en_cours = match modulation {
+        Some(EtatModulation::EnService(m)) => Some(m),
         _ => None,
     };
-    if let Some(cible) = cible_a_venir
-        && let Some(Value::Object(p)) = upsampling.params.as_mut()
-        && let Some(EtatModulation::EnService(m)) = modulation
+    let a_venir = en_cours.and_then(|m| detail_de_la_suite(chaine, m));
+    if let Some(m) = en_cours
+        && a_venir.is_some()
     {
-        p.insert("rate".into(), json!(m.rate));
-        p.insert("pending_rate".into(), json!(cible));
-        upsampling.detail = Some(detail_cible_a_venir(cible));
+        match cible_dsd_a_venir(chaine, m) {
+            Some(cible) => {
+                if let Some(Value::Object(p)) = upsampling.params.as_mut() {
+                    p.insert("rate".into(), json!(m.rate));
+                    p.insert("pending_rate".into(), json!(cible));
+                }
+            }
+            // La chaîne ne va plus vers le DSD : ses paramètres (PCM, ou
+            // rien) ne décrivent pas ce qui joue.
+            None => {
+                upsampling.params = Some(json!({
+                    "target": "dsd",
+                    "rate": m.rate,
+                    "pending_target": chaine_cible(chaine),
+                }));
+            }
+        }
+        upsampling.detail = a_venir.clone();
     }
 
     if volume.effective && !en_service.volume_logiciel {
@@ -564,8 +599,9 @@ pub fn chemin_du_signal(
     // ── Étape finale, recalculée sur le réel ───────────────────────
     let modifie =
         headroom.effective || greffons_effectifs || upsampling.effective || volume.effective;
-    let vers_dsd =
-        upsampling.effective && matches!(chaine.fixed.upsampling, Upsampling::Dsd { .. });
+    // Le modulateur qui JOUE compte, même quand la chaîne n'y va plus.
+    let vers_dsd = upsampling.effective
+        && (matches!(chaine.fixed.upsampling, Upsampling::Dsd { .. }) || en_cours.is_some());
     let finale = if vers_dsd {
         let mut f = etape_vide(CodeEtape::DsdModulator);
         f.requested = true;
@@ -574,8 +610,8 @@ pub fn chemin_du_signal(
         if let Some(EtatModulation::EnService(m)) = modulation {
             fusionner_params(&mut f, params_du_modulateur(m));
         }
-        if let Some(cible) = cible_a_venir {
-            f.detail = Some(detail_cible_a_venir(cible));
+        if a_venir.is_some() {
+            f.detail = a_venir.clone();
         }
         f
     } else {
