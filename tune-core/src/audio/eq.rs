@@ -766,7 +766,8 @@ impl EqProcessor {
         // rc14 (série TESS) — la retenue d'un égaliseur ACTIF revient en
         // `REMONTEE_RAPIDE_TESS_MS` (bornée, voir `retenir_la_hausse_de`).
         if !self.est_neutre() {
-            let total = (u64::from(self.sample_rate) * u64::from(REMONTEE_RAPIDE_TESS_MS) / 1000).max(1);
+            let total =
+                (u64::from(self.sample_rate) * u64::from(REMONTEE_RAPIDE_TESS_MS) / 1000).max(1);
             if let Some(ext) = self.extinction.as_mut() {
                 ext.total = total as usize;
             }
