@@ -557,12 +557,94 @@ impl PlaybackOrchestrator {
     /// la sortie ne traite pas un porteur DSD, c'est le producteur qui porte
     /// les greffons. La piste est relancée à la même position (anti-rebond et
     /// plancher de [`Self::schedule_eq_replay`]). `true` : relance programmée.
+    ///
+    /// rc14 (relecture de #9575, sécurité auditive) — la relance n'a lieu que
+    /// si la piste RESTERAIT modulée ([`Self::la_relance_resterait_modulee`]).
+    /// Une relance qui repartirait en PCM (cible éteinte ou PCM, DSD refusé,
+    /// PURE, « Bypass all »…) perdrait la marge du modulateur (−3 dB) EN
+    /// COURS de piste : le flux modulé continue, le changement s'entend à la
+    /// piste suivante et le chemin du signal le dit.
     pub async fn relancer_si_flux_dsd_module(self: &Arc<Self>, zone_id: i64) -> bool {
-        if !self.modulation_dsd_en_service(zone_id).await {
+        let etat = self.playback.get_state(zone_id).await;
+        let Some(np) = etat.now_playing.as_ref() else {
+            return false;
+        };
+        let Some(EtatModulation::EnService(m)) =
+            modulation::etat_pour(zone_id, np.stream_id.as_deref(), np.track_id)
+        else {
+            return false;
+        };
+        if !self.la_relance_resterait_modulee(zone_id, &m).await {
+            info!(zone_id, "tess_dsd_relance_ecartee_repli_pcm_piste_suivante");
             return false;
         }
         info!(zone_id, "tess_dsd_reglage_change_relance");
         self.schedule_eq_replay(zone_id)
+    }
+
+    /// rc14 (relecture de #9575) — la piste modulée `m`, relancée avec la
+    /// chaîne ENREGISTRÉE, repartirait-elle modulée ? Les mêmes contrôles que
+    /// [`Self::decider_la_modulation_dsd`], sur la source de la piste en
+    /// cours : cible DSD, étage effectif, plan accepté (sortie, cadence,
+    /// machine), porteur DoP non refusé. Machine pas encore mesurée : non
+    /// (jamais de pari sur le niveau).
+    pub(crate) async fn la_relance_resterait_modulee(
+        &self,
+        zone_id: i64,
+        m: &ModulationEnService,
+    ) -> bool {
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let premium = self.premium_instantane();
+        let Ok(lecture) = crate::tess::migration::lire_zone(&settings, zone_id, premium) else {
+            return false;
+        };
+        let Upsampling::Dsd { rate, .. } = lecture.chaine.fixed.upsampling.clone() else {
+            return false;
+        };
+        let (effective, _) = etage_dsd_effectif(
+            &settings,
+            &lecture,
+            premium,
+            m.source_rate_hz,
+            m.source_channels,
+        );
+        if !effective {
+            return false;
+        }
+        let Some(temps_reel) = modulation::mesure_de_la_machine() else {
+            return false;
+        };
+        let faits = // Sans sonder le pilote : la sortie joue (exclusive), on ne la
+        // dérange pas ; un fait inconnu refuse la relance (sens sûr).
+        self.faits_dsd_de_zone(zone_id, false).await;
+        let plan = {
+            let natif = |c: u32, v: u16| faits.natif(c, v);
+            let dop_refuse = |c: u32, v: u16| faits.dop_refuse_connu(c, v);
+            modulation::planifier(
+                &faits.pures(&natif, &dop_refuse, Some(temps_reel)),
+                rate,
+                m.source_rate_hz,
+                m.source_channels,
+            )
+        };
+        let Ok(plan) = plan else {
+            return false;
+        };
+        if plan.transport == TransportModulation::Dop {
+            let device_id = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id);
+            let cadence_dop = plan.cadence_du_porteur();
+            let accueil = self
+                .accueil_du_dop_local(device_id.as_deref(), cadence_dop, plan.voies)
+                .await;
+            if crate::audio::dop_ecarte_7265::decider(&accueil, cadence_dop, plan.voies).is_some() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Le préampli que l'égaliseur désactivé garde dans la sortie locale (dB
@@ -639,49 +721,8 @@ impl PlaybackOrchestrator {
             modulation::oublier(zone_id, piste);
             return Ok(None);
         };
-        // La résolution de TESS décide si l'étage est effectif (Premium,
-        // moteur installé, PURE, « Bypass all ») et donne le headroom à
-        // appliquer avant le modulateur. Les fermetures (non `Send`) vivent
-        // dans ce bloc, hors des `await`.
-        let (effective, headroom_de_la_chaine_db) = {
-            let disponible = |id: &str| {
-                id != ID_UPSAMPLING
-                    || crate::audio::premium_plugins::enabled(
-                        &settings,
-                        crate::audio::premium_plugins::UPSAMPLER,
-                    )
-            };
-            let ctx = ContexteExecution {
-                transport: TransportZone::Local,
-                source: Some(SourceFlux::Pcm {
-                    sample_rate_hz: cadence_pcm,
-                    bits: 24,
-                    channels: voies,
-                }),
-                premium,
-                greffon_disponible: &disponible,
-                pure: lecture.pure,
-                volume: VolumeZone {
-                    control: ControleVolume::Software,
-                    db: 0.0,
-                },
-                replaygain_actif: false,
-                // (#9523) Voies du réglage des enceintes : celles de la
-                // source, comme une résolution sans sortie connue.
-                voies_de_sortie: None,
-            };
-            let r = lecture
-                .chaine
-                .resoudre(&crate::tess::catalogue_de_reference(), &ctx);
-            let effective = r
-                .etapes
-                .iter()
-                .any(|e| e.code == CodeEtape::Upsampling && e.effective);
-            // Le headroom de la chaîne (manuel ; 0 en automatique) : la marge
-            // propre du modulateur s'y ajoutera une fois, et le manuel n'est
-            // appliqué qu'une fois (`servir_la_modulation_dsd`).
-            (effective, r.headroom_db)
-        };
+        let (effective, headroom_de_la_chaine_db) =
+            etage_dsd_effectif(&settings, &lecture, premium, cadence_pcm, voies);
         if !effective {
             modulation::oublier(zone_id, piste);
             return Ok(None);
@@ -967,6 +1008,54 @@ impl PlaybackOrchestrator {
             file_size: None,
         })
     }
+}
+
+/// La résolution de TESS décide si l'étage vers le DSD est effectif (Premium,
+/// moteur installé, PURE, « Bypass all ») et donne le headroom de la chaîne
+/// (manuel ; 0 en automatique) : la marge propre du modulateur s'y ajoutera
+/// une fois, et le manuel n'est appliqué qu'une fois
+/// (`servir_la_modulation_dsd`).
+fn etage_dsd_effectif(
+    settings: &crate::db::settings_repo::SettingsRepo,
+    lecture: &crate::tess::migration::LectureZone,
+    premium: bool,
+    cadence_pcm: u32,
+    voies: u16,
+) -> (bool, f64) {
+    let disponible = |id: &str| {
+        id != ID_UPSAMPLING
+            || crate::audio::premium_plugins::enabled(
+                settings,
+                crate::audio::premium_plugins::UPSAMPLER,
+            )
+    };
+    let ctx = ContexteExecution {
+        transport: TransportZone::Local,
+        source: Some(SourceFlux::Pcm {
+            sample_rate_hz: cadence_pcm,
+            bits: 24,
+            channels: voies,
+        }),
+        premium,
+        greffon_disponible: &disponible,
+        pure: lecture.pure,
+        volume: VolumeZone {
+            control: ControleVolume::Software,
+            db: 0.0,
+        },
+        replaygain_actif: false,
+        // (#9523) Voies du réglage des enceintes : celles de la source,
+        // comme une résolution sans sortie connue.
+        voies_de_sortie: None,
+    };
+    let r = lecture
+        .chaine
+        .resoudre(&crate::tess::catalogue_de_reference(), &ctx);
+    let effective = r
+        .etapes
+        .iter()
+        .any(|e| e.code == CodeEtape::Upsampling && e.effective);
+    (effective, r.headroom_db)
 }
 
 #[cfg(test)]
