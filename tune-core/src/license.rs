@@ -405,6 +405,10 @@ pub struct LicenseManager {
     db: Arc<dyn DbBackend>,
     /// Max zones a free-tier instance may create. Set once at construction.
     free_max_zones: i64,
+    /// La dernière réponse du site de licences, sans aucun secret — de quoi
+    /// dire POURQUOI le palier est gratuit. Purement descriptif : n'entre dans
+    /// aucune décision d'autorisation (voir [`ReponseLicence`]).
+    derniere_reponse: std::sync::Mutex<Option<ReponseLicence>>,
 }
 
 impl LicenseManager {
@@ -502,10 +506,17 @@ impl LicenseManager {
             key_premium_marker,
         };
 
+        let derniere_reponse = settings
+            .get(CLE_DERNIERE_REPONSE)
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_str::<ReponseLicence>(&v).ok());
+
         Self {
             state: Arc::new(RwLock::new(state)),
             db,
             free_max_zones,
+            derniere_reponse: std::sync::Mutex::new(derniere_reponse),
         }
     }
 
@@ -634,6 +645,9 @@ impl LicenseManager {
         state.tier = Tier::Free;
         state.last_validated = None;
         state.key_premium_marker = false;
+        drop(state);
+        // Une nouvelle clé n'hérite pas de la raison de l'ancienne.
+        self.oublier_la_derniere_reponse();
 
         info!(
             key_prefix = &key[..key.len().min(8)],
@@ -656,6 +670,8 @@ impl LicenseManager {
         state.expires_at = None;
         state.last_validated = None;
         state.key_premium_marker = false;
+        drop(state);
+        self.oublier_la_derniere_reponse();
 
         info!("license_cleared");
     }
@@ -878,6 +894,49 @@ impl LicenseManager {
         let fp = Self::hardware_fingerprint();
         let _ = settings.set("hardware_fingerprint", &fp);
         fp
+    }
+
+    /// Retient la dernière réponse du site de licences, et la journalise
+    /// (`license_validation_result reason=…`, jamais la clé).
+    ///
+    /// **Ne change pas le palier** : seuls `update_from_server` et
+    /// `set_session_conflict` le font, aux mêmes conditions qu'avant. Ce qui
+    /// est retenu ici sert uniquement à expliquer le palier à l'écran.
+    pub fn noter_reponse(&self, reponse: ReponseLicence) {
+        info!(
+            reason = reponse.reason.map(RaisonLicence::code).unwrap_or("confirmed"),
+            upstream_status = ?reponse.upstream_status,
+            session_conflict = reponse.session_conflict,
+            "license_validation_result"
+        );
+        let settings = SettingsRepo::with_backend(self.db.clone());
+        if let Ok(json) = serde_json::to_string(&reponse) {
+            settings.set(CLE_DERNIERE_REPONSE, &json).ok();
+        }
+        if let Ok(mut d) = self.derniere_reponse.lock() {
+            *d = Some(reponse);
+        }
+    }
+
+    fn oublier_la_derniere_reponse(&self) {
+        SettingsRepo::with_backend(self.db.clone())
+            .delete(CLE_DERNIERE_REPONSE)
+            .ok();
+        if let Ok(mut d) = self.derniere_reponse.lock() {
+            *d = None;
+        }
+    }
+
+    /// La dernière réponse retenue du site de licences, s'il y en a une.
+    pub fn derniere_reponse(&self) -> Option<ReponseLicence> {
+        self.derniere_reponse.lock().ok().and_then(|d| d.clone())
+    }
+
+    /// Pourquoi le palier est ce qu'il est — `None` quand il n'y a rien à
+    /// dire. Lecture seule, voir [`raison_du_palier`].
+    pub async fn raison_du_palier(&self) -> Option<ExplicationLicence> {
+        let state = self.state.read().await;
+        raison_du_palier(&state, self.derniere_reponse().as_ref(), chrono::Utc::now())
     }
 
     /// État de la grâce hors ligne, pour l'affichage (#1999).
@@ -1320,6 +1379,240 @@ pub fn verdict_licence(body: &serde_json::Value) -> VerdictLicence {
             .get("license_expires_at")
             .and_then(|v| v.as_str())
             .map(String::from),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pourquoi le palier est gratuit — AFFICHAGE seulement
+// ---------------------------------------------------------------------------
+//
+// Quand mozaiklabs.fr refuse ou rétrograde une clé, Tune montrait un palier
+// FREE muet. Ce qui suit retient la dernière réponse du site (sans la clé, ni
+// l'empreinte, ni le server_id) et la traduit en une raison normalisée que
+// l'interface met en phrase. Rien ici n'accorde ni ne retire quoi que ce soit :
+// le palier reste celui d'`effective_tier`, calculé ailleurs, inchangé.
+
+/// Réglage où la dernière réponse est persistée (JSON, aucun secret).
+const CLE_DERNIERE_REPONSE: &str = "license_last_response";
+
+/// Durée de vie d'une session de licence côté site (`License::
+/// SESSION_TTL_MINUTES`, site-mozaiklabs) : au-delà, la session d'un autre
+/// appareil qui ne s'est plus manifesté se libère d'elle-même. Ne sert qu'à
+/// estimer, pour l'affichage, l'attente restante.
+pub const SESSION_TTL_MINUTES: i64 = 90;
+
+/// La raison normalisée — le seul terme du contrat avec les clients, jamais
+/// traduit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RaisonLicence {
+    /// Un autre appareil tient la clé (session unique).
+    SessionConflict,
+    /// Abonnement Premium échu.
+    KeyExpired,
+    /// Clé inconnue du site.
+    KeyInvalid,
+    /// Le site n'a pas pu se prononcer : réseau, erreur, réponse illisible.
+    ServerUnreachable,
+    /// Le site a plafonné les requêtes (429).
+    RateLimited,
+    /// Hors ligne, Premium conservé pendant la grâce.
+    GracePeriod,
+}
+
+impl RaisonLicence {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::SessionConflict => "session_conflict",
+            Self::KeyExpired => "key_expired",
+            Self::KeyInvalid => "key_invalid",
+            Self::ServerUnreachable => "server_unreachable",
+            Self::RateLimited => "rate_limited",
+            Self::GracePeriod => "grace_period",
+        }
+    }
+}
+
+/// La dernière réponse du site de licences, telle qu'on la retient.
+///
+/// **Aucun secret** : ni clé, ni empreinte matérielle, ni `server_id`, ni le
+/// nom du serveur détenteur — seulement une raison, des dates et un statut.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReponseLicence {
+    /// `None` = clé confirmée sans réserve.
+    pub reason: Option<RaisonLicence>,
+    pub session_conflict: bool,
+    /// Dernier signe de vie de l'appareil qui tient la session (site).
+    pub active_since: Option<String>,
+    /// Date de fin de la clé, quand le site la donne.
+    pub expires_at: Option<String>,
+    /// Statut HTTP du site ; `None` quand la requête n'a pas abouti.
+    pub upstream_status: Option<u16>,
+    /// Quand la réponse a été reçue (ISO-8601 Zulu).
+    pub at: String,
+}
+
+/// Ce que l'interface reçoit : la raison et de quoi la mettre en phrase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplicationLicence {
+    pub reason: RaisonLicence,
+    /// `session_conflict` : minutes avant que la session de l'autre appareil
+    /// ne se libère d'elle-même, s'il cesse de se manifester. Estimation.
+    pub minutes_remaining: Option<i64>,
+    /// `key_expired` : la date de fin de l'abonnement.
+    pub expires_at: Option<String>,
+    /// `grace_period` : la fin de la tolérance hors ligne.
+    pub grace_until: Option<String>,
+    pub upstream_status: Option<u16>,
+    /// Quand le site a répondu pour la dernière fois.
+    pub checked_at: Option<String>,
+}
+
+/// Lit une réponse du site de licences — `POST /api/v1/license/validate` ou
+/// les champs de licence du battement.
+///
+/// `upstream_status` = `None` quand la requête n'a pas abouti ; `body` =
+/// `None` quand le corps est illisible. Fonction pure.
+///
+/// Champs du site (`LicenseController::validate`, site-mozaiklabs) :
+/// clé inconnue ⇒ `license_valid:false` + « Invalid license key » ; clé échue
+/// sans module ⇒ `license_valid:false` + `expired_at` ; session tenue
+/// ailleurs ⇒ `session_conflict:true` + `active_since` ; clé échue AVEC
+/// modules ⇒ `license_valid:true` + `license_tier:"free"`.
+pub fn lire_reponse_licence(
+    upstream_status: Option<u16>,
+    body: Option<&serde_json::Value>,
+) -> ReponseLicence {
+    let mut r = ReponseLicence {
+        reason: None,
+        session_conflict: false,
+        active_since: None,
+        expires_at: None,
+        upstream_status,
+        at: format_utc(chrono::Utc::now()),
+    };
+    let texte = |b: &serde_json::Value, champ: &str| {
+        b.get(champ).and_then(|v| v.as_str()).map(String::from)
+    };
+    let Some(status) = upstream_status else {
+        r.reason = Some(RaisonLicence::ServerUnreachable);
+        return r;
+    };
+    if status == 429 {
+        r.reason = Some(RaisonLicence::RateLimited);
+        return r;
+    }
+    if !(200..300).contains(&status) {
+        r.reason = Some(RaisonLicence::ServerUnreachable);
+        return r;
+    }
+    let Some(body) = body else {
+        r.reason = Some(RaisonLicence::ServerUnreachable);
+        return r;
+    };
+    r.expires_at = texte(body, "license_expires_at").or_else(|| texte(body, "expired_at"));
+    if body.get("session_conflict").and_then(|v| v.as_bool()) == Some(true) {
+        r.session_conflict = true;
+        r.active_since = texte(body, "active_since");
+        r.reason = Some(RaisonLicence::SessionConflict);
+        return r;
+    }
+    let Some(valide) = body.get("license_valid").and_then(|v| v.as_bool()) else {
+        // Le site ne s'est pas prononcé : rien n'est validé.
+        r.reason = Some(RaisonLicence::ServerUnreachable);
+        return r;
+    };
+    let date_passee = r.expires_at.as_deref().is_some_and(is_timestamp_past);
+    if !valide {
+        // Le battement ne porte pas `expired_at`, seulement son message.
+        let message_echu = ["message", "license_message"].iter().any(|c| {
+            texte(body, c).is_some_and(|m| m.eq_ignore_ascii_case("License expired"))
+        });
+        r.reason = Some(if body.get("expired_at").is_some() || date_passee || message_echu {
+            RaisonLicence::KeyExpired
+        } else {
+            RaisonLicence::KeyInvalid
+        });
+        return r;
+    }
+    let premium = body.get("license_tier").and_then(|v| v.as_str()) == Some("premium");
+    if !premium && date_passee {
+        r.reason = Some(RaisonLicence::KeyExpired);
+    }
+    r
+}
+
+/// Minutes avant que la session tenue ailleurs ne se libère d'elle-même.
+fn minutes_avant_liberation(active_since: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+    let vu = parse_timestamp(active_since?)?;
+    let ecoule = (now - vu).num_minutes().max(0);
+    Some((SESSION_TTL_MINUTES - ecoule).clamp(1, SESSION_TTL_MINUTES))
+}
+
+/// Pourquoi le palier est ce qu'il est. **Lecture seule** : ne décide rien,
+/// et le palier dont elle parle est celui d'[`effective_tier`].
+///
+/// - Premium : `grace_period` quand la dernière validation a échoué ou que la
+///   grâce hors ligne court, sinon `None` ;
+/// - Free : la raison de la dernière réponse du site ; `server_unreachable`
+///   quand la grâce s'est écoulée sans confirmation ; sinon `None` (aucune
+///   clé, ou clé confirmée au palier gratuit sans motif connu).
+pub fn raison_du_palier(
+    state: &LicenseState,
+    derniere: Option<&ReponseLicence>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<ExplicationLicence> {
+    let base = |reason| ExplicationLicence {
+        reason,
+        minutes_remaining: None,
+        expires_at: None,
+        grace_until: None,
+        upstream_status: derniere.and_then(|d| d.upstream_status),
+        checked_at: derniere.map(|d| d.at.clone()),
+    };
+
+    if let Some(c) = state.session_conflict.as_ref() {
+        let depuis = c
+            .active_since
+            .as_deref()
+            .or_else(|| derniere.and_then(|d| d.active_since.as_deref()));
+        return Some(ExplicationLicence {
+            minutes_remaining: minutes_avant_liberation(depuis, now),
+            ..base(RaisonLicence::SessionConflict)
+        });
+    }
+
+    let grace = offline_grace(state);
+    if effective_tier(state) == Tier::Premium {
+        let echec = derniere.is_some_and(|d| d.reason.is_some());
+        let hors_ligne = grace.as_ref().is_some_and(|g| g.phase == GracePhase::Grace);
+        return match grace {
+            Some(g) if echec || hors_ligne => Some(ExplicationLicence {
+                grace_until: g.until,
+                ..base(RaisonLicence::GracePeriod)
+            }),
+            _ => None,
+        };
+    }
+
+    match derniere.and_then(|d| d.reason.map(|r| (d, r))) {
+        Some((d, RaisonLicence::SessionConflict)) => Some(ExplicationLicence {
+            minutes_remaining: minutes_avant_liberation(d.active_since.as_deref(), now),
+            ..base(RaisonLicence::SessionConflict)
+        }),
+        Some((d, RaisonLicence::KeyExpired)) => Some(ExplicationLicence {
+            expires_at: d.expires_at.clone(),
+            ..base(RaisonLicence::KeyExpired)
+        }),
+        // Pas de grâce en Free : la raison n'a pas lieu d'être.
+        Some((_, RaisonLicence::GracePeriod)) => None,
+        Some((_, r)) => Some(base(r)),
+        None => match grace {
+            Some(g) if g.phase == GracePhase::Expired && g.since.is_some() => {
+                Some(base(RaisonLicence::ServerUnreachable))
+            }
+            _ => None,
+        },
     }
 }
 
@@ -2769,5 +3062,126 @@ mod droits_t19_tests {
             assert!(mgr.check_feature(Feature::DspEq).await);
             assert_eq!(ouverts(mgr).await, vec!["dsp_eq", "crossfeed"]);
         }
+    }
+}
+
+/// Pourquoi le palier est gratuit : lecture des réponses du site et raison
+/// affichée. Les essais de bout en bout, avec un faux serveur de licences,
+/// sont dans `tune-server/tests/licence_raison_du_palier.rs`.
+#[cfg(test)]
+mod raison_du_palier_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn zulu(dt: chrono::DateTime<chrono::Utc>) -> String {
+        format_utc(dt)
+    }
+
+    fn etat(tier: Tier, last_validated: Option<String>) -> LicenseState {
+        LicenseState {
+            tier,
+            license_key: Some("TUNE-TEST-KEY".into()),
+            expires_at: None,
+            last_validated,
+            hardware_fingerprint: "test".into(),
+            account_premium: false,
+            account_premium_expires: None,
+            account_premium_checked: None,
+            qobuz_proxy_first: false,
+            modules: vec![],
+            session_conflict: None,
+            key_premium_marker: tier == Tier::Premium,
+        }
+    }
+
+    #[test]
+    fn chaque_reponse_du_site_a_sa_raison() {
+        let r = |s, b: serde_json::Value| lire_reponse_licence(Some(s), Some(&b)).reason;
+        assert_eq!(lire_reponse_licence(None, None).reason, Some(RaisonLicence::ServerUnreachable));
+        assert_eq!(r(429, json!({})), Some(RaisonLicence::RateLimited));
+        assert_eq!(r(503, json!({})), Some(RaisonLicence::ServerUnreachable));
+        assert_eq!(lire_reponse_licence(Some(200), None).reason, Some(RaisonLicence::ServerUnreachable));
+        assert_eq!(r(200, json!({"ok": true})), Some(RaisonLicence::ServerUnreachable));
+        assert_eq!(
+            r(200, json!({"license_valid": false, "session_conflict": true})),
+            Some(RaisonLicence::SessionConflict)
+        );
+        assert_eq!(
+            r(200, json!({"license_valid": false, "message": "Invalid license key"})),
+            Some(RaisonLicence::KeyInvalid)
+        );
+        assert_eq!(
+            r(200, json!({"license_valid": false, "expired_at": "2020-01-01T00:00:00+01:00"})),
+            Some(RaisonLicence::KeyExpired)
+        );
+        assert_eq!(
+            r(200, json!({"license_valid": false, "license_message": "License expired"})),
+            Some(RaisonLicence::KeyExpired)
+        );
+        assert_eq!(
+            r(200, json!({"license_valid": true, "license_tier": "free",
+                          "license_expires_at": "2020-01-01T00:00:00+01:00"})),
+            Some(RaisonLicence::KeyExpired)
+        );
+        assert_eq!(
+            r(200, json!({"license_valid": true, "license_tier": "premium"})),
+            None
+        );
+    }
+
+    #[test]
+    fn la_reponse_retenue_ne_porte_aucun_secret() {
+        let b = json!({"license_valid": false, "session_conflict": true,
+                       "active_server": "srv-autre", "active_since": "2026-11-26T10:00:00Z",
+                       "license_key": "TUNE-SECRET"});
+        let texte = serde_json::to_string(&lire_reponse_licence(Some(200), Some(&b))).unwrap();
+        assert!(!texte.contains("TUNE-SECRET"), "{texte}");
+        assert!(!texte.contains("srv-autre"), "{texte}");
+    }
+
+    #[test]
+    fn conflit_de_session_donne_les_minutes_restantes() {
+        let now = chrono::Utc::now();
+        let b = json!({"license_valid": false, "session_conflict": true,
+                       "active_since": zulu(now - chrono::Duration::minutes(30))});
+        let d = lire_reponse_licence(Some(200), Some(&b));
+        let e = raison_du_palier(&etat(Tier::Free, None), Some(&d), now).unwrap();
+        assert_eq!(e.reason, RaisonLicence::SessionConflict);
+        assert_eq!(e.minutes_remaining, Some(60));
+    }
+
+    #[test]
+    fn premium_hors_ligne_dit_la_grace_et_sa_fin() {
+        let now = chrono::Utc::now();
+        let etat = etat(Tier::Premium, Some(zulu(now - chrono::Duration::days(1))));
+        let d = lire_reponse_licence(None, None);
+        let e = raison_du_palier(&etat, Some(&d), now).unwrap();
+        assert_eq!(e.reason, RaisonLicence::GracePeriod);
+        assert!(e.grace_until.is_some());
+        // Validation fraîche et réussie : rien à dire.
+        let ok = lire_reponse_licence(Some(200), Some(&json!({"license_valid": true, "license_tier": "premium"})));
+        assert_eq!(raison_du_palier(&etat, Some(&ok), now), None);
+    }
+
+    #[test]
+    fn la_raison_ne_change_jamais_le_palier() {
+        // Quelle que soit la réponse retenue, `effective_tier` reste maître.
+        let now = chrono::Utc::now();
+        let free = etat(Tier::Free, None);
+        for b in [
+            json!({"license_valid": true, "license_tier": "premium"}),
+            json!({"license_valid": false, "session_conflict": true}),
+        ] {
+            let d = lire_reponse_licence(Some(200), Some(&b));
+            let _ = raison_du_palier(&free, Some(&d), now);
+            assert_eq!(effective_tier(&free), Tier::Free);
+        }
+    }
+
+    #[test]
+    fn rien_a_dire_sans_cle_ni_reponse() {
+        let mut e = etat(Tier::Free, None);
+        e.license_key = None;
+        assert_eq!(raison_du_palier(&e, None, chrono::Utc::now()), None);
     }
 }
