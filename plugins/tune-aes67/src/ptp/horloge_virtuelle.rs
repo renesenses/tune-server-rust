@@ -54,6 +54,12 @@ impl HorlogeMonotone {
         }
     }
 
+    pub(super) fn ns_a(&self, instant: Instant) -> Option<u64> {
+        let duree = instant.checked_duration_since(self.origine)?;
+        self.origine_ns
+            .checked_add(u64::try_from(duree.as_nanos()).ok()?)
+    }
+
     pub fn ns(&self) -> u64 {
         let ecoule = u64::try_from(self.origine.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.origine_ns.saturating_add(ecoule)
@@ -128,6 +134,17 @@ impl HorlogeVirtuelle {
     pub fn maintenant_ns(&self) -> u64 {
         let m = self.0.monotone.ns();
         u64::try_from(self.formule().virtuel(m).max(0)).unwrap_or(u64::MAX)
+    }
+
+    /// Un paquet daté avant le dernier rebasage appartient à l'ancienne
+    /// formule. En particulier, ne jamais lui appliquer un saut PTP ultérieur.
+    pub(super) fn temps_du_paquet(&self, arrivee: Instant) -> Option<Time> {
+        let m = self.0.monotone.ns_a(arrivee)?;
+        let f = self.formule();
+        if m < f.base_monotone {
+            return None;
+        }
+        Some(Time::from_nanos(u64::try_from(f.virtuel(m)).ok()?))
     }
 
     /// L'écart de fréquence appliqué, en ppm.
@@ -232,6 +249,23 @@ mod tests {
     fn horloge() -> (HorlogeVirtuelle, Arc<AtomicU64>) {
         let g = Arc::new(AtomicU64::new(0));
         (HorlogeVirtuelle::new(g.clone()), g)
+    }
+
+    #[test]
+    fn une_reception_anterieure_au_saut_ne_prend_pas_la_nouvelle_phase() {
+        let (h, _) = horloge();
+        let arrivee = Instant::now();
+        let m = h.0.monotone.ns_a(arrivee).unwrap();
+        assert!(h.temps_du_paquet(arrivee).is_some());
+        h.sauter_a(DureePtp::from_seconds(3600.0), m + 1).unwrap();
+        assert!(h.temps_du_paquet(arrivee).is_none());
+        assert_eq!(
+            ns_de(
+                h.temps_du_paquet(arrivee + std::time::Duration::from_nanos(1))
+                    .unwrap()
+            ),
+            m + 1 + 3_600_000_000_000
+        );
     }
 
     #[test]

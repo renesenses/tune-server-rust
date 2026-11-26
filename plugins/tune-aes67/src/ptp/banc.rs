@@ -190,7 +190,8 @@ impl MaitreSimule {
             fils: Mutex::new(Vec::new()),
             compteurs: Arc::new(CompteursMaitre::default()),
         };
-        m.lancer()?;
+        let emission = super::reception::Emission::activer(&m.evenement);
+        m.lancer(emission)?;
         Ok(m)
     }
 
@@ -230,9 +231,10 @@ impl MaitreSimule {
         p
     }
 
-    fn lancer(&self) -> io::Result<()> {
+    fn lancer(&self, mut emission: super::reception::Emission) -> io::Result<()> {
         let cfg = self.cfg;
         let port = self.port();
+        let noyau = emission.au_noyau();
         let horloge = self.horloge;
         let mut fils = self.fils.lock().unwrap();
 
@@ -299,9 +301,10 @@ impl MaitreSimule {
                                     },
                                     &[0u8; 10],
                                 );
-                                if ev.send_to(&sync, d_ev).is_ok() {
-                                    // Horodatage logiciel, comme le suiveur.
-                                    let t1 = horloge.maintenant_ns();
+                                if let Ok(depart) = emission.envoyer(&ev, &sync, d_ev)
+                                    && let Some(m) = horloge.monotone.ns_a(depart)
+                                {
+                                    let t1 = horloge.temps_a(m);
                                     let suivi = message(
                                         &Entete {
                                             type_msg: FOLLOW_UP,
@@ -341,10 +344,16 @@ impl MaitreSimule {
                 std::thread::Builder::new()
                     .name("banc-ptp-reponse".into())
                     .spawn(move || {
+                        let mut reception = super::reception::Reception::new(&ev, noyau);
                         let mut t = [0u8; 1500];
                         while !arret.load(Ordering::Acquire) {
-                            let Ok(n) = ev.recv(&mut t) else { continue };
-                            let t4 = horloge.maintenant_ns();
+                            let Ok((n, Some(arrivee))) = reception.recevoir(&mut t) else {
+                                continue;
+                            };
+                            let Some(m) = horloge.monotone.ns_a(arrivee) else {
+                                continue;
+                            };
+                            let t4 = horloge.temps_a(m.max(horloge.origine));
                             let r = &t[..n];
                             if n < 44 || r[0] & 0x0f != DELAY_REQ || r[4] != cfg.domaine {
                                 continue;

@@ -2,15 +2,9 @@
 //! pour les messages d'événement (port 319 : Sync, Delay_Req), l'autre pour
 //! les messages généraux (port 320 : Announce, Follow_Up, Delay_Resp).
 //!
-//! HORODATAGE LOGICIEL, en espace utilisateur : l'instant de réception est
-//! lu sur l'horloge virtuelle juste après `recv`, l'instant d'émission juste
-//! après `send`. Pas de `SO_TIMESTAMPING` ni de carte réseau PTP : ils
-//! demandent une carte compatible ou des droits, et leur horloge (REALTIME ou
-//! PHC) n'est pas celle qu'on asservit. Le prix : la latence de la pile et de
-//! l'ordonnanceur entre dans la mesure, typiquement quelques dizaines de µs
-//! de gigue sur un réseau calme, que le filtre de Kalman de `statime` moyenne.
-//! L'étude (§ 3.2) vise ~100 µs : le récepteur absorbe la gigue dans son
-//! tampon, seule la dérive à long terme doit être nulle.
+//! Sous Linux, SO_TIMESTAMPING date la réception et l’émission des messages
+//! d’événement. Le transport convertit ces dates sur l’horloge virtuelle.
+//! Faute de date noyau, il encadre send_to et date le retour de recv.
 //!
 //! Les ports 319 et 320 sont PRIVILÉGIÉS sous Linux. Sans
 //! `CAP_NET_BIND_SERVICE` (ou `net.ipv4.ip_unprivileged_port_start`), la
@@ -142,13 +136,16 @@ pub struct TransportUdp {
     evenement: UdpSocket,
     general: UdpSocket,
     cfg: ConfigReseauPtp,
+    emission: std::sync::Mutex<super::reception::Emission>,
 }
 
 impl TransportUdp {
     pub fn ouvrir(cfg: ConfigReseauPtp) -> io::Result<Self> {
         let evenement = ouvrir_un(cfg.liaison_evenement, &cfg)?;
         let general = ouvrir_un(cfg.liaison_generale, &cfg)?;
+        let emission = std::sync::Mutex::new(super::reception::Emission::activer(&evenement));
         Ok(Self {
+            emission,
             evenement,
             general,
             cfg,
@@ -170,9 +167,14 @@ impl TransportUdp {
         donnees: &[u8],
         horloge: &HorlogeVirtuelle,
     ) -> io::Result<Time> {
-        self.evenement
-            .send_to(donnees, self.cfg.destination_evenement)?;
-        Ok(statime::Clock::now(horloge))
+        let depart = self
+            .emission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .envoyer(&self.evenement, donnees, self.cfg.destination_evenement)?;
+        horloge
+            .temps_du_paquet(depart)
+            .ok_or_else(|| io::Error::other("changement d’époque pendant l’envoi PTP"))
     }
 
     pub fn envoyer_general(&self, donnees: &[u8]) -> io::Result<()> {
@@ -190,6 +192,11 @@ impl TransportUdp {
         vers: Sender<Recu>,
         arret: Arc<AtomicBool>,
     ) -> io::Result<Vec<JoinHandle<()>>> {
+        let noyau = self
+            .emission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .au_noyau();
         let mut fils = Vec::new();
         for (canal, socket) in [
             (Canal::Evenement, self.evenement.try_clone()?),
@@ -206,11 +213,24 @@ impl TransportUdp {
                 std::thread::Builder::new()
                     .name(nom.into())
                     .spawn(move || {
+                        let mut reception = super::reception::Reception::new(
+                            &socket,
+                            noyau && canal == Canal::Evenement,
+                        );
                         let mut tampon = [0u8; 1500];
                         while !arret.load(Ordering::Acquire) {
-                            match socket.recv(&mut tampon) {
-                                Ok(n) => {
-                                    let horodatage = statime::Clock::now(&horloge);
+                            match reception.recevoir(&mut tampon) {
+                                Ok((_, None)) => continue,
+                                Ok((n, Some(arrivee))) => {
+                                    let horodatage = match canal {
+                                        Canal::Evenement => {
+                                            let Some(t) = horloge.temps_du_paquet(arrivee) else {
+                                                continue;
+                                            };
+                                            t
+                                        }
+                                        Canal::General => statime::Clock::now(&horloge),
+                                    };
                                     let recu = Recu {
                                         canal,
                                         donnees: tampon[..n].to_vec(),

@@ -36,10 +36,13 @@ reqwest = { workspace = true }
 # Foundation), MIT OR Apache-2.0, `no_std` avec plateforme fournie par
 # l'appelant : on lui donne une horloge VIRTUELLE (OverlayClock sur l'horloge
 # monotone, aucun droit sur l'horloge système) et des sockets UDP ordinaires
-# horodatés en espace utilisateur. Version figée : l'API bouge entre les 0.x.
+# horodatés par logiciel. Version figée : l'API bouge entre les 0.x.
 statime = { version = "=0.4.0", default-features = false, features = ["std"] }
 # Le générateur que `statime` 0.4 attend (trait `rand` 0.8, déjà au Cargo.lock).
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", features = ["net", "uio"] }
 
 [dev-dependencies]
 tempfile = "3"

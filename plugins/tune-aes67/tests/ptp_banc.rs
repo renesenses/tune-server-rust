@@ -150,24 +150,63 @@ fn la_marge_de_frequence_vient_de_la_mesure_et_rejette_une_horloge_non_corrigee(
     assert!(seuil_frequence_ppm(i64::MAX, u64::MAX, 1) < 40.0);
 }
 
+/// Pente des temps effectivement lus, en µs de dérive par seconde. Une
+/// correction de phase sur le premier ou le dernier relevé ne représente
+/// pas, à elle seule, la vitesse du suiveur pendant toute la fenêtre.
+fn pente_mesuree_ppm(points: &[(f64, f64)]) -> f64 {
+    let n = points.len() as f64;
+    let t_moyen = points.iter().map(|p| p.0).sum::<f64>() / n;
+    let phase_moyenne = points.iter().map(|p| p.1).sum::<f64>() / n;
+    let covariance: f64 = points
+        .iter()
+        .map(|&(t, phase)| (t - t_moyen) * (phase - phase_moyenne))
+        .sum();
+    let variance: f64 = points.iter().map(|&(t, _)| (t - t_moyen).powi(2)).sum();
+    covariance / variance
+}
+
+#[test]
+fn la_pente_mesuree_distingue_une_derive_d_un_decalage_de_phase_en_bord_de_fenetre() {
+    for derive in [0.0, 40.0, 80.0] {
+        let mut points: Vec<_> = (0..=100)
+            .map(|i| {
+                let t = i as f64 / 20.0;
+                (t, t * derive)
+            })
+            .collect();
+        points[0].1 -= 90.0;
+        points[100].1 += 90.0;
+        assert!((pente_mesuree_ppm(&points) - derive).abs() < 3.0);
+    }
+}
+
 /// Mesure l'écart, le délai de chemin et la fréquence apprise toutes les
 /// 50 ms pendant `duree`.
 fn mesurer(maitre: &MaitreSimule, s: &SuiveurPtp, duree: Duration) -> Mesure {
     let debut = Instant::now();
     let generation = s.generation();
     let (t0, v0, lecture0) = lire_pente(s);
+    let mut points = vec![(0.0, 0.0)];
+    let mut relever_pente = || {
+        let (t, virtuel, largeur) = lire_pente(s);
+        let ecoule = t - t0;
+        let phase_ns = i128::from(virtuel) - i128::from(v0) - ecoule.as_nanos() as i128;
+        points.push((ecoule.as_secs_f64(), phase_ns as f64 / 1_000.0));
+        (ecoule, largeur)
+    };
     let mut v = Vec::new();
     let mut frequences = Vec::new();
     let mut delai_max = 0i64;
     while debut.elapsed() < duree {
+        relever_pente();
         v.push(ecart_ns(maitre, s));
         let e = s.etat();
         delai_max = delai_max.max(e.delai_moyen_ns.unwrap_or(0).abs());
         frequences.push(e.frequence_ppm);
         std::thread::sleep(Duration::from_millis(50));
     }
-    let (t1, v1, lecture1) = lire_pente(s);
-    let duree_ns = (t1 - t0).as_nanos() as u64;
+    let (ecoule, lecture1) = relever_pente();
+    let duree_ns = ecoule.as_nanos() as u64;
     frequences.sort_by(f64::total_cmp);
     Mesure {
         min: *v.iter().min().unwrap(),
@@ -175,7 +214,7 @@ fn mesurer(maitre: &MaitreSimule, s: &SuiveurPtp, duree: Duration) -> Mesure {
         moyenne: v.iter().sum::<i64>() / v.len() as i64,
         delai_max,
         frequence_ppm: frequences[frequences.len() / 2],
-        frequence_mesuree_ppm: ((v1 as i128 - v0 as i128) as f64 / duree_ns as f64 - 1.0) * 1e6,
+        frequence_mesuree_ppm: pente_mesuree_ppm(&points),
         incertitude_lecture_ns: lecture0.saturating_add(lecture1) / 2,
         duree_ns,
         meme_generation: generation == s.generation(),
