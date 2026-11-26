@@ -58,8 +58,8 @@ pub fn sign_jwt(user_id: i64, role: &str, secret: &str) -> Result<String, String
 fn maintenant_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn signer_session(
