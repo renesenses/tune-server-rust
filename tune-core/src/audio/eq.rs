@@ -31,14 +31,6 @@ pub const RAMPE_DE_BASCULE_MS: u32 = 300;
 /// biquad hérite de l'historique et ne claque pas.
 pub const SEUIL_DE_RAMPE_DB: f64 = 1.0;
 
-/// rc14 (sécurité auditive, série TESS #9520) — durée de la remontée d'une
-/// hausse de préampli RETENUE entre deux égaliseurs ACTIFS (voir
-/// [`EqProcessor::retenir_la_hausse_de`]). Décocher un maillon d'une série,
-/// baisser ses bandes ou changer de préréglage fait baisser la marge : le
-/// niveau rejoint celui de la nouvelle chaîne en moins de 0,5 s (A/B, comme
-/// le retour au sec de TESS), jamais au-delà du niveau d'avant l'égaliseur.
-pub const REMONTEE_SERIE_MS: u32 = 450;
-
 /// #6211 — durée du fondu qui éteint le préampli GARDÉ d'un égaliseur coupé
 /// sur un flux SANS FIN (radio).
 ///
@@ -84,6 +76,13 @@ pub const REMONTEE_DB_PAR_SECONDE: f64 = 2.0;
 /// geste sert une comparaison A/B, le signal sec revient en moins d'une
 /// demi-seconde, par la même rampe linéaire en dB (aucune marche). Hors de
 /// TESS, la règle du 10/10 et [`REMONTEE_DB_PAR_SECONDE`] restent.
+///
+/// rc14 (sécurité auditive, série TESS #9520) — même durée pour la remontée
+/// d'une hausse de préampli RETENUE entre deux égaliseurs ACTIFS (voir
+/// [`EqProcessor::retenir_la_hausse_de`]) : décocher un maillon d'une série,
+/// baisser ses bandes ou changer de préréglage fait rejoindre le niveau de la
+/// nouvelle chaîne en moins de 0,5 s, jamais au-delà du niveau d'avant
+/// l'égaliseur.
 pub const REMONTEE_RAPIDE_TESS_MS: u32 = 450;
 
 /// #6211 — extinction en cours du préampli gardé : `depart` est le gain par
@@ -592,7 +591,7 @@ impl EqProcessor {
     /// monterait d'un coup — +12,9 dB en 300 ms mesurés à 40 Hz. La règle du
     /// 10/10 (#6741, fil 1974) vaut ici comme pour une coupure : la hausse
     /// est RETENUE (gain gardé appliqué après le filtre), puis rendue par
-    /// une rampe de [`REMONTEE_SERIE_MS`] jusqu'à la borne de remontée — le
+    /// une rampe de [`REMONTEE_RAPIDE_TESS_MS`] jusqu'à la borne de remontée — le
     /// niveau d'avant l'égaliseur, volume compris —, jamais au-delà. À volume
     /// inchangé, le niveau rejoint donc exactement celui de la nouvelle
     /// chaîne en moins de 0,5 s ; volume monté, le surplus reste gardé, se
@@ -765,9 +764,9 @@ impl EqProcessor {
             fait: 0,
         });
         // rc14 (série TESS) — la retenue d'un égaliseur ACTIF revient en
-        // `REMONTEE_SERIE_MS` (bornée, voir `retenir_la_hausse_de`).
+        // `REMONTEE_RAPIDE_TESS_MS` (bornée, voir `retenir_la_hausse_de`).
         if !self.est_neutre() {
-            let total = (u64::from(self.sample_rate) * u64::from(REMONTEE_SERIE_MS) / 1000).max(1);
+            let total = (u64::from(self.sample_rate) * u64::from(REMONTEE_RAPIDE_TESS_MS) / 1000).max(1);
             if let Some(ext) = self.extinction.as_mut() {
                 ext.total = total as usize;
             }
