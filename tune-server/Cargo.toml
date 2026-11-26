@@ -305,6 +305,18 @@ path = "tests/pont_administration.rs"
 name = "relais_routes_relayables"
 path = "tests/relais_routes_relayables.rs"
 
+# Session « rester connecté » (remember) des remotes : 30 jours, révocable.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "session_longue_remember"
+path = "tests/session_longue_remember.rs"
+
+# rc14 — la session renouvelée tant qu'elle sert (`POST /auth/refresh`) :
+# rotation, réutilisation, expiration, révocations, relais, WebSocket.
+[[test]]
+name = "session_renouvelee_rc14"
+path = "tests/session_renouvelee_rc14.rs"
+
 # #9174 — la provenance du lecteur d'une zone navigateur (relais ou local).
 # `autotests = false` plus haut : sans cette cible, jamais compilé.
 [[test]]

@@ -90,6 +90,8 @@ pub mod reprise_des_passes;
 pub mod recuperation_admin;
 pub mod routes;
 pub mod scan_import;
+/// rc14 — la session renouvelée tant qu'elle sert (`POST /auth/refresh`).
+pub mod session_renouvelee;
 /// L'echelle de dialectes CIFS, partagee par la route de montage et par le
 /// remontage au demarrage. Voir [`smb`] pour ce que leur divergence coutait.
 pub mod smb;
