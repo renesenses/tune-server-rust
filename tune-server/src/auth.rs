@@ -803,7 +803,9 @@ pub struct AdminOuCetteMachine;
 /// La garde STRICTE de la rc13 : l'administrateur, ou cette machine
 /// seulement, jamais le réseau local. Pour le compte et la licence : délier
 /// le compte mozaiklabs.fr (décision du 23/11), poser, activer, désactiver ou
-/// retirer la licence, et lire la clé de licence en clair.
+/// retirer la licence, et lire la clé de licence en clair ; pour le pont
+/// d'accès à distance, tout ce qui en rend le jeton (activer, renouveler,
+/// lire le lien d'accès).
 pub struct AdminOuCetteMachineStricte;
 
 /// Réglage « Administration depuis cette machine seulement » : allumé
@@ -1230,20 +1232,132 @@ async fn refus_action_reservee(
 }
 
 /// Adresse du RÉSEAU LOCAL : privée IPv4 (RFC 1918), lien local IPv4
-/// (169.254/16), unique locale IPv6 (fc00::/7), lien local IPv6 (fe80::/10),
+/// (169.254/16), unique locale IPv6 (fd00::/8), lien local IPv6 (fe80::/10),
 /// et leurs formes IPv4 d'une socket à double pile. PAS le partage
-/// d'adresses 100.64/10 (CGNAT, Tailscale) : c'est un accès à distance.
+/// d'adresses 100.64/10 (CGNAT, réseaux superposés) : c'est un accès à
+/// distance. Hors aussi les plages de [`PLAGES_EXCLUES_DU_RESEAU_LOCAL`] et
+/// celles que l'exploitant ajoute par [`VARIABLE_PLAGES_EXCLUES_DU_RESEAU_LOCAL`].
 pub fn adresse_du_reseau_local(ip: std::net::IpAddr) -> bool {
-    let v4_local = |v4: std::net::Ipv4Addr| v4.is_private() || v4.is_link_local();
+    adresse_du_reseau_local_hors(ip, &plages_exclues_par_l_exploitant())
+}
+
+/// Plages privées exclues d'office du réseau local, parce qu'elles servent à
+/// des réseaux superposés (accès à distance) et non au réseau domestique :
+///
+/// - `fc00::/8` : moitié de `fc00::/7` que la RFC 4193 n'attribue pas ; les
+///   box et routeurs tirent leurs préfixes uniques locaux dans `fd00::/8` ;
+/// - `fd7a:115c:a1e0::/48` : préfixe fixe d'un réseau superposé courant.
+///
+/// On ne peut pas exclure tout `fd00::/8` : de nombreuses box (et OpenWrt par
+/// défaut) y tirent au hasard le préfixe du réseau domestique, et un réseau
+/// superposé qui tire le sien de la même façon ne s'en distingue pas par
+/// l'adresse. Dans ce cas : déclarer sa plage dans
+/// [`VARIABLE_PLAGES_EXCLUES_DU_RESEAU_LOCAL`], ou allumer le réglage
+/// « Administration depuis cette machine seulement ».
+pub const PLAGES_EXCLUES_DU_RESEAU_LOCAL: &[(std::net::IpAddr, u8)] = &[
+    (
+        std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)),
+        8,
+    ),
+    (
+        std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+            0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0,
+        )),
+        48,
+    ),
+];
+
+/// Variable par laquelle l'exploitant retire des plages du réseau local
+/// (liste séparée par des virgules, notation `adresse/longueur`, par exemple
+/// `fd12:3456:789a::/48,10.8.0.0/24`). Elle ne fait que RESTREINDRE : une
+/// plage publique ajoutée ici ne devient jamais locale. Une entrée illisible
+/// est ignorée (et signalée au journal).
+pub const VARIABLE_PLAGES_EXCLUES_DU_RESEAU_LOCAL: &str = "TUNE_ADMIN_LAN_EXCLUDED_RANGES";
+
+/// Lit une plage `adresse/longueur` (ou une adresse seule).
+pub fn plage_d_adresses(texte: &str) -> Option<(std::net::IpAddr, u8)> {
+    let texte = texte.trim();
+    let (adresse, longueur) = match texte.split_once('/') {
+        Some((a, l)) => (a.trim(), Some(l.trim())),
+        None => (texte, None),
+    };
+    let adresse: std::net::IpAddr = adresse.parse().ok()?;
+    let maximum = if adresse.is_ipv4() { 32 } else { 128 };
+    let longueur = match longueur {
+        Some(l) => l.parse::<u8>().ok()?,
+        None => maximum,
+    };
+    (longueur <= maximum).then_some((adresse, longueur))
+}
+
+/// L'adresse est-elle dans la plage ? Une adresse IPv4 dans IPv6 est jugée
+/// sous sa forme IPv4.
+pub fn adresse_dans_la_plage(ip: std::net::IpAddr, plage: (std::net::IpAddr, u8)) -> bool {
+    let (reseau, longueur) = plage;
+    match (adresse_ipv4_si_possible(ip), reseau) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+            let l = u32::from(longueur.min(32));
+            let masque = if l == 0 { 0 } else { u32::MAX << (32 - l) };
+            u32::from(a) & masque == u32::from(b) & masque
+        }
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+            let l = u32::from(longueur.min(128));
+            let masque = if l == 0 { 0 } else { u128::MAX << (128 - l) };
+            u128::from(a) & masque == u128::from(b) & masque
+        }
+        _ => false,
+    }
+}
+
+/// La forme IPv4 d'une adresse IPv4 dans IPv6, l'adresse telle quelle sinon.
+fn adresse_ipv4_si_possible(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip {
-        std::net::IpAddr::V4(v4) => v4_local(v4),
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// Les plages de [`VARIABLE_PLAGES_EXCLUES_DU_RESEAU_LOCAL`].
+fn plages_exclues_par_l_exploitant() -> Vec<(std::net::IpAddr, u8)> {
+    let Ok(liste) = std::env::var(VARIABLE_PLAGES_EXCLUES_DU_RESEAU_LOCAL) else {
+        return Vec::new();
+    };
+    liste
+        .split(',')
+        .filter(|e| !e.trim().is_empty())
+        .filter_map(|e| {
+            let plage = plage_d_adresses(e);
+            if plage.is_none() {
+                tracing::warn!(
+                    entree = %e.trim(),
+                    "plage_exclue_du_reseau_local_illisible"
+                );
+            }
+            plage
+        })
+        .collect()
+}
+
+/// [`adresse_du_reseau_local`], avec les plages de l'exploitant données.
+pub fn adresse_du_reseau_local_hors(
+    ip: std::net::IpAddr,
+    exclues: &[(std::net::IpAddr, u8)],
+) -> bool {
+    let ip = adresse_ipv4_si_possible(ip);
+    let privee = match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
         std::net::IpAddr::V6(v6) => {
             let premier = v6.segments()[0];
-            (premier & 0xfe00) == 0xfc00
-                || (premier & 0xffc0) == 0xfe80
-                || v6.to_ipv4_mapped().is_some_and(v4_local)
+            (premier & 0xfe00) == 0xfc00 || (premier & 0xffc0) == 0xfe80
         }
-    }
+    };
+    privee
+        && !PLAGES_EXCLUES_DU_RESEAU_LOCAL
+            .iter()
+            .chain(exclues)
+            .any(|p| adresse_dans_la_plage(ip, *p))
 }
 
 /// L'appel vient-il du RÉSEAU LOCAL ? Mêmes critères que la garde d'hôte et
@@ -1259,6 +1373,16 @@ pub fn adresse_du_reseau_local(ip: std::net::IpAddr) -> bool {
 /// (`appliance::bouclage_fiable` faux) : c'est exactement ce qu'il relaie.
 /// Ailleurs, le bouclage relève de [`appel_depuis_cette_machine`].
 async fn appel_depuis_le_reseau_local(parts: &mut Parts, state: &AppState) -> bool {
+    appel_du_reseau_local(parts, state, true).await
+}
+
+/// [`appel_depuis_le_reseau_local`] ; `verifier_la_passerelle` faux laisse
+/// à [`juger_l_adresse_du_reseau_local`] le soin de juger la passerelle.
+async fn appel_du_reseau_local(
+    parts: &mut Parts,
+    state: &AppState,
+    verifier_la_passerelle: bool,
+) -> bool {
     if crate::garde_du_relais::requete_relayee(&parts.headers) {
         return false;
     }
@@ -1283,7 +1407,7 @@ async fn appel_depuis_le_reseau_local(parts: &mut Parts, state: &AppState) -> bo
     if adresse_de_cette_machine(ip) {
         return !crate::routes::appliance::bouclage_fiable();
     }
-    adresse_du_reseau_local(ip)
+    adresse_du_reseau_local(ip) && !(verifier_la_passerelle && source_passerelle_par_defaut(ip))
 }
 
 /// Garde de la SEULE installation d'une mise à jour officielle
@@ -2666,13 +2790,190 @@ fn source_passerelle(ip: std::net::IpAddr, passerelles: &[std::net::IpAddr]) -> 
     if passerelles.is_empty() {
         return true;
     }
-    let ip = match ip {
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
-        v4 => v4,
+    passerelles.contains(&adresse_ipv4_si_possible(ip))
+}
+
+/// L'appel vient-il d'une passerelle par défaut de CETTE machine ? Partout,
+/// conteneur ou non : derrière une traduction d'adresses (machine virtuelle
+/// en NAT, sous-système Linux de Windows, routeur qui réécrit l'adresse
+/// source), les connexions traduites arrivent de la passerelle, quelle que
+/// soit leur origine. Passerelle illisible : oui (dans le doute, refus).
+/// Aucune route par défaut : non.
+pub(crate) fn source_passerelle_par_defaut(ip: std::net::IpAddr) -> bool {
+    let oui = match passerelles_par_defaut_du_systeme() {
+        None => true,
+        Some(passerelles) => passerelles.contains(&adresse_ipv4_si_possible(ip)),
     };
-    passerelles.contains(&ip)
+    if oui {
+        tracing::info!(%ip, "appel_vu_de_la_passerelle_par_defaut");
+    }
+    oui
+}
+
+/// Durée pendant laquelle la lecture des passerelles par défaut est gardée.
+const DUREE_DES_PASSERELLES_LUES: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Les passerelles par défaut de cette machine (IPv4 et IPv6), ou `None` si
+/// le système ne permet pas de les lire. Lecture gardée
+/// [`DUREE_DES_PASSERELLES_LUES`].
+///
+/// En développement et sous test : `TUNE_TEST_PASSERELLES` (adresses
+/// séparées par des virgules, `illisible` pour une lecture impossible) ;
+/// sinon, un conteneur simulé (`TUNE_TEST_PASSERELLE_CONTENEUR`) prend ses
+/// passerelles, et une machine simulée (`TUNE_TEST_HORS_CONTENEUR=1`) n'en a
+/// aucune.
+pub fn passerelles_par_defaut_du_systeme() -> Option<Vec<std::net::IpAddr>> {
+    if cfg!(debug_assertions) {
+        let liste = |v: &str| -> Vec<std::net::IpAddr> {
+            v.split(',').filter_map(|a| a.trim().parse().ok()).collect()
+        };
+        if let Ok(v) = std::env::var("TUNE_TEST_PASSERELLES") {
+            return (v.trim() != "illisible").then(|| liste(&v));
+        }
+        if let Ok(v) = std::env::var("TUNE_TEST_PASSERELLE_CONTENEUR") {
+            return Some(liste(&v));
+        }
+        if std::env::var("TUNE_TEST_HORS_CONTENEUR").is_ok_and(|v| v == "1") {
+            return Some(Vec::new());
+        }
+    }
+    type Lecture = Option<(std::time::Instant, Option<Vec<std::net::IpAddr>>)>;
+    static LECTURE: std::sync::Mutex<Lecture> = std::sync::Mutex::new(None);
+    let mut lecture = LECTURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((quand, passerelles)) = lecture.as_ref()
+        && quand.elapsed() < DUREE_DES_PASSERELLES_LUES
+    {
+        return passerelles.clone();
+    }
+    let passerelles = lire_les_passerelles_par_defaut();
+    if passerelles.is_none() {
+        tracing::warn!("passerelle_par_defaut_illisible");
+    }
+    *lecture = Some((std::time::Instant::now(), passerelles.clone()));
+    passerelles
+}
+
+/// Linux et Android : `/proc/net/route` et `/proc/net/ipv6_route`. Sans pile
+/// IPv6 (`/proc/net/if_inet6` absent), la table IPv6 manquante est vide.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn lire_les_passerelles_par_defaut() -> Option<Vec<std::net::IpAddr>> {
+    let v4 = std::fs::read_to_string("/proc/net/route").ok()?;
+    let v6 = match std::fs::read_to_string("/proc/net/ipv6_route") {
+        Ok(v6) => v6,
+        Err(_) if !std::path::Path::new("/proc/net/if_inet6").exists() => String::new(),
+        Err(_) => return None,
+    };
+    Some(passerelles_par_defaut(&v4, &v6))
+}
+
+/// macOS et BSD : `route -n get default`, en IPv4 puis en IPv6. Une commande
+/// qui ne se lance pas rend `None` ; « pas de route » rend une liste vide.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+fn lire_les_passerelles_par_defaut() -> Option<Vec<std::net::IpAddr>> {
+    let mut passerelles = Vec::new();
+    for famille in ["-inet", "-inet6"] {
+        let sortie = std::process::Command::new("/sbin/route")
+            .args(["-n", "get", famille, "default"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        passerelles.extend(passerelles_de_route_get(&String::from_utf8_lossy(
+            &sortie.stdout,
+        )));
+    }
+    Some(passerelles)
+}
+
+/// Windows : `route print` (les lignes de routes ne sont pas traduites).
+#[cfg(windows)]
+fn lire_les_passerelles_par_defaut() -> Option<Vec<std::net::IpAddr>> {
+    use std::os::windows::process::CommandExt;
+    const SANS_FENETRE: u32 = 0x0800_0000;
+    let racine = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let sortie = std::process::Command::new(format!(r"{racine}\System32\route.exe"))
+        .arg("print")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(SANS_FENETRE)
+        .output()
+        .ok()?;
+    if !sortie.status.success() {
+        return None;
+    }
+    Some(passerelles_de_route_print(&String::from_utf8_lossy(
+        &sortie.stdout,
+    )))
+}
+
+/// Ailleurs : illisible.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    windows
+)))]
+fn lire_les_passerelles_par_defaut() -> Option<Vec<std::net::IpAddr>> {
+    None
+}
+
+/// Une adresse de passerelle, sans son suffixe de portée (`fe80::1%en0`).
+fn adresse_de_passerelle(texte: &str) -> Option<std::net::IpAddr> {
+    let texte = texte.split('%').next().unwrap_or_default();
+    texte.parse().ok()
+}
+
+/// Les passerelles de la sortie de `route -n get default` (macOS, BSD) :
+/// la ligne `gateway: …`.
+pub fn passerelles_de_route_get(sortie: &str) -> Vec<std::net::IpAddr> {
+    sortie
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("gateway:"))
+        .filter_map(|a| adresse_de_passerelle(a.trim()))
+        .collect()
+}
+
+/// Les passerelles de la sortie de `route print` (Windows) : en IPv4, les
+/// lignes `0.0.0.0 0.0.0.0 <passerelle> …` ; en IPv6, les lignes
+/// `<interface> <métrique> ::/0 <passerelle>`, la passerelle pouvant passer
+/// à la ligne suivante quand elle est longue.
+pub fn passerelles_de_route_print(sortie: &str) -> Vec<std::net::IpAddr> {
+    let mut passerelles = Vec::new();
+    let mut lignes = sortie.lines().peekable();
+    while let Some(ligne) = lignes.next() {
+        let champs: Vec<&str> = ligne.split_whitespace().collect();
+        if champs.len() >= 3 && champs[0] == "0.0.0.0" && champs[1] == "0.0.0.0" {
+            if let Some(ip) = adresse_de_passerelle(champs[2]) {
+                passerelles.push(ip);
+            }
+        } else if champs.len() >= 3 && champs[2] == "::/0" {
+            let suite = match champs.get(3) {
+                Some(p) => Some((*p).to_string()),
+                None => lignes
+                    .peek()
+                    .and_then(|l| l.split_whitespace().next())
+                    .map(str::to_string),
+            };
+            if let Some(ip) = suite.as_deref().and_then(adresse_de_passerelle)
+                && ip.is_ipv6()
+            {
+                passerelles.push(ip);
+            }
+        }
+    }
+    passerelles
 }
 
 /// Ce que vaut l'adresse d'un appel « du réseau local » quand on veut s'y fier
@@ -2698,7 +2999,9 @@ pub(crate) enum AdresseDuReseauLocal {
 /// - jamais dans un conteneur, sauf si l'exploitant l'autorise
 ///   (`conteneur_autorise`), et alors jamais depuis la passerelle du
 ///   conteneur (réseau en pont : toutes les connexions publiées y arrivent) ;
-/// - jamais avec un `Host` à un seul label étranger à cette machine.
+/// - jamais avec un `Host` à un seul label étranger à cette machine ;
+/// - jamais depuis une passerelle par défaut de la machine, conteneur ou non
+///   ([`source_passerelle_par_defaut`]).
 pub(crate) async fn juger_l_adresse_du_reseau_local(
     parts: &mut Parts,
     state: &AppState,
@@ -2707,7 +3010,7 @@ pub(crate) async fn juger_l_adresse_du_reseau_local(
     if !crate::routes::appliance::bouclage_fiable() {
         return AdresseDuReseauLocal::RelaisDuPort80;
     }
-    if !appel_depuis_le_reseau_local(parts, state).await
+    if !appel_du_reseau_local(parts, state, false).await
         || crate::garde_origine::hote_de_la_requete_a_un_seul_label_etranger(&parts.headers)
     {
         return AdresseDuReseauLocal::HorsDuReseauLocal;
@@ -2716,12 +3019,14 @@ pub(crate) async fn juger_l_adresse_du_reseau_local(
         return AdresseDuReseauLocal::HorsDuReseauLocal;
     };
     match passerelles_du_conteneur() {
-        None => AdresseDuReseauLocal::Fiable,
-        Some(passerelles) if conteneur_autorise && !source_passerelle(ip, &passerelles) => {
-            AdresseDuReseauLocal::Fiable
-        }
-        Some(_) => AdresseDuReseauLocal::Conteneur,
+        Some(passerelles) if conteneur_autorise && !source_passerelle(ip, &passerelles) => {}
+        Some(_) => return AdresseDuReseauLocal::Conteneur,
+        None => {}
     }
+    if source_passerelle_par_defaut(ip) {
+        return AdresseDuReseauLocal::HorsDuReseauLocal;
+    }
+    AdresseDuReseauLocal::Fiable
 }
 
 /// L'appel vient-il du RÉSEAU LOCAL, au sens de la première configuration ?

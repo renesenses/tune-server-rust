@@ -15,7 +15,10 @@
 //! 7. `X-Forwarded-For` / `Forwarded` : jamais crus ;
 //! 8. authentification active : inchangé (l'administrateur, de partout) ;
 //! 9. requête d'un autre site ou `Host` étranger : refusée ;
-//! 10. la déliaison du compte reste à cette machine.
+//! 10. la déliaison du compte reste à cette machine ;
+//! 11. plages exclues du réseau local (d'office et par l'exploitant) ;
+//! 12. la passerelle par défaut, conteneur ou non, n'est jamais locale ;
+//! 13. ce qui rend le jeton du pont reste à cette machine.
 //!
 //! Sondes sans effet : `POST /auth/admin-scope` (le réglage lui-même) ;
 //! `POST /appliance/reboot` hors appliance rend 404 APRÈS la garde — un 403
@@ -97,6 +100,8 @@ impl Environnement {
             std::env::remove_var("TUNE_ALLOWED_ORIGINS");
             std::env::remove_var("TUNE_ALLOWED_HOSTS");
             std::env::remove_var("TUNE_FIRST_SETUP_IN_CONTAINER");
+            std::env::remove_var("TUNE_TEST_PASSERELLES");
+            std::env::remove_var("TUNE_ADMIN_LAN_EXCLUDED_RANGES");
             match passerelle {
                 Some(p) => {
                     std::env::set_var("TUNE_TEST_PASSERELLE_CONTENEUR", p);
@@ -129,6 +134,8 @@ impl Drop for Environnement {
                 "TUNE_TEST_PASSERELLE_CONTENEUR",
                 "TUNE_TEST_HORS_CONTENEUR",
                 "TUNE_ADMIN_LAN_IN_CONTAINER",
+                "TUNE_TEST_PASSERELLES",
+                "TUNE_ADMIN_LAN_EXCLUDED_RANGES",
             ] {
                 std::env::remove_var(v);
             }
@@ -655,4 +662,243 @@ async fn deliaison_du_compte_reste_a_cette_machine() {
     )
     .await;
     refus(status, &corps, "not_local", "déliaison depuis le LAN");
+}
+
+/// 11. Plages exclues d'office (`fc00::/8`, `fd7a:115c:a1e0::/48`), partage
+/// d'adresses `100.64.0.0/10`, et plages ajoutées par l'exploitant.
+#[tokio::test]
+async fn plages_exclues_du_reseau_local() {
+    use tune_server::auth::{adresse_du_reseau_local_hors, plage_d_adresses};
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    for exclue in [
+        "fd7a:115c:a1e0::1",
+        "fd7a:115c:a1e0:ab12:4843:cd96:6258:b240",
+        "fc12:3456::1",
+        "100.64.0.1",
+        "100.101.102.103",
+        "100.127.255.254",
+        "::ffff:100.100.1.2",
+    ] {
+        assert!(!adresse_du_reseau_local_hors(ip(exclue), &[]), "{exclue}");
+    }
+    for locale in [
+        "fd12:3456:789a::5",
+        "fd7a:115c:a1e1::1",
+        "fe80::1234",
+        "192.168.1.50",
+        "10.0.0.7",
+        "172.16.0.1",
+        "::ffff:192.168.1.60",
+    ] {
+        assert!(adresse_du_reseau_local_hors(ip(locale), &[]), "{locale}");
+    }
+    let plages = [
+        plage_d_adresses("fd12:3456:789a::/48").unwrap(),
+        plage_d_adresses(" 10.8.0.0/24 ").unwrap(),
+        plage_d_adresses("192.168.1.77").unwrap(),
+    ];
+    for exclue in [
+        "fd12:3456:789a:1::5",
+        "10.8.0.9",
+        "::ffff:10.8.0.9",
+        "192.168.1.77",
+    ] {
+        assert!(
+            !adresse_du_reseau_local_hors(ip(exclue), &plages),
+            "{exclue}"
+        );
+    }
+    for locale in ["fd12:3456:789b::5", "10.8.1.9", "192.168.1.78"] {
+        assert!(
+            adresse_du_reseau_local_hors(ip(locale), &plages),
+            "{locale}"
+        );
+    }
+    // Une plage ne fait que restreindre : une adresse publique reste dehors.
+    let tout = [plage_d_adresses("0.0.0.0/0").unwrap()];
+    assert!(!adresse_du_reseau_local_hors(ip("8.8.8.8"), &tout));
+    for illisible in [
+        "",
+        "fd00::/129",
+        "10.0.0.0/33",
+        "pas-une-adresse",
+        "10.0.0.0/x",
+    ] {
+        assert_eq!(plage_d_adresses(illisible), None, "{illisible}");
+    }
+
+    // Sur les routes montées, par la variable de l'exploitant.
+    let _v = verrou();
+    let _env = Environnement::machine_ordinaire();
+    let state = serveur();
+    for pair in ["[fd7a:115c:a1e0::5]:50000", "[fc00::5]:50000"] {
+        let (status, corps) = sonde(&state, pair, &[("host", HOTE_LAN)]).await;
+        refus(status, &corps, "not_local_network", pair);
+    }
+    unsafe {
+        std::env::set_var(
+            "TUNE_ADMIN_LAN_EXCLUDED_RANGES",
+            "fd12:3456:789a::/48, illisible ,10.0.0.0/24",
+        )
+    };
+    for pair in ["[fd12:3456:789a::5]:50000", "10.0.0.7:50000"] {
+        let (status, corps) = sonde(&state, pair, &[("host", HOTE_LAN)]).await;
+        refus(status, &corps, "not_local_network", pair);
+    }
+    let (status, corps) = sonde(&state, LAN, &[("host", HOTE_LAN)]).await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+}
+
+/// 12. Hors conteneur aussi, une connexion vue de la passerelle par défaut
+/// (machine virtuelle en NAT, routeur qui réécrit l'adresse source) n'est
+/// jamais locale ; passerelle illisible : rien n'est local.
+#[tokio::test]
+async fn passerelle_par_defaut_jamais_locale() {
+    let _v = verrou();
+    let _env = Environnement::machine_ordinaire();
+    let state = serveur();
+    unsafe { std::env::set_var("TUNE_TEST_PASSERELLES", "10.0.2.2,192.168.1.1,fe80::1") };
+    for pair in [
+        "10.0.2.2:50000",
+        "192.168.1.1:50000",
+        "[::ffff:192.168.1.1]:50000",
+        "[fe80::1]:50000",
+    ] {
+        let (status, corps) = sonde(&state, pair, &[("host", HOTE_LAN)]).await;
+        refus(status, &corps, "not_local_network", pair);
+        assert_eq!(
+            redemarrer(&state, pair, &[("host", HOTE_LAN)]).await,
+            StatusCode::FORBIDDEN,
+            "{pair}"
+        );
+        let (_, etat) = appel(&state, "GET", pair, ACTIVATION, &[("host", HOTE_LAN)], None).await;
+        assert_eq!(
+            etat["machine_actions_allowed"],
+            json!(false),
+            "{pair} — {etat}"
+        );
+    }
+    // Les autres appareils du réseau local passent.
+    for pair in [LAN, "10.0.2.15:50000", "[fe80::1234]:50000"] {
+        let (status, corps) = sonde(&state, pair, &[("host", HOTE_LAN)]).await;
+        assert_eq!(status, StatusCode::OK, "{pair} — {corps}");
+    }
+    // Passerelle illisible : dans le doute, rien n'est local.
+    unsafe { std::env::set_var("TUNE_TEST_PASSERELLES", "illisible") };
+    let (status, corps) = sonde(&state, LAN, &[("host", HOTE_LAN)]).await;
+    refus(status, &corps, "not_local_network", "passerelle illisible");
+    // Aucune route par défaut : le réseau local passe.
+    unsafe { std::env::set_var("TUNE_TEST_PASSERELLES", "") };
+    let (status, corps) = sonde(&state, LAN, &[("host", HOTE_LAN)]).await;
+    assert_eq!(status, StatusCode::OK, "sans route par défaut — {corps}");
+    // Cette machine n'est jamais concernée.
+    unsafe { std::env::set_var("TUNE_TEST_PASSERELLES", "illisible") };
+    let (status, corps) = sonde(&state, CETTE_MACHINE, &[("host", "localhost:8888")]).await;
+    assert_eq!(status, StatusCode::OK, "cette machine — {corps}");
+}
+
+/// 12 bis. Lecture des passerelles par défaut selon le système.
+#[test]
+fn lecture_des_passerelles_par_defaut() {
+    use tune_server::auth::{
+        passerelles_de_route_get, passerelles_de_route_print, passerelles_par_defaut,
+    };
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    // Linux : /proc/net/route (petit-boutiste) et /proc/net/ipv6_route.
+    let v4 = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n\
+              eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\n\
+              eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\n";
+    let v6 = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00450003 eth0\n";
+    assert_eq!(
+        passerelles_par_defaut(v4, v6),
+        vec![ip("192.168.1.1"), ip("fe80::1")]
+    );
+    // macOS : route -n get default.
+    let mac = "   route to: default\ndestination: default\n       mask: default\n    gateway: 192.168.1.254\n  interface: en0\n";
+    assert_eq!(passerelles_de_route_get(mac), vec![ip("192.168.1.254")]);
+    let mac6 = "   route to: ::\n    gateway: fe80::1%en0\n  interface: en0\n";
+    assert_eq!(passerelles_de_route_get(mac6), vec![ip("fe80::1")]);
+    assert!(
+        passerelles_de_route_get("route: writing to routing socket: not in table\n").is_empty()
+    );
+    // Windows : route print.
+    let win = "\
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0         10.0.2.2       10.0.2.15     25
+        127.0.0.0        255.0.0.0         On-link         127.0.0.1    331
+      192.168.1.0    255.255.255.0         Sur la liaison  192.168.1.20  281
+===========================================================================
+IPv6 Route Table
+===========================================================================
+Active Routes:
+ If Metric Network Destination      Gateway
+ 12     25 ::/0                     fe80::1
+  9    281 ::/0
+                                    fe80::a00:27ff:fe12:3456
+  1    331 ::1/128                  On-link
+";
+    assert_eq!(
+        passerelles_de_route_print(win),
+        vec![
+            ip("10.0.2.2"),
+            ip("fe80::1"),
+            ip("fe80::a00:27ff:fe12:3456")
+        ]
+    );
+}
+
+/// 13. Ce qui rend le jeton du pont (l'activer, le renouveler, lire le lien
+/// d'accès) reste à cette machine, même quand le réseau local administre ;
+/// l'éteindre reste ouvert au réseau local.
+#[tokio::test]
+async fn jeton_du_pont_reste_a_cette_machine() {
+    let _v = verrou();
+    let _env = Environnement::machine_ordinaire();
+    let state = serveur();
+    state.license.set_account_premium(true, None).await;
+    for (methode, chemin) in [
+        ("POST", "/api/v1/cloud/bridge/enable"),
+        ("POST", "/api/v1/cloud/bridge/rotate-token"),
+        ("GET", "/api/v1/cloud/bridge/access-link"),
+    ] {
+        let (status, corps) =
+            appel(&state, methode, LAN, chemin, &[("host", HOTE_LAN)], None).await;
+        refus(status, &corps, "not_local", chemin);
+        let (status, corps) = appel(
+            &state,
+            methode,
+            CETTE_MACHINE,
+            chemin,
+            &[("host", "localhost:8888")],
+            None,
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{chemin} cette machine — {corps}"
+        );
+    }
+    assert_ne!(
+        reglages(&state).get("bridge_token").ok().flatten(),
+        None,
+        "activé depuis cette machine"
+    );
+    let (status, corps) = appel(
+        &state,
+        "POST",
+        LAN,
+        "/api/v1/cloud/bridge/disable",
+        &[("host", HOTE_LAN)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "éteindre depuis le réseau local — {corps}"
+    );
 }

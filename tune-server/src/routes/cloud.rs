@@ -1758,8 +1758,8 @@ pub const MESSAGE_ACCES_PAR_COMPTE: &str =
 /// jeton, et n'en fabrique JAMAIS un — c'est le rôle de `bridge_enable`.
 async fn bridge_access_link(
     // Le lien porte le jeton du pont : administrateur, ou authentification
-    // coupée, seulement depuis cette machine.
-    _admin: crate::auth::AdminOuCetteMachine,
+    // coupée, cette machine seulement (garde stricte, jamais le réseau local).
+    _admin: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1844,9 +1844,9 @@ fn reponse_lien_d_acces(settings: &SettingsRepo, token: &str) -> axum::response:
 ///
 /// Réponse : le nouveau lien, de la forme de `bridge_access_link`.
 async fn bridge_rotate_token(
-    // Engage la machine : administrateur, ou authentification coupée,
-    // seulement depuis cette machine.
-    _admin: crate::auth::AdminOuCetteMachine,
+    // La réponse porte le nouveau jeton du pont : administrateur, ou
+    // authentification coupée, cette machine seulement (garde stricte).
+    _admin: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1878,9 +1878,9 @@ async fn bridge_rotate_token(
 /// Active le pont. Administrateur seulement dès que l'authentification est
 /// active : la réponse porte le jeton de pont.
 async fn bridge_enable(
-    // Ouvrir l'accès à distance engage la machine : administrateur, ou
-    // authentification coupée, seulement depuis cette machine.
-    _admin: crate::auth::AdminOuCetteMachine,
+    // La réponse porte le jeton du pont : administrateur, ou
+    // authentification coupée, cette machine seulement (garde stricte).
+    _admin: crate::auth::AdminOuCetteMachineStricte,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     // Premium gate: Cloud Relay requires Premium
