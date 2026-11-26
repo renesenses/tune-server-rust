@@ -220,11 +220,12 @@ async fn renouvellement_avec_rotation() {
     // L'ancien jeton d'accès reste valide jusqu'à son échéance (même famille).
     assert_eq!(moi(&app, &acces).await, StatusCode::OK);
 
-    // L'ancien jeton de renouvellement, rejoué tout de suite (deux onglets) :
-    // 409, rien n'est révoqué.
+    // Réponse perdue (5G) : l'ancien jeton rejoué tout de suite rend le
+    // MÊME successeur, et rien n'est révoqué.
     let (st, v) = renouveler(&app, &rt).await;
-    assert_eq!(st, StatusCode::CONFLICT, "{v}");
-    assert_eq!(v["code"], "refresh_token_already_rotated");
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["refresh_token"], nouveau_rt, "rejeu idempotent");
+    assert_eq!(moi(&app, v["token"].as_str().unwrap()).await, StatusCode::OK);
     let (st, v) = renouveler(&app, nouveau_rt).await;
     assert_eq!(st, StatusCode::OK, "le jeton tourné sert toujours : {v}");
 
@@ -258,8 +259,8 @@ async fn reutiliser_un_ancien_jeton_revoque_toute_la_famille() {
     let rt_legitime = v["refresh_token"].as_str().unwrap().to_string();
     assert_eq!(moi(&app, &acces_legitime).await, StatusCode::OK);
 
-    // Une minute plus tard, le voleur rejoue l'ancien jeton.
-    reculer(&state, "remplace_le", 60);
+    // Dix minutes plus tard, le voleur rejoue l'ancien jeton.
+    reculer(&state, "remplace_le", 600);
     let (st, v) = renouveler(&app, &vole).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
     assert_eq!(v["code"], "refresh_token_reused");
@@ -275,6 +276,64 @@ async fn reutiliser_un_ancien_jeton_revoque_toute_la_famille() {
     let (acces_autre, rt_autre) = connexion(&app, "ana").await;
     assert_eq!(moi(&app, &acces_autre).await, StatusCode::OK);
     assert_eq!(renouveler(&app, &rt_autre).await.0, StatusCode::OK);
+}
+
+/// Revue de sécurité (M) : le voleur renouvelle juste avant la victime.
+/// Elle rejoue et reçoit le même successeur ; au tour suivant, le second
+/// rejeu de la famille révoque la session — le voleur la perd aussi.
+#[tokio::test]
+async fn la_course_gagnee_par_le_voleur_revoque_la_session() {
+    let state = etat();
+    activer_l_authentification(&state);
+    compte(&state, "ana", false);
+    let app = app(&state, DISTANT);
+    let (_, rt1) = connexion(&app, "ana").await;
+    let (st, v) = renouveler(&app, &rt1).await;
+    assert_eq!(st, StatusCode::OK);
+    let rt2 = v["refresh_token"].as_str().unwrap().to_string();
+    let (st, v) = renouveler(&app, &rt1).await;
+    assert_eq!(st, StatusCode::OK, "rejeu de la victime : {v}");
+    assert_eq!(v["refresh_token"], rt2.as_str());
+    let (st, v) = renouveler(&app, &rt2).await;
+    assert_eq!(st, StatusCode::OK);
+    let rt3_voleur = v["refresh_token"].as_str().unwrap().to_string();
+    let acces_voleur = v["token"].as_str().unwrap().to_string();
+    let (st, v) = renouveler(&app, &rt2).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    assert_eq!(v["code"], "refresh_token_reused");
+    assert_eq!(renouveler(&app, &rt3_voleur).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(moi(&app, &acces_voleur).await, StatusCode::UNAUTHORIZED);
+}
+
+/// La révocation globale réutilisable (#9564 l'appellera) : toutes les
+/// sessions longues et toutes les familles.
+#[tokio::test]
+async fn la_revocation_globale_coupe_toutes_les_sessions() {
+    let state = etat();
+    activer_l_authentification(&state);
+    compte(&state, "ana", false);
+    compte(&state, "bob", false);
+    let app = app(&state, DISTANT);
+    let (a_ana, rt_ana) = connexion(&app, "ana").await;
+    let (a_bob, rt_bob) = connexion(&app, "bob").await;
+    tune_server::auth::revoquer_toutes_les_sessions(&state.backend);
+    for (a, rt) in [(&a_ana, &rt_ana), (&a_bob, &rt_bob)] {
+        assert_eq!(moi(&app, a).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(renouveler(&app, rt).await.0, StatusCode::UNAUTHORIZED);
+    }
+    // La forme transactionnelle rend le même service.
+    let (a_ana, rt_ana) = connexion(&app, "ana").await;
+    state
+        .backend
+        .write_tx(&mut |tx| {
+            tune_core::db::jetons_de_renouvellement::revoquer_toutes_les_sessions_tx(
+                tx,
+                tune_server::session_renouvelee::maintenant(),
+            )
+        })
+        .unwrap();
+    assert_eq!(moi(&app, &a_ana).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(renouveler(&app, &rt_ana).await.0, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

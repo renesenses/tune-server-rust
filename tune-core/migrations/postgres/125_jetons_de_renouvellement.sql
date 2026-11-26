@@ -8,7 +8,9 @@ CREATE TABLE IF NOT EXISTS jetons_de_renouvellement (
  cree_le BIGINT NOT NULL,
  expire_le BIGINT NOT NULL,
  remplace_le BIGINT,
- revoque_le BIGINT
+ revoque_le BIGINT,
+ rejoue_le BIGINT,
+ session_creee_le BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jetons_de_renouvellement_famille ON jetons_de_renouvellement(famille);
 CREATE INDEX IF NOT EXISTS idx_jetons_de_renouvellement_profil ON jetons_de_renouvellement(profile_id);

@@ -230,14 +230,30 @@ fn sessions_longues(settings: &SettingsRepo) -> Vec<(String, SessionLongue)> {
 }
 
 fn effacer_sessions_longues(settings: &SettingsRepo) {
+    revoquer_toutes_les_sessions(settings.backend());
+}
+
+/// rc14 — RÉVOCATION GLOBALE réutilisable : toutes les sessions longues
+/// inscrites (`auth_session_token:*`) et toutes les familles de jetons de
+/// renouvellement ; les WebSocket ouvertes avec une session se ferment.
+///
+/// ⚠️ À appeler par tout chemin qui change `jwt_secret` ou un mot de passe
+/// administrateur hors des routes de ce module — en particulier la
+/// récupération de l'accès administrateur (#9564, `poser_le_mot_de_passe`),
+/// qui change le secret en SQL direct : elle doit exécuter
+/// `tune_core::db::jetons_de_renouvellement::revoquer_toutes_les_sessions_tx`
+/// DANS SA TRANSACTION (la PR fusionnée en second branche l'appel).
+pub fn revoquer_toutes_les_sessions(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    let settings = SettingsRepo::with_backend(backend.clone());
     for (cle, _) in settings
         .par_prefixe(PREFIXE_SESSION_LONGUE)
         .unwrap_or_default()
     {
         settings.delete(&cle).ok();
     }
-    // rc14 — et leurs jetons de renouvellement.
-    crate::session_renouvelee::revoquer_tout(settings.backend());
+    crate::session_renouvelee::revoquer_tout(backend);
 }
 
 /// Désinscrit UNE session : son inscription (ses jetons d'accès ne valent
@@ -2050,10 +2066,12 @@ struct RefreshRequest {
 ///   révocation par l'administrateur, plafond, secrets renouvelés), mot de
 ///   passe changé, compte supprimé ;
 /// - 401 `refresh_token_reused` : jeton déjà consommé qui revient au-delà de
-///   30 s — vol présumé, la session entière est révoquée ;
-/// - 409 `refresh_token_already_rotated` : consommé il y a moins de 30 s
-///   (deux onglets, deux tâches) ; rien n'est révoqué, le client relit le
-///   jeton qu'il a rangé et réessaie une fois.
+///   2 min, second rejeu dans la famille, ou rejeu d'un jeton dont le
+///   successeur a déjà servi — vol présumé, la session entière est révoquée.
+///
+/// Un jeton consommé il y a moins de 2 min (réponse perdue) rend le MÊME
+/// successeur, sans rien révoquer, une fois par 7 jours et par session. La
+/// session meurt aussi 90 jours après la connexion, quel que soit l'usage.
 ///
 /// Tous les 401 veulent dire : retour à l'écran de connexion.
 async fn refresh(
@@ -2067,8 +2085,11 @@ async fn refresh(
         (statut, Json(json!({"error": code, "code": code}))).into_response()
     };
     let maintenant = crate::session_renouvelee::maintenant();
+    // La clé qui dérive le successeur d'un jeton (rejeu idempotent) : le
+    // secret de signature, propre au serveur ; le renouveler révoque tout.
+    let secret = get_or_create_jwt_secret(&settings);
     let emis = match JetonsDeRenouvellementRepo::with_backend(state.backend.clone())
-        .renouveler(body.refresh_token.trim(), maintenant)
+        .renouveler(body.refresh_token.trim(), secret.as_bytes(), maintenant)
     {
         Ok(e) => e,
         Err(r) => {
@@ -2090,7 +2111,6 @@ async fn refresh(
                     };
                     refus(StatusCode::UNAUTHORIZED, code)
                 }
-                Refus::DejaTourne => refus(StatusCode::CONFLICT, "refresh_token_already_rotated"),
                 Refus::Base => refus(StatusCode::SERVICE_UNAVAILABLE, "database_unavailable"),
             };
         }
@@ -2126,7 +2146,6 @@ async fn refresh(
         )
             .into_response();
     }
-    let secret = get_or_create_jwt_secret(&settings);
     let token = match signer_session(emis.profile_id, role, &secret, DUREE_SESSION, Some(&sid)) {
         Ok(t) => t,
         Err(e) => {

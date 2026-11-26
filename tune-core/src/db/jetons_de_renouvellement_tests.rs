@@ -10,6 +10,8 @@ use crate::db::migrations;
 use crate::db::sqlite::SqliteDb;
 
 const T0: i64 = 1_800_000_000;
+/// La clé du serveur qui dérive les successeurs.
+const CLE: &[u8] = b"cle-de-l-epreuve";
 
 fn base() -> (Arc<dyn DbBackend>, i64) {
     let db = SqliteDb::open_in_memory().unwrap();
@@ -36,8 +38,11 @@ pub(crate) fn epreuves_communes(db: Arc<dyn DbBackend>, id: i64) {
     rotation(&db, id);
     reutilisation_revoque_la_famille(&db, id);
     course_dans_le_delai_de_grace(&db, id);
+    course_gagnee_par_le_voleur(&db, id);
+    rejeu_d_un_jeton_dont_le_successeur_a_tourne(&db, id);
     expiration_a_30_jours_sans_usage(&db, id);
     fenetre_glissante(&db, id);
+    plafond_absolu_de_90_jours(&db, id);
     mot_de_passe_change(&db, id);
     revocations(&db, id);
     jamais_de_jeton_en_clair(&db, id);
@@ -48,50 +53,91 @@ fn rotation(db: &Arc<dyn DbBackend>, id: i64) {
     let a = repo.ouvrir(id, Some("Tune iOS"), T0).unwrap();
     assert!(a.jeton.starts_with(PREFIXE_JETON));
     assert_eq!(a.expire_le, T0 + DUREE_RENOUVELLEMENT);
-    let b = repo.renouveler(&a.jeton, T0 + 3600).unwrap();
+    let b = repo.renouveler(&a.jeton, CLE, T0 + 3600).unwrap();
     assert_ne!(a.jeton, b.jeton, "le jeton tourne");
     assert_eq!(a.famille, b.famille, "même famille");
     assert_eq!(b.profile_id, id);
-    // L'ancien ne sert plus (dans le délai de grâce : refusé sans révoquer).
-    assert_eq!(
-        repo.renouveler(&a.jeton, T0 + 3601).unwrap_err(),
-        Refus::DejaTourne
-    );
+    assert_eq!(b.jeton, successeur(CLE, &a.jeton), "successeur dérivé");
     assert!(repo.famille_active(&b.famille, T0 + 3601));
     // Le nouveau, lui, tourne à son tour.
-    let c = repo.renouveler(&b.jeton, T0 + 7200).unwrap();
+    let c = repo.renouveler(&b.jeton, CLE, T0 + 7200).unwrap();
     assert_eq!(c.famille, a.famille);
 }
 
 fn reutilisation_revoque_la_famille(db: &Arc<dyn DbBackend>, id: i64) {
     let repo = JetonsDeRenouvellementRepo::with_backend(db.clone());
     let vole = repo.ouvrir(id, None, T0).unwrap();
-    let legitime = repo.renouveler(&vole.jeton, T0 + 10).unwrap();
+    let legitime = repo.renouveler(&vole.jeton, CLE, T0 + 10).unwrap();
     // Le voleur rejoue l'ancien jeton une minute plus tard.
     assert_eq!(
-        repo.renouveler(&vole.jeton, T0 + 10 + DELAI_DE_GRACE + 1)
+        repo.renouveler(&vole.jeton, CLE, T0 + 10 + DELAI_DE_GRACE + 1)
             .unwrap_err(),
         Refus::Reutilise
     );
     assert!(!repo.famille_active(&vole.famille, T0 + 100));
     // Le jeton légitime de la famille est mort aussi.
     assert_eq!(
-        repo.renouveler(&legitime.jeton, T0 + 120).unwrap_err(),
+        repo.renouveler(&legitime.jeton, CLE, T0 + 120).unwrap_err(),
         Refus::Revoque
     );
 }
 
+/// Réponse perdue (5G) puis rejouée dans le délai de grâce : le MÊME
+/// successeur, rien n'est révoqué.
 fn course_dans_le_delai_de_grace(db: &Arc<dyn DbBackend>, id: i64) {
     let repo = JetonsDeRenouvellementRepo::with_backend(db.clone());
     let a = repo.ouvrir(id, None, T0).unwrap();
-    let b = repo.renouveler(&a.jeton, T0 + 5).unwrap();
+    let b = repo.renouveler(&a.jeton, CLE, T0 + 5).unwrap();
+    let rejoue = repo
+        .renouveler(&a.jeton, CLE, T0 + 5 + DELAI_DE_GRACE)
+        .unwrap();
+    assert_eq!(rejoue.jeton, b.jeton, "rejeu idempotent");
+    assert_eq!(rejoue.famille, b.famille);
+    // Rien n'est révoqué : le successeur sert toujours.
+    assert!(repo.renouveler(&b.jeton, CLE, T0 + 200).is_ok());
+}
+
+/// Revue de sécurité (M) : le voleur renouvelle juste avant la victime. La
+/// victime rejoue et reçoit le même successeur ; au tour suivant, un second
+/// rejeu dans la famille la révoque — le voleur perd la session.
+fn course_gagnee_par_le_voleur(db: &Arc<dyn DbBackend>, id: i64) {
+    let repo = JetonsDeRenouvellementRepo::with_backend(db.clone());
+    let rt1 = repo.ouvrir(id, None, T0).unwrap();
+    let rt2_voleur = repo.renouveler(&rt1.jeton, CLE, T0 + 10).unwrap();
+    let rt2_victime = repo.renouveler(&rt1.jeton, CLE, T0 + 20).unwrap();
+    assert_eq!(rt2_victime.jeton, rt2_voleur.jeton);
+    // Le voleur tourne encore le premier ; la victime rejoue de nouveau.
+    let rt3_voleur = repo.renouveler(&rt2_voleur.jeton, CLE, T0 + 3600).unwrap();
     assert_eq!(
-        repo.renouveler(&a.jeton, T0 + 5 + DELAI_DE_GRACE)
+        repo.renouveler(&rt2_victime.jeton, CLE, T0 + 3610)
             .unwrap_err(),
-        Refus::DejaTourne
+        Refus::Reutilise,
+        "second rejeu dans la famille"
     );
-    // Rien n'est révoqué : le jeton tourné sert toujours.
-    assert!(repo.renouveler(&b.jeton, T0 + 60).is_ok());
+    assert_eq!(
+        repo.renouveler(&rt3_voleur.jeton, CLE, T0 + 3620)
+            .unwrap_err(),
+        Refus::Revoque,
+        "le jeton du voleur est mort"
+    );
+    assert!(!repo.famille_active(&rt1.famille, T0 + 3620));
+}
+
+/// Un jeton rejoué alors que son successeur a déjà tourné : révocation, même
+/// dans le délai de grâce.
+fn rejeu_d_un_jeton_dont_le_successeur_a_tourne(db: &Arc<dyn DbBackend>, id: i64) {
+    let repo = JetonsDeRenouvellementRepo::with_backend(db.clone());
+    let a = repo.ouvrir(id, None, T0).unwrap();
+    let b = repo.renouveler(&a.jeton, CLE, T0 + 10).unwrap();
+    let c = repo.renouveler(&b.jeton, CLE, T0 + 20).unwrap();
+    assert_eq!(
+        repo.renouveler(&a.jeton, CLE, T0 + 30).unwrap_err(),
+        Refus::Reutilise
+    );
+    assert_eq!(
+        repo.renouveler(&c.jeton, CLE, T0 + 40).unwrap_err(),
+        Refus::Revoque
+    );
 }
 
 fn expiration_a_30_jours_sans_usage(db: &Arc<dyn DbBackend>, id: i64) {
@@ -99,7 +145,7 @@ fn expiration_a_30_jours_sans_usage(db: &Arc<dyn DbBackend>, id: i64) {
     let a = repo.ouvrir(id, None, T0).unwrap();
     assert!(repo.famille_active(&a.famille, T0 + DUREE_RENOUVELLEMENT - 1));
     assert_eq!(
-        repo.renouveler(&a.jeton, T0 + DUREE_RENOUVELLEMENT)
+        repo.renouveler(&a.jeton, CLE, T0 + DUREE_RENOUVELLEMENT)
             .unwrap_err(),
         Refus::Expire
     );
@@ -112,9 +158,24 @@ fn fenetre_glissante(db: &Arc<dyn DbBackend>, id: i64) {
     // 30 jours.
     let mut j = repo.ouvrir(id, None, T0).unwrap();
     for n in 1..=4 {
-        j = repo.renouveler(&j.jeton, T0 + n * 20 * 86400).unwrap();
+        j = repo.renouveler(&j.jeton, CLE, T0 + n * 20 * 86400).unwrap();
     }
-    assert_eq!(j.expire_le, T0 + 80 * 86400 + DUREE_RENOUVELLEMENT);
+    // Plafond absolu : 90 jours depuis la connexion, pas 80 + 30.
+    assert_eq!(j.expire_le, T0 + PLAFOND_SESSION);
+}
+
+fn plafond_absolu_de_90_jours(db: &Arc<dyn DbBackend>, id: i64) {
+    let repo = JetonsDeRenouvellementRepo::with_backend(db.clone());
+    let mut j = repo.ouvrir(id, None, T0).unwrap();
+    for n in 1..=4 {
+        j = repo.renouveler(&j.jeton, CLE, T0 + n * 20 * 86400 + 1).unwrap();
+    }
+    assert_eq!(
+        repo.renouveler(&j.jeton, CLE, T0 + PLAFOND_SESSION)
+            .unwrap_err(),
+        Refus::Expire
+    );
+    assert!(!repo.famille_active(&j.famille, T0 + PLAFOND_SESSION));
 }
 
 fn mot_de_passe_change(db: &Arc<dyn DbBackend>, id: i64) {
@@ -126,13 +187,13 @@ fn mot_de_passe_change(db: &Arc<dyn DbBackend>, id: i64) {
     )
     .unwrap();
     assert_eq!(
-        repo.renouveler(&a.jeton, T0 + 60).unwrap_err(),
+        repo.renouveler(&a.jeton, CLE, T0 + 60).unwrap_err(),
         Refus::Revoque
     );
     assert!(!repo.famille_active(&a.famille, T0 + 60));
     // Une connexion avec le nouveau mot de passe ouvre une famille neuve.
     let b = repo.ouvrir(id, None, T0 + 120).unwrap();
-    assert!(repo.renouveler(&b.jeton, T0 + 180).is_ok());
+    assert!(repo.renouveler(&b.jeton, CLE, T0 + 180).is_ok());
 }
 
 fn revocations(db: &Arc<dyn DbBackend>, id: i64) {
@@ -146,7 +207,7 @@ fn revocations(db: &Arc<dyn DbBackend>, id: i64) {
     );
     assert!(repo.revoquer_famille(&a.famille, T0 + 1) >= 1);
     assert_eq!(
-        repo.renouveler(&a.jeton, T0 + 2).unwrap_err(),
+        repo.renouveler(&a.jeton, CLE, T0 + 2).unwrap_err(),
         Refus::Revoque
     );
     assert!(
@@ -156,22 +217,22 @@ fn revocations(db: &Arc<dyn DbBackend>, id: i64) {
     // Se déconnecter partout.
     repo.revoquer_profil(id, T0 + 3);
     assert_eq!(
-        repo.renouveler(&autre.jeton, T0 + 4).unwrap_err(),
+        repo.renouveler(&autre.jeton, CLE, T0 + 4).unwrap_err(),
         Refus::Revoque
     );
     // Secrets renouvelés : tout le monde.
     let c = repo.ouvrir(id, None, T0 + 5).unwrap();
     repo.revoquer_tout(T0 + 6);
     assert_eq!(
-        repo.renouveler(&c.jeton, T0 + 7).unwrap_err(),
+        repo.renouveler(&c.jeton, CLE, T0 + 7).unwrap_err(),
         Refus::Revoque
     );
     // Jeton inconnu ou mal formé.
     assert_eq!(
-        repo.renouveler("tune_rt_0000", T0).unwrap_err(),
+        repo.renouveler("tune_rt_0000", CLE, T0).unwrap_err(),
         Refus::Inconnu
     );
-    assert_eq!(repo.renouveler("", T0).unwrap_err(), Refus::Inconnu);
+    assert_eq!(repo.renouveler("", CLE, T0).unwrap_err(), Refus::Inconnu);
     // Purge des expirés.
     assert!(repo.purger(T0 + 2 * DUREE_RENOUVELLEMENT) >= 1);
 }
@@ -179,7 +240,7 @@ fn revocations(db: &Arc<dyn DbBackend>, id: i64) {
 fn jamais_de_jeton_en_clair(db: &Arc<dyn DbBackend>, id: i64) {
     let repo = JetonsDeRenouvellementRepo::with_backend(db.clone());
     let a = repo.ouvrir(id, None, T0).unwrap();
-    let b = repo.renouveler(&a.jeton, T0 + 1).unwrap();
+    let b = repo.renouveler(&a.jeton, CLE, T0 + 1).unwrap();
     let lignes = db
         .query_many("SELECT * FROM jetons_de_renouvellement", &[])
         .unwrap();
