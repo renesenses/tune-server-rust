@@ -3196,13 +3196,6 @@ fn un_administrateur_a_un_mot_de_passe(state: &AppState) -> bool {
     }
 }
 
-fn maintenant_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Ouvre la fenêtre de première configuration. Appelé au démarrage, et
 /// seulement quand [`base_neuve_avant_ouverture`] a répondu oui. Ne rouvre
 /// jamais une fenêtre déjà ouverte ou fermée. Rend vrai si elle s'ouvre.

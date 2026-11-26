@@ -354,7 +354,11 @@ fn changement_de_marge_sous_pure_puis_sortie_9576() {
         let sortie = b.gains_db.len();
         b.jouer(150);
         let plafond = if monte { 0.0 } else { 6.02 };
-        b.jamais_au_dessus(sortie, plafond, &format!("marge changée sous PURE (monté {monte})"));
+        b.jamais_au_dessus(
+            sortie,
+            plafond,
+            &format!("marge changée sous PURE (monté {monte})"),
+        );
         b.sans_marche(sortie, &format!("marge changée sous PURE (monté {monte})"));
     }
 }

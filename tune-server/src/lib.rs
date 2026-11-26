@@ -83,11 +83,11 @@ pub mod plugins_host;
 pub mod premium_guard;
 /// Actions root d'un service qui ne tourne pas en root (Tune OS, #3206).
 pub mod privilege;
+/// Retrouver l'accès administrateur depuis la machine du serveur.
+pub mod recuperation_admin;
 /// Détail du RSS (`RssAnon`, `RssFile`, `RssShmem`) pour `memory_diagnostics`.
 pub mod releve_memoire;
 pub mod reprise_des_passes;
-/// Retrouver l'accès administrateur depuis la machine du serveur.
-pub mod recuperation_admin;
 pub mod routes;
 pub mod scan_import;
 /// rc14 — la session renouvelée tant qu'elle sert (`POST /auth/refresh`).

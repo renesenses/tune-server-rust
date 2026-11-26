@@ -741,7 +741,11 @@ async fn reinitialisation_refuse_l_ancien_jeton_d_acces_et_de_renouvellement() {
 
         // La révocation est écrite, pas seulement déduite du mot de passe.
         assert_eq!(compter(&state, FAMILLES_OUVERTES), 0, "familles révoquées");
-        assert_eq!(compter(&state, SESSIONS_INSCRITES), 0, "sessions désinscrites");
+        assert_eq!(
+            compter(&state, SESSIONS_INSCRITES),
+            0,
+            "sessions désinscrites"
+        );
         assert_eq!(
             moi(state.clone(), bearer.clone()).await,
             StatusCode::UNAUTHORIZED,

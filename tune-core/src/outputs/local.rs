@@ -10713,9 +10713,9 @@ mod tests;
 mod convolution_sous_licence_7632;
 // Revue de #9561 — la marge du filtre suit le headroom, flux en cours.
 #[cfg(test)]
-mod marge_convolution_9561;
-#[cfg(test)]
 mod interaction_pure_marge_9576;
+#[cfg(test)]
+mod marge_convolution_9561;
 
 #[cfg(test)]
 mod open_failure_tests;
