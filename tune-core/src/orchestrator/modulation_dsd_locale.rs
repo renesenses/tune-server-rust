@@ -139,6 +139,16 @@ pub(crate) fn sortie_locale_exclusive(
     }
 }
 
+/// rc14.1 (relecture de #9617) — la fenêtre de course : la case
+/// « exclusif » décochée PENDANT une lecture DoP ne change le mode de la
+/// sortie qu'au repos (`changer_de_mode_exclusif_au_repos`) ; la piste
+/// suivante, enchaînée sans repos, s'ouvre pourtant sous le réglage
+/// nouveau. La décision exige donc les DEUX : le mode vivant de la sortie
+/// (`None` : sortie non lisible sans attendre) ET la demande de la zone.
+pub(crate) fn exclusif_de_decision(vivant: Option<bool>, demande_de_zone: bool) -> bool {
+    demande_de_zone && vivant.unwrap_or(true)
+}
+
 /// Ce que l'on sait du périphérique d'une sortie locale.
 enum NomDuPeripherique {
     Connu(String),
@@ -488,6 +498,21 @@ impl PlaybackOrchestrator {
         let Some(device_id) = device_id else {
             return false;
         };
+        let (exclusif, backend) = self.exclusif_retenu(device_id);
+        let endpoint = ZoneRepo::with_backend(self.db.clone()).endpoint_id_de_la_sortie(device_id);
+        sortie_locale_exclusive(
+            std::env::consts::OS,
+            cfg!(feature = "asio"),
+            exclusif,
+            &backend,
+            endpoint.as_deref(),
+        )
+    }
+
+    /// rc14.1 (relecture de #9617) — l'exclusif que la décision retient :
+    /// le mode VIVANT de la sortie inscrite ET la demande de sa zone
+    /// ([`exclusif_de_decision`]), et le backend de la sortie.
+    pub(super) fn exclusif_retenu(&self, device_id: &str) -> (bool, String) {
         #[cfg(feature = "local-audio")]
         let lu: Option<(bool, String)> = {
             let sortie = self
@@ -506,19 +531,15 @@ impl PlaybackOrchestrator {
         };
         #[cfg(not(feature = "local-audio"))]
         let lu: Option<(bool, String)> = None;
-        let (exclusif, backend) = lu.unwrap_or_else(|| {
-            let (machine, backend) = self.reglages_sortie_locale();
-            let demande = self.exclusif_de_la_sortie_recreee(device_id, &backend, machine);
-            (demande.demande, backend)
-        });
-        let endpoint = ZoneRepo::with_backend(self.db.clone()).endpoint_id_de_la_sortie(device_id);
-        sortie_locale_exclusive(
-            std::env::consts::OS,
-            cfg!(feature = "asio"),
-            exclusif,
-            &backend,
-            endpoint.as_deref(),
-        )
+        let (machine, backend_machine) = self.reglages_sortie_locale();
+        let (vivant, backend) = match lu {
+            Some((mode, backend)) => (Some(mode), backend),
+            None => (None, backend_machine),
+        };
+        let demande = self
+            .exclusif_de_la_sortie_recreee(device_id, &backend, machine)
+            .demande;
+        (exclusif_de_decision(vivant, demande), backend)
     }
 
     /// La capacité native DÉJÀ connue (aucune sonde).

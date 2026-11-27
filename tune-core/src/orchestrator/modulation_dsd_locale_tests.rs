@@ -827,3 +827,60 @@ async fn une_sortie_partagee_ne_porte_pas_de_dop_module() {
     verifier_dop_stereo(&j, 176_400);
     assert!(matches!(j.etat(&b), Some(EtatModulation::EnService(_))));
 }
+
+/// rc14.1 (relecture de #9617) — la fenêtre de course : la case décochée
+/// pendant une lecture DoP laisse la sortie en exclusif jusqu'au repos ; la
+/// décision de la piste suivante lit le mode vivant ET la demande de la zone.
+#[test]
+fn exclusif_de_decision_exige_le_mode_vivant_et_la_demande() {
+    use super::exclusif_de_decision as d;
+    assert!(d(Some(true), true));
+    assert!(!d(Some(true), false), "case décochée pendant la lecture");
+    assert!(!d(Some(false), true), "sortie encore ouverte en partagé");
+    assert!(!d(Some(false), false));
+    assert!(d(None, true), "sortie occupée : la demande de la zone");
+    assert!(!d(None, false));
+}
+
+/// Même fenêtre, sur une vraie sortie inscrite : vivante en exclusif, case
+/// décochée → non ; recochée → oui ; sortie partagée, case cochée → non.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn la_case_decochee_pendant_la_lecture_l_emporte_sur_le_mode_vivant() {
+    let b = banc(true, "dop").await;
+    let id = "local:DAC DSD banc";
+    let inscrire = |exclusif: bool| {
+        crate::outputs::local::LocalOutput::new_with_exclusive("DAC DSD banc".into(), exclusif)
+    };
+    b.orch
+        .outputs
+        .lock()
+        .await
+        .register(Box::new(inscrire(true)));
+    assert!(b.orch.exclusif_retenu(id).0, "vivant exclusif, case cochée");
+    SettingsRepo::with_backend(b.orch.db.clone())
+        .set("local_exclusive_mode", "false")
+        .unwrap();
+    assert!(
+        !b.orch.exclusif_retenu(id).0,
+        "case décochée pendant la lecture : la piste suivante ne module plus"
+    );
+    SettingsRepo::with_backend(b.orch.db.clone())
+        .set("local_exclusive_mode", "true")
+        .unwrap();
+    b.orch
+        .outputs
+        .lock()
+        .await
+        .register(Box::new(inscrire(false)));
+    assert!(
+        !b.orch.exclusif_retenu(id).0,
+        "case cochée, sortie encore ouverte en partagé"
+    );
+    b.orch
+        .outputs
+        .lock()
+        .await
+        .register(Box::new(inscrire(true)));
+    assert!(b.orch.exclusif_retenu(id).0);
+}
