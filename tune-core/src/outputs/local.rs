@@ -889,6 +889,16 @@ pub struct LocalOutput {
     /// jamais au-delà : si le volume a été monté entre-temps, la remontée
     /// s'arrête au rapport `avant / courant` (`EqProcessor::borner_la_remontee`).
     volume_avant_egaliseur: AtomicU32,
+    /// rc14 (sécurité auditive, PURE) — le volume de l'auditeur (millièmes)
+    /// quand la chaîne a commencé à baisser le niveau hors égaliseur :
+    /// convolution, crossfeed, repli mono ou ReplayGain sous l'unité ;
+    /// `u32::MAX` : aucun. L'entrée en PURE rend ce niveau-là, jamais plus
+    /// (voir [`Self::borne_de_la_transition_pure`]).
+    volume_avant_traitement: AtomicU32,
+    /// rc14 (Didier) — le même repère pour la marge d'un filtre de
+    /// convolution : le volume de l'auditeur quand un filtre qui en porte une
+    /// a été posé ; `u32::MAX` : aucun (la remontée va alors au signal sec).
+    volume_avant_convolution: AtomicU32,
     /// #3973 — « bit-perfect strict » de la zone qui joue sur cette sortie.
     /// Armé, une conversion de fréquence (ouverture cpal ou changement de
     /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
@@ -1200,6 +1210,7 @@ impl LocalOutput {
         let f = (factor.clamp(0.0, 4.0) * 1000.0).round() as u32;
         self.replaygain_seul.store(f, Ordering::SeqCst);
         self.recalculer_la_compensation();
+        self.suivre_le_volume_avant_le_traitement();
     }
 
     /// #4685 — armer ou désarmer la compensation de niveau pour la zone qui
@@ -1546,6 +1557,8 @@ impl LocalOutput {
             volume_pose: AtomicBool::new(false),
             flux_sans_fin: AtomicBool::new(false),
             volume_avant_egaliseur: AtomicU32::new(u32::MAX),
+            volume_avant_traitement: AtomicU32::new(u32::MAX),
+            volume_avant_convolution: AtomicU32::new(u32::MAX),
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
             pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
@@ -1600,10 +1613,21 @@ impl LocalOutput {
             // préampli gardé à la coupure passe sur cette piste sans saut, et sa
             // rampe s'y poursuit vers le niveau d'avant l'égaliseur (#6524 b,
             // #6741). Jamais sous PURE, qui ne doit rien laisser monté.
-            if eq.is_none() && !self.pure_bypass.load(Ordering::Relaxed) {
+            // rc14 — sous PURE aussi : un surplus gardé (volume monté) ne
+            // saute pas à la piste suivante ; seul « Rendre le niveau » le rend.
+            if eq.is_none() {
                 eq = emplacement
                     .as_ref()
                     .and_then(|p| p.reporter_le_preampli_garde());
+            }
+            // rc14 (série TESS) — un égaliseur actif qui succède à un étage
+            // qui retenait une hausse de marge (maillon décoché, volume monté)
+            // la reprend : la piste suivante ne saute pas au-dessus du niveau
+            // d'avant l'égaliseur.
+            if !self.pure_bypass.load(Ordering::Relaxed)
+                && let (Some(neuf), Some(precedent)) = (eq.as_mut(), emplacement.as_ref())
+            {
+                neuf.reprendre_la_retenue_de(precedent);
             }
             self.eteindre_si_flux_sans_fin(&mut eq);
             self.borner_la_remontee(&mut eq);
@@ -1647,10 +1671,15 @@ impl LocalOutput {
     /// locale est un gain numérique linéaire (`effective_volume_units`). 0
     /// (gain gardé) sans référence ; 1 à volume nul (rien ne sort).
     fn borne_de_remontee(&self) -> f64 {
-        let avant = self.volume_avant_egaliseur.load(Ordering::SeqCst);
+        self.borne_depuis(self.volume_avant_egaliseur.load(Ordering::SeqCst), 0.0)
+    }
+
+    /// Le rapport `avant / courant` borné à 1 ; `sans_repere` quand `avant`
+    /// n'a pas été retenu (`u32::MAX`).
+    fn borne_depuis(&self, avant: u32, sans_repere: f64) -> f64 {
         let courant = self.volume_de_l_auditeur();
         if avant == u32::MAX {
-            0.0
+            sans_repere
         } else if courant == 0 {
             1.0
         } else {
@@ -1658,10 +1687,83 @@ impl LocalOutput {
         }
     }
 
+    /// rc14 (Didier) — la borne de remontée de la marge d'un filtre de
+    /// convolution retiré : la règle de #6741, depuis le volume retenu à la
+    /// pose du filtre ; sans repère, le signal sec (rien n'a bougé).
+    fn borne_de_la_convolution(&self) -> f64 {
+        self.borne_depuis(self.volume_avant_convolution.load(Ordering::SeqCst), 1.0)
+    }
+
     fn borner_la_remontee(&self, eq: &mut Option<super::super::audio::eq::EqProcessor>) {
         if let Some(eq) = eq.as_mut() {
-            eq.borner_la_remontee(self.borne_de_remontee());
+            let borne = if self.pure_bypass.load(Ordering::Relaxed) {
+                self.borne_de_la_transition_pure()
+            } else {
+                self.borne_de_remontee()
+            };
+            eq.borner_la_remontee(borne);
         }
+    }
+
+    /// rc14 (sécurité auditive, PURE) — suivre le volume d'avant la chaîne
+    /// hors égaliseur : retenu quand un premier étage baisse le niveau
+    /// (convolution, crossfeed, repli mono, ReplayGain sous l'unité), oublié
+    /// quand il n'en reste aucun. Rien ne bouge sous PURE : la chaîne y est
+    /// vidée, la référence sert à la transition.
+    fn suivre_le_volume_avant_le_traitement(&self) {
+        if self.pure_bypass.load(Ordering::Relaxed) {
+            return;
+        }
+        // Relecture de #9576 : un filtre retiré dont la marge gardée remonte
+        // encore (#9561) baisse toujours le niveau. Chaque verrou est pris et
+        // rendu dans son propre `let` : jamais deux tenus à la fois.
+        let filtre_configure = self.convolver_config.lock().is_ok_and(|c| c.is_some());
+        let marge_gardee = self
+            .convolver
+            .lock()
+            .is_ok_and(|c| c.as_ref().is_some_and(|m| m.porte_une_marge()));
+        let actif = filtre_configure
+            || marge_gardee
+            || self.crossfeed.lock().is_ok_and(|c| c.is_some())
+            || self.mono_downmix.load(Ordering::Relaxed)
+            || self.replaygain_seul.load(Ordering::SeqCst) < 1000
+            // rc14 (relecture de #9556) — un réglage des enceintes qui agit
+            // (sa réserve baisse les voies).
+            || enceintes_de_sortie::agit(&self.pure_bypass, false);
+        if !actif {
+            self.volume_avant_traitement
+                .store(u32::MAX, Ordering::SeqCst);
+        } else {
+            let _ = self.volume_avant_traitement.compare_exchange(
+                u32::MAX,
+                self.volume_de_l_auditeur(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    /// rc14 (sécurité auditive, PURE) — la borne de la transition d'entrée en
+    /// PURE : le plus bas des rapports `volume d'avant / volume courant` des
+    /// références connues (égaliseur, chaîne hors égaliseur), borné à 1. 0
+    /// (tout reste gardé) sans aucune référence ; 1 à volume nul.
+    fn borne_de_la_transition_pure(&self) -> f64 {
+        let courant = self.volume_de_l_auditeur();
+        [
+            self.volume_avant_egaliseur.load(Ordering::SeqCst),
+            self.volume_avant_traitement.load(Ordering::SeqCst),
+        ]
+        .into_iter()
+        .filter(|v| *v != u32::MAX)
+        .map(|avant| {
+            if courant == 0 {
+                1.0
+            } else {
+                (f64::from(avant) / f64::from(courant)).min(1.0)
+            }
+        })
+        .reduce(f64::min)
+        .unwrap_or(0.0)
     }
 
     /// #6741 — un geste de volume recalcule la borne du préampli gardé : un
@@ -1671,6 +1773,25 @@ impl LocalOutput {
     fn reborner_le_preampli_garde(&self) {
         if let Ok(mut eq) = self.eq.lock() {
             self.borner_la_remontee(&mut eq);
+        }
+        // rc14 (relecture de #9556) — l'entrée en PURE ou la coupure du
+        // réglage des enceintes suit la même borne.
+        enceintes_de_sortie::borner_en_pure(&self.pure_bypass, self.borne_de_la_transition_pure());
+        // rc14 — la garde du rendu suit la même borne (jamais vers le bas).
+        if self.pure_bypass.load(Ordering::Relaxed)
+            && self.reserve_du_surechantillonneur.garde() < 1.0 - 1e-6
+        {
+            self.reserve_du_surechantillonneur.ramper_la_garde(
+                self.cible_de_la_garde_du_rendu(),
+                super::super::audio::eq::REMONTEE_RAPIDE_TESS_MS,
+            );
+        }
+        // rc14 (Didier) — la marge gardée d'un filtre de convolution retiré.
+        let borne = self.borne_de_la_convolution();
+        if let Ok(mut c) = self.convolver.lock()
+            && let Some(c) = c.as_mut()
+        {
+            c.borner_la_remontee(borne);
         }
     }
 
@@ -1693,18 +1814,87 @@ impl LocalOutput {
         {
             p.liberer_le_gain_garde();
         }
+        // rc14 (relecture de #9556) — et le niveau tenu par l'entrée en PURE
+        // du réglage des enceintes.
+        enceintes_de_sortie::liberer_en_pure(&self.pure_bypass);
+        // rc14 — et la garde du rendu de l'entrée en PURE.
+        if self.reserve_du_surechantillonneur.garde() < 1.0 - 1e-6 {
+            self.reserve_du_surechantillonneur
+                .ramper_la_garde(1.0, super::super::audio::eq::REMONTEE_RAPIDE_TESS_MS);
+        }
     }
 
     /// #6741 — ce qu'un égaliseur coupé applique encore (voyant de la sortie).
     pub fn preampli_garde(&self) -> Option<super::super::audio::eq::PreampliGarde> {
-        if self.pure_bypass.load(Ordering::Relaxed) {
-            return None;
+        // rc14 — sous PURE, seul l'égaliseur coupé de la transition d'entrée
+        // peut rester monté : son gain gardé se voit (« niveau réduit »).
+        let etage = if self.pure_bypass.load(Ordering::Relaxed)
+            && self
+                .eq
+                .lock()
+                .ok()
+                .is_none_or(|e| e.as_ref().is_none_or(|p| !p.est_neutre()))
+        {
+            None
+        } else {
+            self.eq
+                .lock()
+                .ok()
+                .and_then(|e| e.as_ref().and_then(|p| p.preampli_garde()))
+        };
+        // rc14 (relecture de #9556) — le niveau que tient l'entrée en PURE du
+        // réglage des enceintes s'y ajoute : même voyant, même geste.
+        let etage = match (etage, enceintes_de_sortie::garde_en_pure(&self.pure_bypass)) {
+            (Some(e), Some((db, en_retour))) => Some(super::super::audio::eq::PreampliGarde {
+                db: e.db + db,
+                en_retour: e.en_retour || en_retour,
+            }),
+            (None, Some((db, en_retour))) => {
+                Some(super::super::audio::eq::PreampliGarde { db, en_retour })
+            }
+            (e, None) => e,
+        };
+        // rc14 — la garde du rendu (ReplayGain retiré par PURE) s'y ajoute :
+        // même voyant, même geste.
+        let garde = self.reserve_du_surechantillonneur.garde();
+        if garde < 1.0 - 1e-6 {
+            let garde_db = 20.0 * garde.log10();
+            let en_rampe = self.reserve_du_surechantillonneur.garde_en_rampe();
+            return Some(match etage {
+                Some(e) => super::super::audio::eq::PreampliGarde {
+                    db: e.db + garde_db,
+                    en_retour: e.en_retour || en_rampe,
+                },
+                None => super::super::audio::eq::PreampliGarde {
+                    db: garde_db,
+                    en_retour: en_rampe,
+                },
+            });
         }
-        self.eq
+        etage
+    }
+
+    /// rc14 (sécurité auditive, PURE) — la cible de la garde du rendu : ce
+    /// qu'il faut pour que le niveau, étage de transition compris, rejoigne
+    /// la borne de la transition (le niveau d'avant le traitement), jamais
+    /// au-delà. À volume inchangé : 1, PURE redevient bit-perfect.
+    fn cible_de_la_garde_du_rendu(&self) -> f64 {
+        let borne = self.borne_de_la_transition_pure();
+        if borne >= 1.0 - 1e-9 {
+            return 1.0;
+        }
+        let etage = self
+            .eq
             .lock()
-            .ok()?
-            .as_ref()
-            .and_then(|p| p.preampli_garde())
+            .ok()
+            .and_then(|e| e.as_ref().map(|p| p.niveau_hors_courbe()))
+            .unwrap_or(1.0);
+        let fin_de_l_etage = etage.max(borne.min(1.0));
+        if fin_de_l_etage > 0.0 {
+            (borne / fin_de_l_etage).min(1.0)
+        } else {
+            0.0
+        }
     }
 
     /// #5227 — confier à l'égaliseur qu'on installe la compensation de SON
@@ -1800,7 +1990,13 @@ impl LocalOutput {
             *emplacement = if self.pure_bypass.load(Ordering::Relaxed) {
                 // PURE : la chaîne est contournée, rien à fondre — et rien ne
                 // doit rester monté qui ferait croire à un DSP actif.
-                eq
+                // rc14 — sauf l'égaliseur coupé de la transition d'entrée
+                // (`set_pure_bypass`) : il finit de rejoindre le niveau d'avant
+                // l'égaliseur, ou garde le surplus d'un volume monté.
+                match eq {
+                    None => precedent.filter(|p| p.est_neutre() && !p.est_neutre_au_repos()),
+                    eq => eq,
+                }
             } else {
                 // #5215 — héritage des filtres ET, si le niveau bouge
                 // (coupure, activation, préampli déplacé), fondu enchaîné de
@@ -2050,7 +2246,42 @@ impl LocalOutput {
             active = current_format.is_some(),
             "convolver_ir_set"
         );
+        self.suivre_le_volume_avant_le_traitement();
         Ok(())
+    }
+
+    /// Revue de #9561 — la chaîne a changé (headroom Auto ↔ manuel, marge
+    /// manuelle, égaliseur qui la porte) : `config` est retenue pour les
+    /// pistes suivantes, et le moteur n'est RECONSTRUIT que si la marge qu'il
+    /// appliquerait au flux en cours n'est plus celle qu'il applique (un
+    /// réglage d'égaliseur ne refait pas la FFT du filtre). Rend vrai s'il a
+    /// été reconstruit.
+    pub fn reposer_la_convolution_si_la_marge_change(
+        &self,
+        config: super::super::audio::convolver::ConvolverConfig,
+    ) -> Result<bool, String> {
+        let en_service = self.convolver.lock().ok().and_then(|c| {
+            c.as_ref()
+                .filter(|c| !c.est_eteint())
+                .map(|c| c.reserve_db())
+        });
+        let format = self
+            .current_format()
+            .filter(|_| self.convolution_autorisee.load(Ordering::Relaxed));
+        if let (Some(r), Some((cadence, _))) = (en_service, format)
+            && let Ok(m) = config.marge_pour(cadence)
+            && (m.appliquee_db - r).abs() < 1e-9
+        {
+            *self.convolver_config.lock().unwrap() = Some(config);
+            return Ok(false);
+        }
+        self.set_convolver_config(config).map(|()| true)
+    }
+
+    /// Le jeu de convolution retenu (celui des pistes suivantes), marge
+    /// comprise : diagnostic et témoins.
+    pub fn config_de_convolution(&self) -> Option<super::super::audio::convolver::ConvolverConfig> {
+        self.convolver_config.lock().ok().and_then(|c| c.clone())
     }
 
     pub fn clear_convolver(&self) {
@@ -2059,6 +2290,7 @@ impl LocalOutput {
         // reste un simple retard jusqu'à la piste suivante, qui ne le
         // reconstruit pas) : ni clic ni saut de temps.
         self.installer_moteur(None, Self::trames_de_fondu(self.current_format()));
+        self.suivre_le_volume_avant_le_traitement();
         tracing::info!(device = %self.device_name, "convolver_cleared");
     }
 
@@ -2100,8 +2332,29 @@ impl LocalOutput {
             )),
             _ => None,
         };
+        let borne = self.borne_de_la_convolution();
+        let volume = self.volume_de_l_auditeur();
         {
             let mut actif = self.convolver.lock().unwrap();
+            // rc14 (Didier) — retenir le volume quand un filtre à marge arrive
+            // là où aucune marge ne tournait ; borner la remontée de celle
+            // qu'on retire (jamais au-dessus du niveau d'avant le filtre).
+            if nouveau.as_ref().is_some_and(|n| n.reserve_db() < 0.0)
+                && !actif.as_ref().is_some_and(|a| a.porte_une_marge())
+            {
+                self.volume_avant_convolution
+                    .store(volume, Ordering::SeqCst);
+            }
+            if let Some(a) = actif.as_mut() {
+                a.borner_la_remontee(borne);
+            }
+            // Revue de #9561 — un filtre moins atténué que celui qui joue
+            // (marge Auto retirée au passage en manuel) part du niveau
+            // entendu et remonte en ~0,5 s, borné au niveau d'avant.
+            let mut nouveau = nouveau;
+            if joue && let (Some(n), Some(a)) = (nouveau.as_mut(), actif.as_ref()) {
+                n.raccorder_le_niveau(a.niveau_en_service(), borne);
+            }
             // Le droit est relu SOUS le verrou : un retrait du Premium
             // concurrent (`set_convolution_autorisee`) n'est jamais ignoré.
             let nouveau = match nouveau {
@@ -2172,9 +2425,11 @@ impl LocalOutput {
                 .unwrap_or(0);
             // Les moteurs retirés sortent du verrou avant d'être libérés.
             let mut a_liberer = [None, None];
+            let borne = self.borne_de_la_convolution();
             if let Ok(mut c) = self.convolver.lock()
                 && let Some(conv) = c.as_mut()
             {
+                conv.borner_la_remontee(borne);
                 a_liberer = conv.eteindre_en_fondu_en_rendant(trames);
                 tracing::info!(device = %self.device_name, trames, "convolution_eteinte_sans_licence");
             }
@@ -2220,11 +2475,153 @@ impl LocalOutput {
             self.pure_contourne_un_gain_garde
                 .store(false, Ordering::Relaxed);
         }
+        // rc14 (sécurité auditive, décision du 25/11) — ENTRER en PURE ou en
+        // « Bypass all » ne saute plus d'un bloc au signal sec (toute la
+        // marge d'une série, jusqu'à +24 dB) : l'égaliseur en place devient
+        // un égaliseur coupé qui efface sa courbe par le fondu de #5215 et
+        // rejoint le niveau d'avant l'égaliseur en `REMONTEE_RAPIDE_TESS_MS`,
+        // jamais au-delà (#6741). Seul cet étage joue pendant la transition
+        // (`executeur_tess`) ; revenu à 0 dB il se retire et PURE redevient
+        // bit-perfect. Volume monté : le surplus reste gardé, avec le voyant
+        // et « Rendre le niveau » (#6524). Posé AVANT le drapeau, sous le
+        // verrou de l'égaliseur : aucun bloc ne passe sec entre les deux.
+        let entree = bypass && !self.pure_bypass.load(Ordering::Relaxed);
+        let sortie = !bypass && self.pure_bypass.load(Ordering::Relaxed);
+        if entree {
+            self.entrer_en_pure_par_un_fondu();
+            // rc14 (relecture de #9556) — le réglage des enceintes aussi :
+            // fondu, puis le niveau d'avant le réglage, jamais au-delà.
+            enceintes_de_sortie::entrer_en_pure(
+                &self.pure_bypass,
+                self.borne_de_la_transition_pure(),
+            );
+            // rc14 — le ReplayGain (remis à l'unité par l'orchestrateur), la
+            // compensation de niveau et la part portée par l'égaliseur tombent
+            // au RENDU : la garde du rendu tient le niveau d'avant, posée
+            // AVANT le drapeau (aucun bloc rendu plus fort entre les deux).
+            self.garder_le_rendu_a_l_entree_en_pure();
+        } else if sortie {
+            // Sortir de PURE ne garde rien : la chaîne revient à son niveau.
+            self.reserve_du_surechantillonneur.poser_la_garde(1.0);
+            // rc14 (relecture de #9556) — une chaîne sortante encore en
+            // fondu reprend sa place : l'étage de transition peut se mettre
+            // au repos, et le crossfeed revient tout de suite (historique
+            // compris), même quand l'orchestrateur ne le recharge pas (sortie
+            // de PURE pendant le démarrage d'un flux).
+            executeur_tess::abandonner_la_chaine_sortante(&self.eq, &self.crossfeed);
+            // rc14 (relecture de #9556) — et l'entrée en PURE du réglage des
+            // enceintes, si elle est en cours.
+            enceintes_de_sortie::sortir_de_pure(&self.pure_bypass);
+        }
         self.pure_bypass.store(bypass, Ordering::Relaxed);
         self.pure_ou_mesure.store(bypass, Ordering::Relaxed);
         // #4685 — un DSP contourné ne change aucun niveau : sa compensation
         // doit tomber avec lui.
         self.recalculer_la_compensation();
+        if entree && self.reserve_du_surechantillonneur.garde() < 1.0 - 1e-6 {
+            self.reserve_du_surechantillonneur.ramper_la_garde(
+                self.cible_de_la_garde_du_rendu(),
+                super::super::audio::eq::REMONTEE_RAPIDE_TESS_MS,
+            );
+        }
+    }
+
+    /// rc14 (sécurité auditive, décision du 25/11) — à l'entrée en PURE, la
+    /// garde du rendu vaut le rapport du gain rendu AVANT (volume ×
+    /// ReplayGain × compensation, part portée par l'égaliseur ôtée) à celui
+    /// que PURE rendra (le volume seul) : le niveau ne bouge pas d'un coup.
+    /// Rien en DoP (gain à l'unité de toute façon).
+    fn garder_le_rendu_a_l_entree_en_pure(&self) {
+        if self.dop_active.load(Ordering::Relaxed) {
+            return;
+        }
+        // Le volume de l'auditeur (celui d'avant la sourdine) : une bascule
+        // faite en sourdine ne doit pas perdre la garde au retour du son. À
+        // volume nul, le rapport se lit à mi-course (il ne dépend alors que
+        // des facteurs).
+        let user = match self.volume_de_l_auditeur() {
+            0 => UNITE_DU_GAIN_DE_RENDU / 2,
+            v => v,
+        };
+        let avant = effective_volume_units(user, self.rg_factor.load(Ordering::SeqCst), false);
+        let facteur_pure = reserve_du_surechantillonneur::facteur_compense(
+            composer_le_facteur_de_rendu(1000, 1000),
+            self.reserve_du_surechantillonneur.gain(),
+        );
+        let apres = effective_volume_units(user, facteur_pure, false);
+        if apres == 0 || avant >= apres {
+            return;
+        }
+        self.reserve_du_surechantillonneur
+            .poser_la_garde(f64::from(avant) / f64::from(apres));
+    }
+
+    /// rc14 — voir [`Self::set_pure_bypass`] : l'étage d'égaliseur passe en
+    /// transition vers le niveau d'avant l'égaliseur. Il porte aussi la
+    /// chaîne que PURE retire (convolution, crossfeed, repli mono), fondue
+    /// vers le sec par l'exécuteur ([`super::super::audio::eq::ChaineSortante`]) ;
+    /// sans égaliseur monté, un égaliseur coupé de transition la porte. Ni
+    /// égaliseur ni chaîne : rien à faire. Jamais en DoP.
+    fn entrer_en_pure_par_un_fondu(&self) {
+        use super::super::audio::eq::{ChaineSortante, EqProcessor};
+        let dop = self.dop_active.load(Ordering::Relaxed);
+        let format = self.current_format();
+        let chaine = if dop {
+            None
+        } else {
+            format.and_then(|(taux, canaux)| {
+                let stereo = canaux == 2;
+                let convolution = self
+                    .convolver
+                    .lock()
+                    // Relecture de #9576 : éteint mais portant encore la
+                    // marge gardée d un filtre retiré (#9561), à fondre aussi.
+                    .is_ok_and(|c| {
+                        c.as_ref()
+                            .is_some_and(|m| !m.est_eteint() || m.porte_une_marge())
+                    });
+                let mono = stereo && self.mono_downmix.load(Ordering::Relaxed);
+                let crossfeed = if stereo {
+                    self.crossfeed.lock().ok().and_then(|mut c| c.take())
+                } else {
+                    None
+                };
+                // Estimation de départ, avant toute mesure : le niveau moyen
+                // du crossfeed, et −3 dB pour un repli mono.
+                let estime_db = crossfeed
+                    .as_ref()
+                    .map_or(0.0, |c| c.gain_moyen_db().min(0.0))
+                    + if mono { -3.01 } else { 0.0 };
+                ChaineSortante::nouvelle(
+                    crossfeed,
+                    mono,
+                    convolution,
+                    taux,
+                    10.0_f64.powf(estime_db / 20.0),
+                )
+            })
+        };
+        let borne = self.borne_de_la_transition_pure();
+        let Ok(mut emplacement) = self.eq.lock() else {
+            return;
+        };
+        if emplacement.is_none() && chaine.is_none() {
+            return;
+        }
+        let precedent = emplacement.take();
+        let mut transition = EqProcessor::prendre_la_releve(None, precedent);
+        if let Some(chaine) = chaine {
+            let t = transition.get_or_insert_with(|| {
+                let (taux, canaux) = format.unwrap_or((44_100, 2));
+                EqProcessor::neutre_de_transition(taux, canaux)
+            });
+            t.poser_la_chaine_sortante(chaine);
+        }
+        if let Some(t) = transition.as_mut() {
+            t.borner_la_remontee(borne);
+            t.rendre_le_niveau_d_avant_en();
+        }
+        *emplacement = transition;
     }
 
     /// #6522, #6524 — dire à la sortie si les réglages ENREGISTRÉS de la zone
@@ -2460,6 +2857,7 @@ impl LocalOutput {
     /// ne peut pas claquer.
     pub fn set_mono_downmix(&self, mono: bool) {
         self.mono_downmix.store(mono, Ordering::Relaxed);
+        self.suivre_le_volume_avant_le_traitement();
     }
 
     /// rc14 — changer À CHAUD le réglage des enceintes de la zone (greffon
@@ -2472,7 +2870,16 @@ impl LocalOutput {
         dans_la_chaine: bool,
         reglages: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
     ) {
-        enceintes_de_sortie::poser(&self.pure_bypass, dans_la_chaine, reglages);
+        // rc14 (suite de la relecture de #9556) — une coupure (« Bypass
+        // all », greffon décoché) rejoint le niveau d'avant le réglage, borné
+        // par le volume, jamais au-delà.
+        enceintes_de_sortie::poser_borne(
+            &self.pure_bypass,
+            dans_la_chaine,
+            reglages,
+            self.borne_de_la_transition_pure(),
+        );
+        self.suivre_le_volume_avant_le_traitement();
     }
 
     /// rc14 — une NOUVELLE lecture démarre (lancement, reprise, seek, piste
@@ -2484,6 +2891,7 @@ impl LocalOutput {
         reglages: Option<crate::audio::reglage_enceintes::ReglagesEnceintes>,
     ) {
         enceintes_de_sortie::nouvelle_lecture(&self.pure_bypass, dans_la_chaine, reglages);
+        self.suivre_le_volume_avant_le_traitement();
     }
 
     /// rc14 — les voies qu'a vues le réglage des enceintes de cette sortie au
@@ -2681,6 +3089,7 @@ impl LocalOutput {
     pub fn set_crossfeed(&self, cf: Option<super::super::audio::crossfeed::CrossfeedProcessor>) {
         *self.crossfeed.lock().unwrap() = cf;
         self.recalculer_la_compensation();
+        self.suivre_le_volume_avant_le_traitement();
     }
 
     /// #7614 — pose (ou retire avec `None`) le choix du greffon de
@@ -2772,6 +3181,7 @@ impl LocalOutput {
         }
         // Verrou relâché : la compensation relit l'égaliseur ET le crossfeed.
         self.recalculer_la_compensation();
+        self.suivre_le_volume_avant_le_traitement();
     }
 
     pub fn has_crossfeed(&self) -> bool {
@@ -5317,7 +5727,12 @@ fn local_dsp_is_identity(
     mono_downmix: &AtomicBool,
 ) -> bool {
     if pure_bypass.load(Ordering::Relaxed) {
-        return true;
+        // rc14 — sauf pendant la transition d'entrée en PURE (égaliseur coupé
+        // qui rejoint le niveau d'avant l'égaliseur, ou surplus gardé).
+        return eq.lock().is_ok_and(|g| {
+            g.as_ref()
+                .is_none_or(|p| !p.est_neutre() || p.est_neutre_au_repos())
+        });
     }
     // Le repli mono compte comme les autres (#2362) : il RÉÉCRIT chaque
     // échantillon. Sans lui ici, le producteur Windows prendrait la branche
@@ -5344,6 +5759,14 @@ fn local_dsp_runtime_state(
         return OutputDspState::BypassedDop;
     }
     if pure_bypass.load(Ordering::Relaxed) {
+        // rc14 — transition d'entrée en PURE ou surplus gardé : le signal est
+        // encore modifié, le chemin ne dit PAS « bit-perfect ».
+        if eq.lock().is_ok_and(|g| {
+            g.as_ref()
+                .is_some_and(|p| p.est_neutre() && !p.est_neutre_au_repos())
+        }) {
+            return OutputDspState::Applied;
+        }
         // #4176 — dire si PURE contourne quelque chose. Un verrou
         // empoisonné ne permet pas de l'affirmer : on garde alors le
         // « contourné » d'avant, qui reste vrai.
@@ -10288,6 +10711,11 @@ mod tests;
 // #7632 — la convolution par RI est un droit Premium, éteinte sans clic.
 #[cfg(test)]
 mod convolution_sous_licence_7632;
+// Revue de #9561 — la marge du filtre suit le headroom, flux en cours.
+#[cfg(test)]
+mod interaction_pure_marge_9576;
+#[cfg(test)]
+mod marge_convolution_9561;
 
 #[cfg(test)]
 mod open_failure_tests;
@@ -10423,6 +10851,15 @@ mod chemin_compresse_publie_ses_transformations_4347;
 /// un fil arrêté pendant sa première lecture n'ouvre plus le périphérique.
 #[cfg(test)]
 mod bascule_pure_flux_en_demarrage_4176;
+
+/// rc14 — entrer en PURE ou en « Bypass all » ne fait plus sauter le niveau.
+#[cfg(test)]
+mod pure_sans_remontee_brutale_rc14;
+
+/// rc14 — sous PURE, convolution, crossfeed, repli mono et ReplayGain ne font
+/// plus sauter le niveau.
+#[cfg(test)]
+mod pure_chaine_et_replaygain_rc14;
 
 /// #4177 — en exclusif Windows, la pause rend le périphérique au lieu de le
 /// garder en poussant du silence.

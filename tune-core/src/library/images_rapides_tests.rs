@@ -5,7 +5,7 @@
 use super::*;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::time::Instant;
+use tokio::time::Instant;
 
 /// Une source simulée : elle attend son créneau sur `limiteur` (s'il y en a
 /// un), note l'instant où elle part, puis répond après `latence`.
@@ -66,7 +66,7 @@ async fn quatre_elements_a_la_fois_vont_au_moins_trois_fois_plus_vite() {
 /// un limiteur à une requête toutes les 20 ms, 4 à la fois. Deux départs ne
 /// sont jamais à moins de 20 ms l'un de l'autre, et la passe reste plus
 /// rapide que la version séquentielle (latence 80 ms > intervalle).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn le_debit_permis_par_la_source_est_tenu_en_parallele() {
     let intervalle = Duration::from_millis(20);
     let limiteur = RateLimiter::with_interval(intervalle);
@@ -76,7 +76,7 @@ async fn le_debit_permis_par_la_source_est_tenu_en_parallele() {
     for paire in departs.windows(2) {
         let ecart = paire[1] - paire[0];
         assert!(
-            ecart + Duration::from_millis(1) >= intervalle,
+            ecart >= intervalle,
             "deux requêtes à {ecart:?} d'intervalle : le débit du service est dépassé"
         );
     }

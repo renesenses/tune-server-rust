@@ -2583,17 +2583,48 @@ fn d1_les_cles_tenues_par_le_serveur() {
         "room_profile_index",
         "zone_7_tess_chain",
         "zone_12_tess_chain_sync",
+        // rc14 : les profils d'égaliseur et les préréglages.
+        "zone_7_eq_profile",
+        "zone_7_eq_profile_before_tess",
+        "eq_presets",
     ] {
         assert!(cle_tenue_par_le_serveur(cle), "{cle}");
     }
     for cle in [
-        "zone_7_eq_profile",
+        "zone_7_eq_profilette",
+        "zone_x_eq_profile",
+        "eq_presets_index",
+        "eq_active_preset",
+        "eq_expert_bands",
         "zone_7_tess_chainette",
         "zone_x_tess_chain",
         "room_correction_enabled",
         "theme",
     ] {
         assert!(!cle_tenue_par_le_serveur(cle), "{cle}");
+    }
+}
+
+/// rc14 : un import ne réécrit jamais tels quels le profil de pièce ni la
+/// chaîne ; les profils d'égaliseur, eux, passent par la règle de leurs
+/// routes (`config_export::egaliseurs`).
+#[test]
+fn rc14_les_profils_d_egaliseur_s_importent_selon_leur_regle() {
+    for cle in [
+        "zone_7_eq_profile",
+        "zone_7_eq_profile_before_tess",
+        "eq_presets",
+    ] {
+        assert!(cle_de_profil_d_egaliseur(cle), "{cle}");
+        assert!(!cle_jamais_importee(cle), "{cle}");
+    }
+    for cle in [
+        "room_profile_7",
+        "zone_7_tess_chain",
+        "zone_7_tess_chain_sync",
+    ] {
+        assert!(cle_jamais_importee(cle), "{cle}");
+        assert!(!cle_de_profil_d_egaliseur(cle), "{cle}");
     }
 }
 
@@ -3081,4 +3112,46 @@ fn retirer_la_correction_de_piece_efface_la_trace_de_la_correction_appliquee() {
     sans.plugins.retain(|m| m.id != ID_CORRECTION_PIECE);
     ecrire_chaine(&s, z, &sans).unwrap();
     assert_eq!(s.get(&cle_correction_appliquee(z)).unwrap(), None);
+}
+
+/// rc14 (fil 3103) — changer la seule cible DSD de l'étage fixe (DSD128 →
+/// DSD256) n'écrit aucune ancienne clé : la clé du suréchantillonneur figure
+/// tout de même au bilan, pour que la route qui écrit relance le flux modulé.
+#[test]
+fn changer_la_seule_cible_dsd_rend_la_cle_du_surechantillonneur() {
+    let (_b, s) = base();
+    let z = 55;
+    let cle = Partie::Surechantillonnage.cle(z);
+    let dsd = |rate| {
+        let mut c = ChaineTess::default();
+        c.fixed.upsampling = Upsampling::Dsd {
+            rate,
+            filter: OFFERED_FILTERS[0].into(),
+        };
+        c
+    };
+    ecrire_chaine(&s, z, &dsd(TauxDsd::Dsd128)).unwrap();
+    let avant = hors_tess(&s);
+    let b = ecrire_chaine(&s, z, &dsd(TauxDsd::Dsd256)).unwrap();
+    // Aucune ancienne clé réécrite (l'ancien suréchantillonneur reste éteint)…
+    assert_eq!(hors_tess(&s), avant);
+    // … mais l'étage fixe a changé : sa clé est au bilan, une seule fois.
+    assert_eq!(b.cles_modifiees, vec![cle.clone()], "{b:?}");
+    assert!(matches!(
+        lire_zone(&s, z, true).unwrap().chaine.fixed.upsampling,
+        Upsampling::Dsd {
+            rate: TauxDsd::Dsd256,
+            ..
+        }
+    ));
+    // Contre-épreuve : la même cible réécrite ne rend rien.
+    assert!(
+        ecrire_chaine(&s, z, &dsd(TauxDsd::Dsd256))
+            .unwrap()
+            .cles_modifiees
+            .is_empty()
+    );
+    // DSD → éteint : l'ancienne clé ne bouge pas non plus, la clé est rendue.
+    let b = ecrire_chaine(&s, z, &ChaineTess::default()).unwrap();
+    assert_eq!(b.cles_modifiees, vec![cle], "{b:?}");
 }

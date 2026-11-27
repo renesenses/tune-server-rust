@@ -301,6 +301,16 @@ fn chaine_brute(settings: &SettingsRepo, zone_id: i64) -> Option<ChaineTess> {
     serde_json::from_str(&brut).ok()
 }
 
+/// rc14 (Didier) — le headroom réglé sur la chaîne de la zone (Auto pour une
+/// chaîne absente ou illisible, comme le défaut de TESS). Lu par le jeu de
+/// réponses impulsionnelles : la marge de la convolution suit ce mode
+/// ([`crate::tess::etages_fixes::marge_de_convolution`]).
+pub fn headroom_de_zone(settings: &SettingsRepo, zone_id: i64) -> Headroom {
+    chaine_brute(settings, zone_id)
+        .map(|c| c.fixed.headroom)
+        .unwrap_or_default()
+}
+
 /// « Bypass all » est-il coché sur la chaîne de la zone ?
 pub fn bypass_all_de_zone(settings: &SettingsRepo, zone_id: i64) -> bool {
     settings

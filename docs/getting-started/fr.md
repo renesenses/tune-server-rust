@@ -74,6 +74,21 @@ L'assistant d'accueil vous guide à travers les premières étapes :
 
 ---
 
+## 2 bis. Administration sans mot de passe
+
+Tant que l'authentification n'est pas activée, les actions d'administration (redémarrer, mettre à jour, greffons…) sont acceptées depuis cette machine et depuis les appareils du réseau local. Ne sont jamais considérés comme locaux : l'accès à distance (relais, mandataire inverse), les adresses publiques, le partage d'adresses `100.64.0.0/10`, les plages `fc00::/8` et `fd7a:115c:a1e0::/48`, et la passerelle par défaut de la machine (une machine virtuelle en NAT ou un routeur qui réécrit l'adresse source y font apparaître toutes les connexions).
+
+Le compte, la licence et le jeton de l'accès à distance restent réservés à cette machine (ou à l'administrateur).
+
+Allumez **Réglages → Administration depuis cette machine seulement** (ou activez l'authentification) si :
+
+- un relais TCP (redirection de port) est placé sur une autre machine du réseau devant Tune : il n'est pas détectable ;
+- un réseau superposé utilise des adresses privées que Tune ne peut pas distinguer du réseau domestique. Vous pouvez aussi retirer ses plages avec `TUNE_ADMIN_LAN_EXCLUDED_RANGES=fd12:3456:789a::/48,10.8.0.0/24`.
+
+En conteneur, l'administration depuis le réseau local n'est ouverte qu'avec `TUNE_ADMIN_LAN_IN_CONTAINER=1`, à ne poser qu'avec le réseau de l'hôte (`--network host`). Sous Podman sans root, toutes les connexions semblent venir de `10.0.2.100` : ne pas poser cette variable.
+
+---
+
 ## 3. Ajouter votre bibliothèque
 
 **Réglages → Dossiers musicaux → Ajouter**
@@ -150,5 +165,46 @@ Seuls les points de diffusion Tune regroupés par **OAAT** partagent une horloge
 - **Forum communauté** : https://mozaiklabs.fr/forum
 - **GitHub** : https://github.com/renesenses/tune-server-rust
 - **CLI** : `cargo install tune-cli` pour piloter depuis le terminal
+
+---
+
+## 9. Mot de passe administrateur perdu
+
+Authentification active et mot de passe du compte administrateur (`default`,
+ou `admin`) perdu : la récupération se fait **sur la machine du serveur**, par
+une commande qui ne démarre pas le serveur et n'affiche jamais de mot de passe.
+Elle doit voir la même base que le service : même compte, mêmes
+`TUNE_DATA_DIR` / `TUNE_DB_PATH`. Sans base à cet endroit, elle le dit et ne
+crée rien.
+
+Deux façons de finir :
+
+- **avec un navigateur sur la machine** : `tune-server --reinitialiser-admin`
+  (ou `--reset-admin`) écrit un code à usage unique (15 min, 5 essais) dans la
+  console et dans `tune-server.log`. Ouvrir `http://localhost:8888` **sur cette
+  machine**, cliquer « Mot de passe oublié ? », saisir le code et le nouveau
+  mot de passe. Depuis un autre appareil, derrière un mandataire ou par le
+  relais distant, c'est refusé ;
+- **sans navigateur sur la machine** : ajouter `--mot-de-passe-stdin` (ou
+  `--password-stdin`) et taper le nouveau mot de passe, deux fois, sans qu'il
+  s'affiche (ou le passer par un tube : la première ligne est lue).
+
+Dans les deux cas, en une seule opération : les sessions ouvertes sont
+révoquées (il faut se reconnecter partout, et les WebSocket du serveur en
+marche se ferment dans les secondes qui suivent) et la **clé d'API est
+effacée** (à régénérer pour les scripts qui s'en servaient). Le **jeton du
+pont** (écoute à distance) ne change pas : les apps appairées le restent.
+Si l'écriture échoue, rien n'est changé et la commande le dit.
+
+| Système | Commande |
+|---|---|
+| Windows | Menu Démarrer → *Tune Server* → **Mot de passe administrateur oublié** (lance `reinitialiser-admin.bat` à côté de `tune-server.exe`) |
+| macOS | dans le Terminal, sous votre compte : `tune-server --reinitialiser-admin` (Homebrew) |
+| Debian / Ubuntu | `sudo -u tune sh -c 'cd /var/lib/tune && set -a && . /etc/default/tune-server && exec /opt/tune/tune-server --reinitialiser-admin'` |
+| Docker (conteneur `tune-server` du docker-compose) | `docker exec -it -u tune tune-server /app/tune-server --reinitialiser-admin --mot-de-passe-stdin` (le navigateur de l'hôte n'est pas « cette machine » pour le conteneur) |
+| Tune OS | en SSH : `sudo sh -c 'cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server --reinitialiser-admin --mot-de-passe-stdin'` |
+
+> Le mot de passe du **compte système** `tune` de Tune OS (SSH, console) est
+> une autre affaire : voir l'assistant de la console de l'image.
 
 Bonne écoute !

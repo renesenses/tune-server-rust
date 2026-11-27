@@ -53,6 +53,20 @@ pub(super) struct ReserveDuSurechantillonneur {
     dop_active: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
     device_name: Arc<str>,
+    /// rc14 (sécurité auditive, PURE) — la GARDE du rendu, en millionièmes
+    /// ([`UNITE`] : aucune) : un gain de plus sur la part ReplayGain du
+    /// facteur publié. L'entrée en PURE remet le ReplayGain à l'unité ; sans
+    /// elle, le niveau montait d'un coup de toute sa réduction (+6 à +10 dB).
+    /// Elle part du rapport « avant / après » et rejoint le niveau d'avant
+    /// le traitement par une rampe ([`Self::ramper_la_garde`]), jamais
+    /// au-delà. Elle vit au RENDU, comme le ReplayGain qu'elle remplace :
+    /// aucun décalage avec l'anneau.
+    garde: Arc<AtomicU32>,
+    /// rc14 — génération de la rampe de garde en cours : une rampe plus
+    /// récente (ou un arrêt) fait taire la précédente.
+    generation_garde: Arc<AtomicU64>,
+    /// rc14 — une rampe de garde est en cours (voyant « en retour »).
+    garde_en_rampe: Arc<AtomicBool>,
     /// Deux écrivains (la sortie, le fil de lecture) : chacun pose son entrée
     /// PUIS recompose sous ce verrou, si bien que le dernier à recomposer lit
     /// les deux entrées les plus récentes. Il garde aussi le flux auquel
@@ -87,7 +101,79 @@ impl ReserveDuSurechantillonneur {
             dop_active,
             volume,
             device_name: Arc::from(device_name),
+            garde: Arc::new(AtomicU32::new(UNITE)),
+            generation_garde: Arc::new(AtomicU64::new(0)),
+            garde_en_rampe: Arc::new(AtomicBool::new(false)),
             verrou: Arc::new(Mutex::new(FluxOuvert::default())),
+        }
+    }
+
+    /// rc14 — la garde du rendu, linéaire (1,0 : aucune).
+    pub(super) fn garde(&self) -> f64 {
+        f64::from(self.garde.load(Ordering::SeqCst)) / f64::from(UNITE)
+    }
+
+    /// rc14 — une rampe de garde est-elle en cours ?
+    pub(super) fn garde_en_rampe(&self) -> bool {
+        self.garde_en_rampe.load(Ordering::SeqCst)
+    }
+
+    /// rc14 — poser la garde (bornée à `]0, 1]`) et republier le facteur.
+    /// Arrête une rampe en cours.
+    pub(super) fn poser_la_garde(&self, gain: f64) {
+        self.generation_garde.fetch_add(1, Ordering::SeqCst);
+        self.garde_en_rampe.store(false, Ordering::SeqCst);
+        self.ecrire_la_garde(gain);
+    }
+
+    fn ecrire_la_garde(&self, gain: f64) {
+        let _tenu = self.tenir();
+        self.garde
+            .store(garde_en_millioniemes(gain), Ordering::SeqCst);
+        self.publier_sous_le_verrou();
+    }
+
+    /// rc14 — mener la garde de sa valeur courante à `cible` en `ms`, par une
+    /// rampe linéaire en dB (pas de 5 ms, hors du fil audio) : aucune marche.
+    /// Une cible sous la garde courante n'est jamais visée (la garde ne fait
+    /// jamais baisser le niveau) ; une rampe plus récente remplace celle-ci.
+    pub(super) fn ramper_la_garde(&self, cible: f64, ms: u32) {
+        let generation = self.generation_garde.fetch_add(1, Ordering::SeqCst) + 1;
+        let depart = self.garde();
+        let cible = if cible.is_finite() {
+            cible.clamp(depart, 1.0)
+        } else {
+            depart
+        };
+        if (cible - depart).abs() < 1e-6 {
+            self.garde_en_rampe.store(false, Ordering::SeqCst);
+            return;
+        }
+        self.garde_en_rampe.store(true, Ordering::SeqCst);
+        let moi = self.clone();
+        let pas = (ms / PAS_DE_GARDE_MS).max(1);
+        let lancee = std::thread::Builder::new()
+            .name("tune-garde-pure".into())
+            .spawn(move || {
+                for i in 1..=pas {
+                    std::thread::sleep(std::time::Duration::from_millis(u64::from(
+                        PAS_DE_GARDE_MS,
+                    )));
+                    if moi.generation_garde.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    let t = f64::from(i) / f64::from(pas);
+                    moi.ecrire_la_garde(depart.powf(1.0 - t) * cible.powf(t));
+                }
+                if moi.generation_garde.load(Ordering::SeqCst) == generation {
+                    moi.garde_en_rampe.store(false, Ordering::SeqCst);
+                }
+            });
+        if lancee.is_err() {
+            // Sans fil, la cible d'un coup plutôt qu'un niveau figé : elle ne
+            // dépasse jamais la borne.
+            self.garde_en_rampe.store(false, Ordering::SeqCst);
+            self.ecrire_la_garde(cible);
         }
     }
 
@@ -170,6 +256,8 @@ impl ReserveDuSurechantillonneur {
     fn publier_sous_le_verrou(&self) {
         let gain = self.gain();
         let facteur = facteur_compense(self.facteur_sans_reserve.load(Ordering::SeqCst), gain);
+        // rc14 — la garde de l'entrée en PURE, sur la part ReplayGain.
+        let facteur = facteur_garde(facteur, self.garde());
         // Le crête-mètre (RMS, spectre) mesure AVANT l'étage : la réserve est
         // un gain de plus entre son point de mesure et le DAC.
         let dsp = (f64::from(self.dsp_sans_reserve.load(Ordering::SeqCst)) * gain)
@@ -197,6 +285,29 @@ impl ReserveDuSurechantillonneur {
         let facteur = self.facteur_sans_reserve.load(Ordering::SeqCst);
         Some(ecart_de_niveau_db(user, facteur, gain))
     }
+}
+
+/// rc14 — pas de la rampe de garde du rendu.
+const PAS_DE_GARDE_MS: u32 = 5;
+
+/// rc14 — un gain de garde en millionièmes, dans `[1, UNITE]`.
+fn garde_en_millioniemes(gain: f64) -> u32 {
+    if gain.is_finite() && gain > 0.0 {
+        ((gain.min(1.0) * f64::from(UNITE)).round() as u32).clamp(1, UNITE)
+    } else {
+        UNITE
+    }
+}
+
+/// rc14 — le facteur de rendu empaqueté (#5227), sa part ReplayGain ×
+/// compensation multipliée par la garde (≤ 1). À l'unité, inchangé au bit.
+pub(super) fn facteur_garde(facteur: u32, garde: f64) -> u32 {
+    if !(garde.is_finite() && garde > 0.0 && garde < 1.0) {
+        return facteur;
+    }
+    let (rg, porte) = super::decomposer_le_facteur_de_rendu(facteur);
+    let rg = (f64::from(rg) * garde).round().clamp(0.0, 64_000.0) as u32;
+    super::composer_le_facteur_de_rendu(rg, porte)
 }
 
 /// `reserve_db` (≤ 0) en gain linéaire, en millionièmes ; l'unité sans étage

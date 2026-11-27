@@ -6,6 +6,8 @@ license.workspace = true
 autotests = false
 
 [features]
+# Fonctions réservées aux épreuves (fenêtre de première configuration).
+test-utils = []
 default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "collection-physique", "mon-theme", "aes67", "calibration"]
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
@@ -203,6 +205,8 @@ dotenvy = { workspace = true }
 tune-aes67 = { path = "../plugins/tune-aes67", optional = true }
 
 [dev-dependencies]
+# Les épreuves d'intégration voient les fonctions de `test-utils`.
+tune-server = { path = ".", default-features = false, features = ["test-utils"] }
 tower = "0.5"
 # Test-only (#6286) : donner aux FLAC témoins de l'audit d'intégrité le MD5
 # STREAMINFO de leur PCM. Déjà dans Cargo.lock par tune-core.
@@ -300,6 +304,18 @@ path = "tests/pont_administration.rs"
 [[test]]
 name = "relais_routes_relayables"
 path = "tests/relais_routes_relayables.rs"
+
+# Session « rester connecté » (remember) des remotes : 30 jours, révocable.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "session_longue_remember"
+path = "tests/session_longue_remember.rs"
+
+# rc14 — la session renouvelée tant qu'elle sert (`POST /auth/refresh`) :
+# rotation, réutilisation, expiration, révocations, relais, WebSocket.
+[[test]]
+name = "session_renouvelee_rc14"
+path = "tests/session_renouvelee_rc14.rs"
 
 # #9174 — la provenance du lecteur d'une zone navigateur (relais ou local).
 # `autotests = false` plus haut : sans cette cible, jamais compilé.
@@ -1589,6 +1605,11 @@ path = "tests/import_convolution_t09a.rs"
 name = "tess_prereglages_routes_t17"
 path = "tests/tess_prereglages_routes_t17.rs"
 
+# rc14 (Rémi) — « Enregistrer » écrase le préréglage d'origine, « Recharger ».
+[[test]]
+name = "tess_prereglage_ecraser_rc14"
+path = "tests/tess_prereglage_ecraser_rc14.rs"
+
 # #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
 # et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans
 # cette cible, le fichier ne serait jamais compilé.
@@ -2058,6 +2079,12 @@ path = "tests/sso_modules_du_compte.rs"
 name = "licence_par_le_compte_7419"
 path = "tests/licence_par_le_compte_7419.rs"
 
+# #1279 — une clé valide collée débloque le Premium du premier appel.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "licence_activation_immediate"
+path = "tests/licence_activation_immediate.rs"
+
 # #5682 — les gardes du montage SMB (#1834, #1916) et l'ordre « remonter les
 # partages, PUIS scanner » de `bootstrap.rs`. Le fichier existait sans cible :
 # `autotests = false` ne l'avait jamais compilé (relevé pendant #5682).
@@ -2273,6 +2300,12 @@ path = "tests/raccourcis_windows_sans_console_7637.rs"
 name = "licence_retrait_libere_la_machine_7726"
 path = "tests/licence_retrait_libere_la_machine_7726.rs"
 
+# rc14 — dire pourquoi le palier est gratuit : une raison par réponse du site
+# de licences, contre un faux serveur local.
+[[test]]
+name = "licence_raison_du_palier"
+path = "tests/licence_raison_du_palier.rs"
+
 # Durcissement de la configuration : écritures génériques de `settings` et
 # contrôle d'origine, par le vrai routeur. `autotests = false` plus haut : sans
 # cette cible, le banc ne serait JAMAIS compilé.
@@ -2297,6 +2330,37 @@ path = "tests/durcissement_routes_admin.rs"
 [[test]]
 name = "activation_authentification"
 path = "tests/activation_authentification.rs"
+
+# rc14 : mot de passe administrateur créé dans l'assistant de première
+# configuration (installation neuve, réseau local, fenêtre courte, une fois).
+[[test]]
+name = "premiere_configuration_admin"
+path = "tests/premiere_configuration_admin.rs"
+
+[[test]]
+name = "revue_premiere_configuration"
+path = "tests/revue_premiere_configuration.rs"
+
+[[test]]
+name = "revue2_premiere_configuration"
+path = "tests/revue2_premiere_configuration.rs"
+
+# Variables d'environnement : une seule épreuve dans ce binaire.
+[[test]]
+name = "premiere_configuration_environnement"
+path = "tests/premiere_configuration_environnement.rs"
+
+# rc14 : sans authentification, l'administration depuis le réseau local
+# (variables d'environnement : épreuves sérialisées dans ce binaire).
+[[test]]
+name = "administration_reseau_local_rc14"
+path = "tests/administration_reseau_local_rc14.rs"
+
+# rc14 : mot de passe administrateur perdu, réinitialisé depuis la machine
+# du serveur (`--reinitialiser-admin`, `POST /auth/admin/reinitialiser`).
+[[test]]
+name = "recuperation_admin_rc14"
+path = "tests/recuperation_admin_rc14.rs"
 
 # rc13.2 : connexion de `default` sur cette machine et depuis le réseau local,
 # après l'activation et sur une base rc12 (ancien hachage). SQLite, et

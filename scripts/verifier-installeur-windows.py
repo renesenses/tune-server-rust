@@ -16,7 +16,7 @@ import textwrap
 def script_nsis(workflow: str, outils: bool) -> str:
     debut = workflow.index("- name: Create installer (windows)")
     bloc = re.search(
-        r'^          @"\n(.*?)^          "@ \| Out-File -Encoding ASCII installer\.nsi',
+        r'^          @"\n(.*?)^          "@ \| Out-File -Encoding utf8BOM installer\.nsi',
         workflow[debut:], re.MULTILINE | re.DOTALL,
     )
     if bloc is None:
@@ -59,8 +59,9 @@ def compiler(makensis: str, workflow: str, outils: bool) -> None:
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(b"Fichier factice du banc NSIS, ne pas executer.\n")
         nsis = dossier / "installer.nsi"
-        # Out-File -Encoding ASCII dans le workflow de livraison.
-        nsis.write_bytes(source.encode("ascii", errors="replace"))
+        # Out-File -Encoding utf8BOM dans le workflow de livraison, avec
+        # `Unicode true` en tête du script : UTF-8 avec BOM.
+        nsis.write_bytes(source.encode("utf-8-sig"))
         subprocess.run([makensis, str(nsis)], cwd=dossier, check=True)
         resultat = dossier / "tune-verification-setup.exe"
         if not resultat.is_file() or resultat.stat().st_size == 0:

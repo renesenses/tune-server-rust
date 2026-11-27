@@ -178,14 +178,27 @@ async fn le_rapport_de_bug_nomme_le_partage_non_declare() {
                  enregistré — la bibliothèque reste vide sans explication.\n{md}"
             )
         });
-    assert!(ligne.contains(&point), "{ligne}");
+    // Le rapport part sur un forum public : il MASQUE le nom de la machine
+    // dans les chemins (`/srv/tmp/runner/hulk-server-6/…` devient
+    // `/srv/tmp/runner/[appareil 1]-server-6/…`). On ne cherche donc pas le
+    // chemin brut, qui dépend du `TMPDIR` et du nom d'hôte du runner (fil
+    // 6175), mais le nom du partage, qui n'est jamais masqué.
+    let partage = nom_du_partage(&point);
+    assert!(ligne.contains(&partage), "{ligne}");
     assert!(ligne.contains("la bibliothèque reste vide"), "{ligne}");
-    assert_eq!(
-        rapport["library"]["mounted_shares_not_declared"][0]["mount_path"],
-        point.as_str(),
-        "{}",
-        rapport["library"]
-    );
+    let chemin = rapport["library"]["mounted_shares_not_declared"][0]["mount_path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("mount_path absent : {}", rapport["library"]));
+    assert!(chemin.ends_with(&partage), "{chemin}");
+}
+
+/// La partie du chemin que le masquage ne touche pas : le dernier composant.
+fn nom_du_partage(point: &str) -> String {
+    Path::new(point)
+        .file_name()
+        .expect("le point de montage a un nom")
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[tokio::test]

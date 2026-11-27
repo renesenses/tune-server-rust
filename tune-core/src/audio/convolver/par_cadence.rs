@@ -399,6 +399,47 @@ pub(super) fn ri_a_la_cadence(variante: &Variante, vers: u32) -> Result<Arc<[Vec
     Ok(ri)
 }
 
+/// rc14 (Didier) — le gain maximal (`max |H(f)|`, dB, pire canal) de la RI
+/// de `variante` À LA CADENCE `vers`, donc APRÈS rééchantillonnage : le
+/// repli garde la somme des coefficients (le gain continu), pas la crête du
+/// spectre, et un filtre réexporté à une autre cadence n'a pas le même gain.
+/// Calculé une fois par (contenu, cadence) et gardé en cache ; jamais dans
+/// le fil audio (construction du moteur, préchauffe, chemin du signal).
+pub(super) fn gain_max_a_la_cadence(variante: &Variante, vers: u32) -> Result<f64, String> {
+    gain_max_avec(variante, vers, None)
+}
+
+/// [`gain_max_a_la_cadence`], avec la RI à cette cadence déjà en main (la
+/// construction du moteur) : une RI trop grosse pour le cache n'est pas
+/// rééchantillonnée deux fois.
+pub(super) fn gain_max_avec(
+    variante: &Variante,
+    vers: u32,
+    taps: Option<&[Vec<f32>]>,
+) -> Result<f64, String> {
+    let cle = (variante.cle.clone(), vers);
+    if let Some(g) = GAINS.lock().ok().and_then(|c| c.get(&cle).copied()) {
+        return Ok(g);
+    }
+    let g = match taps {
+        Some(t) => super::courbe_fft::gain_max_db(t, vers),
+        None => super::courbe_fft::gain_max_db(&ri_a_la_cadence(variante, vers)?, vers),
+    }
+    .unwrap_or(0.0);
+    if let Ok(mut c) = GAINS.lock() {
+        if c.len() >= GAINS_MAX {
+            c.clear();
+        }
+        c.insert(cle, g);
+    }
+    Ok(g)
+}
+
+/// Le cache des gains maximaux : un `f64` par (contenu, cadence).
+const GAINS_MAX: usize = 256;
+static GAINS: LazyLock<Mutex<HashMap<CleCache, f64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Octets occupés par le cache (tests, diagnostic).
 pub fn octets_en_cache() -> usize {
     CACHE.lock().map(|c| c.octets).unwrap_or(0)
@@ -449,6 +490,15 @@ pub struct JeuDeZone {
     pub principal: String,
     pub supplementaires: Vec<String>,
     pub reechantillonner: bool,
+    /// rc14 (Didier) — le headroom de la chaîne TESS de la zone : il décide
+    /// de la marge que le moteur applique au filtre.
+    pub headroom: crate::tess::chaine::Headroom,
+    /// Revue de #9561 — en marge MANUELLE, l'égaliseur que le moteur fait
+    /// tourner pour la zone (`profil_du_moteur` : la série, ou le gain fixe M
+    /// de la sortie locale), qui porte déjà `min(M, L1)` ; `None` : aucun
+    /// (sortie réseau sans égaliseur), le convolueur porte alors M lui-même.
+    /// Toujours `None` en Auto (inutile).
+    pub egaliseur_amont: Option<crate::audio::eq::EqProfile>,
 }
 
 impl JeuDeZone {
@@ -474,10 +524,16 @@ impl JeuDeZone {
             .ok()
             .flatten()
             .is_none_or(|v| v.trim() != "false" && v.trim() != "0");
+        let headroom = crate::tess::egaliseurs_en_serie::headroom_de_zone(settings, zone_id);
+        let egaliseur_amont = matches!(headroom, crate::tess::chaine::Headroom::Manual { .. })
+            .then(|| egaliseur_en_service(settings, zone_id))
+            .flatten();
         Self {
             principal,
             supplementaires,
             reechantillonner,
+            headroom,
+            egaliseur_amont,
         }
     }
 
@@ -504,8 +560,24 @@ impl JeuDeZone {
     }
 
     pub fn charger(&self) -> Result<ConvolverConfig, String> {
-        ConvolverConfig::depuis_jeu(&self.chemins(), self.reechantillonner)
+        ConvolverConfig::depuis_jeu(&self.chemins(), self.reechantillonner).map(|c| {
+            c.avec_headroom(self.headroom)
+                .avec_egaliseur_amont(self.egaliseur_amont.clone())
+        })
     }
+}
+
+/// L'égaliseur que le moteur construit pour la zone, s'il touche au signal
+/// (la même lecture que le chemin du signal, `active_zone_eq_profile`). Le
+/// droit Premium est tenu pour acquis : la convolution l'exige déjà.
+fn egaliseur_en_service(
+    settings: &crate::db::settings_repo::SettingsRepo,
+    zone_id: i64,
+) -> Option<crate::audio::eq::EqProfile> {
+    let p = crate::tess::egaliseurs_en_serie::profil_du_moteur(settings, zone_id, true)?;
+    crate::audio::eq::EqProcessor::new(&p, 48_000, 2)
+        .is_enabled()
+        .then_some(p)
 }
 
 #[cfg(test)]

@@ -1333,3 +1333,127 @@ async fn un_prereglage_par_son_corps_suit_les_bornes_de_gain_9520() {
         .await;
     assert_eq!(s, StatusCode::CREATED, "{v}");
 }
+
+/// rc14 (fil 3103) — un préréglage qui ne change QUE la cible DSD (DSD128 →
+/// DSD256) rend la clé de l'étage fixe : elle rejoint la file du mode
+/// `at_next_playback` (et, en mode immédiat, `rafraichir` relance le flux
+/// modulé à sa position). Avant : `cles=[]`, rien ne suivait.
+#[tokio::test]
+async fn un_prereglage_qui_change_la_seule_cible_dsd_rend_la_cle_de_l_etage_fixe() {
+    let b = Banc::avec_sortie(true, "local", "local:SMSL SU-9", 80).await;
+    ZoneRepo::with_backend(b.state.backend.clone())
+        .update_dsd_mode(b.zone, "dop")
+        .unwrap();
+    tune_core::tess::modulation_dsd::retenir_mesure_de_la_machine([50.0, 25.0, 12.0]);
+    let dsd =
+        |rate: &str| json!({"version": 1, "fixed": {"upsampling": {"mode": "dsd", "rate": rate}}});
+    let cle = format!("zone_{}_upsampler", b.zone);
+
+    let (s, v) = b.put_chaine(dsd("dsd256")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, p) = b.enregistrer("DSD256 upsampling").await;
+    assert_eq!(s, StatusCode::CREATED, "{p}");
+    let id = p["id"].as_str().unwrap().to_owned();
+    let (s, v) = b.put_chaine(dsd("dsd128")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    mode(&b, "at_next_playback").await;
+    assert!(cles_en_attente(b.zone).is_empty());
+
+    let (s, v) = b.appliquer(&id).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["apply_mode"], json!("at_next_playback"));
+    let attente = cles_en_attente(b.zone);
+    assert!(attente.contains(&cle), "{attente:?}");
+    // Le panneau (même `PUT`) aussi : DSD256 → DSD128.
+    appliquer_a_la_lecture(&b.state, b.zone).await;
+    let (s, v) = b.put_chaine(dsd("dsd128")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(cles_en_attente(b.zone).contains(&cle));
+    appliquer_a_la_lecture(&b.state, b.zone).await;
+
+    // Contre-épreuve : la même cible renvoyée ne rend rien.
+    let (s, v) = b.put_chaine(dsd("dsd128")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(
+        cles_en_attente(b.zone).is_empty(),
+        "{:?}",
+        cles_en_attente(b.zone)
+    );
+    mode(&b, "immediately").await;
+}
+
+/// #9575 — seule la bascule de Bypass all demande de rouvrir le flux PCM
+/// pour en retirer la cadence fixe. Le changement de cible DSD rend aussi
+/// la clé de l'étage fixe, mais le flux en cours n'est pas modulé.
+#[tokio::test(start_paused = true)]
+async fn un_prereglage_bascule_bypass_all_et_change_la_cible_dsd() {
+    use std::time::Duration;
+    use tune_core::{audio::frequence_fixe, playback::NowPlaying};
+
+    let b = Banc::avec_sortie(true, "local", "local:SMSL SU-9", 81).await;
+    ZoneRepo::with_backend(b.state.backend.clone())
+        .update_dsd_mode(b.zone, "dop")
+        .unwrap();
+    tune_core::tess::modulation_dsd::retenir_mesure_de_la_machine([50.0, 25.0, 12.0]);
+    let chaine = |bypass: bool, rate: &str| {
+        json!({
+            "version": 1, "bypass_all": bypass,
+            "fixed": {"upsampling": {"mode": "dsd", "rate": rate}}
+        })
+    };
+    let (s, v) = b.put_chaine(chaine(true, "dsd256")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, preset) = b.enregistrer("Bypass et DSD256").await;
+    assert_eq!(s, StatusCode::CREATED, "{preset}");
+    let (s, v) = b.put_chaine(chaine(false, "dsd128")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    b.settings()
+        .set(&frequence_fixe::cle_de_zone(b.zone), "48000")
+        .unwrap();
+    assert_eq!(
+        frequence_fixe::active(&b.state.backend, b.zone),
+        Some(48_000)
+    );
+    b.state
+        .playback
+        .play(
+            b.zone,
+            NowPlaying {
+                title: "PCM en cours".into(),
+                source: "local".into(),
+                format: Some("wav".into()),
+                sample_rate: Some(48_000),
+                duration_ms: 60_000,
+                ..Default::default()
+            },
+        )
+        .await;
+    b.state.playback.update_position(b.zone, 12_000).await;
+    let mut evenements = b.state.playback.subscribe();
+    let (s, v) = b.appliquer(preset["id"].as_str().unwrap()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["apply_mode"], "immediately");
+    let chaine = &v["zone"]["chain"];
+    assert_eq!(chaine["bypass_all"], true);
+    assert_eq!(chaine["fixed"]["upsampling"]["rate"], "dsd256");
+    assert_eq!(frequence_fixe::active(&b.state.backend, b.zone), None);
+
+    // L'ordonnanceur de relance repositionne réellement la lecture après
+    // l'anti-rebond. Lire seulement la chaîne persistée laisserait passer
+    // une bascule ignorée par le moteur.
+    let position = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let e = evenements.recv().await.unwrap();
+            if e.zone_id == b.zone && e.event == "seek" {
+                break e.data["position_ms"].as_i64().unwrap();
+            }
+        }
+    })
+    .await
+    .expect("Bypass all doit relancer le flux PCM à sa position");
+    assert!(
+        (12_000..60_000).contains(&position),
+        "position de reprise {position} ms"
+    );
+}

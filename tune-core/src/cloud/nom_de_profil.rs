@@ -28,8 +28,9 @@ pub fn nom_neutre(nom_affiche: &str, courriel: &str) -> String {
     } else {
         base
     };
-    // `default` est le profil d'origine de toute installation : jamais pris.
-    if base.is_empty() || base.eq_ignore_ascii_case("default") {
+    // `admin` est le profil d'origine de toute installation depuis la rc14, et
+    // `default` son ancien nom, resté son alias à la connexion : jamais pris.
+    if base.is_empty() || crate::db::profil_administrateur::nom_reserve(&base) {
         "compte".to_string()
     } else {
         base
@@ -171,6 +172,8 @@ mod tests {
         assert_eq!(nom_neutre("lea@exemple.test", "lea@exemple.test"), "lea");
         assert_eq!(nom_neutre("", ""), "compte");
         assert_eq!(nom_neutre("Default", "x@y.z"), "compte");
+        assert_eq!(nom_neutre("Admin", "x@y.z"), "compte");
+        assert_eq!(nom_neutre("", "admin@y.z"), "compte");
         assert_eq!(nom_affiche_neutre("lea@exemple.test"), "lea");
         assert_eq!(nom_affiche_neutre("Léa"), "Léa");
         assert!(!nom_neutre("x@y.z", "x@y.z").contains('@'));

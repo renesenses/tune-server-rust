@@ -493,6 +493,7 @@ fn en_service() -> ModulationEnService {
         channels: 2,
         plugins_in_stream: false,
         headroom_db: -3.0,
+        modulator_margin_db: MARGE_DU_MODULATEUR_DB,
         continued: false,
     }
 }
@@ -803,53 +804,48 @@ fn pure_deverrouille_en_cours_de_piste_puis_volume_baisse() {
 fn l_attente_suit_l_avance_de_la_precedente() {
     let zone = 9_430_960;
     let pl = plan(TransportModulation::Dop, TauxDsd::Dsd64, 44_100);
-    ouvrir_le_relais(zone, "v3-g", pl);
-    let fin = std::sync::Arc::new(AtomicBool::new(false));
-    let f2 = fin.clone();
-    // La précédente avance pendant 600 ms, puis dépose.
-    let joue = std::thread::spawn(move || {
-        for _ in 0..12 {
-            std::thread::sleep(Duration::from_millis(50));
-            signaler_l_avance("v3-g");
-        }
-        deposer_au_relais("v3-g", ProducteurDsd::new(pl).unwrap());
-        f2.store(true, Ordering::SeqCst);
-    });
-    let t = Instant::now();
-    let r = attendre_le_relais_lue("v3-g", pl, Duration::from_millis(200), &|| false, &|| true);
-    joue.join().unwrap();
-    assert!(
-        r.is_some(),
-        "attendue tant que la précédente avance ({:?})",
-        t.elapsed()
-    );
-    assert!(fin.load(Ordering::SeqCst));
-    // Bloquée : plus aucune avance ; la suivante, lue, cède.
-    ouvrir_le_relais(zone, "v3-h", pl);
-    let t = Instant::now();
-    let r = attendre_le_relais_lue("v3-h", pl, Duration::from_millis(200), &|| false, &|| true);
-    assert!(r.is_none());
-    assert!(
-        t.elapsed() < Duration::from_millis(600),
-        "{:?}",
-        t.elapsed()
-    );
-    // Pas encore lue (pré-armement) : elle attend malgré l'inactivité.
-    ouvrir_le_relais(zone, "v3-i", pl);
-    let lue = std::sync::Arc::new(AtomicBool::new(false));
-    let l2 = lue.clone();
-    let h = std::thread::spawn(move || {
-        attendre_le_relais_lue("v3-i", pl, Duration::from_millis(100), &|| false, &|| {
-            l2.load(Ordering::SeqCst)
-        })
-        .is_some()
-    });
-    std::thread::sleep(Duration::from_millis(400));
-    deposer_au_relais("v3-i", ProducteurDsd::new(pl).unwrap());
-    assert!(
-        h.join().unwrap(),
-        "pré-armée et non lue : elle attend le dépôt"
-    );
+    // Chaque réveil fait avancer l'horloge du scénario de 50 ms, même si
+    // le système suspend le processus entre deux tours de la boucle.
+    for (session, avance, lue, depot_ms) in [
+        ("v3-g", true, true, Some(600)),
+        ("v3-h", false, true, None),
+        ("v3-i", false, false, Some(400)),
+    ] {
+        ouvrir_le_relais(zone, session, pl);
+        let debut = Instant::now();
+        let instant = std::cell::Cell::new(debut);
+        let delai = Duration::from_millis(if lue { 200 } else { 100 });
+        let resultat = attendre_le_relais_avec(
+            session,
+            pl,
+            delai,
+            &|| false,
+            &|| lue,
+            || instant.get(),
+            |garde| {
+                drop(garde);
+                instant.set(instant.get() + Duration::from_millis(50));
+                let ecoule = (instant.get() - debut).as_millis();
+                assert!(
+                    ecoule <= 600,
+                    "le relais {session} aurait dû rendre la main"
+                );
+                if avance {
+                    signaler_l_avance_a(session, || instant.get());
+                }
+                if depot_ms == Some(ecoule) {
+                    deposer_au_relais(session, ProducteurDsd::new(pl).unwrap());
+                }
+                relais().0.lock().unwrap()
+            },
+        );
+        assert_eq!(resultat.is_some(), depot_ms.is_some(), "{session}");
+        assert_eq!(
+            (instant.get() - debut).as_millis(),
+            depot_ms.unwrap_or(200),
+            "{session}"
+        );
+    }
 }
 
 /// v4 D1 : une piste longue (ouverte depuis plus de `RELAIS_PERIME`, pauses
@@ -892,11 +888,17 @@ fn la_longueur_dop_annoncee_est_alignee_sur_une_paire_de_trames() {
 }
 
 /// La marge du modulateur ne dépend PAS du headroom automatique de la chaîne
-/// PCM (qui peut valoir 0 dB) : −3 dB au moins, un manuel plus fort gardé.
+/// PCM (qui peut valoir 0 dB) : elle s'ajoute, une fois, au headroom de la
+/// chaîne ; le modulateur n'applique le manuel que si le flux ne l'a pas
+/// déjà fait (revue rc14, #9518 × #9520).
 #[test]
 fn la_marge_du_modulateur_est_la_sienne() {
     assert_eq!(headroom_avant_le_modulateur(0.0), -3.0);
-    assert_eq!(headroom_avant_le_modulateur(-1.0), -3.0);
-    assert_eq!(headroom_avant_le_modulateur(-6.0), -6.0);
+    assert_eq!(headroom_avant_le_modulateur(-1.0), -4.0);
+    assert_eq!(headroom_avant_le_modulateur(-12.0), -15.0);
+    assert_eq!(headroom_avant_le_modulateur(2.0), -3.0);
     assert_eq!(headroom_avant_le_modulateur(f64::NAN), -3.0);
+    assert_eq!(gain_fixe_du_modulateur_db(-12.0, true), -3.0);
+    assert_eq!(gain_fixe_du_modulateur_db(-12.0, false), -15.0);
+    assert_eq!(gain_fixe_du_modulateur_db(0.0, false), -3.0);
 }

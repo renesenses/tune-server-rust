@@ -214,6 +214,14 @@ pub async fn run_with(opts: RunOptions) {
 
     let config = TuneConfig::load();
 
+    // rc14 — mot de passe administrateur perdu : `--reinitialiser-admin`
+    // (`--reset-admin`). Après le `.env` et la configuration, pour ouvrir la
+    // MÊME base que le service ; avant le journal, le port et `AppState` : la
+    // commande ne démarre pas le serveur.
+    if crate::recuperation_admin::demandee(std::env::args().skip(1)) {
+        std::process::exit(crate::recuperation_admin::executer(&config).await);
+    }
+
     let _chemin_du_journal = installer_le_journal(&config.log_level);
 
     // #5513 : pour `artwork_cache_dir()` et le rapport de scan, qui n'ont
@@ -434,8 +442,18 @@ pub async fn run_with(opts: RunOptions) {
     tune_core::coffre::installer_le_dossier_du_serveur(tune_core::coffre::dossier_de_la_base(
         &config.db_path,
     ));
+    // Installation neuve : la base n'existe pas encore. Lu AVANT de l'ouvrir
+    // (l'ouverture la crée). Seule une base neuve ouvre la fenêtre de
+    // première configuration (mot de passe administrateur dans l'assistant).
+    let base_neuve =
+        crate::auth::base_neuve_avant_ouverture(&config.db_path, config.database_url.as_deref());
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");
+    if base_neuve {
+        crate::auth::ouvrir_la_premiere_configuration(&state);
+    } else {
+        crate::auth::fermer_une_premiere_configuration_heritee(&state);
+    }
 
     // #5320 — la sonde du processeur est relevée en tâche de fond, une fois
     // par seconde : l'écran et la garde thermique lisent une médiane, pas la
@@ -592,6 +610,9 @@ pub async fn run_with(opts: RunOptions) {
     // Background tasks: squeezebox poller, session GC, position poller,
     // token refresh, UPnP advertiser, Deezer proxy, alarms, notifications, memory diag
     crate::background::spawn_background_tasks(&state, &config).await;
+    // rc14 — un secret de signature changé hors du processus (mot de passe
+    // administrateur réinitialisé dans le terminal) ferme les WebSocket.
+    let _ = crate::auth::surveiller_le_secret(state.clone(), crate::auth::PERIODE_VEILLE_DU_SECRET);
 
     // Auto-resume network zones (waits for device.reconnected events)
     crate::auto_resume::spawn_auto_resume_listener(&state);

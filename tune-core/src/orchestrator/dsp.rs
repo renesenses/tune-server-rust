@@ -1025,6 +1025,8 @@ impl PlaybackOrchestrator {
     }
 
     /// Le préampli réellement gardé par la sortie locale, sans mutation.
+    /// rc14 — sur une zone réseau, celui que publie le porteur du flux qui
+    /// joue (relève en vol, flux refait qui garde un niveau).
     pub async fn preampli_garde_de_zone(
         &self,
         zone_id: i64,
@@ -1032,48 +1034,62 @@ impl PlaybackOrchestrator {
         #[cfg(feature = "local-audio")]
         {
             let device = self.peripherique_de_la_zone(zone_id);
-            let sortie = { self.outputs.lock().await.get(&device) }?;
-            let sortie = sortie.try_lock().ok()?;
-            sortie
-                .as_any()
-                .downcast_ref::<crate::outputs::local::LocalOutput>()?
-                .preampli_garde()
+            if let Some(sortie) = { self.outputs.lock().await.get(&device) } {
+                let sortie = sortie.try_lock().ok()?;
+                if let Some(locale) = sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                {
+                    return locale.preampli_garde();
+                }
+            }
         }
-        #[cfg(not(feature = "local-audio"))]
-        {
-            let _ = zone_id;
-            None
-        }
+        self.poste_du_flux_joue(zone_id)
+            .await
+            .and_then(|p| p.preampli_garde())
+    }
+
+    /// rc14 — le poste de relève du flux que la zone JOUE, s'il en a un.
+    async fn poste_du_flux_joue(
+        &self,
+        zone_id: i64,
+    ) -> Option<std::sync::Arc<super::eq_en_vol::EqEnVol>> {
+        let np = self.playback.get_state(zone_id).await.now_playing?;
+        let sid = np.stream_id.as_deref()?;
+        self.poste_eq_en_vol(zone_id, sid)
     }
 
     /// #6524 — geste explicite : libère la borne, par la rampe existante.
     /// Aucun profil, volume ou état de transport n'est modifié ; PURE reste intact.
     pub async fn rendre_le_niveau_garde(&self, zone_id: i64) -> bool {
-        if self.zone_audiophile(zone_id) {
-            return false;
-        }
+        // rc14 — PURE et « Bypass all » ne sont plus refusés : leur entrée
+        // peut garder un surplus (volume monté), que ce geste seul rend ;
+        // la sortie locale ne répond que si elle garde un préampli.
         #[cfg(feature = "local-audio")]
         {
             let device = self.peripherique_de_la_zone(zone_id);
-            let Some(sortie) = ({ self.outputs.lock().await.get(&device) }) else {
-                return false;
-            };
-            let sortie = sortie.lock().await;
-            let Some(locale) = sortie
-                .as_any()
-                .downcast_ref::<crate::outputs::local::LocalOutput>()
-            else {
-                return false;
-            };
-            if locale.preampli_garde().is_none() {
-                return false;
+            if let Some(sortie) = { self.outputs.lock().await.get(&device) } {
+                let sortie = sortie.lock().await;
+                if let Some(locale) = sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                {
+                    if locale.preampli_garde().is_none() {
+                        return false;
+                    }
+                    locale.liberer_le_preampli_garde();
+                    return true;
+                }
             }
-            locale.liberer_le_preampli_garde();
-            true
         }
-        #[cfg(not(feature = "local-audio"))]
-        {
-            false
+        // rc14 — zone réseau : le porteur du flux qui joue rend son niveau
+        // gardé au bloc suivant, par sa rampe.
+        match self.poste_du_flux_joue(zone_id).await {
+            Some(poste) if poste.preampli_garde().is_some() => {
+                poste.rendre_le_niveau();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1282,6 +1298,26 @@ impl PlaybackOrchestrator {
         {
             poste.noter_le_volume(zone.volume / 100.0);
         }
+        // rc14 (sécurité auditive) — le flux qui reprend le niveau gardé du
+        // flux refait (`load_streaming_dsp`) reprend aussi sa référence : le
+        // préampli ne remonte que si le volume redescend au niveau d'avant.
+        // rc14 (relecture de #9556) — seulement si un flux refait de la
+        // MÊME piste l'a repris (`load_streaming_dsp`) : le poste d'une autre
+        // piste ne consomme pas le report.
+        let repris = {
+            let mut reports = self.niveaux_reseau_a_reporter.lock().unwrap();
+            if reports.get(&zone_id).is_some_and(|r| r.pris) {
+                reports.remove(&zone_id)
+            } else {
+                None
+            }
+        };
+        if let Some(report) = repris
+            && report.depuis.elapsed() < super::eq_en_vol::NiveauAReporter::VALIDITE
+            && let Some(avant) = report.volume_avant
+        {
+            poste.reprendre_le_volume_d_avant(avant);
+        }
         let mut postes = self.eq_en_vol_des_flux.lock().unwrap();
         let notes = postes.entry(zone_id).or_default();
         notes.retain(|(sid, _)| sid != stream_id);
@@ -1299,6 +1335,134 @@ impl PlaybackOrchestrator {
                 poste.noter_le_volume(volume);
             }
         }
+    }
+
+    /// rc14 — le volume de la zone en millièmes, comme le note
+    /// [`super::eq_en_vol::EqEnVol::noter_le_volume`]. `None` : zone inconnue.
+    fn volume_de_zone_en_milliemes(&self, zone_id: i64) -> Option<u32> {
+        ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .map(|z| z.volume / 100.0)
+            .filter(|v| v.is_finite())
+            .map(|v| (v.clamp(0.0, 1.0) * 1000.0).round() as u32)
+    }
+
+    /// rc14 (sécurité auditive, flux réseau REFAIT) — le niveau gardé que le
+    /// flux refait de `piste` sur la zone doit reprendre, s'il est encore
+    /// valable. Relecture de #9556 : un report ne vaut que pour la piste du
+    /// flux quitté ; une autre piste lancée sur la zone n'est ni forcée au
+    /// transcodage ni jouée au niveau gardé.
+    pub(super) fn niveau_reseau_a_reporter(
+        &self,
+        zone_id: i64,
+        piste: crate::audio::replaygain::PisteRg<'_>,
+    ) -> Option<super::eq_en_vol::NiveauAReporter> {
+        self.niveau_reseau_a_reporter_en_le_prenant(zone_id, piste, false)
+    }
+
+    fn niveau_reseau_a_reporter_en_le_prenant(
+        &self,
+        zone_id: i64,
+        piste: crate::audio::replaygain::PisteRg<'_>,
+        prendre: bool,
+    ) -> Option<super::eq_en_vol::NiveauAReporter> {
+        let mut reports = self.niveaux_reseau_a_reporter.lock().unwrap();
+        match reports.get_mut(&zone_id) {
+            Some(r) if r.depuis.elapsed() >= super::eq_en_vol::NiveauAReporter::VALIDITE => {
+                reports.remove(&zone_id);
+                None
+            }
+            Some(r) if r.piste == super::eq_en_vol::PisteDuReport::de(piste) => {
+                r.pris |= prendre;
+                Some(r.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// rc14 (sécurité auditive, décision de Bertrand du 25/11) — juste avant
+    /// de REFAIRE le flux réseau d'une zone pour un réglage (égaliseur coupé,
+    /// PURE, chaîne TESS) : retenir le niveau hors courbe du flux qui joue,
+    /// pour que le flux refait démarre au même niveau borné au lieu du signal
+    /// sec (voir [`super::eq_en_vol::NiveauAReporter`]).
+    ///
+    /// Le niveau vient du poste de relève du flux (ce que son porteur
+    /// applique au dernier bloc), ou, pour un flux sans poste (fichier
+    /// pré-transcodé), de l'égaliseur de son empreinte. Rien n'est retenu sur
+    /// une sortie locale (elle garde son égaliseur coupé d'un flux à
+    /// l'autre), ni quand le volume n'a pas monté : le sec ne dépasse alors
+    /// pas le niveau d'avant.
+    pub(super) fn retenir_le_niveau_du_flux_refait(
+        &self,
+        zone_id: i64,
+        np: Option<&crate::playback::NowPlaying>,
+    ) {
+        self.niveaux_reseau_a_reporter
+            .lock()
+            .unwrap()
+            .remove(&zone_id);
+        let sortie_locale = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id)
+            .is_none_or(|id| id.starts_with("local:"));
+        if sortie_locale {
+            return;
+        }
+        let Some(sid) = np.and_then(|n| n.stream_id.as_deref()) else {
+            return;
+        };
+        let (niveau, volume_avant) = match self.poste_eq_en_vol(zone_id, sid) {
+            Some(poste) => (poste.niveau_publie(), poste.volume_d_avant()),
+            None => {
+                let empreinte = self
+                    .traitement_des_flux
+                    .lock()
+                    .unwrap()
+                    .get(&zone_id)
+                    .and_then(|notes| notes.iter().find(|(s, _)| s == sid).map(|(_, e)| e.clone()));
+                let volume = self
+                    .volume_a_la_creation_des_flux
+                    .lock()
+                    .unwrap()
+                    .get(&zone_id)
+                    .filter(|(s, _)| s == sid)
+                    .map(|(_, v)| *v);
+                (
+                    empreinte.as_deref().map_or(1.0, niveau_de_l_empreinte),
+                    volume,
+                )
+            }
+        };
+        if !(niveau.is_finite() && niveau > 0.0 && niveau < 1.0 - 1e-6) {
+            return;
+        }
+        let report = super::eq_en_vol::NiveauAReporter {
+            niveau,
+            volume_avant,
+            depuis: std::time::Instant::now(),
+            piste: np.map_or_else(Default::default, |n| {
+                super::eq_en_vol::PisteDuReport::de(n.piste_rg())
+            }),
+            pris: false,
+        };
+        if report.borne(self.volume_de_zone_en_milliemes(zone_id)) >= 1.0 {
+            return;
+        }
+        info!(
+            zone_id,
+            stream_id = sid,
+            niveau_db = 20.0 * niveau.log10(),
+            volume_avant = ?volume_avant,
+            "flux_refait_niveau_garde_retenu"
+        );
+        self.niveaux_reseau_a_reporter
+            .lock()
+            .unwrap()
+            .insert(zone_id, report);
     }
 
     /// #4407 — le poste de relève du flux `stream_id`, s'il en a un.
@@ -1396,11 +1560,12 @@ impl PlaybackOrchestrator {
     /// crossfeed, la correction de pièce, les greffons tiers et le
     /// ReplayGain n'y entrent jamais), et son format est celui de la
     /// station, PURE ou non. Basculer PURE n'y change donc QUE l'égaliseur :
-    /// - entrée en PURE : l'égaliseur est coupé et le préampli gardé remonte
-    ///   jusqu'au signal sec ([`super::eq_en_vol::EqEnVol::poser_vers_le_sec`]) :
-    ///   au bout de la rampe (fondu de 300 ms, puis remontée à 2 dB/s, soit
-    ///   quelques secondes pour une réserve de plusieurs dB), plus aucun étage
-    ///   ne touche les échantillons ; avant, aucune marche de niveau ;
+    /// - entrée en PURE : l'égaliseur est coupé et le préampli gardé rejoint
+    ///   le niveau d'avant l'égaliseur ([`super::eq_en_vol::EqEnVol::poser_vers_le_sec`]) :
+    ///   fondu de 300 ms et remontée de 450 ms qui se recouvrent, BORNÉE par
+    ///   le volume (rc14, #6741). Volume inchangé : plus aucun étage ne touche
+    ///   les échantillons au bout de la rampe ; volume monté : le préampli
+    ///   reste gardé (voyant, « Rendre le niveau »). Aucune marche de niveau ;
     /// - sortie de PURE : l'égaliseur enregistré revient par le fondu de #5215.
     ///
     /// Impossible :
@@ -1472,6 +1637,16 @@ impl PlaybackOrchestrator {
         stream_id: &str,
         empreinte: String,
     ) {
+        // rc14 — la référence de volume d'un flux sans poste de relève : le
+        // volume à sa CRÉATION, pas aux réglages posés en vol ensuite.
+        {
+            let volume = self.volume_de_zone_en_milliemes(zone_id);
+            let mut volumes = self.volume_a_la_creation_des_flux.lock().unwrap();
+            let deja = volumes.get(&zone_id).is_some_and(|(s, _)| s == stream_id);
+            if !deja && let Some(v) = volume {
+                volumes.insert(zone_id, (stream_id.to_string(), v));
+            }
+        }
         let mut flux = self.traitement_des_flux.lock().unwrap();
         let notes = flux.entry(zone_id).or_default();
         notes.retain(|(sid, _)| sid != stream_id);
@@ -1955,6 +2130,9 @@ impl PlaybackOrchestrator {
                 .lock()
                 .unwrap()
                 .insert(zone_id, std::time::Instant::now());
+            // rc14 (sécurité auditive) — le flux refait reprend le niveau
+            // borné de celui qu'on quitte, pas le signal sec.
+            moi.retenir_le_niveau_du_flux_refait(zone_id, etat.now_playing.as_ref());
             match moi
                 .replay_zone_at_position(zone_id, position_ms, raison.code())
                 .await
@@ -2484,6 +2662,28 @@ impl PlaybackOrchestrator {
                 dsp.crossfeed.as_ref().filter(|_| channels == 2),
             )
         };
+        // rc14 (sécurité auditive, flux réseau REFAIT) — après la
+        // compensation, qui ne doit pas en tenir compte : le flux reprend le
+        // niveau gardé du flux quitté, borné (#6741). Sans égaliseur, un
+        // égaliseur coupé le porte ; avec un égaliseur, la hausse de son
+        // préampli est retenue (`EqProcessor::reprendre_la_retenue_de`).
+        if let Some(report) = self.niveau_reseau_a_reporter_en_le_prenant(zone_id, piste, true) {
+            let borne = report.borne(self.volume_de_zone_en_milliemes(zone_id));
+            if let Some(garde) = crate::audio::eq::EqProcessor::neutre_qui_garde(
+                sample_rate,
+                channels,
+                report.niveau,
+                borne,
+            ) {
+                dsp.eq = match dsp.eq.take() {
+                    None => Some(garde),
+                    Some(mut neuf) => {
+                        neuf.reprendre_la_retenue_de(&garde);
+                        Some(neuf)
+                    }
+                };
+            }
+        }
         dsp
     }
 
@@ -4653,3 +4853,40 @@ impl Drop for EtapeDePreparation {
 #[cfg(test)]
 #[path = "sonde_niveaux_mandataire_9450_tests.rs"]
 mod sonde_niveaux_mandataire_9450_tests;
+
+/// rc14 (sécurité auditive, flux refait sans poste de relève) — le niveau
+/// hors courbe de l'égaliseur qu'une empreinte de traitement décrit
+/// (`PlaybackOrchestrator::empreinte_du_traitement`) : 1,0 sans égaliseur,
+/// en PURE, ou pour une empreinte illisible.
+pub(super) fn niveau_de_l_empreinte(empreinte: &str) -> f64 {
+    let Some(eq) = empreinte
+        .split('\u{1f}')
+        .find_map(|champ| champ.strip_prefix("eq="))
+        .filter(|e| !e.is_empty())
+    else {
+        return 1.0;
+    };
+    let (json, suffixes) = match eq.find("|marge=").or_else(|| eq.rfind("|l1")) {
+        Some(i) if eq[i..].starts_with("|marge=") || &eq[i..] == "|l1" => (&eq[..i], &eq[i..]),
+        _ => (eq, ""),
+    };
+    let Ok(mut profil) = serde_json::from_str::<crate::audio::eq::EqProfile>(json) else {
+        return 1.0;
+    };
+    for suffixe in suffixes.split('|').filter(|x| !x.is_empty()) {
+        if let Some(bits) = suffixe
+            .strip_prefix("marge=")
+            .and_then(|b| b.parse::<u64>().ok())
+        {
+            profil.reserve_imposee_db = Some(f64::from_bits(bits));
+        } else if suffixe == "l1" {
+            profil.reserve_l1_toujours = true;
+        }
+    }
+    let eq = crate::audio::eq::EqProcessor::new(&profil, 44_100, 2);
+    if eq.is_enabled() {
+        eq.niveau_hors_courbe()
+    } else {
+        1.0
+    }
+}

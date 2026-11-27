@@ -122,8 +122,8 @@ pub fn revendiquer(settings: &SettingsRepo, profil: i64) -> bool {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Relieur {
     /// Le profil d'une session AUTHENTIFIÉE (authentification active). Sans
-    /// authentification, une session ne prouve rien — le profil `default` s'y
-    /// ouvre sans mot de passe — et ce champ reste vide.
+    /// authentification, une session ne prouve rien — le profil administrateur
+    /// d'origine (`admin`, `default` avant la rc14) s'y ouvre sans mot de passe — et ce champ reste vide.
     pub session_authentifiee: Option<i64>,
     /// L'appelant a-t-il aussi le droit de DÉLIER le compte du serveur
     /// (administrateur, ou cette machine sans authentification) ? Jamais vrai

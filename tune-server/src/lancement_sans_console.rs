@@ -264,7 +264,7 @@ mod installeur_tests {
         assert!(
             instruction(
                 &yml,
-                "CreateShortcut \"`$SMPROGRAMS\\Tune Server\\Tune Server (avec console, depannage).lnk\" \"`$INSTDIR\\start-tune-server.bat\""
+                "CreateShortcut \"`$SMPROGRAMS\\Tune Server\\Tune Server (avec console, dépannage).lnk\" \"`$INSTDIR\\start-tune-server.bat\""
             ),
             "la console reste offerte par l'entrée de dépannage"
         );

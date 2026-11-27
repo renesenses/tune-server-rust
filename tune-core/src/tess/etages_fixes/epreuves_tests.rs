@@ -190,6 +190,7 @@ fn bilan(chaine: &ChaineTess, r: &Resolution, greffons_db: f64) -> BilanDeNiveau
         gain_de_zone_db: 0.0,
         gain_moyen_greffons_db: greffons_db,
         compensation_active: true,
+        gain_max_convolution_db: 0.0,
     })
 }
 
@@ -375,6 +376,7 @@ fn pas_de_double_compte_avec_la_compensation_4594() {
             gain_de_zone_db: 0.0,
             gain_moyen_greffons_db: reserve,
             compensation_active: true,
+            gain_max_convolution_db: 0.0,
         })
     };
     // AutoEq qui réserve 12 dB : l'automatique n'ajoute RIEN (pas −15 dB).
@@ -406,6 +408,7 @@ fn pas_de_double_compte_avec_la_compensation_4594() {
         gain_de_zone_db: 0.0,
         gain_moyen_greffons_db: -12.0,
         compensation_active: true,
+        gain_max_convolution_db: 0.0,
     });
     assert_eq!((b.headroom_db, b.compensation_db), (-6.0, 18.0));
     // Interrupteur coupé : rien de rendu.
@@ -416,6 +419,7 @@ fn pas_de_double_compte_avec_la_compensation_4594() {
         gain_de_zone_db: 0.0,
         gain_moyen_greffons_db: -12.0,
         compensation_active: false,
+        gain_max_convolution_db: 0.0,
     };
     assert_eq!(BilanDeNiveau::calculer(&e).compensation_db, 0.0);
     // ReplayGain et gain de zone : du NIVEAU, jamais compensés. Négatifs à

@@ -62,19 +62,22 @@ pub fn demandee_active_hors_bypass(db: &Arc<dyn DbBackend>, id: i64) -> Option<u
 /// Décision de Bertrand du 12/11 : ramener au plafond au lieu d'échouer.
 pub fn active(db: &Arc<dyn DbBackend>, id: i64) -> Option<u32> {
     let demandee = demandee_active(db, id)?;
+    Some(plafond_de_zone(db, id).map_or(demandee, |p| demandee.min(p)))
+}
+
+/// Le plafond de cadence d'une zone : son réglage et le catalogue de son
+/// appareil (un Sonos : 48 kHz), le plus strict des deux. `None` sans plafond.
+/// Fil 3107 — la radio le respecte aussi sans fréquence fixe.
+pub fn plafond_de_zone(db: &Arc<dyn DbBackend>, id: i64) -> Option<u32> {
     let zone = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
         .get(id)
         .ok()
         .flatten();
-    let plafond = crate::device_catalog::combine_max_sample_rate(
+    crate::device_catalog::combine_max_sample_rate(
         zone.and_then(|z| z.max_sample_rate),
         crate::device_catalog::resolve_zone_quirks(db, id).max_sample_rate,
-    );
-    Some(
-        plafond
-            .filter(|p| *p > 0)
-            .map_or(demandee, |p| demandee.min(p)),
     )
+    .filter(|p| *p > 0)
 }
 
 /// Le chemin de lecture peut connaître un plafond plus précis que la zone.

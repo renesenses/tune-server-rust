@@ -250,8 +250,8 @@ async fn get_music_folders(Query(params): Query<Parametres>) -> Response {
     )
 }
 
-fn profil(state: &AppState, sql: &str, valeur: &dyn ToSqlValue) -> Option<(i64, String, bool)> {
-    let row = state.backend.query_one(sql, &[valeur]).ok().flatten()?;
+fn profil(state: &AppState, sql: &str, valeurs: &[&dyn ToSqlValue]) -> Option<(i64, String, bool)> {
+    let row = state.backend.query_one(sql, valeurs).ok().flatten()?;
     Some((
         row.first()?.as_i64()?,
         row.get(1)?.as_string()?,
@@ -268,7 +268,7 @@ async fn get_user(
     let Some(appelant) = profil(
         &state,
         "SELECT id, username, is_admin FROM profiles WHERE id = ?",
-        &client.profile_id,
+        &[&client.profile_id],
     ) else {
         return reponse::erreur(format, CodeErreur::Introuvable, "User not found");
     };
@@ -279,10 +279,14 @@ async fn get_user(
         Some(_) if !appelant.2 => {
             return reponse::erreur(format, CodeErreur::NonAutorise, "Not authorized");
         }
+        // rc14 : `default` reste l'alias du profil 1 renommé `admin`.
         Some(nom) => match profil(
             &state,
-            "SELECT id, username, is_admin FROM profiles WHERE username = ?",
-            &nom,
+            &format!(
+                "SELECT id, username, is_admin FROM profiles WHERE {}",
+                tune_core::db::profil_administrateur::SQL_PROFIL_PAR_NOM_DE_CONNEXION
+            ),
+            &[&nom, &nom],
         ) {
             Some(p) => p,
             None => return reponse::erreur(format, CodeErreur::Introuvable, "User not found"),

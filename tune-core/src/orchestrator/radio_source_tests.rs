@@ -59,6 +59,7 @@ async fn preparer_contre_la_station(
             expected_format: None,
             radio_eq: None,
             eq_de_depart_pose: false,
+            reechantillonneur: None,
         };
         let rt = tokio::runtime::Handle::current();
         let canaux = CanauxRadio {
@@ -71,6 +72,7 @@ async fn preparer_contre_la_station(
             rt: &rt,
             strict_bitperfect,
             frequence_fixe: None,
+            plafond: None,
             sortie_locale: false,
         };
         match preparer_la_sortie(&mut etat, &url, &canaux, &sonde) {
@@ -243,6 +245,7 @@ async fn radio_5716_la_sonde_retient_le_codec_de_la_station() {
                 expected_format: None,
                 radio_eq: None,
                 eq_de_depart_pose: false,
+                reechantillonneur: None,
             };
             let rt = tokio::runtime::Handle::current();
             let canaux = CanauxRadio {
@@ -254,6 +257,7 @@ async fn radio_5716_la_sonde_retient_le_codec_de_la_station() {
                 levels_tx: &None,
                 rt: &rt,
                 frequence_fixe: None,
+                plafond: None,
                 strict_bitperfect: false,
                 sortie_locale: false,
             };
