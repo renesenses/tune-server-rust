@@ -352,6 +352,10 @@ impl DevialetAirOutput {
         self.session
     }
 
+    pub(crate) fn doit_reveiller_ampli(&self) -> bool {
+        self.ampli().is_some_and(|a| !a.annonce.allume)
+    }
+
     fn ampli(&self) -> Option<AmpliVu> {
         self.ecoute.ampli(&self.mac)
     }

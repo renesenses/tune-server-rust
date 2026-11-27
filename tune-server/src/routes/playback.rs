@@ -1378,6 +1378,11 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         v.as_object_mut()
             .unwrap()
             .insert("resolving".into(), json!(zone_state.resolving));
+        v["startup_status"] = json!(
+            state
+                .orchestrator
+                .statut_de_reveil(zone_id, zone.output_device_id.as_deref())
+        );
     }
     v
 }
@@ -4612,6 +4617,9 @@ async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl 
                 zone_id,
                 crate::routes::zones::relais_de_groupe_6155::GesteDUnMembre::Pause,
             );
+            Json(build_zone_json(&state, zone_id).await).into_response()
+        }
+        Ok(tune_core::orchestrator::IssueDePause::RemplaceePendantLeReveil) => {
             Json(build_zone_json(&state, zone_id).await).into_response()
         }
         // #7894 — l'appareil ne jouait rien : la zone est arrêtée (reprise

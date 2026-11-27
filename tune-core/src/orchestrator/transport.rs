@@ -66,6 +66,8 @@ pub enum IssueDePause {
     /// L'appareil ne jouait rien (aucun média chargé) : la zone est arrêtée,
     /// sa piste et sa position gardées pour la reprise.
     RienNeJouait,
+    /// Une commande plus récente a remplacé la pause pendant le réveil.
+    RemplaceePendantLeReveil,
 }
 
 /// Le nom d'appareil à MONTRER dans un refus, ou `None` s'il n'y en a pas.
@@ -1036,6 +1038,9 @@ impl PlaybackOrchestrator {
             }
         }
 
+        let reveil = self
+            .signaler_le_reveil(req.zone_id, req.output_device_id.as_deref())
+            .await;
         let (output_sent, output_error) = self
             .envoyer_a_la_sortie(
                 &req, &resolved, &habillage, is_local, play_start, resolve_ms,
@@ -1154,6 +1159,9 @@ impl PlaybackOrchestrator {
         if !output_sent && output_error.is_some() && req.output_device_id.is_some() {
             self.arreter_sur_refus_de_sortie(&req, &resolved, &output_error)
                 .await;
+            if let Some(reveil) = &reveil {
+                reveil.terminer(Err(output_error.clone().unwrap_or_default()));
+            }
             return Ok(PlayResult {
                 stream_url: Some(resolved.url),
                 output_sent: false,
@@ -1166,6 +1174,9 @@ impl PlaybackOrchestrator {
         // This runs concurrently with the current playback so the next
         // streaming track is already decoded in memory when needed.
         self.lancer_le_prechargement(req.zone_id);
+        if output_sent && let Some(reveil) = &reveil {
+            reveil.terminer(Ok(()));
+        }
 
         Ok(PlayResult {
             stream_url: Some(resolved.url),
@@ -3511,8 +3522,15 @@ impl PlaybackOrchestrator {
         device_id: Option<&str>,
     ) -> OutputCommandResult<IssueDePause> {
         // #5476 — rend caduc un Seek de reprise détaché encore en attente.
-        self.playback.marquer_commande_de_transport(zone_id).await;
+        let seq = self.playback.marquer_commande_de_transport(zone_id).await;
         if let Some(did) = device_id {
+            let reveil = self.reveils.attendre(zone_id, did).await;
+            if !matches!(reveil, Ok(false))
+                && self.playback.current_transport_seq(zone_id).await != seq
+            {
+                return Ok(IssueDePause::RemplaceePendantLeReveil);
+            }
+            reveil?;
             // Le backend confirme la commande AVANT que la copie mémoire et
             // la base annoncent Paused.
             let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
