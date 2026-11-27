@@ -1598,7 +1598,15 @@ pub(super) struct MotifsDeTranscodage {
     pub(super) oaat_needs_wav: bool,
     pub(super) local_needs_wav: bool,
     pub(super) browser_needs_wav: bool,
+    /// Le plafond de fréquence de la zone fait descendre la source.
     pub(super) needs_downsample: bool,
+    /// rc15 — la cadence fixe de la zone est PLUS HAUTE que la source
+    /// (44,1 → 768 kHz sur le DMP-A8 du .18) : c'est un suréchantillonnage,
+    /// que le journal appelait à tort `needs_downsample`.
+    pub(super) frequence_fixe_montante: bool,
+    /// rc15 — la cadence fixe de la zone est plus basse que la source (ou de
+    /// la même valeur sous une autre forme, DSD) : un sous-échantillonnage.
+    pub(super) frequence_fixe_descendante: bool,
     pub(super) dlna_needs_wav: bool,
     pub(super) eq_forces_transcode: bool,
     pub(super) dsp_progressif_wav: bool,
@@ -1653,6 +1661,8 @@ impl MotifsDeTranscodage {
             (self.local_needs_wav, "local_needs_wav"),
             (self.browser_needs_wav, "browser_needs_wav"),
             (self.needs_downsample, "needs_downsample"),
+            (self.frequence_fixe_montante, "fixed_rate_upsample"),
+            (self.frequence_fixe_descendante, "fixed_rate_downsample"),
             (self.dlna_needs_wav, "dlna_needs_wav"),
             (self.eq_forces_transcode, "eq_forces_transcode"),
             (self.dsp_progressif_wav, "dsp_progressif_wav"),
@@ -1905,6 +1915,8 @@ mod lecture_locale_tests {
             local_needs_wav: false,
             browser_needs_wav: false,
             needs_downsample: false,
+            frequence_fixe_montante: false,
+            frequence_fixe_descendante: false,
             dlna_needs_wav: false,
             eq_forces_transcode: false,
             dsp_progressif_wav: false,
@@ -2036,7 +2048,7 @@ mod lecture_locale_tests {
     /// aucune décision de transcodage.
     #[test]
     fn les_motifs_nommes_rendent_la_decision_du_ou_d_origine() {
-        for masque in 0u32..(1 << 15) {
+        for masque in 0u32..(1 << 17) {
             let b = |i: u32| masque & (1 << i) != 0;
             let m = MotifsDeTranscodage {
                 needs_transcode_for_output: b(0),
@@ -2054,12 +2066,17 @@ mod lecture_locale_tests {
                 conteneur_flac_neuf_pret: b(12),
                 reduction_de_canaux: b(13),
                 dans_une_image_iso: b(14),
+                frequence_fixe_montante: b(15),
+                frequence_fixe_descendante: b(16),
             };
             let ou_d_origine = m.needs_transcode_for_output
                 || m.oaat_needs_wav
                 || m.local_needs_wav
                 || m.browser_needs_wav
                 || m.needs_downsample
+                // rc15 — l'ancien `needs_downsample` = plafond OU cadence fixe.
+                || m.frequence_fixe_montante
+                || m.frequence_fixe_descendante
                 || m.dlna_needs_wav
                 || m.eq_forces_transcode
                 || m.dsp_progressif_wav
@@ -2074,6 +2091,30 @@ mod lecture_locale_tests {
                 "masque {masque:#017b}"
             );
         }
+    }
+
+    /// rc15 — le .18 (DMP-A8, `zone_10_fixed_sample_rate=768000`, FLAC
+    /// 44,1 kHz) écrivait `motifs=["needs_downsample"]` pour une MONTÉE à
+    /// 768 kHz. Chaque raison porte désormais son nom, et chacune transcode.
+    #[test]
+    fn la_cadence_fixe_dit_si_elle_monte_ou_descend_rc15() {
+        let monte = MotifsDeTranscodage {
+            frequence_fixe_montante: true,
+            ..aucun_motif()
+        };
+        assert_eq!(monte.motifs_actifs(), vec!["fixed_rate_upsample"]);
+        assert!(transcodage_requis(&monte));
+        let descend = MotifsDeTranscodage {
+            frequence_fixe_descendante: true,
+            ..aucun_motif()
+        };
+        assert_eq!(descend.motifs_actifs(), vec!["fixed_rate_downsample"]);
+        assert!(transcodage_requis(&descend));
+        let plafond = MotifsDeTranscodage {
+            needs_downsample: true,
+            ..aucun_motif()
+        };
+        assert_eq!(plafond.motifs_actifs(), vec!["needs_downsample"]);
     }
 
     #[test]
@@ -2136,6 +2177,8 @@ mod flac_ffmpeg_tests {
             local_needs_wav: false,
             browser_needs_wav: false,
             needs_downsample: false,
+            frequence_fixe_montante: false,
+            frequence_fixe_descendante: false,
             dlna_needs_wav: false,
             eq_forces_transcode: false,
             dsp_progressif_wav: false,

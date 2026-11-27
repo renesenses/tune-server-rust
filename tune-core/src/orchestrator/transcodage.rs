@@ -70,6 +70,19 @@ pub(super) enum FinDeTranscodage {
         /// laissait courir jusqu'au bout.
         perdu: std::time::Duration,
     },
+    /// rc15 — la MESURE des premières secondes dit que le fichier ne sera pas
+    /// prêt dans le délai accordé à la première note
+    /// ([`BudgetAdaptatif::delai_max`]). On rend la main tout de suite, pour
+    /// que l'appelant prenne son repli au lieu de laisser la zone muette.
+    TropLent {
+        /// Facteur temps réel mesuré sur cet hôte.
+        facteur: f64,
+        /// Délai projeté avant que le fichier soit prêt (décodage seul :
+        /// l'encodage et l'écriture viennent encore après).
+        projection: std::time::Duration,
+        /// Temps passé avant de conclure.
+        ecoule: std::time::Duration,
+    },
 }
 
 /// Écrit le pré-transcodage dans son fichier temporaire, sauf si l'abandon est
@@ -240,6 +253,11 @@ pub(super) struct BudgetAdaptatif {
     /// Le budget historique, indexé sur la taille. Plancher indéplaçable.
     pub(super) budget_taille: std::time::Duration,
     pub(super) plafond: std::time::Duration,
+    /// rc15 — le délai au-delà duquel un fichier pas encore prêt ne vaut plus
+    /// la peine d'être attendu, parce qu'un repli existe (flux progressif,
+    /// cadence native) : `FinDeTranscodage::TropLent` dès que la mesure
+    /// projette plus long. `None` : la règle de #3140, inchangée.
+    pub(super) delai_max: Option<std::time::Duration>,
 }
 
 /// Ce que la politique conclut d'une observation de la balise.
@@ -261,7 +279,26 @@ impl BudgetAdaptatif {
             piste_s,
             budget_taille,
             plafond: PLAFOND_BUDGET_TRANSCODAGE,
+            delai_max: None,
         }
+    }
+
+    /// rc15 — la même politique, qui rend la main dès que la mesure projette
+    /// plus de `delai` avant que le fichier soit prêt.
+    pub(super) fn avec_delai_max(self, delai: Option<std::time::Duration>) -> Self {
+        Self {
+            delai_max: delai,
+            ..self
+        }
+    }
+
+    /// rc15 — le délai projeté avant la fin du décodage d'une piste ENTIÈRE à
+    /// `facteur` fois le temps réel. `None` sans durée de piste ou sans
+    /// facteur exploitable.
+    pub(super) fn projection(&self, facteur: f64) -> Option<std::time::Duration> {
+        let s = self.piste_s / facteur;
+        (self.piste_s > 0.0 && facteur > 0.0 && s.is_finite())
+            .then(|| std::time::Duration::from_secs_f64(s.min(self.plafond.as_secs_f64())))
     }
 
     /// `ecoule` : temps depuis le début du transcodage. `decode` : audio déjà
@@ -352,6 +389,16 @@ where
     let mut facteur: Option<f64> = None;
     let mut sondages = 0usize;
     let mut annonce = false;
+    // Tests seulement : un hôte lent IMPOSÉ pour ce fichier (rc15), sondé
+    // finement pour conclure avant que le vrai décodage ne finisse.
+    #[cfg(test)]
+    let impose = journal.and_then(hote_lent_impose::facteur);
+    #[cfg(test)]
+    let pas = if impose.is_some() {
+        pas.min(std::time::Duration::from_millis(5))
+    } else {
+        pas
+    };
     tokio::pin!(travail);
     loop {
         tokio::select! {
@@ -375,12 +422,29 @@ where
         if decode > std::time::Duration::ZERO {
             sondages += 1;
         }
+        let verdict = politique.observer(ecoule, decode, sondages);
+        #[cfg(test)]
+        let verdict = match impose {
+            Some(f) => VerdictBudget::Mesure { facteur: f, budget },
+            None => verdict,
+        };
         if let VerdictBudget::Mesure {
             facteur: f,
             budget: b,
-        } = politique.observer(ecoule, decode, sondages)
+        } = verdict
         {
             facteur = Some(f);
+            // rc15 — le fichier ne sera pas prêt à temps : inutile d'attendre
+            // le budget (123 s de silence sur le .18), l'appelant a un repli.
+            if let (Some(delai), Some(projection)) = (politique.delai_max, politique.projection(f))
+                && projection > delai
+            {
+                return Err(FinDeTranscodage::TropLent {
+                    facteur: f,
+                    projection,
+                    ecoule,
+                });
+            }
             if b > budget {
                 // Une seule ligne, à la première extension : la suivre à chaque
                 // sondage remplirait le journal d'un tour par quart de seconde.
@@ -719,4 +783,26 @@ pub(super) async fn abandonner_la_session_de_transcodage(
         stream_id = session_id,
         "streaming_session_abandonnee_producteur_mort"
     );
+}
+
+/// Tests seulement (rc15) : impose à un fichier un facteur temps réel mesuré,
+/// comme si l'hôte était lent. Indexé par chemin, pour qu'aucun autre test
+/// du binaire n'en soit touché.
+#[cfg(test)]
+pub(super) mod hote_lent_impose {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn table() -> &'static Mutex<HashMap<String, f64>> {
+        static T: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
+        T.get_or_init(Default::default)
+    }
+
+    pub(crate) fn imposer(chemin: &str, facteur: f64) {
+        table().lock().unwrap().insert(chemin.to_string(), facteur);
+    }
+
+    pub(crate) fn facteur(chemin: &str) -> Option<f64> {
+        table().lock().unwrap().get(chemin).copied()
+    }
 }

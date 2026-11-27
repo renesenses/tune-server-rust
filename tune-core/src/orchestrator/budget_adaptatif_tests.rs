@@ -319,3 +319,61 @@ fn la_marge_porte_sur_le_restant() {
         "budget {b:?}, attendu {attendu:.1} s"
     );
 }
+
+// ------------------------------------------------------------------
+// rc15 — le délai de la première note. Le .18 : piste de 237,6 s, hôte à
+// × 1,93, cadence fixe de 768 kHz. Sans délai, la règle de #3140 attend ;
+// avec un repli possible (3 s), la mesure des premières secondes rend la
+// main tout de suite.
+// ------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn rc15_la_mesure_des_premieres_secondes_rend_la_main_au_dela_du_delai() {
+    let (piste_s, facteur) = (237.6, 1.93);
+    let debut = tokio::time::Instant::now();
+    let progres = DecodeProgress::new();
+    let politique = BudgetAdaptatif::new(piste_s, Duration::from_secs(123))
+        .avec_delai_max(Some(Duration::from_secs(3)));
+    let r = transcoder_sous_budget(
+        transcodage_feint(progres.clone(), piste_s, facteur),
+        progres,
+        politique,
+        PAS_SONDAGE_BUDGET,
+        None,
+        None,
+    )
+    .await;
+    let ecoule = debut.elapsed();
+    let Err(FinDeTranscodage::TropLent {
+        facteur: f,
+        projection,
+        ..
+    }) = r
+    else {
+        panic!("le fichier ne sera prêt qu'après ~123 s : il fallait rendre la main, {r:?}");
+    };
+    assert!((f - facteur).abs() < 0.2, "facteur mesuré {f}");
+    assert!(projection > Duration::from_secs(100), "{projection:?}");
+    assert!(
+        ecoule <= PAS_SONDAGE_BUDGET * (SONDAGES_AVANT_MESURE as u32 + 2),
+        "conclure dès la mesure, pas au budget : {ecoule:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn rc15_un_fichier_qui_tient_dans_le_delai_va_au_bout() {
+    let (piste_s, facteur) = (30.0, 40.0);
+    let progres = DecodeProgress::new();
+    let politique = BudgetAdaptatif::new(piste_s, Duration::from_secs(120))
+        .avec_delai_max(Some(Duration::from_secs(3)));
+    let r = transcoder_sous_budget(
+        transcodage_feint(progres.clone(), piste_s, facteur),
+        progres,
+        politique,
+        PAS_SONDAGE_BUDGET,
+        None,
+        None,
+    )
+    .await;
+    assert!(matches!(r, Ok(Ok("transcodé"))), "{r:?}");
+}
