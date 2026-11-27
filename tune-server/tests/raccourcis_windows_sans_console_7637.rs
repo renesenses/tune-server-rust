@@ -49,7 +49,7 @@ fn bureau_et_entree_principale_lancent_sans_console() {
 #[test]
 fn entree_de_depannage_garde_la_console() {
     let yml = workflow();
-    let l = raccourci(&yml, "avec console, depannage).lnk").expect("entrée de dépannage");
+    let l = raccourci(&yml, "avec console, dépannage).lnk").expect("entrée de dépannage");
     assert!(l.contains("\\start-tune-server.bat"), "{l}");
     assert!(!l.contains("sans-console"), "{l}");
 }

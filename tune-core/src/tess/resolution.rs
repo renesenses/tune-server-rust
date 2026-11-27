@@ -624,6 +624,25 @@ impl ChaineTess {
                 bloque(&mut headroom);
             } else if auto && !traitement_effectif {
                 headroom.eteindre(MotifEtape::NothingToProtect, None);
+            } else if !auto
+                && ctx.transport != TransportZone::Local
+                && !greffons.iter().any(|e| {
+                    e.effective
+                        && e.plugin_id.as_deref().is_some_and(|id| {
+                            super::migration::FACADES_EQ.contains(&id)
+                                || id == super::migration::ID_CONVOLUTION
+                        })
+                })
+            {
+                // rc14 (Rémi) — une marge manuelle passe par l'étage des
+                // égaliseurs (#9520) : avec un égaliseur effectif, elle
+                // remplace sa réserve, sur toute sortie ; sans égaliseur,
+                // c'est un gain fixe qui ne vit que sur la sortie LOCALE (un
+                // flux réseau bit-perfect ne se transcode pas pour lui).
+                // Revue de #9561 — sans égaliseur, une convolution effective
+                // la porte elle-même (`marge_de_convolution`) : le flux est
+                // déjà traité, et le filtre n'est jamais laissé sans marge.
+                headroom.eteindre(MotifEtape::NotAppliedOnTransport, None);
             }
         }
         let headroom_db = if headroom.effective { demande_db } else { 0.0 };
@@ -1407,6 +1426,78 @@ mod tests {
             ..ChaineTess::default()
         };
         assert_eq!(resoudre(&c, &x).headroom_db, -6.0);
+    }
+
+    /// rc14 (Rémi) — marge manuelle : appliquée telle quelle sur la sortie
+    /// locale, contournée par PURE et « Bypass all », et, sans égaliseur,
+    /// absente d'une sortie réseau (le chemin affiche ce qui est appliqué).
+    #[test]
+    fn marge_manuelle_appliquee_et_contournee_par_pure_rc14() {
+        let manuelle = |db: f64, plugins: Vec<MaillonGreffon>| ChaineTess {
+            plugins,
+            fixed: EtagesFixes {
+                headroom: Headroom::Manual { db },
+                upsampling: Upsampling::default(),
+                quantization: Quantification::default(),
+            },
+            ..ChaineTess::default()
+        };
+        let marge = |r: &Resolution| {
+            r.etapes
+                .iter()
+                .find(|e| e.code == HEADROOM)
+                .cloned()
+                .unwrap()
+        };
+        // Locale : −6,5 dB, avec ou sans greffon.
+        for plugins in [vec![], vec![maillon("crossfeed", true)]] {
+            let r = resoudre(&manuelle(-6.5, plugins), &ctx(TransportZone::Local));
+            assert_eq!(r.headroom_db, -6.5);
+            let h = marge(&r);
+            assert!(h.effective && h.reason.is_none());
+            assert_eq!(h.params, Some(json!({ "mode": "manual", "db": -6.5 })));
+        }
+        // PURE la contourne : rien d'appliqué, motif `pure_mode`.
+        let mut pure = ctx(TransportZone::Local);
+        pure.pure = true;
+        let r = resoudre(&manuelle(-6.5, vec![maillon("crossfeed", true)]), &pure);
+        assert_eq!(r.headroom_db, 0.0);
+        let h = marge(&r);
+        assert!(h.requested && !h.effective);
+        assert_eq!(h.reason, Some(MotifEtape::PureMode));
+        // « Bypass all » aussi.
+        let mut c = manuelle(-6.5, vec![maillon("crossfeed", true)]);
+        c.bypass_all = true;
+        let r = resoudre(&c, &ctx(TransportZone::Local));
+        assert_eq!(
+            (r.headroom_db, marge(&r).reason),
+            (0.0, Some(MotifEtape::BypassAll))
+        );
+        // Réseau sans égaliseur : pas appliquée ; avec un égaliseur : appliquée.
+        let r = resoudre(
+            &manuelle(-6.5, vec![maillon("crossfeed", true)]),
+            &ctx(TransportZone::AirPlay),
+        );
+        assert_eq!(r.headroom_db, 0.0);
+        assert_eq!(marge(&r).reason, Some(MotifEtape::NotAppliedOnTransport));
+        let r = resoudre(
+            &manuelle(-6.5, vec![maillon("equalizer-parametric", true)]),
+            &ctx(TransportZone::AirPlay),
+        );
+        assert_eq!(r.headroom_db, -6.5);
+        // Revue de #9561 — réseau sans égaliseur, avec une convolution : le
+        // convolueur porte M, elle est appliquée.
+        let r = resoudre(
+            &manuelle(-6.5, vec![maillon("convolution", true)]),
+            &ctx(TransportZone::AirPlay),
+        );
+        assert_eq!(r.headroom_db, -6.5);
+        let h = marge(&r);
+        assert!(h.effective && h.reason.is_none(), "{h:?}");
+        // 0 dB manuel : rien n'est demandé.
+        let r = resoudre(&manuelle(0.0, vec![]), &ctx(TransportZone::Local));
+        assert!(!marge(&r).requested);
+        assert_eq!(r.headroom_db, 0.0);
     }
 
     #[test]

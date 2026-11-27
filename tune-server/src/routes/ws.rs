@@ -50,7 +50,11 @@ pub fn router() -> Router<AppState> {
 /// a synthetic `oneshot` request carries no hyper upgrade state, so
 /// `WebSocketUpgrade` itself always fails there — only a check that runs first
 /// can exercise the 401 path.
-struct WsAuthorized;
+///
+/// rc14 — porte le JWT de session (`sid`) de la poignée de main : la socket se
+/// ferme quand cette session cesse de valoir, jamais à la simple expiration
+/// du jeton d'accès.
+struct WsAuthorized(Option<crate::auth::JwtClaims>);
 
 impl axum::extract::FromRequestParts<AppState> for WsAuthorized {
     type Rejection = axum::response::Response;
@@ -60,8 +64,13 @@ impl axum::extract::FromRequestParts<AppState> for WsAuthorized {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let query_token = parts.uri.query().and_then(ws_token_from_query);
-        if crate::auth::ws_authorized(state, &parts.headers, query_token.as_deref()) {
-            Ok(WsAuthorized)
+        if !crate::auth::authentification_active(state) {
+            return Ok(WsAuthorized(None));
+        }
+        if let Some(session) =
+            crate::auth::ws_session(state, &parts.headers, query_token.as_deref())
+        {
+            Ok(WsAuthorized(session))
         } else {
             Err((
                 axum::http::StatusCode::UNAUTHORIZED,
@@ -86,7 +95,7 @@ fn ws_token_from_query(raw: &str) -> Option<String> {
 }
 
 async fn ws_handler(
-    _auth: WsAuthorized,
+    WsAuthorized(session): WsAuthorized,
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<LangueSignal>,
@@ -96,7 +105,7 @@ async fn ws_handler(
     // LAT-Z3 : le client veut voir ses appareils maintenant, pas au prochain
     // tour du scanner. Détaché et borné à une recherche par fenêtre.
     crate::discovery_setup::declencher_la_recherche_a_la_connexion(&state);
-    ws.on_upgrade(move |socket| handle_socket(socket, state, lang))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, lang, session))
 }
 
 fn matches_pattern(event_type: &str, pattern: &str) -> bool {
@@ -270,11 +279,21 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
     })
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState, lang: &str) {
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    lang: &str,
+    session: Option<crate::auth::JwtClaims>,
+) {
     let mut rx = state.playback.subscribe();
     let mut event_rx = state.event_bus.subscribe();
     // Activation de l'authentification : la socket se ferme.
     let mut fermeture = state.fermeture_websockets.subscribe();
+    // rc14 — révocation d'une session (déconnexion, administrateur, secrets
+    // renouvelés, vol détecté) : si c'est CELLE de la socket, elle se ferme.
+    // Relu aussi à chaque ping (mot de passe changé, compte supprimé). Pas à
+    // l'expiration du jeton d'accès.
+    let mut revocations = crate::session_renouvelee::abonner_aux_revocations();
     let mut patterns: Vec<String> = vec!["*".to_string()];
     let mut ping_interval = interval(PING_INTERVAL);
     ping_interval.tick().await;
@@ -301,6 +320,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, lang: &str) {
             _ = fermeture.changed() => {
                 let _ = socket.send(Message::Close(None)).await;
                 break;
+            }
+            Ok(()) = revocations.changed(), if session.is_some() => {
+                if crate::session_renouvelee::websocket_a_fermer(&state.backend, session.as_ref()) {
+                    tracing::info!("websocket_fermee_session_revoquee");
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
             }
             event = rx.recv() => {
                 match event {
@@ -369,6 +395,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, lang: &str) {
                 }
             }
             _ = ping_interval.tick() => {
+                // rc14 — la session de la socket vaut-elle encore ? (mot de
+                // passe changé, compte supprimé ou rétrogradé : sans signal.)
+                if crate::session_renouvelee::websocket_a_fermer(&state.backend, session.as_ref()) {
+                    tracing::info!("websocket_fermee_session_revoquee");
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
                 // Keepalive. Send BOTH a protocol Ping (standards-compliant native
                 // clients auto-Pong) AND an app-level text ping the web client
                 // matches exactly (`{"type":"ping"}` → it replies "pong"). Protocol

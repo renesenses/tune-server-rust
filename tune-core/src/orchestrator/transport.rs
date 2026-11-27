@@ -2421,6 +2421,9 @@ impl PlaybackOrchestrator {
             .filter(|c| *c > 0)
             .unwrap_or(2);
         self.zone_has_active_eq(zone_id)
+            || self
+                .niveau_reseau_a_reporter(zone_id, req.piste_rg())
+                .is_some()
             || self.zone_has_active_crossfeed(zone_id)
             || self.zone_has_active_enceintes(zone_id)
             || self.zone_replaygain_changes_audio(zone_id, req.piste_rg())

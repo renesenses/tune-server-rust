@@ -296,7 +296,7 @@ async fn authentification_active_seul_le_proprietaire_fait_suivre() {
     s.set("jwt_secret", "secret-de-banc").unwrap();
     s.set("auth_enabled", "true").unwrap();
     let profils = ProfileRepo::with_backend(b.state.backend.clone());
-    let admin = profils.create("admin", Some("Admin"), None).unwrap();
+    let admin = profils.create("gerant", Some("Gérant"), None).unwrap();
     let autre_admin = profils.create("admin2", Some("Admin 2"), None).unwrap();
     let jeton_admin = crate::auth::sign_jwt(admin, "admin", "secret-de-banc").unwrap();
     let jeton_autre = crate::auth::sign_jwt(autre_admin, "admin", "secret-de-banc").unwrap();
@@ -344,7 +344,7 @@ async fn authentification_active_un_administrateur_relie_apres_deliaison() {
     s.set("jwt_secret", "secret-de-banc").unwrap();
     s.set("auth_enabled", "true").unwrap();
     let profils = ProfileRepo::with_backend(b.state.backend.clone());
-    let admin = profils.create("admin", Some("Admin"), None).unwrap();
+    let admin = profils.create("gerant", Some("Gérant"), None).unwrap();
     let autre_admin = profils.create("admin2", Some("Admin 2"), None).unwrap();
     let jeton_admin = crate::auth::sign_jwt(admin, "admin", "secret-de-banc").unwrap();
     let jeton_autre = crate::auth::sign_jwt(autre_admin, "admin", "secret-de-banc").unwrap();

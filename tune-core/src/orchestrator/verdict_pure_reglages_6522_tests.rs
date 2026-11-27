@@ -179,6 +179,9 @@ async fn verdict_apres_la_bascule_pure(
     );
     avec_sortie_locale(&orch, |local| {
         assert!(local.pure_bypass_for_test(), "PURE doit être armé");
+        // rc14 (décision du 25/11) — l'entrée en PURE passe par un fondu
+        // d'environ 0,5 s : le verdict se lit une fois PURE revenu au sec.
+        local.jouer_du_pcm_pour_test(1.0);
         assert!(
             !local.has_eq(),
             "prémisse de #6522 : PURE a vidé l'égaliseur de la chaîne vivante"
@@ -367,6 +370,9 @@ async fn pure_sur_un_egaliseur_coupe_qui_garde_son_preampli_le_contourne_4176() 
 
     regler_pure(&orch, zone_id, true);
     assert!(orch.refresh_zone_pure_dsp(zone_id).await);
+    // rc14 (décision du 25/11) — le préampli gardé rejoint le niveau d'avant
+    // l'égaliseur par un fondu (volume inchangé) avant que PURE soit au sec.
+    avec_sortie_locale(&orch, |local| local.jouer_du_pcm_pour_test(1.0)).await;
     assert_eq!(
         verdict(&orch).await,
         OutputDspState::BypassedPure,

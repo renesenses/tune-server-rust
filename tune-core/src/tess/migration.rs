@@ -656,20 +656,41 @@ fn marques_par_le_serveur(reference: Option<&ChaineTess>, chaine: &ChaineTess) -
 }
 
 /// D1 : les réglages que seul le serveur écrit, refusés par l'écriture
-/// générique (`PATCH /system/config`) : le profil de pièce de chaque zone et
-/// son index (l'origine y décide du droit Premium), la chaîne TESS de chaque
-/// zone et son ombre (`zone_{id}_tess_chain`, `zone_{id}_tess_chain_sync`).
+/// générique (`PATCH /system/config`) : ceux qu'aucun import n'écrit non plus
+/// ([`cle_jamais_importee`]) et les profils d'égaliseur
+/// ([`cle_de_profil_d_egaliseur`]), que l'import et la restauration écrivent
+/// par `config_export::egaliseurs`.
 pub fn cle_tenue_par_le_serveur(cle: &str) -> bool {
-    if cle.starts_with("room_profile_") {
-        return true;
-    }
+    cle_jamais_importee(cle) || cle_de_profil_d_egaliseur(cle)
+}
+
+/// La suite d'une clé de zone `zone_{id}_{suite}`, si `cle` en est une.
+fn suite_de_cle_de_zone(cle: &str) -> Option<&str> {
     cle.strip_prefix("zone_")
         .and_then(|reste| reste.split_once('_'))
-        .is_some_and(|(id, suite)| {
-            !id.is_empty()
-                && id.bytes().all(|b| b.is_ascii_digit())
-                && (suite == "tess_chain" || suite == "tess_chain_sync")
-        })
+        .filter(|(id, _)| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(_, suite)| suite)
+}
+
+/// D1 : les réglages que seuls le serveur et ses routes écrivent, et
+/// qu'aucun import ni aucune restauration ne réécrit tels quels : le profil
+/// de pièce de chaque zone et son index (l'origine y décide du droit
+/// Premium), la chaîne TESS de chaque zone et son ombre
+/// (`zone_{id}_tess_chain`, `zone_{id}_tess_chain_sync`).
+pub fn cle_jamais_importee(cle: &str) -> bool {
+    cle.starts_with("room_profile_")
+        || suite_de_cle_de_zone(cle).is_some_and(|s| s == "tess_chain" || s == "tess_chain_sync")
+}
+
+/// rc14 : les réglages qui portent un profil d'égaliseur, écrits par leurs
+/// routes dédiées (qui en valident le contenu) : le profil de chaque zone
+/// (`zone_{id}_eq_profile`), sa copie d'avant TESS
+/// (`zone_{id}_eq_profile_before_tess`, [`cle_sauvegarde_eq`]) et la liste des
+/// préréglages (`eq_presets`).
+pub fn cle_de_profil_d_egaliseur(cle: &str) -> bool {
+    cle == "eq_presets"
+        || suite_de_cle_de_zone(cle)
+            .is_some_and(|s| s == "eq_profile" || s == "eq_profile_before_tess")
 }
 
 /// D1 : ce maillon est-il une correction de pièce CALCULÉE SANS MICRO (C5),
@@ -2173,6 +2194,21 @@ fn ecrire_chaine_avec(
         }
         if r.bypass_all != chaine.bypass_all {
             bilan.cles_modifiees.push(super::cle_chaine_zone(zone_id));
+        }
+        // rc14 (fil 3103) — la cible DSD (DSD128 → DSD256, filtre) ou le
+        // passage DSD ↔ éteint ne se lit que dans la chaîne : l'ancienne clé
+        // du suréchantillonneur, qui ne sait pas dire « dsd », ne bouge pas.
+        // Sans cette clé, un préréglage ou le panneau en mode immédiat ne
+        // relançait rien (`cles=[]`) et la nouvelle cadence attendait la
+        // piste suivante. La clé de l'étage fixe fait suivre la voie
+        // existante : `rafraichir` relance un flux modulé à sa position
+        // (`relancer_si_flux_dsd_module`, qui repasse par toutes les gardes
+        // de la décision DSD).
+        let cle_surech = Partie::Surechantillonnage.cle(zone_id);
+        if r.fixed.upsampling != chaine.fixed.upsampling
+            && !bilan.cles_modifiees.contains(&cle_surech)
+        {
+            bilan.cles_modifiees.push(cle_surech);
         }
         if super::egaliseurs_en_serie::ordre_des_coches(r)
             != super::egaliseurs_en_serie::ordre_des_coches(chaine)

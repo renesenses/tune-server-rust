@@ -3004,7 +3004,54 @@ UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipreggae-hifi.a
 UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac?id=radiofrance' WHERE url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac';
 ",
     },
+    // rc14 (décision du 26/11/2026) — le profil administrateur d'origine
+    // s'appelle `admin` / `Admin`. La migration 6 le sème toujours en
+    // `default` : elle est appliquée partout et ne se modifie pas. Celle-ci le
+    // renomme, sur une base neuve comme sur une base existante, seulement s'il
+    // s'appelle encore `default` et qu'aucun autre profil ne s'appelle `admin`
+    // (voir `profil_administrateur`). Le journal du bloc de version dit le
+    // cas où le nom est déjà pris. Jumelle PG 124, même texte.
+    Migration {
+        version: 158,
+        name: "profil_administrateur_admin",
+        up: crate::db::profil_administrateur::SQL_RENOMMER_LE_PROFIL_D_ORIGINE,
+    },
+    // rc14 — la session renouvelée tant qu'elle sert : les jetons de
+    // renouvellement (`POST /auth/refresh`). Seule l'empreinte SHA-256 du
+    // jeton est stockée, comme les clés Subsonic (139). Jumelle PG : 125.
+    // ⚠️ Numérotée 159 / PG 125 le 26/11 : la 158 / PG 124 est réservée par
+    // #9562 (profil administrateur « admin »), à fusionner AVANT celle-ci —
+    // sinon les gardes de contiguïté (`migration_count_matches`,
+    // `pg_migrations_are_contiguous_and_include_numeric_heals`) rougissent,
+    // et il faut renuméroter.
+    Migration {
+        version: 159,
+        name: "jetons_de_renouvellement",
+        up: include_str!("../../migrations/jetons_de_renouvellement.sql"),
+    },
 ];
+
+/// rc14 — migration 158 : dit au journal que le profil 1 garde `default`
+/// parce qu'un autre profil s'appelle déjà `admin`.
+fn journal_du_profil_administrateur(db: &SqliteDb) {
+    let pris = {
+        let conn = db.connection().lock().unwrap();
+        conn.query_row(
+            crate::db::profil_administrateur::SQL_NOM_ADMIN_DEJA_PRIS,
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+    };
+    if pris > 0 {
+        warn!(
+            "profil_administrateur_garde_default — un autre profil s'appelle deja \
+             `admin` : le profil 1 garde le nom `default`"
+        );
+    } else {
+        info!("profil_administrateur_admin");
+    }
+}
 
 /// #8788 — le format des pistes UPnP, migration 156 et réparation idempotente.
 fn format_des_elements_de_file(db: &SqliteDb) {
@@ -4567,6 +4614,9 @@ fn executer_les_migrations(db: &SqliteDb, semer_meme_sur_base_neuve: bool) -> Re
         }
         if migration.version == 156 {
             format_des_elements_de_file(db);
+        }
+        if migration.version == 158 {
+            journal_du_profil_administrateur(db);
         }
         if migration.version == 123 {
             // L'artiste d'une piste de service chez son service (#6079). Sans
@@ -6503,6 +6553,20 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "queue_items_format_streaming",
         include_str!("../../migrations/postgres/123_queue_items_format_streaming.sql"),
     ),
+    // Jumelle de la SQLite 158 (rc14) : le profil administrateur d'origine
+    // s'appelle `admin` / `Admin`. Même texte, voir `profil_administrateur`.
+    (
+        124,
+        "profil_administrateur_admin",
+        include_str!("../../migrations/postgres/124_profil_administrateur_admin.sql"),
+    ),
+    // Jumelle de la SQLite 159 (rc14) : les jetons de renouvellement de
+    // session. 124 est réservée par #9562, à fusionner avant.
+    (
+        125,
+        "jetons_de_renouvellement",
+        include_str!("../../migrations/postgres/125_jetons_de_renouvellement.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -6696,6 +6760,22 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
                 .execute(pool)
                 .await
                 .map_err(|e| format!("pg migration {version} ({name}): {e}"))?;
+        }
+        if version == 124 {
+            // Même journal que la SQLite 158.
+            let pris: i64 =
+                sqlx::query_scalar(crate::db::profil_administrateur::SQL_NOM_ADMIN_DEJA_PRIS)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or(0);
+            if pris > 0 {
+                warn!(
+                    "pg_profil_administrateur_garde_default — un autre profil s'appelle deja \
+                     `admin` : le profil 1 garde le nom `default`"
+                );
+            } else {
+                info!("pg_profil_administrateur_admin");
+            }
         }
 
         done += 1;
@@ -10577,7 +10657,10 @@ mod tests {
         // SQLite 155. Migration de DONNÉES : annule la bascule de la 118
         // (neutralisée) là où elle a eu lieu, DEFAULT '0'.
         // 123 : format des pistes UPnP en file (#8788), SQLite 156.
-        assert_eq!(pg_latest_version(), 123, "latest PG migration must be 123");
+        // 124 : profil administrateur « admin » (#9562), SQLite 158.
+        // 125 : `jetons_de_renouvellement` (session renouvelée, rc14),
+        // jumelle de la SQLite 159. Crée la table que `/auth/refresh` NOMME.
+        assert_eq!(pg_latest_version(), 125, "latest PG migration must be 125");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

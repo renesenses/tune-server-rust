@@ -83,21 +83,41 @@ use super::chaine::TauxDsd;
 /// Ordre de la boucle sigma-delta publiée au chemin du signal.
 pub const ORDRE_DU_MODULATEUR: usize = tune_plugin_audio_support::modulateur_dsd::ORDRE;
 
-/// La marge PROPRE de l'étage de modulation, en dB : appliquée en headroom
-/// automatique, et plancher d'un headroom manuel (jamais moins de 3 dB de
-/// marge avant le modulateur). Indépendante de `HEADROOM_AUTO_DB` de la
-/// chaîne PCM : une crête intersample à +3 dB d'un master chaud ne doit
-/// jamais atteindre le limiteur de sécurité à ±60 % (+1,6 dB au-dessus du
-/// 0 dB SACD).
+/// La marge PROPRE de l'étage de modulation, en dB, toujours appliquée UNE
+/// fois par le modulateur, en plus du headroom de la chaîne (automatique ou
+/// manuel) : jamais moins de 3 dB de marge entre ce que les greffons rendent
+/// et le modulateur. Indépendante de `HEADROOM_AUTO_DB` de la chaîne PCM :
+/// une crête intersample à +3 dB d'un master chaud ne doit jamais atteindre
+/// le limiteur de sécurité à ±60 % (+1,6 dB au-dessus du 0 dB SACD).
 pub const MARGE_DU_MODULATEUR_DB: f64 = -3.0;
 
-/// Le headroom appliqué avant le modulateur : celui de la chaîne (auto ou
-/// manuel), jamais au-dessus de [`MARGE_DU_MODULATEUR_DB`].
+/// Le headroom de la chaîne (dB ≤ 0 ; 0 en automatique ou non effectif) :
+/// une valeur absurde ne compte pour rien.
+fn headroom_de_la_chaine(db: f64) -> f64 {
+    if db.is_finite() { db.min(0.0) } else { 0.0 }
+}
+
+/// Le headroom TOTAL appliqué avant le modulateur, celui que publie le chemin
+/// du signal : le headroom de la chaîne, appliqué une fois, plus la marge
+/// propre du modulateur ([`MARGE_DU_MODULATEUR_DB`]), ajoutée une fois.
 pub fn headroom_avant_le_modulateur(headroom_de_la_chaine_db: f64) -> f64 {
-    if headroom_de_la_chaine_db.is_finite() {
-        headroom_de_la_chaine_db.min(MARGE_DU_MODULATEUR_DB)
-    } else {
+    headroom_de_la_chaine(headroom_de_la_chaine_db) + MARGE_DU_MODULATEUR_DB
+}
+
+/// Revue rc14 (#9518 × #9520) — la part que le MODULATEUR applique lui-même
+/// (gain fixe, dB) : sa marge, plus le headroom de la chaîne seulement si
+/// aucun étage du flux ne l'a déjà appliqué. Un headroom manuel est porté par
+/// l'égaliseur du flux (`reserve_imposee_db`, ou le gain fixe d'une sortie
+/// locale sans égaliseur coché) : l'appliquer encore ici le doublerait
+/// (−12 dB demandés, −24 dB servis).
+pub fn gain_fixe_du_modulateur_db(
+    headroom_de_la_chaine_db: f64,
+    applique_par_le_flux: bool,
+) -> f64 {
+    if applique_par_le_flux {
         MARGE_DU_MODULATEUR_DB
+    } else {
+        headroom_avant_le_modulateur(headroom_de_la_chaine_db)
     }
 }
 
@@ -769,10 +789,14 @@ pub fn ouvrir_le_relais(zone_id: i64, session: &str, plan: PlanModulation) {
 
 /// Le producteur de `session` vient d'envoyer un bloc : il avance.
 pub fn signaler_l_avance(session: &str) {
+    signaler_l_avance_a(session, Instant::now);
+}
+
+fn signaler_l_avance_a(session: &str, maintenant: impl FnOnce() -> Instant) {
     let (m, _) = relais();
     let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(x) = r.par_session.get_mut(session) {
-        x.avance = Instant::now();
+        x.avance = maintenant();
     }
 }
 
@@ -855,9 +879,28 @@ pub fn attendre_le_relais_lue(
     annule: &dyn Fn() -> bool,
     lue: &dyn Fn() -> bool,
 ) -> Option<ProducteurDsd> {
-    let (m, c) = relais();
-    let debut = Instant::now();
-    let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
+    attendre_le_relais_avec(session, plan, delai, annule, lue, Instant::now, |r| {
+        relais()
+            .1
+            .wait_timeout(r, Duration::from_millis(50))
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+    })
+}
+
+type GardeRelais = std::sync::MutexGuard<'static, TableDesRelais>;
+
+fn attendre_le_relais_avec(
+    session: &str,
+    plan: PlanModulation,
+    delai: Duration,
+    annule: &dyn Fn() -> bool,
+    lue: &dyn Fn() -> bool,
+    maintenant: impl Fn() -> Instant,
+    mut attendre: impl FnMut(GardeRelais) -> GardeRelais,
+) -> Option<ProducteurDsd> {
+    let debut = maintenant();
+    let mut r = relais().0.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         let avance = match r.par_session.get(session).map(|x| (&x.etat, x.avance)) {
             None | Some((EtatDuRelais::Abandonne, _)) => return None,
@@ -872,16 +915,14 @@ pub fn attendre_le_relais_lue(
             }
             Some((EtatDuRelais::EnCours, avance)) => avance,
         };
+        let instant = maintenant();
         if annule()
-            || debut.elapsed() >= ATTENTE_MAX
-            || (avance.elapsed() >= delai && debut.elapsed() >= delai && lue())
+            || instant - debut >= ATTENTE_MAX
+            || (instant - avance >= delai && instant - debut >= delai && lue())
         {
             return None;
         }
-        r = c
-            .wait_timeout(r, Duration::from_millis(50))
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+        r = attendre(r);
     }
 }
 
@@ -1221,11 +1262,30 @@ pub struct ModulationEnService {
     /// Les greffons de la zone sont-ils appliqués dans le flux (égaliseur,
     /// convolution, crossfeed, repli mono) ?
     pub plugins_in_stream: bool,
-    /// Headroom appliqué avant le modulateur (dB ≤ −3 : la marge propre du
-    /// modulateur, ou un headroom manuel plus fort).
+    /// Headroom total appliqué avant le modulateur (dB ≤ −3) : celui de la
+    /// chaîne, une fois, plus la marge propre du modulateur, une fois
+    /// ([`headroom_avant_le_modulateur`]).
     pub headroom_db: f64,
+    /// Décision de Bertrand du 26/11 — la marge propre du modulateur
+    /// ([`MARGE_DU_MODULATEUR_DB`]), comprise dans `headroom_db` mais publiée
+    /// À PART au chemin du signal (« Marge du modulateur DSD : −3 dB ») :
+    /// l'étage headroom n'affiche que la marge de l'utilisateur.
+    #[serde(default = "marge_du_modulateur_db")]
+    pub modulator_margin_db: f64,
     /// Le flux continue l'état de la piste précédente (enchaînement).
     pub continued: bool,
+}
+
+fn marge_du_modulateur_db() -> f64 {
+    MARGE_DU_MODULATEUR_DB
+}
+
+impl ModulationEnService {
+    /// La part du headroom qui vient de la CHAÎNE (la marge de
+    /// l'utilisateur, ou l'automatique), sans la marge du modulateur.
+    pub fn headroom_de_la_chaine_db(&self) -> f64 {
+        self.headroom_db - self.modulator_margin_db
+    }
 }
 
 /// L'état de la modulation DSD d'une piste.

@@ -270,6 +270,7 @@ fn jeton_expire() -> String {
             iat: 1,
             exp: 2,
             role: "user".into(),
+            sid: None,
         },
         &jsonwebtoken::EncodingKey::from_secret(b"test-jwt-secret"),
     )

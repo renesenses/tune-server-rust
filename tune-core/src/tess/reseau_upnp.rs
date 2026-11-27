@@ -613,11 +613,26 @@ mod tests {
             max_ratio: Some(2),
             max_rate_hz: None,
         };
+        // rc14 (Rémi) — un headroom manuel sans égaliseur est déjà résolu non
+        // appliqué hors sortie locale (#9520 : gain fixe local seulement) :
+        // rien de traité avant même la voie, et la voie n'y touche pas.
         let mut hm = chaine(&[]);
         hm.fixed.headroom = Headroom::Manual { db: -3.0 };
+        let mut r = hm.resoudre(&catalogue_de_reference(), &x);
+        assert_eq!(
+            r.badge,
+            Badge::BitPerfect,
+            "headroom manuel : déjà non appliqué"
+        );
+        assert_eq!(r.headroom_db, 0.0);
+        let a = acheminer(&r, &faits(Refused, false, Library));
+        assert_eq!(a.route, VoieUpnp::Untouched);
+        appliquer(&mut r, &a);
+        assert!(r.etapes.iter().any(|e| e.code == CodeEtape::Headroom
+            && !e.effective
+            && e.reason == Some(MotifEtape::NotAppliedOnTransport)));
         for (cas, c) in [
             ("upsampling", up),
-            ("headroom manuel", hm),
             ("repli mono", chaine(&["mono-downmix"])),
             ("réaffectation", chaine(&["channel-remap"])),
         ] {

@@ -54,6 +54,8 @@ pub mod history_repo;
 pub mod home_queries;
 /// Appareils ignorés (#1280) — faire taire un appareil, pas ses zones.
 pub mod ignored_device_repo;
+/// rc14 — les jetons de renouvellement de session (`POST /auth/refresh`).
+pub mod jetons_de_renouvellement;
 /// Lectures SQLite en cours, pour le relevé d'un gel de l'exécuteur (#5677).
 pub mod lectures_en_cours;
 /// #7619 — la révision de la bibliothèque, clé des caches de lecture (L4, L5).
@@ -93,6 +95,8 @@ pub mod politique_parentale;
 pub mod postgres;
 #[cfg(all(test, feature = "postgres"))]
 mod postgres_e2e;
+/// rc14 — le profil administrateur d'origine `admin`, et l'alias `default`.
+pub mod profil_administrateur;
 pub mod profile_repo;
 /// #6682 — le temps d'écoute radio par station (« Mon écoute »).
 pub mod radio_ecoute;

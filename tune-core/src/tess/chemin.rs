@@ -50,7 +50,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use super::chaine::{ChaineTess, Dither, Upsampling};
+use super::chaine::{ChaineTess, Dither, TauxDsd, Upsampling};
 use super::etages_fixes::{BilanDeNiveau, GainDeRendu};
 use super::greffon::Catalogue;
 use super::migration::MARQUE_MONO_INERTE;
@@ -271,6 +271,10 @@ pub fn params_du_modulateur(m: &ModulationEnService) -> Map<String, Value> {
     p.insert("source_channels".into(), json!(m.source_channels));
     p.insert("channels".into(), json!(m.channels));
     p.insert("continued".into(), json!(m.continued));
+    // Décision de Bertrand du 26/11 : la marge propre du modulateur, sur une
+    // ligne à part (« Marge du modulateur DSD : −3 dB »), jamais fondue dans
+    // le headroom de l'utilisateur.
+    p.insert("modulator_margin_db".into(), json!(m.modulator_margin_db));
     // Niveau de référence de T11b : 0 dBFS PCM = 50 % de modulation.
     p.insert(
         "zero_dbfs_modulation".into(),
@@ -278,6 +282,45 @@ pub fn params_du_modulateur(m: &ModulationEnService) -> Map<String, Value> {
     );
     p.insert("reference_level".into(), json!("0 dB SACD"));
     p
+}
+
+/// rc14 (fil 3103) — la cible DSD de la chaîne, quand elle diffère de la
+/// cadence du flux modulé qui joue : elle ne s'entendra qu'à la piste
+/// suivante (ou à la relance du flux).
+pub fn cible_dsd_a_venir(chaine: &ChaineTess, m: &ModulationEnService) -> Option<TauxDsd> {
+    match &chaine.fixed.upsampling {
+        Upsampling::Dsd { rate, .. } if *rate != m.rate => Some(*rate),
+        _ => None,
+    }
+}
+
+/// Ce que la chaîne demande au lieu du flux modulé qui joue, publié tant
+/// que la piste continue : `None` quand elle demande exactement ce qui joue
+/// (même cadence DSD).
+pub fn detail_de_la_suite(chaine: &ChaineTess, m: &ModulationEnService) -> Option<String> {
+    match &chaine.fixed.upsampling {
+        Upsampling::Dsd { .. } => cible_dsd_a_venir(chaine, m).map(detail_cible_a_venir),
+        Upsampling::Pcm { .. } => Some("PCM upsampling at the next track".into()),
+        Upsampling::Off {} | Upsampling::Unknown => Some("Off at the next track".into()),
+    }
+}
+
+fn chaine_cible(chaine: &ChaineTess) -> &'static str {
+    match &chaine.fixed.upsampling {
+        Upsampling::Dsd { .. } => "dsd",
+        Upsampling::Pcm { .. } => "pcm",
+        Upsampling::Off {} | Upsampling::Unknown => "off",
+    }
+}
+
+/// « DSD256 at the next track » : le détail publié sur l'upsampling et le
+/// modulateur tant que la nouvelle cible attend.
+pub fn detail_cible_a_venir(cible: TauxDsd) -> String {
+    let nom = serde_json::to_value(cible)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_uppercase))
+        .unwrap_or_else(|| "DSD".into());
+    format!("{nom} at the next track")
 }
 
 fn etape_vide(code: CodeEtape) -> EtapeResolue {
@@ -508,6 +551,37 @@ pub fn chemin_du_signal(
         }
         _ => {}
     }
+    // rc14 (fil 3103) — la cible a changé pendant une piste modulée
+    // (préréglage ou panneau, zone en pause, relance écartée parce qu'elle
+    // repartirait en PCM) : le chemin dit ce qui JOUE, et la suite « à la
+    // piste suivante ».
+    let en_cours = match modulation {
+        Some(EtatModulation::EnService(m)) => Some(m),
+        _ => None,
+    };
+    let a_venir = en_cours.and_then(|m| detail_de_la_suite(chaine, m));
+    if let Some(m) = en_cours
+        && a_venir.is_some()
+    {
+        match cible_dsd_a_venir(chaine, m) {
+            Some(cible) => {
+                if let Some(Value::Object(p)) = upsampling.params.as_mut() {
+                    p.insert("rate".into(), json!(m.rate));
+                    p.insert("pending_rate".into(), json!(cible));
+                }
+            }
+            // La chaîne ne va plus vers le DSD : ses paramètres (PCM, ou
+            // rien) ne décrivent pas ce qui joue.
+            None => {
+                upsampling.params = Some(json!({
+                    "target": "dsd",
+                    "rate": m.rate,
+                    "pending_target": chaine_cible(chaine),
+                }));
+            }
+        }
+        upsampling.detail = a_venir.clone();
+    }
 
     if volume.effective && !en_service.volume_logiciel {
         eteindre_pas_en_service(&mut volume, &mut ecarts);
@@ -525,8 +599,9 @@ pub fn chemin_du_signal(
     // ── Étape finale, recalculée sur le réel ───────────────────────
     let modifie =
         headroom.effective || greffons_effectifs || upsampling.effective || volume.effective;
-    let vers_dsd =
-        upsampling.effective && matches!(chaine.fixed.upsampling, Upsampling::Dsd { .. });
+    // Le modulateur qui JOUE compte, même quand la chaîne n'y va plus.
+    let vers_dsd = upsampling.effective
+        && (matches!(chaine.fixed.upsampling, Upsampling::Dsd { .. }) || en_cours.is_some());
     let finale = if vers_dsd {
         let mut f = etape_vide(CodeEtape::DsdModulator);
         f.requested = true;
@@ -534,6 +609,9 @@ pub fn chemin_du_signal(
         f.params = upsampling.params.clone();
         if let Some(EtatModulation::EnService(m)) = modulation {
             fusionner_params(&mut f, params_du_modulateur(m));
+        }
+        if a_venir.is_some() {
+            f.detail = a_venir.clone();
         }
         f
     } else {

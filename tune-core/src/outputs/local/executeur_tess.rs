@@ -223,6 +223,8 @@ pub(super) const TRANCHE: usize = 1 << 16;
 thread_local! {
     /// Tampon `f64` du décodage et de l'entrée `f32` : même règle.
     static TAMPON_F64: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    /// rc14 — la copie traitée du fondu de sortie de chaîne (PURE).
+    static TAMPON_TRAITE: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Nombre d'échantillons d'une tranche : au plus [`TRANCHE`], en trames
@@ -421,6 +423,34 @@ thread_local! {
 }
 
 /// Les moteurs de la chaîne locale, sous leurs verrous historiques.
+/// rc14 (sécurité auditive, relecture de #9556) — on a QUITTÉ PURE (ou
+/// « Bypass all ») pendant le fondu de la chaîne sortante : la chaîne est
+/// retirée de l'égaliseur coupé qui la portait (sinon il ne se mettait
+/// jamais au repos : seul le chemin PURE la fond), et son crossfeed, pris à
+/// l'entrée en PURE, revient TOUT DE SUITE dans la sortie, historique
+/// compris, si rien ne l'y a remplacé — au lieu d'attendre la piste
+/// suivante. Appelé par `LocalOutput::set_pure_bypass(false)` et, au cas où
+/// l'exécuteur tenait la chaîne hors du verrou à ce moment, à chaque bloc
+/// hors PURE.
+pub(super) fn abandonner_la_chaine_sortante(
+    eq: &Mutex<Option<EqProcessor>>,
+    crossfeed: &Mutex<Option<CrossfeedProcessor>>,
+) {
+    let rendu = match eq.lock() {
+        Ok(mut g) => match g.as_mut() {
+            Some(p) if p.fond_une_chaine() => p.abandonner_la_chaine_sortante(),
+            _ => return,
+        },
+        Err(_) => return,
+    };
+    if let Some(cf) = rendu
+        && let Ok(mut emplacement) = crossfeed.lock()
+        && emplacement.is_none()
+    {
+        *emplacement = Some(cf);
+    }
+}
+
 pub(super) struct MoteursLocaux<'a> {
     /// `None` : la vidange n'a pas d'égaliseur à faire passer (l'ordre
     /// historique le place avant le convolveur).
@@ -453,7 +483,140 @@ impl MoteursLocaux<'_> {
 
     /// La chaîne laissera-t-elle ce bloc intact ?
     fn sans_effet(&self, ordre: OrdreLocal, channels: u16, dop: bool) -> bool {
-        self.exemptee(ordre, dop) || !self.un_etage_agit(channels)
+        (self.exemptee(ordre, dop) && !self.transition_d_entree(dop))
+            || !self.un_etage_agit(channels)
+    }
+
+    /// rc14 (sécurité auditive, décision du 25/11) — sous PURE ou « Bypass
+    /// all » (jamais en DoP), l'égaliseur COUPÉ de la transition joue encore
+    /// tant qu'il n'est pas au repos : la transition d'entrée (`LocalOutput::set_pure_bypass`)
+    /// le fait rejoindre le niveau d'avant l'égaliseur au lieu d'un saut au
+    /// signal sec, puis il se retire et la chaîne redevient bit-perfect.
+    /// Seul cet étage joue alors ([`Self::executer`]).
+    fn transition_d_entree(&self, dop: bool) -> bool {
+        !dop && self.eq.is_some_and(|m| {
+            m.lock().is_ok_and(|g| {
+                g.as_ref()
+                    .is_some_and(|p| p.est_neutre() && !p.est_neutre_au_repos())
+            })
+        })
+    }
+
+    /// rc14 (sécurité auditive, décision du 25/11) — l'entrée en PURE ou en
+    /// « Bypass all » retire aussi la convolution, le crossfeed et le repli
+    /// mono : d'un bloc à l'autre, un saut de niveau (la réserve d'une
+    /// convolution, −6 à −12 dB) et une discontinuité du signal (un clic).
+    /// Le temps de [`crate::audio::eq::ChaineSortante`], ces étages jouent
+    /// encore sur une COPIE du bloc (après l'égaliseur de la transition), et
+    /// la sortie passe en fondu linéaire du traité au sec. Le sec est
+    /// multiplié par le niveau de la chaîne, MESURÉ sur la musique (rapport
+    /// des énergies, interpolé dans le bloc : aucune marche), jamais au-dessus
+    /// de 1. Fondu fini, ce niveau rejoint le gain gardé de l'égaliseur coupé
+    /// (`EqProcessor::terminer_la_chaine_sortante`), qui remonte vers le
+    /// niveau d'avant le traitement, jamais au-delà.
+    ///
+    /// **Latence de la convolution (relecture de #9556).** Le traité sort
+    /// `Convolver::latency_frames()` trames après le sec (un bloc de 1 024
+    /// trames : 21 ms à 48 kHz). Le sec n'est PAS aligné sur ce retard, à
+    /// dessein : sous PURE, la sortie rend le flux sans ce retard (le bras
+    /// natif bit-perfect ne passe même plus par l'exécuteur), donc ces
+    /// trames doivent disparaître quelque part. Les jeter DANS ce fondu de
+    /// 300 ms est le raccord le plus doux : aligner le sec ne ferait que
+    /// déplacer la coupure à la fin du fondu, en un saut de 21 ms (un clic)
+    /// ou un second raccord. Pour la sécurité auditive, c'est sans risque :
+    /// le traité et le sec × `gain` ont la même énergie (c'est ainsi que
+    /// `gain` est mesuré, sur des énergies insensibles au décalage), et la
+    /// somme `(1 − t)·traité + t·sec·gain` ne dépasse jamais, en amplitude,
+    /// `(1 − t)·|traité| + t·|sec·gain|` : aucun échantillon au-dessus du
+    /// niveau d'avant. Le seul effet est un CREUX passager, jamais une
+    /// hausse : −6 dB au milieu du fondu pour le sinus de 1 kHz du banc de
+    /// mesure (déphasé de 120° par les 1 024 trames), environ −3 dB en
+    /// moyenne sur une musique large bande, au pire une fréquence en
+    /// opposition de phase qui s'efface un instant. Le crossfeed et le repli
+    /// mono n'ont pas de latence.
+    fn fondre_la_chaine_sortante(
+        &self,
+        ordre: OrdreLocal,
+        samples: &mut [f64],
+        canaux: usize,
+        trames: usize,
+    ) {
+        let Some(moteur) = self.eq else {
+            return;
+        };
+        // La chaîne sort du verrou le temps du bloc : la convolution prend
+        // le sien, jamais les deux à la fois.
+        let Some(mut chaine) = moteur
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(EqProcessor::prendre_la_chaine_sortante))
+        else {
+            return;
+        };
+        let n = trames * canaux;
+        avec_tampon(&TAMPON_TRAITE, n, |traite| {
+            traite.copy_from_slice(&samples[..n]);
+            for etage in ordre.etages {
+                match etage {
+                    EtageLocal::Egaliseur => {}
+                    EtageLocal::Convolution if chaine.convolution => {
+                        let mut conv = AdaptateurConvolution {
+                            moteur: self.convolver,
+                            canaux,
+                        };
+                        let _ = conv.traiter_sur_place(traite, trames);
+                    }
+                    EtageLocal::Convolution => {}
+                    EtageLocal::Crossfeed => {
+                        if canaux == 2
+                            && let Some(cf) = chaine.crossfeed.as_mut()
+                        {
+                            cf.process_interleaved_f64(traite);
+                        }
+                    }
+                    EtageLocal::RepliMono => {
+                        if canaux == 2 && chaine.mono {
+                            for trame in traite.as_chunks_mut::<2>().0 {
+                                let m = (trame[0] + trame[1]) * 0.5;
+                                trame[0] = m;
+                                trame[1] = m;
+                            }
+                        }
+                    }
+                }
+            }
+            chaine.energie_traitee += traite.iter().map(|x| x * x).sum::<f64>();
+            chaine.energie_seche += samples[..n].iter().map(|x| x * x).sum::<f64>();
+            let depart = chaine.gain;
+            let arrivee = chaine.gain_mesure();
+            for f in 0..trames {
+                let t = ((chaine.fait + f + 1) as f64 / chaine.total as f64).min(1.0);
+                let g = depart + (arrivee - depart) * ((f + 1) as f64 / trames as f64);
+                for c in 0..canaux {
+                    let i = f * canaux + c;
+                    samples[i] = traite[i] + (samples[i] * g - traite[i]) * t;
+                }
+            }
+            chaine.gain = arrivee;
+            chaine.fait += trames;
+        });
+        if let Ok(mut g) = moteur.lock() {
+            match g.as_mut() {
+                Some(p) if chaine.fait >= chaine.total => {
+                    p.terminer_la_chaine_sortante(
+                        chaine.gain,
+                        crate::audio::eq::REMONTEE_RAPIDE_TESS_MS,
+                    );
+                    // Rien à garder (niveau mesuré à l'unité) : identité
+                    // exacte, l'étage se retire tout de suite.
+                    if p.est_neutre_au_repos() {
+                        *g = None;
+                    }
+                }
+                Some(p) => p.rendre_la_chaine_sortante(chaine),
+                None => {}
+            }
+        }
     }
 
     /// Fait passer `samples` par les étages `ordre.etages()[debut..]`.
@@ -468,6 +631,20 @@ impl MoteursLocaux<'_> {
             canaux,
             contourne: false,
         };
+        // rc14 — transition d'entrée en PURE / « Bypass all » : l'égaliseur
+        // seul, les autres étages restent contournés.
+        if self.pure_bypass.load(Ordering::Relaxed) || ordre.bypass_all {
+            if debut == 0 {
+                let _ = eq.traiter_sur_place(samples, trames);
+                self.fondre_la_chaine_sortante(ordre, samples, canaux, trames);
+            }
+            return;
+        }
+        // rc14 (relecture de #9556) — PURE quitté pendant le fondu de la
+        // chaîne sortante : elle reprend sa place dans le flux.
+        if let Some(m) = self.eq {
+            abandonner_la_chaine_sortante(m, self.crossfeed);
+        }
         let mut conv = AdaptateurConvolution {
             moteur: self.convolver,
             canaux,
