@@ -339,6 +339,77 @@ async fn une_piste_pcm_part_en_dop_dsd64_de_bout_en_bout() {
     }
 }
 
+/// Fil 3135 (rc14.1) — en fin de piste modulée, la session voit l'EOF : sans
+/// lui, la sortie DSD natif ALSA reste en famine sur le motif de repos, ne
+/// signale jamais la fin de piste, et la file n'enchaîne plus (« la lecture
+/// boucle sur les dernières secondes »). Le corps doit se terminer PEU après
+/// le producteur — pas au délai d'inactivité de la session — et seulement
+/// après la DERNIÈRE trame : un EOF prématuré couperait la queue (clic).
+///
+/// Contre-épreuve : sans `end_session_input` dans `servir_la_modulation_dsd`,
+/// le canal reste ouvert par le keep-alive et ce test échoue au délai de 5 s.
+#[tokio::test]
+async fn la_fin_de_la_piste_modulee_ferme_la_session_3135() {
+    let b = banc(true, "dop").await;
+    let id = piste(&b, FLAC, "flac", 2);
+    ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd64)));
+    let pq = PlayQueueRepo::with_backend(b.orch.db.clone());
+    let _ = pq.clear(b.zone_id);
+    pq.append(b.zone_id, &[QueueInput::Local { track_id: id }])
+        .unwrap();
+    let r = b
+        .orch
+        .resolve_queue_item_url(b.zone_id, 0)
+        .await
+        .expect("résolution");
+    let sid = r.stream_id.clone().expect("une session");
+    let session = b
+        .orch
+        .streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(&sid)
+        .cloned()
+        .expect("session inscrite");
+    assert!(
+        session.file_path.lock().await.is_none(),
+        "le flux modulé est un canal, pas un fichier"
+    );
+    let mut octets = Vec::new();
+    let fin = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(c) = session.recv_chunk().await {
+            octets.extend_from_slice(&c);
+        }
+    })
+    .await;
+    assert!(
+        fin.is_ok(),
+        "fil 3135 : la session modulée n'a pas vu d'EOF ({} octets reçus) — la \
+         sortie attendrait sans fin et la piste suivante ne partirait pas",
+        octets.len()
+    );
+    // Toute la piste est passée avant l'EOF : 4 trames DoP par trame PCM, à
+    // la queue du filtre près (≈ 1 ms, gardée pour une suivante liée).
+    let j = Joue {
+        mime: r.mime_type,
+        octets,
+        track_id: id,
+        stream_id: sid,
+    };
+    let charge = verifier_dop_stereo(&j, 176_400);
+    let trames_pcm = crate::audio::decode::decode_to_pcm(FLAC, None, None, 0.0, 0.0)
+        .unwrap()
+        .samples_i32
+        .len()
+        / 2;
+    let trames = charge.len() / 6;
+    assert!(
+        trames <= trames_pcm * 4 && trames + 400 >= trames_pcm * 4,
+        "EOF avant la dernière trame : {trames} trames DoP pour {trames_pcm} PCM"
+    );
+}
+
 /// HAUTE de la relecture : une source MONO part en DoP STÉRÉO (un DoP mono
 /// serait coupé par la sortie, qui ouvre deux voies).
 #[tokio::test]
