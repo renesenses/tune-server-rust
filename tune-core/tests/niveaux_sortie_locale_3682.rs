@@ -55,8 +55,9 @@ use tune_core::event_bus::EventBus;
 use tune_core::http::streamer::AudioStreamer;
 use tune_core::orchestrator::{PlayRequest, PlaybackOrchestrator};
 use tune_core::outputs::registry::OutputRegistry;
-use tune_core::playback::{NowPlaying, PlaybackManager};
+use tune_core::playback::PlaybackManager;
 use tune_core::streaming::registry::ServiceRegistry;
+use tune_output_api::{OutputStatus, OutputTarget, PlayMedia};
 
 /// L'appareil que la zone de la capture adresse : le préfixe `local:` est ce
 /// que `est_sortie_locale` lit, et c'est lui qui décide du chemin.
@@ -140,18 +141,59 @@ const FAMILLE: &[Fixture] = &[
     },
 ];
 
+/// La résolution et le décodeur sont réels. Seule la carte son est simulée.
+struct CarteDuBanc;
+
+#[async_trait::async_trait]
+impl OutputTarget for CarteDuBanc {
+    fn name(&self) -> &str {
+        "Carte du banc"
+    }
+    fn device_id(&self) -> &str {
+        APPAREIL
+    }
+    fn output_type(&self) -> &str {
+        "local"
+    }
+    async fn play_media(&self, _: &PlayMedia<'_>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn pause(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn resume(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stop(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn seek(&self, _: u64) -> Result<(), String> {
+        Ok(())
+    }
+    async fn set_volume(&self, _: f64) -> Result<(), String> {
+        Ok(())
+    }
+    async fn set_mute(&self, _: bool) -> Result<(), String> {
+        Ok(())
+    }
+    async fn get_status(&self) -> Result<OutputStatus, String> {
+        Ok(OutputStatus::default())
+    }
+    async fn is_available(&self) -> bool {
+        true
+    }
+}
+
 struct Banc {
     orch: Arc<PlaybackOrchestrator>,
     db: Arc<dyn DbBackend>,
-    playback: Arc<PlaybackManager>,
     zone_id: i64,
     rx: tokio::sync::broadcast::Receiver<tune_core::event_bus::TuneEvent>,
 }
 
 /// Une base mémoire, un orchestrateur AVEC bus d'événements, une zone
 /// `local` sans égaliseur, sans ReplayGain, sans plafond de fréquence : la
-/// zone bit-perfect de la capture. L'appareil n'est pas enregistré — la
-/// résolution locale n'en a pas besoin, et c'est elle qui arme les niveaux.
+/// zone bit-perfect de la capture. Le registre acquitte la lecture.
 async fn banc() -> Banc {
     let sqlite = SqliteDb::open_in_memory().expect("base mémoire");
     sqlite.init_schema().expect("schéma");
@@ -160,12 +202,14 @@ async fn banc() -> Banc {
     let playback = Arc::new(PlaybackManager::new());
     let bus = Arc::new(EventBus::new());
     let rx = bus.subscribe();
+    let mut sorties = OutputRegistry::new();
+    sorties.register(Box::new(CarteDuBanc));
     let mut orch = PlaybackOrchestrator::new(
         db.clone(),
         playback.clone(),
         Arc::new(AudioStreamer::new(0)),
         Arc::new(Mutex::new(ServiceRegistry::new())),
-        Arc::new(Mutex::new(OutputRegistry::new())),
+        Arc::new(Mutex::new(sorties)),
         None,
     );
     orch.event_bus = Some(bus);
@@ -174,7 +218,6 @@ async fn banc() -> Banc {
         .expect("zone");
     Banc {
         orch: Arc::new(orch),
-        playback,
         zone_id,
         db,
         rx,
@@ -205,12 +248,6 @@ impl Banc {
     /// porte du pré-chargement gapless, dont la première instruction
     /// (`begin_levels_prewarm`) interdit tout forwarder (voir le banc #3807).
     ///
-    /// L'envoi à la sortie échoue (le registre est vide) : sans importance,
-    /// le forwarder est attaché pendant la RÉSOLUTION, en amont de l'envoi.
-    /// En production `transport.rs` marque la zone `Playing` une fois l'ordre
-    /// parti ; ici on le fait à la main, sinon le forwarder gèle son horloge
-    /// et le banc mesure zéro pour tout le monde. `play()` ne bumpe pas
-    /// `play_seq` : le forwarder armé pendant la résolution survit.
     async fn jouer(&self, track_id: i64, f: &Fixture) -> Result<String, String> {
         let r = self
             .orch
@@ -236,20 +273,7 @@ impl Banc {
                 album_ref: None,
             })
             .await?;
-        self.playback
-            .play(
-                self.zone_id,
-                NowPlaying {
-                    title: "Piste 3682".into(),
-                    source: "library".into(),
-                    format: Some(f.format.into()),
-                    sample_rate: Some(f.sample_rate),
-                    bit_depth: Some(f.bit_depth as u32),
-                    duration_ms: 1_000,
-                    ..Default::default()
-                },
-            )
-            .await;
+        assert!(r.error.is_none(), "lecture refusée : {:?}", r.error);
         Ok(r.stream_url.unwrap_or_default())
     }
 
@@ -413,14 +437,46 @@ async fn une_zone_locale_bit_perfect_anime_le_spectre() {
 /// (`transcoder_en_session`), mais chacun par SA branche du décodeur
 /// progressif. Un garde-fou qui ne testerait que le FLAC ne garderait que la
 /// branche symphonia.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn les_autres_conteneurs_locaux_animent_aussi_le_spectre() {
+#[test]
+fn les_autres_conteneurs_locaux_animent_aussi_le_spectre() {
+    const FIXTURE: &str = "TUNE_TEST_SPECTRE_3682_FIXTURE";
+    if let Some(format) = std::env::var_os(FIXTURE) {
+        let f = FAMILLE
+            .iter()
+            .find(|f| format == f.format)
+            .expect("fixture connue");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime du lecteur");
+        runtime.block_on(async {
+            let mut b = banc().await;
+            let id = b.piste(f);
+            let url = b.jouer(id, f).await.expect("lecture");
+            let m = b.compter_niveaux(FENETRE, f.attendus).await;
+            println!("local/{} — {url} — {m:?}", f.format);
+            verifier(f, &url, &m);
+        });
+        return;
+    }
+
+    // La fin du processus termine aussi les producteurs et les tâches de
+    // diffusion du format précédent avant de mesurer le suivant.
     for f in FAMILLE {
-        let mut b = banc().await;
-        let id = b.piste(f);
-        let url = b.jouer(id, f).await.expect("lecture");
-        let m = b.compter_niveaux(FENETRE, f.attendus).await;
-        println!("local/{} — {url} — {m:?}", f.format);
-        verifier(f, &url, &m);
+        let enfant = std::process::Command::new(std::env::current_exe().expect("binaire du banc"))
+            .args([
+                "--exact",
+                "les_autres_conteneurs_locaux_animent_aussi_le_spectre",
+                "--nocapture",
+            ])
+            .env(FIXTURE, f.format)
+            .status()
+            .expect("lancer le lecteur isolé");
+        assert!(
+            enfant.success(),
+            "échec du lecteur isolé {} : {enfant}",
+            f.format
+        );
     }
 }
