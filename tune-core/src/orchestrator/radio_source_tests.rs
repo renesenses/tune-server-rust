@@ -2,7 +2,7 @@ use super::*;
 use crate::http::streamer::{AudioStreamer, RadioSourceInfo, StreamInfo};
 
 async fn observe_station(bytes: &'static [u8], extension: &str) -> StreamInfo {
-    let (wire, preparation) = preparer_contre_la_station(bytes, extension, false).await;
+    let (wire, preparation) = preparer_contre_la_station(bytes, extension, false, false).await;
     assert!(preparation.is_ok());
     wire
 }
@@ -14,6 +14,7 @@ async fn preparer_contre_la_station(
     bytes: &'static [u8],
     extension: &str,
     strict_bitperfect: bool,
+    wav24_accepte: bool,
 ) -> (StreamInfo, Result<(), Option<String>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
@@ -73,7 +74,7 @@ async fn preparer_contre_la_station(
             strict_bitperfect,
             frequence_fixe: None,
             plafond: None,
-            sortie_locale: false,
+            wav24_accepte,
         };
         match preparer_la_sortie(&mut etat, &url, &canaux, &sonde) {
             Ok(_) => Ok(()),
@@ -121,13 +122,13 @@ fn wav_a(cadence: u32) -> &'static [u8] {
 /// fréquences ; sans strict ⇒ elle prépare, comme avant.
 #[tokio::test]
 async fn radio_3973_strict_refuse_de_relever_la_cadence() {
-    let (_, strict) = preparer_contre_la_station(wav_a(22_050), "wav", true).await;
+    let (_, strict) = preparer_contre_la_station(wav_a(22_050), "wav", true, false).await;
     assert_eq!(
         strict,
         Err(Some("bitperfect_strict_refused:22050:44100".to_string())),
         "bit-perfect strict : la radio à 22,05 kHz ne doit pas être relevée à 44,1 kHz en silence"
     );
-    let (wire, defaut) = preparer_contre_la_station(wav_a(22_050), "wav", false).await;
+    let (wire, defaut) = preparer_contre_la_station(wav_a(22_050), "wav", false, false).await;
     assert_eq!(defaut, Ok(()), "sans strict, la conversion est jouée");
     assert_eq!(wire.sample_rate, 44_100);
 }
@@ -259,7 +260,7 @@ async fn radio_5716_la_sonde_retient_le_codec_de_la_station() {
                 frequence_fixe: None,
                 plafond: None,
                 strict_bitperfect: false,
-                sortie_locale: false,
+                wav24_accepte: false,
             };
             preparer_la_sortie(&mut etat, &url, &canaux, &sonde).is_ok()
         })
@@ -499,4 +500,43 @@ async fn radio_7200_cafe_del_mar_se_decode_avec_ses_en_tetes_reels() {
              donner 192 kbit/s"
         );
     }
+}
+
+#[tokio::test]
+async fn radio_3113_la_profondeur_du_flux_depend_du_lecteur_et_de_la_source() {
+    let hires = include_bytes!("../../tests/fixtures/flac/ref_24_96000_stereo.flac");
+    for (accepte, profondeur) in [(true, 24), (false, 16)] {
+        let (fil, resultat) = preparer_contre_la_station(hires, "flac", false, accepte).await;
+        assert!(resultat.is_ok());
+        assert_eq!((fil.sample_rate, fil.bit_depth), (96_000, profondeur));
+        assert_eq!(fil.radio_source.unwrap().bit_depth, Some(24));
+    }
+    let (fil, resultat) = preparer_contre_la_station(wav_a(44_100), "wav", false, true).await;
+    assert!(resultat.is_ok());
+    assert_eq!(fil.bit_depth, 16);
+}
+
+#[test]
+fn radio_3113_un_plafond_16_prime_sur_le_catalogue_la_sonde_et_air() {
+    let neutre = crate::device_catalog::DeviceQuirks::default();
+    let hires = serde_json::from_str(r#"{"max_bit_depth":24}"#).unwrap();
+    let limite = serde_json::from_str(r#"{"max_bit_depth":16}"#).unwrap();
+    let ruark = crate::device_catalog::quirks_for("Ruark", "R3");
+    assert_eq!(
+        wav24_du_profil("devialet_air", &neutre, false, false),
+        Some(true)
+    );
+    assert_eq!(wav24_du_profil("dlna", &neutre, false, false), None);
+    assert_eq!(
+        wav24_du_profil("openhome", &hires, false, false),
+        Some(true)
+    );
+    assert_eq!(wav24_du_profil("dlna", &neutre, false, true), Some(true));
+    assert_eq!(wav24_du_profil("dlna", &ruark, false, true), Some(false));
+    assert_eq!(wav24_du_profil("dlna", &limite, false, true), Some(false));
+    assert_eq!(
+        wav24_du_profil("devialet_air", &hires, true, true),
+        Some(false)
+    );
+    assert_eq!(wav24_du_profil("airplay", &hires, false, true), Some(false));
 }

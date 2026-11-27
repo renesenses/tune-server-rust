@@ -332,7 +332,7 @@ struct CanauxRadio<'a> {
     /// #3973 — « bit-perfect strict » de la zone : une cadence que le décodeur
     /// devrait relever (`renderer_safe_wav_rate`) est refusée, pas convertie.
     strict_bitperfect: bool,
-    sortie_locale: bool,
+    wav24_accepte: bool,
     frequence_fixe: Option<u32>,
     /// Fil 3107 — le plafond de cadence de la zone (réglage et catalogue).
     plafond: Option<u32>,
@@ -427,7 +427,7 @@ pub(super) fn decode_radio_stream_to_pcm(
     )
 }
 
-/// Seule la sortie locale relève le PCM à 24 bits quand la source le demande.
+/// Cette entrée conserve le 24 bits sur une sortie qui accepte ce format.
 /// Les autres appelants conservent leur contrat réseau 16 bits (#1654).
 ///
 /// #8110 — `replis` : les autres flux autorisés de la fiche, du meilleur au
@@ -447,7 +447,7 @@ pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
     levels_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>>,
     strict_bitperfect: bool,
     en_vol: Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
-    sortie_locale: bool,
+    wav24_accepte: bool,
 ) -> Result<(), String> {
     decode_radio_stream_to_pcm_avec_cadence(
         url,
@@ -459,7 +459,7 @@ pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
         levels_tx,
         strict_bitperfect,
         en_vol,
-        sortie_locale,
+        wav24_accepte,
         None,
         None,
     )
@@ -476,7 +476,7 @@ pub(super) fn decode_radio_stream_to_pcm_avec_cadence(
     levels_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>>,
     strict_bitperfect: bool,
     en_vol: Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
-    sortie_locale: bool,
+    wav24_accepte: bool,
     frequence_fixe: Option<u32>,
     plafond: Option<u32>,
 ) -> Result<(), String> {
@@ -507,7 +507,7 @@ pub(super) fn decode_radio_stream_to_pcm_avec_cadence(
         levels_tx: &levels_tx,
         rt: &rt,
         strict_bitperfect,
-        sortie_locale,
+        wav24_accepte,
         frequence_fixe,
         plafond,
     };
@@ -1016,6 +1016,26 @@ fn premiere_trame(
     Err(derniere_erreur)
 }
 
+/// Une réponse absente demande une sonde LPCM 24 du renderer.
+pub(super) fn wav24_du_profil(
+    genre: &str,
+    profil: &crate::device_catalog::DeviceQuirks,
+    limite_16: bool,
+    wav24: bool,
+) -> Option<bool> {
+    if limite_16 || profil.force_16bit || profil.max_bit_depth.is_some_and(|bits| bits < 24) {
+        return Some(false);
+    }
+    match genre {
+        crate::outputs::devialet_air::TYPE_DE_SORTIE => Some(true),
+        "dlna" | "openhome" => {
+            (wav24 || profil.dlna_wav24 || profil.max_bit_depth.is_some_and(|bits| bits >= 24))
+                .then_some(true)
+        }
+        _ => Some(false),
+    }
+}
+
 /// Deuxième temps : le format attendu est vérifié, le taux de sortie
 /// décidé, l'EQ construit une seule fois, le format publié à la session, et
 /// la coupure mesurée.
@@ -1030,7 +1050,7 @@ fn preparer_la_sortie(
     let source_channels = sonde.source_channels;
     let source_sample_rate = sonde.source_sample_rate;
     let output_bit_depth =
-        if canaux.sortie_locale && sonde.source_info.bit_depth.is_some_and(|bits| bits > 16) {
+        if canaux.wav24_accepte && sonde.source_info.bit_depth.is_some_and(|bits| bits > 16) {
             24
         } else {
             16

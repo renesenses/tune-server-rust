@@ -2375,6 +2375,43 @@ impl PlaybackOrchestrator {
         )
     }
 
+    async fn lecteur_accepte_radio_24(&self, req: &PlayRequest) -> bool {
+        let Some(id) = req.output_device_id.as_deref() else {
+            return false;
+        };
+        let (genre, sortie) = {
+            let registre = self.outputs.lock().await;
+            (registre.type_of(id), registre.get(id))
+        };
+        let Some(genre) = genre.as_deref() else {
+            return false;
+        };
+        let zones = ZoneRepo::with_backend(self.db.clone());
+        let profil = crate::device_catalog::resolve_zone_quirks(&self.db, req.zone_id);
+        if let Some(accepte) = super::radio::wav24_du_profil(
+            genre,
+            &profil,
+            zones.get_dlna_cap_16bit(req.zone_id),
+            zones.get_dlna_wav24(req.zone_id),
+        ) {
+            return accepte;
+        }
+        let Some(sortie) = sortie else {
+            return false;
+        };
+        let garde = sortie.lock().await;
+        let appareil = garde.as_any();
+        let caps = if let Some(dlna) = appareil.downcast_ref::<crate::outputs::dlna::DlnaOutput>() {
+            dlna.probe_capabilities().await
+        } else if let Some(oh) = appareil.downcast_ref::<crate::outputs::openhome::OpenHomeOutput>()
+        {
+            oh.probe_capabilities().await
+        } else {
+            return false;
+        };
+        caps.probed && caps.lpcm24
+    }
+
     /// Radio vers un renderer réseau : transcodage WAV par mandataire quand le
     /// renderer ou l'égaliseur l'exige, sinon l'URL de la station, en HTTP.
     async fn servir_la_radio_au_reseau(&self, req: &PlayRequest, d: Directe<'_>) -> FluxDirect {
@@ -2517,6 +2554,7 @@ impl PlaybackOrchestrator {
             // Fil 3107 — un Sonos s'arrête à 48 kHz : une station FLAC
             // 192 kHz lui est servie à 48 kHz, pas en WAV qu'il rejette.
             let plafond = crate::audio::frequence_fixe::plafond_de_zone(&self.db, req.zone_id);
+            let accepte_24 = self.lecteur_accepte_radio_24(req).await;
             let err_station = title.clone();
             // #3756 — même mémoire que le chemin local/OAAT. Le journal du
             // ticket vient d'une sortie ALSA, mais rien dans la boucle de
@@ -2538,7 +2576,7 @@ impl PlaybackOrchestrator {
                         radio_levels_tx,
                         radio_strict,
                         Some(en_vol),
-                        false,
+                        accepte_24,
                         frequence_fixe,
                         plafond,
                     )

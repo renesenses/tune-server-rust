@@ -54,6 +54,9 @@ pub struct DeviceQuirks {
     /// (combiné en `min` avec l'override de zone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sample_rate: Option<u32>,
+    /// Profondeur PCM WAV vérifiée pour ce lecteur. Absente si inconnue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bit_depth: Option<u16>,
     /// Forcer une orthographe/valeur MIME précise à l'annonce DLNA
     /// (ex. `audio/x-flac` pour les Sink stricts B&O). **Framework only** : le
     /// repli 714 gère déjà cela dynamiquement.
@@ -132,6 +135,7 @@ impl DeviceQuirks {
         self.dlna_wav24 |= marque.dlna_wav24;
         self.dlna_native_flac |= marque.dlna_native_flac;
         self.reprise_par_nouveau_flux |= marque.reprise_par_nouveau_flux;
+        self.max_bit_depth = self.max_bit_depth.or(marque.max_bit_depth);
         self.max_sample_rate = self.max_sample_rate.or(marque.max_sample_rate);
         if self.force_mime.is_none() {
             self.force_mime = marque.force_mime.clone();
