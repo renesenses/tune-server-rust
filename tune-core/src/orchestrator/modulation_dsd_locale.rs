@@ -929,6 +929,7 @@ impl PlaybackOrchestrator {
         let fichier = file_path.to_string();
         let session = session_id.clone();
         let enchainement = lien.map(|precedente| Enchainement { precedente, plan });
+        let streamer = self.streamer.clone();
         tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             let au_repris = || {
@@ -950,7 +951,7 @@ impl PlaybackOrchestrator {
                 volume,
                 tx,
                 data_ready,
-                rt,
+                rt.clone(),
             ) {
                 Ok(producteur) => {
                     let bilan = BilanDuFlux {
@@ -971,6 +972,14 @@ impl PlaybackOrchestrator {
                     warn!(zone_id, error = %e, "tess_dsd_modulation_interrompue");
                 }
             }
+            // Fil 3135 (rc14.1) — contenu FINI : fermer l'entrée de la
+            // session, APRÈS le dépôt au relais (une suivante liée y reprend
+            // le modulateur). Sans ça, le keep-alive de la session garde le
+            // canal ouvert : le corps HTTP ne se termine jamais, la sortie
+            // (DSD natif ALSA) ne voit pas l'EOF, reste en famine sur le
+            // motif de repos et n'annonce jamais la fin de piste — la file
+            // n'avance plus. Même règle que `source_pcm` et le transcodage.
+            rt.block_on(streamer.end_session_input(&session));
         });
         if let Some(bus) = self
             .event_bus
