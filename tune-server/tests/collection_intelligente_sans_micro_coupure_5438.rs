@@ -119,78 +119,50 @@ const GENRES: [&str; 8] = [
     "Pop",
 ];
 
-/// SQLite prépare le programme des déclencheurs à chaque INSERT. Grouper les
-/// valeurs amortit cette préparation ; chaque ligne traverse les mêmes index
-/// et déclencheurs, dans le même ordre et la même transaction.
-fn ajouter_les_lignes(
-    sql: &mut String,
-    table_et_colonnes: &str,
-    nombre: i64,
-    valeurs: impl Fn(i64) -> String,
-) {
-    for debut in (1..=nombre).step_by(256) {
-        sql.push_str("INSERT INTO ");
-        sql.push_str(table_et_colonnes);
-        sql.push_str(" VALUES ");
-        for id in debut..=(debut + 255).min(nombre) {
-            if id > debut {
-                sql.push(',');
-            }
-            sql.push_str(&valeurs(id));
-        }
-        sql.push_str(";\n");
-    }
-}
-
 fn remplir_au_profil_du_testeur(state: &AppState) -> i64 {
     let albums = (PISTES + PISTES_PAR_ALBUM - 1) / PISTES_PAR_ALBUM;
     let mut sql = String::from("BEGIN;\n");
-    ajouter_les_lignes(&mut sql, "artists (id, name)", ARTISTES, |a| {
-        format!("({a}, 'Artiste {a}')")
-    });
-    ajouter_les_lignes(
-        &mut sql,
-        "albums (id, title, artist_id, source, genre, year, cover_path)",
-        albums,
-        |al| {
-            let genre = GENRES[(al % GENRES.len() as i64) as usize];
+    for a in 1..=ARTISTES {
+        sql.push_str(&format!(
+            "INSERT INTO artists (id, name) VALUES ({a}, 'Artiste {a}');\n"
+        ));
+    }
+    for al in 1..=albums {
+        let genre = GENRES[(al % GENRES.len() as i64) as usize];
+        sql.push_str(&format!(
+            "INSERT INTO albums (id, title, artist_id, source, genre, year, cover_path) \
+             VALUES ({al}, 'Album {al}', {}, 'local', '{genre}', {}, {});\n",
+            al % ARTISTES + 1,
+            1950 + al % 70,
             // Un album sur cinq sans pochette : la mosaïque doit les sauter.
-            let pochette = if al % 5 == 0 {
-                "NULL".to_owned()
+            if al % 5 == 0 {
+                "NULL".to_string()
             } else {
                 format!("'/pochettes/{al}.jpg'")
-            };
-            format!(
-                "({al}, 'Album {al}', {}, 'local', '{genre}', {}, {pochette})",
-                al % ARTISTES + 1,
-                1950 + al % 70
-            )
-        },
-    );
-    ajouter_les_lignes(
-        &mut sql,
-        "tracks (id, title, album_id, artist_id, disc_number, track_number, \
-        file_path, format, sample_rate, bit_depth, source, album_artist, genre, year, label, duration_ms)",
-        PISTES,
-        |id| {
-            let al = (id - 1) / PISTES_PAR_ALBUM + 1;
-            let n = (id - 1) % PISTES_PAR_ALBUM + 1;
-            let genre = GENRES[(al % GENRES.len() as i64) as usize];
-            let (format, cadence) = if id % 7 == 0 {
-                ("dsf", 2_822_400)
-            } else {
-                ("flac", if id % 3 == 0 { 192_000 } else { 44_100 })
-            };
-            format!(
-                "({id}, 'Piste {n}', {al}, {artiste}, 1, {n}, \
+            },
+        ));
+    }
+    for id in 1..=PISTES {
+        let al = (id - 1) / PISTES_PAR_ALBUM + 1;
+        let n = (id - 1) % PISTES_PAR_ALBUM + 1;
+        let genre = GENRES[(al % GENRES.len() as i64) as usize];
+        let (format, cadence) = if id % 7 == 0 {
+            ("dsf", 2_822_400)
+        } else {
+            ("flac", if id % 3 == 0 { 192_000 } else { 44_100 })
+        };
+        sql.push_str(&format!(
+            "INSERT INTO tracks (id, title, album_id, artist_id, disc_number, track_number, \
+             file_path, format, sample_rate, bit_depth, source, album_artist, genre, year, \
+             label, duration_ms) \
+             VALUES ({id}, 'Piste {n}', {al}, {artiste}, 1, {n}, \
              '/musique/Artiste {artiste}/Album {al}/{n:02}.{format}', '{format}', {cadence}, 24, \
-             'local', 'Artiste {artiste}', '{genre}', {annee}, 'Label {label}', 240000)",
-                artiste = al % ARTISTES + 1,
-                annee = 1950 + al % 70,
-                label = al % 150,
-            )
-        },
-    );
+             'local', 'Artiste {artiste}', '{genre}', {annee}, 'Label {label}', 240000);\n",
+            artiste = al % ARTISTES + 1,
+            annee = 1950 + al % 70,
+            label = al % 150,
+        ));
+    }
     sql.push_str("COMMIT;");
     state.backend.execute_batch(&sql).unwrap();
     albums
@@ -290,51 +262,8 @@ fn mesurer_la_resolution_seule(state: &AppState) {
     );
 }
 
-/// Une rafale dans le processus client. Comme dans le navigateur, les
-/// allocations, le décodage et la libération des 22 réponses JSON ne
-/// disputent pas l'allocateur du serveur aux deux fils Tokio.
-fn jouer_le_client(addr: SocketAddr, chemins: Vec<String>, resultat: Option<&std::ffi::OsStr>) {
-    let requetes: Vec<_> = chemins
-        .into_iter()
-        .map(|c| {
-            std::thread::spawn(move || {
-                let t0 = Instant::now();
-                let r = obtenir(addr, &c);
-                (c, r, t0.elapsed())
-            })
-        })
-        .collect();
-    let mut durees = Vec::new();
-    let reponses: Vec<(String, (u16, Value))> = requetes
-        .into_iter()
-        .map(|r| {
-            let (c, r, d) = r.join().unwrap();
-            durees.push((d, c.clone()));
-            (c, r)
-        })
-        .collect();
-
-    if let Some(fichier) = resultat {
-        serde_json::to_writer(
-            std::io::BufWriter::new(std::fs::File::create(fichier).unwrap()),
-            &(reponses, durees),
-        )
-        .unwrap();
-    }
-}
-
 #[test]
 fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
-    if let Ok(addr) = std::env::var("TUNE_BANC_5438_CLIENT") {
-        let chemins =
-            serde_json::from_str(&std::env::var("TUNE_BANC_5438_CHEMINS").unwrap()).unwrap();
-        jouer_le_client(
-            addr.parse().unwrap(),
-            chemins,
-            std::env::var_os("TUNE_BANC_5438_RESULTAT").as_deref(),
-        );
-        return;
-    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(FILS_EXECUTEUR)
         .enable_all()
@@ -433,12 +362,10 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
                 let (fait, recu) = std::sync::mpsc::channel();
                 let t0 = Instant::now();
                 executeur.spawn(async move {
-                    let _ = fait.send(Instant::now());
+                    let _ = fait.send(());
                 });
-                // Horodater la prise sur le fil Tokio. Le réveil ultérieur de
-                // la sonde par le système ne fait pas partie de cette attente.
-                let prise = recu.recv().unwrap();
-                attentes.push((t0, prise - t0));
+                recu.recv().unwrap();
+                attentes.push((t0, t0.elapsed()));
                 std::thread::sleep(CADENCE_FLUX);
             }
             attentes
@@ -477,7 +404,7 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
     ));
 
     let mut clics = Vec::new();
-    let premiere_rafale = dossier.path().join("premier-clic.json");
+    let mut premiere_rafale = None;
     for clic in 0..CLICS {
         if clic > 0 {
             bus.emit_typed(
@@ -487,31 +414,31 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
             std::thread::sleep(Duration::from_millis(100));
         }
         let debut = Instant::now();
-        let mut client = std::process::Command::new(std::env::current_exe().unwrap());
-        client
-            .args([
-                "--exact",
-                "un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux",
-                "--nocapture",
-            ])
-            .env("TUNE_BANC_5438_CLIENT", addr.to_string())
-            .env(
-                "TUNE_BANC_5438_CHEMINS",
-                serde_json::to_string(&chemins).unwrap(),
-            )
-            .env_remove("TUNE_BANC_5438_RESULTAT");
-        if clic == 0 {
-            client.env("TUNE_BANC_5438_RESULTAT", &premiere_rafale);
-        }
-        assert!(client.status().expect("processus client du banc").success());
+        let requetes: Vec<_> = chemins
+            .iter()
+            .cloned()
+            .map(|c| {
+                std::thread::spawn(move || {
+                    let t0 = Instant::now();
+                    let r = obtenir(addr, &c);
+                    (c, r, t0.elapsed())
+                })
+            })
+            .collect();
+        let mut durees = Vec::new();
+        let reponses: Vec<(String, (u16, Value))> = requetes
+            .into_iter()
+            .map(|r| {
+                let (c, r, d) = r.join().unwrap();
+                durees.push((d, c.clone()));
+                (c, r)
+            })
+            .collect();
         let fin = Instant::now();
         clics.push((debut, fin));
+        premiere_rafale.get_or_insert((reponses, durees));
     }
-    type Rafale = (Vec<(String, (u16, Value))>, Vec<(Duration, String)>);
-    let (reponses, mut durees): Rafale = serde_json::from_reader(std::io::BufReader::new(
-        std::fs::File::open(premiere_rafale).unwrap(),
-    ))
-    .unwrap();
+    let (reponses, mut durees) = premiere_rafale.unwrap();
     std::thread::sleep(Duration::from_millis(50));
     arret.store(true, Ordering::Relaxed);
     let arrivees = renderer.join().unwrap();
