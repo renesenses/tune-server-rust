@@ -14,18 +14,20 @@ use std::sync::mpsc::RecvTimeoutError;
 const TRAJET_NS: u64 = 50_000;
 
 /// Le pilote rend le maître actif à chaque émission et inspecte le suiveur
-/// toutes les 5 ms. Rendre false à l'observation termine le scénario.
+/// toutes les 5 ms. Renvoie le nombre de Delay_Req servis au maître.
 pub fn jouer(
     cfg: ConfigPtp,
     maitre: impl Fn(u64) -> Option<ConfigMaitre>,
     observer: impl FnMut(u64, &SuiveurPtp) -> bool,
-) {
+) -> u64 {
+    let demandes = AtomicU64::new(0);
     let temps = Arc::new(AtomicU64::new(0));
     SuiveurPtp::jouer_sur_banc(cfg, temps.clone(), |suiveur| Liaison {
         temps,
         suiveur,
         maitre,
         observer,
+        demandes: &demandes,
         file: BTreeMap::new(),
         sync: 0,
         annonce: 0,
@@ -33,6 +35,7 @@ pub fn jouer(
         seq_sync: 0,
         seq_annonce: 0,
     });
+    demandes.into_inner()
 }
 
 pub fn temps_du_maitre(cfg: ConfigMaitre, ns: u64) -> u64 {
@@ -47,7 +50,8 @@ fn port(cfg: ConfigMaitre) -> [u8; 10] {
     port
 }
 
-struct Liaison<M, O> {
+struct Liaison<'a, M, O> {
+    demandes: &'a AtomicU64,
     temps: Arc<AtomicU64>,
     suiveur: Arc<SuiveurPtp>,
     maitre: M,
@@ -61,7 +65,7 @@ struct Liaison<M, O> {
 }
 
 impl<M: Fn(u64) -> Option<ConfigMaitre>, O: FnMut(u64, &SuiveurPtp) -> bool> LiaisonPtp
-    for Liaison<M, O>
+    for Liaison<'_, M, O>
 {
     fn graine(&self) -> u64 {
         5438
@@ -73,6 +77,7 @@ impl<M: Fn(u64) -> Option<ConfigMaitre>, O: FnMut(u64, &SuiveurPtp) -> bool> Lia
             && donnees[0] & 0xf == DELAY_REQ
             && donnees[4] == cfg.domaine
         {
+            self.demandes.fetch_add(1, Ordering::Relaxed);
             let rep = reponse_delai(cfg, port(cfg), donnees, temps_du_maitre(cfg, t + TRAJET_NS));
             self.file
                 .entry(t + 2 * TRAJET_NS)
