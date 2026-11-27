@@ -607,6 +607,14 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             }
             // Recherche en cours (extraction YouTube longue) : l'interface peut le dire.
             obj.insert("resolving".into(), json!(ps.resolving));
+            obj.insert(
+                "startup_status".into(),
+                json!(
+                    state
+                        .orchestrator
+                        .statut_de_reveil(zone_id, z.output_device_id.as_deref())
+                ),
+            );
             obj.insert("is_default".into(), json!(default_zone_id == Some(zone_id)));
             // Flux DoP en cours : le curseur de volume ne fait rien, et
             // l'interface doit le dire (#1735). Détecté sur les octets par la
@@ -882,6 +890,14 @@ pub(crate) async fn get_zone(
                 }
                 // Recherche en cours (extraction YouTube longue) : l'interface peut le dire.
                 obj.insert("resolving".into(), json!(ps.resolving));
+                obj.insert(
+                    "startup_status".into(),
+                    json!(
+                        state
+                            .orchestrator
+                            .statut_de_reveil(id, zone.output_device_id.as_deref())
+                    ),
+                );
                 // Voir la note au site jumeau : DoP en cours ⇒ volume inerte.
                 obj.insert("dop_active".into(), json!(ps.dop_active));
                 // Voir la note au site jumeau : le mode demandé n'est pas le

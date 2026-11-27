@@ -1054,12 +1054,14 @@ async fn air_ampli_en_veille_sur_une_autre_source_allume_puis_choisit_la_source_
     a.allume = false;
     a.source_choisie = 6;
     let b = banc(a, true).await;
+    assert!(b.sortie.doit_reveiller_ampli());
     let dossier = crate::test_scratch::scratch_dir("devialet-air-veille");
     let (chemin, _) = wav_16_bits(&dossier, 44_100, 4_410);
     b.sortie.play_media(&media(&chemin)).await.unwrap();
     let st = attendre_l_arret(&b.sortie).await;
     assert!(st.ended_naturally);
     let s = b.sim.etat();
+    assert!(!b.sortie.doit_reveiller_ampli());
     let ops: Vec<u16> = s.commandes.iter().map(|c| c.opcode).collect();
     assert_eq!(
         ops,

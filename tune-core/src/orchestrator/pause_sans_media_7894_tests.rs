@@ -171,3 +171,93 @@ async fn une_pause_acceptee_met_la_zone_en_pause() {
         PlayState::Paused
     );
 }
+
+/// Le départ possède le verrou jusqu'à la confirmation. La pause qui
+/// arrive entre-temps est réellement envoyée une fois le départ publié.
+#[tokio::test(start_paused = true)]
+async fn reveil_3115_transmet_la_pause_aux_instants_du_journal_apres_le_depart() {
+    let Renderer {
+        output,
+        recues,
+        task: _serveur,
+        ..
+    } = renderer(Scenario::Fige("PLAYING")).await;
+    let did = output.device_id().to_owned();
+    let orch = orchestrateur();
+    let zone = ZoneRepo::with_backend(orch.db.clone())
+        .create("AIR", Some("devialet_air"), Some(&did))
+        .unwrap();
+    orch.outputs.lock().await.register(Box::new(output));
+    let arc = orch.outputs.lock().await.get(&did).unwrap();
+    let verrou = arc.lock().await;
+    let reveil = orch.reveils.inscrire(zone, &did);
+    assert_eq!(orch.statut_de_reveil(zone, Some(&did)), Some("waking"));
+    // Journal 3115 : ALLUMER à t=0, demande de pause à +772 ms,
+    // ancien refus à +5 772 ms, première réponse AIR à +17 225 ms.
+    tokio::time::advance(std::time::Duration::from_millis(772)).await;
+    let pause = orch.pause_avec_issue(zone, Some(&did));
+    tokio::pin!(pause);
+    for delai_ms in [5_000, 11_453] {
+        tokio::select! {
+            biased;
+            resultat = &mut pause => panic!("pause terminée pendant le réveil : {resultat:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(delai_ms)) => {}
+        }
+        assert_eq!(orch.statut_de_reveil(zone, Some(&did)), Some("waking"));
+    }
+    assert_eq!(compte_dans(&recues, "Pause"), 0);
+    drop(verrou);
+    reveil.terminer(Ok(()));
+    drop(reveil);
+    assert_eq!(orch.statut_de_reveil(zone, Some(&did)), None);
+    tokio::time::resume();
+    assert_eq!(pause.await.unwrap(), IssueDePause::EnPause);
+    assert_eq!(compte_dans(&recues, "Pause"), 1);
+    assert_eq!(orch.playback.get_state(zone).await.state, PlayState::Paused);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reveil_3115_refus_et_abandon_restent_des_erreurs_bornees() {
+    let orch = orchestrateur();
+    for echec in [true, false] {
+        let reveil = orch.reveils.inscrire(1, "AIR");
+        assert!(!orch.reveils.attendre(2, "AIR").await.unwrap());
+        let pause = orch.pause_avec_issue(1, Some("AIR"));
+        tokio::pin!(pause);
+        tokio::select! {
+            biased;
+            resultat = &mut pause => panic!("pause prématurée : {resultat:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        if echec {
+            reveil.terminer(Err("l'ampli ne s'est pas allumé".into()));
+        }
+        let message = pause.await.unwrap_err().to_string();
+        assert!(
+            message.contains(if echec {
+                "pas allumé"
+            } else {
+                "ne termine pas"
+            }),
+            "{message}"
+        );
+        drop(reveil);
+        assert!(!orch.reveils.attendre(1, "AIR").await.unwrap());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reveil_3115_une_commande_plus_recente_annule_la_pause_en_attente() {
+    let orch = orchestrateur();
+    let reveil = orch.reveils.inscrire(1, "AIR");
+    let pause = orch.pause_avec_issue(1, Some("AIR"));
+    tokio::pin!(pause);
+    tokio::select! {
+        biased;
+        resultat = &mut pause => panic!("pause prématurée : {resultat:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    orch.playback.marquer_commande_de_transport(1).await;
+    drop(reveil);
+    assert_eq!(pause.await.unwrap(), IssueDePause::RemplaceePendantLeReveil);
+}

@@ -1605,6 +1605,7 @@ fn sonder_une_adresse(
 type DerniereLectureReseau = (String, Option<String>, Option<i64>, std::time::Instant);
 
 pub struct PlaybackOrchestrator {
+    reveils: reveil_du_lecteur::Reveils,
     pub db: Arc<dyn crate::db::backend::DbBackend>,
     pub playback: Arc<PlaybackManager>,
     pub streamer: Arc<AudioStreamer>,
@@ -2390,6 +2391,7 @@ impl PlaybackOrchestrator {
             confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
+            reveils: Default::default(),
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             zones_tirees_a_distance: Default::default(),
             enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
@@ -2510,6 +2512,7 @@ pub use confirmation_navigateur_6066::SignalDuLecteur;
 mod reenumeration_avant_refus;
 // #8152 — l'épisode repris sur un renderer réseau : Seek une fois en lecture.
 mod reprise_d_episode_8152;
+mod reveil_du_lecteur;
 mod transport;
 pub use transport::IssueDePause;
 #[cfg(test)]

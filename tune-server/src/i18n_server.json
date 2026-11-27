@@ -1,4 +1,26 @@
 {
+  "playback.renderer_waking": {
+    "fr": "Réveil du lecteur en cours…",
+    "en": "Waking up the player…",
+    "de": "Wiedergabegerät wird aufgeweckt…",
+    "es": "Activando el reproductor…",
+    "it": "Riattivazione del lettore in corso…",
+    "zh": "正在唤醒播放器…",
+    "ja": "プレーヤーを起動しています…",
+    "ko": "플레이어를 깨우는 중…",
+    "ro": "Se activează playerul…",
+    "sv": "Väcker spelaren…",
+    "hu": "A lejátszó ébresztése…",
+    "vi": "Đang đánh thức thiết bị phát…",
+    "nb": "Vekker spilleren…",
+    "pl": "Wybudzanie odtwarzacza…",
+    "el": "Αφύπνιση της συσκευής αναπαραγωγής…",
+    "tr": "Oynatıcı uyandırılıyor…",
+    "nl": "Speler wordt gewekt…",
+    "zh-Hant": "正在喚醒播放器…",
+    "ru": "Пробуждение проигрывателя…",
+    "uk": "Пробудження програвача…"
+  },
   "parental.explicit.refused": {
     "fr": "Ce contenu est marqué explicite : le contrôle parental de ce profil en interdit l'affichage et la lecture.",
     "en": "This content is marked explicit: this profile's parental controls do not allow it to be shown or played.",
