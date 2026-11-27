@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -233,6 +233,40 @@ fn split_lms_host(raw: &str) -> (String, u16) {
     }
 }
 
+/// Delai TOTAL (toutes adresses confondues) pour joindre le serveur CLI.
+const LMS_CLI_DELAI_TOTAL: Duration = Duration::from_secs(5);
+/// Essaie CHAQUE adresse resolue, dans l'ordre, dans un delai total borne.
+///
+/// Sur macOS, `localhost` se resout d'abord en `::1` alors que le serveur CLI
+/// de Tune n'ecoute qu'en IPv4 : ne prendre que la premiere adresse donnait
+/// « Connection refused » (fil 3119). On n'echoue qu'apres les avoir toutes
+/// essayees, et le message cite chacune.
+fn connecter_a_toutes_les_adresses(
+    adresses: &[SocketAddr],
+    delai_total: Duration,
+) -> Result<TcpStream, String> {
+    if adresses.is_empty() {
+        return Err("aucune adresse IP resolue".to_string());
+    }
+    let debut = Instant::now();
+    let mut echecs: Vec<String> = Vec::new();
+    for adresse in adresses {
+        let reste = delai_total.saturating_sub(debut.elapsed());
+        if reste.is_zero() {
+            echecs.push(format!("{adresse} : delai total de {delai_total:?} epuise"));
+            continue;
+        }
+        match TcpStream::connect_timeout(adresse, reste) {
+            Ok(flux) => return Ok(flux),
+            Err(e) => echecs.push(format!("{adresse} : {e}")),
+        }
+    }
+    Err(format!(
+        "{} adresse(s) essayee(s) ({})",
+        adresses.len(),
+        echecs.join(" ; ")
+    ))
+}
 /// Send a raw CLI command to LMS via TCP and return the response line.
 fn lms_cli_command(host: &str, port: u16, cmd: &str) -> Result<String, String> {
     let addr = format!("{host}:{port}");
@@ -240,7 +274,7 @@ fn lms_cli_command(host: &str, port: u16, cmd: &str) -> Result<String, String> {
     // Resolve rather than `str::parse::<SocketAddr>()`: the latter only accepts
     // an IP literal, so every hostname — including our own "localhost" default
     // — was rejected as "invalid address" before a single packet was sent.
-    let sock = addr
+    let adresses: Vec<SocketAddr> = addr
         .to_socket_addrs()
         .map_err(|e| {
             tracing::warn!(addr = %addr, error = %e, "lms_cli_command: address not resolvable");
@@ -248,21 +282,15 @@ fn lms_cli_command(host: &str, port: u16, cmd: &str) -> Result<String, String> {
                 "Adresse LMS invalide ou introuvable ({addr}) : {e}. Verifiez le champ Serveur Squeezebox dans les reglages."
             )
         })?
-        .next()
-        .ok_or_else(|| {
-            tracing::warn!(addr = %addr, "lms_cli_command: address resolved to nothing");
-            format!("Adresse LMS {addr} ne resout vers aucune adresse IP.")
-        })?;
-    let stream = TcpStream::connect_timeout(&sock, Duration::from_secs(5)).map_err(|e| {
+        .collect();
+    let stream = connecter_a_toutes_les_adresses(&adresses, LMS_CLI_DELAI_TOTAL).map_err(|e| {
         // An unreachable/refused optional LMS is a warning, not an app-level
-        // ERROR — logging it at error! flooded Yacine's log (a Daphile box that
-        // refuses :9090 every poll). The Err string still reaches the UI.
+        // ERROR (a Daphile box that refuses :9090 every poll flooded a log).
         tracing::warn!(addr = %addr, error = %e, "lms_cli_command: TCP connect failed");
         format!(
-            "Impossible de se connecter au serveur Squeezebox (LMS) sur {addr}: {e}. Verifiez que Logitech Media Server est demarre."
+            "Impossible de se connecter au serveur Squeezebox (LMS) sur {addr}: {e}. Verifiez que Logitech Media Server est demarre et que l'adresse est correcte."
         )
     })?;
-
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .map_err(|e| format!("set read timeout: {e}"))?;
@@ -702,11 +730,13 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        LMS_CLI_PORT, adresse_auto_detectee, diagnostic_recensement_vide, list_players_cli,
-        reponse_identifie_tune_lui_meme, split_lms_host, statut_json,
+        LMS_CLI_PORT, adresse_auto_detectee, connecter_a_toutes_les_adresses,
+        diagnostic_recensement_vide, list_players_cli, reponse_identifie_tune_lui_meme,
+        split_lms_host, statut_json,
     };
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
+    use std::time::Duration;
 
     /// La réponse RÉELLE du .18, relevée en lecture seule le 22/09/2026 par
     /// `GET /api/v1/squeezebox/status` — champ `response`, recopié tel quel.
@@ -940,5 +970,48 @@ mod tests {
             split_lms_host("192.168.0.34:abc"),
             ("192.168.0.34".into(), LMS_CLI_PORT)
         );
+    }
+
+    /// Fil 3119 : `localhost` -> `::1` d'abord, serveur CLI en IPv4 seulement.
+    fn adresses_ipv6_puis_ipv4(port: u16) -> Vec<std::net::SocketAddr> {
+        // `::1` sur le meme port : personne n'y ecoute (ou, au pire, refus).
+        vec![
+            std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        ]
+    }
+
+    #[test]
+    fn localhost_resolu_en_ipv6_d_abord_se_connecte_quand_meme_en_ipv4() {
+        let ecoute = TcpListener::bind("127.0.0.1:0").expect("bind ipv4");
+        let port = ecoute.local_addr().unwrap().port();
+        let adresses = adresses_ipv6_puis_ipv4(port);
+        // Contre-epreuve : l'ancien `.next()` ne tentait que `::1` et echouait.
+        assert!(
+            std::net::TcpStream::connect_timeout(&adresses[0], Duration::from_secs(2)).is_err(),
+            "l'ancien comportement (premiere adresse seule) doit echouer"
+        );
+        let flux = connecter_a_toutes_les_adresses(&adresses, Duration::from_secs(5))
+            .expect("repli sur 127.0.0.1");
+        assert_eq!(flux.peer_addr().unwrap().port(), port);
+    }
+
+    #[test]
+    fn echec_cite_toutes_les_adresses_essayees() {
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let erreur =
+            connecter_a_toutes_les_adresses(&adresses_ipv6_puis_ipv4(port), Duration::from_secs(5))
+                .expect_err("rien n'ecoute");
+        assert!(erreur.contains("[::1]"), "{erreur}");
+        assert!(erreur.contains("127.0.0.1"), "{erreur}");
+        assert!(erreur.starts_with("2 adresse(s)"), "{erreur}");
+    }
+
+    #[test]
+    fn aucune_adresse_est_une_erreur_claire() {
+        assert!(connecter_a_toutes_les_adresses(&[], Duration::from_secs(1)).is_err());
     }
 }
