@@ -148,13 +148,27 @@ struct Partage {
 }
 
 impl Partage {
+    fn initial() -> Self {
+        Partage {
+            actif: false,
+            etat_port: "indisponible",
+            calee: false,
+            raison: Some("aucun maître vu"),
+            maitre: None,
+            decalage_ns: None,
+            delai_ns: None,
+            derniere_sync: None,
+            erreur: None,
+        }
+    }
+
     /// Calée, ET une Sync récente : si le fil PTP s'arrêtait net, la
     /// lecture se replierait d'elle-même sur l'horloge locale.
-    fn calee(&self, delai_sans_sync: Duration) -> bool {
+    fn calee(&self, delai_sans_sync: Duration, maintenant: Instant) -> bool {
         self.calee
             && self
                 .derniere_sync
-                .is_some_and(|t| t.elapsed() < delai_sans_sync)
+                .is_some_and(|t| maintenant.duration_since(t) < delai_sans_sync)
     }
 }
 
@@ -196,17 +210,7 @@ impl SuiveurPtp {
         let generation = Arc::new(AtomicU64::new(0));
         let horloge = HorlogeVirtuelle::new(generation.clone());
         let identite = cfg.identite.unwrap_or_else(identite_aleatoire);
-        let partage = Arc::new(Mutex::new(Partage {
-            actif: false,
-            etat_port: "indisponible",
-            calee: false,
-            raison: Some("aucun maître vu"),
-            maitre: None,
-            decalage_ns: None,
-            delai_ns: None,
-            derniere_sync: None,
-            erreur: None,
-        }));
+        let partage = Arc::new(Mutex::new(Partage::initial()));
         let arret = Arc::new(AtomicBool::new(false));
         let mut fils = Vec::new();
         let mut adresses = None;
@@ -226,7 +230,7 @@ impl SuiveurPtp {
                         let partage = p.clone();
                         let generation = g.clone();
                         let issue = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            boucle(cfg, identite, transport, rx, h, p, g, a)
+                            boucle(cfg, identite, (transport, rx), h, p, g, a)
                         }));
                         if issue.is_err() {
                             // Le fil PTP est mort : repli explicite et durable.
@@ -282,6 +286,34 @@ impl SuiveurPtp {
         })
     }
 
+    #[cfg(feature = "banc-ptp")]
+    pub(super) fn jouer_sur_banc<L: LiaisonPtp>(
+        cfg: ConfigPtp,
+        temps: Arc<AtomicU64>,
+        lien: impl FnOnce(Arc<Self>) -> L,
+    ) {
+        let generation = Arc::new(AtomicU64::new(0));
+        let horloge = HorlogeVirtuelle::simulee(generation.clone(), temps);
+        let partage = Arc::new(Mutex::new(Partage {
+            actif: true,
+            ..Partage::initial()
+        }));
+        let arret = Arc::new(AtomicBool::new(false));
+        let identite = [2, 0, 0, 0, 0, 0, 0, 1];
+        let s = Arc::new(Self {
+            horloge: horloge.clone(),
+            generation: generation.clone(),
+            partage: partage.clone(),
+            arret: arret.clone(),
+            fils: Mutex::new(Vec::new()),
+            domaine: cfg.domaine,
+            delai_sans_sync: cfg.delai_sans_sync,
+            identite,
+            adresses: None,
+        });
+        boucle(cfg, identite, lien(s), horloge, partage, generation, arret);
+    }
+
     fn partage(&self) -> MutexGuard<'_, Partage> {
         self.partage.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -298,7 +330,7 @@ impl SuiveurPtp {
 
     pub fn etat(&self) -> EtatPtp {
         let p = self.partage();
-        let calee = p.calee(self.delai_sans_sync);
+        let calee = p.calee(self.delai_sans_sync, self.horloge.instant());
         let raison = if p.calee && !calee {
             "aucune Sync récente du maître"
         } else {
@@ -317,7 +349,9 @@ impl SuiveurPtp {
             frequence_ppm: self.horloge.ppm(),
             sauts: self.horloge.sauts(),
             generation: self.generation.load(Ordering::Acquire),
-            derniere_sync_il_y_a_ms: p.derniere_sync.map(|t| t.elapsed().as_millis() as u64),
+            derniere_sync_il_y_a_ms: p
+                .derniere_sync
+                .map(|t| self.horloge.instant().duration_since(t).as_millis() as u64),
             horodatage: "logiciel",
             identite: eui64(&self.identite),
             erreur: p.erreur.clone(),
@@ -361,7 +395,10 @@ impl SourceHorloge for SuiveurPtp {
     }
     fn reference(&self) -> ReferenceHorloge {
         let p = self.partage();
-        match (p.calee(self.delai_sans_sync), p.maitre) {
+        match (
+            p.calee(self.delai_sans_sync, self.horloge.instant()),
+            p.maitre,
+        ) {
             (true, Some(identite_maitre)) => ReferenceHorloge::Ptp {
                 identite_maitre,
                 domaine: self.domaine,
@@ -370,7 +407,8 @@ impl SourceHorloge for SuiveurPtp {
         }
     }
     fn calee(&self) -> bool {
-        self.partage().calee(self.delai_sans_sync)
+        self.partage()
+            .calee(self.delai_sans_sync, self.horloge.instant())
     }
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
@@ -459,12 +497,40 @@ struct Suivi {
     calee: bool,
 }
 
+pub(super) trait LiaisonPtp {
+    fn evenement(
+        &mut self,
+        donnees: &[u8],
+        horloge: &HorlogeVirtuelle,
+    ) -> std::io::Result<statime::time::Time>;
+    fn general(&mut self, donnees: &[u8]) -> std::io::Result<()>;
+    fn recevoir(&mut self, attente: Duration) -> Result<Recu, RecvTimeoutError>;
+    fn graine(&self) -> u64 {
+        graine()
+    }
+}
+
+impl LiaisonPtp for (TransportUdp, Receiver<Recu>) {
+    fn evenement(
+        &mut self,
+        donnees: &[u8],
+        horloge: &HorlogeVirtuelle,
+    ) -> std::io::Result<statime::time::Time> {
+        self.0.envoyer_evenement(donnees, horloge)
+    }
+    fn general(&mut self, donnees: &[u8]) -> std::io::Result<()> {
+        self.0.envoyer_general(donnees)
+    }
+    fn recevoir(&mut self, attente: Duration) -> Result<Recu, RecvTimeoutError> {
+        self.1.recv_timeout(attente)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn boucle(
     cfg: ConfigPtp,
     identite: [u8; 8],
-    transport: TransportUdp,
-    rx: Receiver<Recu>,
+    mut liaison: impl LiaisonPtp,
     horloge: HorlogeVirtuelle,
     partage: Arc<Mutex<Partage>>,
     generation: Arc<AtomicU64>,
@@ -501,12 +567,12 @@ fn boucle(
             ..KalmanConfiguration::default()
         },
         horloge.clone(),
-        StdRng::seed_from_u64(graine()),
+        StdRng::seed_from_u64(liaison.graine()),
     );
     let (mut port, premieres) = port.end_bmca();
     let mut file: VecDeque<Action> = posseder(premieres).into();
     let mut minuteurs: [Option<Instant>; 5] = [None; 5];
-    let mut prochain_bmca = Instant::now() + instance.bmca_interval();
+    let mut prochain_bmca = horloge.instant() + instance.bmca_interval();
     let mut suivi = Suivi {
         maitre: None,
         corrections_au_choix: horloge.corrections(),
@@ -519,17 +585,17 @@ fn boucle(
         while let Some(action) = file.pop_front() {
             match action {
                 Action::Evenement { context, donnees } => {
-                    match transport.envoyer_evenement(&donnees, &horloge) {
+                    match liaison.evenement(&donnees, &horloge) {
                         Ok(t) => file.extend(posseder(port.handle_send_timestamp(context, t))),
                         Err(e) => debug!(error = %e, "aes67_ptp_envoi_evenement_refuse"),
                     }
                 }
                 Action::General(donnees) => {
-                    if let Err(e) = transport.envoyer_general(&donnees) {
+                    if let Err(e) = liaison.general(&donnees) {
                         debug!(error = %e, "aes67_ptp_envoi_general_refuse");
                     }
                 }
-                Action::Armer(m, d) => minuteurs[m as usize] = Some(Instant::now() + d),
+                Action::Armer(m, d) => minuteurs[m as usize] = Some(horloge.instant() + d),
             }
         }
         if arret.load(Ordering::Acquire) {
@@ -537,13 +603,13 @@ fn boucle(
         }
 
         // 2. Le BMCA, à sa cadence.
-        if Instant::now() >= prochain_bmca {
+        if horloge.instant() >= prochain_bmca {
             let mut en_bmca = port.start_bmca();
             instance.bmca(&mut [&mut en_bmca]);
             let (p, actions) = en_bmca.end_bmca();
             port = p;
             file.extend(posseder(actions));
-            prochain_bmca = Instant::now() + instance.bmca_interval();
+            prochain_bmca = horloge.instant() + instance.bmca_interval();
         }
 
         // 3. Ce que le monde en voit.
@@ -569,7 +635,7 @@ fn boucle(
         }
 
         // 4. Attendre un message ou le prochain minuteur.
-        let maintenant = Instant::now();
+        let maintenant = horloge.instant();
         let echeance = minuteurs
             .iter()
             .flatten()
@@ -577,7 +643,7 @@ fn boucle(
             .chain([prochain_bmca, maintenant + Duration::from_millis(100)])
             .min()
             .unwrap_or(maintenant);
-        match rx.recv_timeout(echeance.saturating_duration_since(maintenant)) {
+        match liaison.recevoir(echeance.saturating_duration_since(maintenant)) {
             Ok(recu) => {
                 let actions = match recu.canal {
                     Canal::Evenement => {
@@ -585,7 +651,7 @@ fn boucle(
                             partage
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .derniere_sync = Some(Instant::now());
+                                .derniere_sync = Some(horloge.instant());
                         }
                         port.handle_event_receive(&recu.donnees, recu.horodatage)
                     }
@@ -598,7 +664,7 @@ fn boucle(
         }
 
         // 5. Les minuteurs échus.
-        let maintenant = Instant::now();
+        let maintenant = horloge.instant();
         for m in MINUTEURS {
             if minuteurs[m as usize].is_some_and(|t| t <= maintenant) {
                 minuteurs[m as usize] = None;
@@ -651,14 +717,14 @@ fn publier(
     }
     let sync_recente = p
         .derniere_sync
-        .is_some_and(|t| t.elapsed() < cfg.delai_sans_sync);
+        .is_some_and(|t| horloge.instant().duration_since(t) < cfg.delai_sans_sync);
     let regle = horloge.corrections() > suivi.corrections_au_choix;
     // Le filtre rend (0, 0) tant qu'il n'a rien mesuré : un délai moyen
     // nul n'est pas une estimation.
     let estime = estimation.is_some_and(|(_, delai)| delai != 0);
     let stable = horloge
         .dernier_saut()
-        .is_none_or(|t| t.elapsed() >= cfg.stabilisation);
+        .is_none_or(|t| horloge.instant().duration_since(t) >= cfg.stabilisation);
     let decalage = estimation.map(|(d, _)| d.unsigned_abs());
     let seuil = if suivi.calee {
         seuil_ns.saturating_mul(10)

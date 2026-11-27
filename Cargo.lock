@@ -6477,6 +6477,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "tune-aes67",
  "tune-core",
 ]
 
