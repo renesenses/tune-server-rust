@@ -165,8 +165,10 @@ impl CiblesDeSurechantillonnage {
     }
 
     pub fn reserve_db(&self, de: u32, vers: u32) -> f64 {
+        // rc15 (M2) — la réserve EFFECTIVE : le niveau de la zone.
         crate::audio::surechantillonnage::greffon::headroom_db(&self.filtre, vers / de.max(1))
             .unwrap_or(0.0)
+            .min(crate::audio::surechantillonnage::RESERVE_DE_ZONE_DB)
     }
 }
 
@@ -456,6 +458,10 @@ pub struct StreamSession {
     /// rc14 — les cibles du suréchantillonnage d'une radio servie à un
     /// lecteur UPnP, posées avant le décodage (`None` : aucun).
     pub surechantillonnage_radio: std::sync::OnceLock<CiblesDeSurechantillonnage>,
+    /// rc15 (m) — l'étage de la radio n'a pas pu être bâti : la session
+    /// publie de nouveau la cadence de la STATION (sinon le flux partirait à
+    /// la mauvaise vitesse, annoncé à la cible et servi à la source).
+    surechantillonnage_radio_abandonne: std::sync::atomic::AtomicBool,
     pub detected_channels: std::sync::atomic::AtomicU16,
     detected_bit_depth: std::sync::atomic::AtomicU16,
     pub wav_header_included: std::sync::atomic::AtomicBool,
@@ -751,10 +757,30 @@ impl StreamSession {
         let servie = self
             .surechantillonnage_radio
             .get()
+            .filter(|_| {
+                !self
+                    .surechantillonnage_radio_abandonne
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
             .and_then(|c| c.cible(sample_rate))
             .unwrap_or(sample_rate);
         self.detected_sample_rate
             .store(servie, std::sync::atomic::Ordering::Release);
+    }
+
+    /// rc15 (m) — l'étage de suréchantillonnage de la radio n'a pas pu être
+    /// bâti : la cadence SERVIE redevient celle de la station, avant que le
+    /// premier octet ne parte (le relais l'appelle sur son premier bloc).
+    pub fn renoncer_au_surechantillonnage_radio(&self) {
+        self.surechantillonnage_radio_abandonne
+            .store(true, std::sync::atomic::Ordering::Release);
+        let source = self
+            .detected_source_sample_rate
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if source != 0 {
+            self.detected_sample_rate
+                .store(source, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// rc14 — la cadence que le décodeur radio produit, avant le
@@ -841,6 +867,9 @@ impl StreamSession {
                     self.surechantillonnage_radio.get(),
                     self.detected_source_output_format(),
                 ) && source != sample_rate
+                    && !self
+                        .surechantillonnage_radio_abandonne
+                        .load(std::sync::atomic::Ordering::Acquire)
                 {
                     info.surechantillonnage = Some(SurechDuFlux {
                         de_hz: source,
@@ -952,6 +981,7 @@ impl StreamSession {
             detected_sample_rate: std::sync::atomic::AtomicU32::new(0),
             detected_source_sample_rate: std::sync::atomic::AtomicU32::new(0),
             surechantillonnage_radio: std::sync::OnceLock::new(),
+            surechantillonnage_radio_abandonne: std::sync::atomic::AtomicBool::new(false),
             detected_channels: std::sync::atomic::AtomicU16::new(0),
             detected_bit_depth: std::sync::atomic::AtomicU16::new(0),
             wav_header_included: std::sync::atomic::AtomicBool::new(false),

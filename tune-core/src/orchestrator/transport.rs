@@ -2768,6 +2768,15 @@ impl PlaybackOrchestrator {
                 Err(e) => {
                     drop(output);
                     warn!(device_id = %used_device_id, error = %e, "output_play_failed");
+                    // rc15 (m) — un lecteur UPnP qui refuse le flux
+                    // suréchantillonné qu'il disait lire : la cadence est
+                    // retenue, la piste suivante ne la retentera pas.
+                    super::surechantillonnage_reseau::retenir_un_refus_de_cadence(
+                        self,
+                        zone_id,
+                        &used_device_id,
+                        media.sample_rate,
+                    );
                     // Le message rendu à l'utilisateur nomme le RÉGLAGE quand
                     // le serveur savait, avant d'envoyer, que la zone forçait
                     // du DSD brut vers un lecteur qui annonce ne pas le lire

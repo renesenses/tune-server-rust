@@ -53,6 +53,11 @@ pub(crate) struct SurechPlanifie {
     pub(crate) cadences_flac: Vec<u32>,
     pub(crate) cadences_lpcm: Vec<u32>,
     pub(crate) plafond_zone: Option<u32>,
+    /// rc15 (M1) — les bords de la piste (voisines enchaînées sans blanc).
+    /// Posés par la résolution, juste avant de servir : `Inconnu` sinon.
+    pub(crate) jonction: super::jonction_surech_reseau::ContexteDeJonction,
+    /// rc15 (M2) — le niveau de la piste (gain total) et d'où il part.
+    pub(crate) niveau: Option<super::jonction_surech_reseau::NiveauPlanifie>,
 }
 
 impl SurechPlanifie {
@@ -80,6 +85,34 @@ impl SurechPlanifie {
         }
     }
 
+    /// rc15 (M3) — la même décision à la plus HAUTE cadence annoncée,
+    /// inférieure à la cible, qui reste un multiple entier admis de la source
+    /// et pour laquelle `tient` est vrai. `None` : aucune.
+    pub(crate) fn cadence_plus_basse_qui_tient(
+        &self,
+        tient: impl Fn(&Self) -> bool,
+    ) -> Option<Self> {
+        let choix = su::ChoixSurechantillonnage {
+            reglages: self.reglages.clone(),
+            verdict: self.verdict.clone(),
+        };
+        let mut candidates: Vec<u32> = self
+            .proposees
+            .iter()
+            .copied()
+            .filter(|r| *r < self.vers)
+            .collect();
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        candidates.into_iter().find_map(|r| {
+            let vers = su::cible_reseau(&choix, self.de, &[r], self.plafond_zone).ok()?;
+            let q = Self {
+                vers,
+                ..self.clone()
+            };
+            tient(&q).then_some(q)
+        })
+    }
+
     /// Ce que l'étage change au fichier servi, pour sa clé de cache : le
     /// filtre et les deux cadences (la cible est déjà dans la clé, la source
     /// et le filtre non).
@@ -94,13 +127,29 @@ impl SurechPlanifie {
             h.update(b"dsp\0");
             h.update(d);
         }
+        // rc15 — les bords et le niveau changent les octets servis.
+        h.update(b"zone-3db\0");
+        self.jonction.empreinte(&mut h);
+        if let Some(n) = self.niveau.as_ref() {
+            n.empreinte(&mut h);
+        }
         Some(h.finalize().into())
     }
 
-    /// La réserve fixe du filtre à ce rapport, en dB (≤ 0).
+    /// La réserve EFFECTIVE de l'étage, en dB (≤ 0) : celle de la zone
+    /// (rc15, M2), jamais moins que celle du filtre à ce rapport.
     pub(crate) fn reserve_db(&self) -> f64 {
-        su::greffon::headroom_db(&self.reglages.filter, self.vers / self.de.max(1)).unwrap_or(0.0)
+        reserve_effective_db(&self.reglages.filter, self.de, self.vers)
     }
+}
+
+/// rc15 (M2) — la réserve effective d'un étage `filtre` de `de` à `vers`, en
+/// dB : le niveau de la zone, ou la réserve du filtre si elle était plus
+/// forte (jamais le cas aujourd'hui : la réserve fixe est le plancher).
+pub(crate) fn reserve_effective_db(filtre: &str, de: u32, vers: u32) -> f64 {
+    su::greffon::headroom_db(filtre, vers / de.max(1))
+        .unwrap_or(0.0)
+        .min(su::RESERVE_DE_ZONE_DB)
 }
 
 /// L'état publié du suréchantillonnage réseau d'une zone (`delivery.upsampling`
@@ -287,6 +336,33 @@ pub(crate) fn noter_un_refus_si_demande(
     }
 }
 
+/// rc15 (m) — la lecture d'un flux vient d'échouer sur `appareil` : si c'est
+/// le flux suréchantillonné que la zone venait de décider (même cadence), le
+/// lecteur a menti sur ses cadences. La cadence est retenue
+/// ([`su::noter_une_cadence_refusee`]) et n'est plus proposée.
+pub(crate) fn retenir_un_refus_de_cadence(
+    orch: &PlaybackOrchestrator,
+    zone_id: i64,
+    appareil: &str,
+    cadence: Option<u32>,
+) {
+    let Some(cadence) = cadence else {
+        return;
+    };
+    let Some(etat) = orch.surechantillonnage_reseau_de_la_zone(zone_id) else {
+        return;
+    };
+    if etat.active && etat.to_hz == Some(cadence) {
+        tracing::warn!(
+            zone_id,
+            appareil,
+            cadence,
+            "upsampler_network_rate_refused_by_renderer"
+        );
+        su::noter_une_cadence_refusee(appareil, cadence);
+    }
+}
+
 /// Ce que [`PlaybackOrchestrator::decider_le_surechantillonnage_reseau`] lit
 /// de la piste et de la zone.
 pub(crate) struct DemandeSurechReseau<'a> {
@@ -308,11 +384,14 @@ impl PlaybackOrchestrator {
         &self,
         device_id: &str,
     ) -> Option<(Vec<u32>, Vec<u32>)> {
+        // rc15 (m) — une cadence que ce lecteur a déjà refusée n'est plus
+        // proposée : il ne retente pas la même cible à chaque piste.
+        let sans = |v: Vec<u32>| su::sans_les_cadences_refusees(device_id, v);
         #[cfg(test)]
         if let Some(sink) = sink_de_test(device_id) {
             return Some((
-                cadences_annoncees(&sink, true),
-                cadences_annoncees(&sink, false),
+                sans(cadences_annoncees(&sink, true)),
+                sans(cadences_annoncees(&sink, false)),
             ));
         }
         if device_id.is_empty() {
@@ -335,8 +414,8 @@ impl PlaybackOrchestrator {
             return None;
         }
         Some((
-            cadences_annoncees(&caps.sink, true),
-            cadences_annoncees(&caps.sink, false),
+            sans(cadences_annoncees(&caps.sink, true)),
+            sans(cadences_annoncees(&caps.sink, false)),
         ))
     }
 
@@ -427,25 +506,40 @@ impl PlaybackOrchestrator {
         &self,
         d: &DemandeSurechReseau<'_>,
     ) -> Result<SurechPlanifie, Option<(&'static str, Vec<u32>)>> {
+        use super::jonction_surech_reseau::noter_l_aptitude as apte;
         let pure = self.zone_audiophile(d.zone_id);
         let choix = match self.decision_du_surechantillonneur(d.zone_id, pure) {
             Ok(c) => c,
-            Err(su::Ecarte::Desactive) => return Err(None),
-            Err(e) => return Err(Some((e.code(), Vec::new()))),
+            Err(su::Ecarte::Desactive) => {
+                apte(d.zone_id, false);
+                return Err(None);
+            }
+            Err(e) => {
+                apte(d.zone_id, false);
+                return Err(Some((e.code(), Vec::new())));
+            }
         };
         if d.source_format == Some(AudioFormat::Dsd) {
             return Err(Some((refus_reseau::DSD, Vec::new())));
         }
         if crate::audio::bitperfect_strict::zone_enabled(&self.db, d.zone_id) {
+            apte(d.zone_id, false);
             return Err(Some((refus_reseau::STRICT, Vec::new())));
         }
         if !type_avec_sonde_de_cadences(d.type_de_zone) {
+            apte(d.zone_id, false);
             return Err(Some((refus_reseau::LECTEUR_SANS_SONDE, Vec::new())));
         }
         let (cadences_flac, cadences_lpcm) = self
             .cadences_du_lecteur(d.device_id)
             .await
             .unwrap_or_default();
+        // rc15 (M2) — le lecteur se prête-t-il au suréchantillonnage ? Alors
+        // toutes les pistes de la zone sont jouées au niveau de la zone.
+        apte(
+            d.zone_id,
+            !(cadences_flac.is_empty() && cadences_lpcm.is_empty()),
+        );
         // La famille attendue d'abord ; l'autre sert quand la voie change
         // (relais progressif WAV vers un lecteur qui lit aussi le FLAC).
         let base = SurechPlanifie {
@@ -458,6 +552,8 @@ impl PlaybackOrchestrator {
             cadences_flac,
             cadences_lpcm,
             plafond_zone: d.plafond_zone,
+            jonction: Default::default(),
+            niveau: None,
         };
         base.pour_la_famille(d.flac)
             .or_else(|e| base.pour_la_famille(!d.flac).map_err(|_| e))

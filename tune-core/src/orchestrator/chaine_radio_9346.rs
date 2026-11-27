@@ -235,7 +235,13 @@ pub(super) fn relayer_la_radio(
                         from_hz: Some(sample_rate),
                         to_hz: Some(e.cadence_sortie()),
                         filter: Some(c.filtre.clone()),
-                        headroom_db: Some((e.reserve_db() * 100.0).round() / 100.0),
+                        headroom_db: Some(
+                            (e.reserve_db()
+                                .min(crate::audio::surechantillonnage::RESERVE_DE_ZONE_DB)
+                                * 100.0)
+                                .round()
+                                / 100.0,
+                        ),
                         offered_rates_hz: c.cibles.iter().map(|(_, v)| *v).collect(),
                     },
                     None => crate::tess::reseau_upnp::SurechantillonnageUpnp::refuse(
@@ -243,6 +249,11 @@ pub(super) fn relayer_la_radio(
                         Vec::new(),
                     ),
                 }));
+            }
+            // rc15 (m) — sans étage, la session ne doit plus annoncer la
+            // cible : elle republie la cadence de la station.
+            if etage.is_none() {
+                session.renoncer_au_surechantillonnage_radio();
             }
             dsp.surechantillonneur = etage.map(super::chaine_reseau_tess::SurechReseau::nouveau);
         }

@@ -474,6 +474,18 @@ pub(super) async fn transcode_source_to_file(
 /// pré-chauffage (`queue.rs`) garde la porte d'origine, sans crossfeed : sa
 /// rendition n'a pas la même clé de cache.
 #[allow(clippy::too_many_arguments)]
+/// rc15 — ce que le fichier refait d'une zone UPnP porte en plus de la chaîne :
+/// l'étage de suréchantillonnage (réglages, cadence de SORTIE, bords de la
+/// piste) et le niveau de la zone (`jonction_surech_reseau`).
+pub(crate) struct EtageReseauDuFichier {
+    pub(crate) surech: Option<(
+        crate::audio::surechantillonnage::UpsamplerSettings,
+        u32,
+        super::jonction_surech_reseau::ContexteDeJonction,
+    )>,
+    pub(crate) niveau: Option<super::jonction_surech_reseau::NiveauPlanifie>,
+}
+
 pub(super) async fn transcode_source_to_file_avec_crossfeed(
     source: String,
     out_sr: u32,
@@ -506,7 +518,7 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // restent à `out_sr` (la cadence de la source) ; l'étage, dernier avant
     // la quantification, porte le flux à la cible, et c'est à elle que le
     // fichier est encodé. `None` : strictement la chaîne d'avant.
-    surechantillonnage: Option<(crate::audio::surechantillonnage::UpsamplerSettings, u32)>,
+    surechantillonnage: Option<EtageReseauDuFichier>,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // LAT-F1 (phase 2a) : le chemin fichier reste le seul où le renderer
     // attend le morceau ENTIER (cible FLAC, Content-Length exigé). Avant de
@@ -622,18 +634,36 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // décodée. Un étage qui ne se bâtit pas (cadence décodée inattendue) est
     // une erreur franche : jamais un fichier annoncé à la cible qui serait à
     // la cadence de la source.
-    let surechantillonneur = match surechantillonnage.as_ref() {
-        Some((reglages, vers)) => Some(super::chaine_reseau_tess::SurechReseau::nouveau(
-            crate::audio::surechantillonnage::SurechantillonneurF64::nouveau(
-                reglages,
-                decoded_sample_rate,
-                *vers,
-                decoded_channels as u16,
+    let (surechantillonnage, niveau_de_zone) = match surechantillonnage {
+        Some(e) => (e.surech, e.niveau),
+        None => (None, None),
+    };
+    let filtre_et_cible = surechantillonnage
+        .as_ref()
+        .map(|(r, vers, _)| (r.filter.clone(), *vers));
+    let surechantillonneur = match surechantillonnage {
+        Some((reglages, vers, jonction)) => Some(
+            super::chaine_reseau_tess::SurechReseau::nouveau(
+                crate::audio::surechantillonnage::SurechantillonneurF64::nouveau(
+                    &reglages,
+                    decoded_sample_rate,
+                    vers,
+                    decoded_channels as u16,
+                )
+                .map_err(|e| format!("upsampler_network_build_failed: {e}"))?,
             )
-            .map_err(|e| format!("upsampler_network_build_failed: {e}"))?,
-        )),
+            .avec_jonction(jonction),
+        ),
         None => None,
     };
+    // rc15 (M2) — le niveau de la zone, juste avant l'étage.
+    let niveau = niveau_de_zone.and_then(|n| {
+        n.rampe(
+            decoded_sample_rate,
+            decoded_channels as usize,
+            surechantillonneur.is_some(),
+        )
+    });
     let cadence_encodee = surechantillonneur
         .as_ref()
         .map_or(decoded_sample_rate, |s| s.etage.cadence_sortie());
@@ -646,8 +676,11 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         compensation,
         sample_rate: decoded_sample_rate,
         surechantillonneur,
+        niveau,
         ..Default::default()
     };
+    let trames_source = pcm_bytes.len()
+        / ((actual_bd as usize).div_ceil(8) * (decoded_channels as usize).max(1)).max(1);
     chaine.process_piste(&mut pcm_bytes, actual_bd);
     let compensation_appliquee_db = chaine
         .compensation
@@ -685,6 +718,23 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     .await
     .map_err(|e| format!("write task panic: {e}"))??;
     let total_ms = chrono.elapsed().as_millis() as u64;
+    // rc15 (M3) — le coût RÉEL de ce fichier refait, pour juger les suivants
+    // sur cette machine (et non sur une estimation).
+    if let Some((filtre, vers)) = filtre_et_cible.as_ref() {
+        let musique_s = trames_source as f64 / f64::from(decoded_sample_rate.max(1));
+        let rendu_s = total_ms as f64 / 1000.0;
+        info!(
+            filtre = %filtre,
+            vers_hz = *vers,
+            musique_s,
+            rendu_s,
+            "upsampler_network_file_cost_measured"
+        );
+        #[cfg(not(test))]
+        crate::audio::surechantillonnage::noter_le_cout_du_fichier(
+            filtre, *vers, musique_s, rendu_s,
+        );
+    }
     info!(
         dest = %dest_journal,
         decode_ms,

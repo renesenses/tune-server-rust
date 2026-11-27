@@ -538,10 +538,27 @@ pub(super) struct SurechReseau {
     /// entière, reportée en tête du suivant (jamais servie à la cadence de
     /// la source au milieu d'un flux suréchantillonné).
     reste: Vec<u8>,
+    /// rc15 (M2) — le gain qui ramène ce filtre au niveau de la zone
+    /// ([`crate::audio::surechantillonnage::gain_de_zone`]) : ≤ 1, appliqué
+    /// avant le noyau (un gain commute avec le filtre linéaire).
+    ramene_a_la_zone: f64,
+    /// rc15 (M1) — les bords de la piste : contexte de la voisine enchaînée
+    /// sans blanc, ou fondu court quand il n'y a pas de continuité.
+    jonction: super::jonction_surech_reseau::ContexteDeJonction,
+    /// Trames d'entrée reçues pour la piste en cours.
+    entrees: usize,
+    /// Trames ALIGNÉES déjà émises (quantifiées ou retenues) pour la piste.
+    emises: usize,
+    /// Les dernières trames retenues pour le fondu de sortie (bord
+    /// [`super::jonction_surech_reseau::Bord::Rupture`] en fin de piste).
+    retenue: Vec<f64>,
 }
 
 impl SurechReseau {
     pub(super) fn nouveau(etage: crate::audio::surechantillonnage::SurechantillonneurF64) -> Self {
+        let ramene_a_la_zone = (crate::audio::surechantillonnage::gain_de_zone()
+            / etage.gain_du_filtre().max(f64::MIN_POSITIVE))
+        .min(1.0);
         Self {
             a_jeter: etage.latence_trames(),
             etage,
@@ -550,53 +567,170 @@ impl SurechReseau {
             mots: Vec::new(),
             sortie: Vec::new(),
             reste: Vec::new(),
+            ramene_a_la_zone,
+            jonction: Default::default(),
+            entrees: 0,
+            emises: 0,
+            retenue: Vec::new(),
         }
     }
 
-    fn quantifier_le_rendu(&mut self, bit_depth: u16) {
-        let Some(w) = largeur(bit_depth) else {
-            self.rendu.clear();
-            return;
-        };
-        let canaux = usize::from(self.etage.canaux()).max(1);
+    /// rc15 (M1) — pose les bords de la piste. Un contexte AVANT est passé
+    /// tout de suite par le noyau (sa sortie est jetée : elle appartient à
+    /// la piste précédente) : l'état du filtre est alors celui qu'il aurait
+    /// au bout de la piste précédente, et la latence reste à retirer en tête.
+    pub(super) fn avec_jonction(
+        mut self,
+        jonction: super::jonction_surech_reseau::ContexteDeJonction,
+    ) -> Self {
+        use super::jonction_surech_reseau::Bord;
+        if let Bord::Continu(avant) = &jonction.avant {
+            let mut jete = Vec::new();
+            let mut x = avant.clone();
+            for v in &mut x {
+                *v *= self.ramene_a_la_zone;
+            }
+            self.etage.traiter(&x, &mut jete);
+        }
+        self.jonction = jonction;
+        self
+    }
+
+    fn canaux(&self) -> usize {
+        usize::from(self.etage.canaux()).max(1)
+    }
+
+    fn trames_de_fondu(&self) -> usize {
+        super::jonction_surech_reseau::trames_de_fondu(self.etage.cadence_sortie())
+    }
+
+    /// Émet ce que le noyau a rendu : latence retirée, plafond `limite`
+    /// (trames alignées de la piste) respecté, fondu d'entrée sur une
+    /// rupture, retenue des dernières trames pour un fondu de sortie.
+    fn ecouler(&mut self, bit_depth: u16, limite: Option<usize>) {
+        use super::jonction_surech_reseau::Bord;
+        let canaux = self.canaux();
         let jetees = self.a_jeter.min(self.rendu.len() / canaux);
         self.a_jeter -= jetees;
-        let y = &self.rendu[jetees * canaux..];
-        if !y.is_empty() {
-            let format = FormatFlux {
-                channels: self.etage.canaux(),
-                sample_rate_hz: self.etage.cadence_sortie(),
-            };
-            let max_trames = pas_de_tranche(canaux) / canaux;
-            let quant = preparer_quantification(&mut self.quantification, format, max_trames);
-            let mut ecrits = self.sortie.len();
-            self.sortie.resize(ecrits + y.len() * w, 0);
-            quantifier_vers(
-                quant,
-                &mut self.mots,
-                canaux,
-                bit_depth,
-                y,
-                &mut self.sortie,
-                &mut ecrits,
-            );
-            self.sortie.truncate(ecrits);
+        let mut y = std::mem::take(&mut self.rendu);
+        y.drain(..jetees * canaux);
+        if let Some(l) = limite {
+            let deja = self.emises + self.retenue.len() / canaux;
+            y.truncate(l.saturating_sub(deja) * canaux);
         }
-        self.rendu.clear();
+        if y.is_empty() {
+            return;
+        }
+        let f = self.trames_de_fondu();
+        if self.jonction.avant == Bord::Rupture {
+            let debut = self.emises + self.retenue.len() / canaux;
+            for (i, trame) in y.chunks_exact_mut(canaux).enumerate() {
+                let k = debut + i;
+                if k >= f {
+                    break;
+                }
+                let g = super::jonction_surech_reseau::gain_de_fondu(k, f);
+                for v in trame {
+                    *v *= g;
+                }
+            }
+        }
+        if self.jonction.apres == Bord::Rupture {
+            self.retenue.extend_from_slice(&y);
+            let garder = f * canaux;
+            if self.retenue.len() > garder {
+                let pret: Vec<f64> = self.retenue.drain(..self.retenue.len() - garder).collect();
+                self.quantifier(&pret, bit_depth);
+            }
+        } else {
+            self.quantifier(&y, bit_depth);
+        }
     }
 
-    /// Une sortie de la chaîne (à la cadence de la source) : suréchantillonnée
-    /// puis quantifiée.
+    fn quantifier(&mut self, y: &[f64], bit_depth: u16) {
+        let canaux = self.canaux();
+        self.emises += y.len() / canaux;
+        let Some(w) = largeur(bit_depth) else {
+            return;
+        };
+        if y.is_empty() {
+            return;
+        }
+        let format = FormatFlux {
+            channels: self.etage.canaux(),
+            sample_rate_hz: self.etage.cadence_sortie(),
+        };
+        let max_trames = pas_de_tranche(canaux) / canaux;
+        let quant = preparer_quantification(&mut self.quantification, format, max_trames);
+        let mut ecrits = self.sortie.len();
+        self.sortie.resize(ecrits + y.len() * w, 0);
+        quantifier_vers(
+            quant,
+            &mut self.mots,
+            canaux,
+            bit_depth,
+            y,
+            &mut self.sortie,
+            &mut ecrits,
+        );
+        self.sortie.truncate(ecrits);
+    }
+
+    /// Une sortie de la chaîne (à la cadence de la source) : ramenée au
+    /// niveau de la zone, suréchantillonnée puis quantifiée.
     fn pousser(&mut self, y: &[f64], bit_depth: u16) {
-        self.etage.traiter(y, &mut self.rendu);
-        self.quantifier_le_rendu(bit_depth);
+        self.entrees += y.len() / self.canaux();
+        if (self.ramene_a_la_zone - 1.0).abs() > 1e-12 {
+            let mut x = y.to_vec();
+            for v in &mut x {
+                *v *= self.ramene_a_la_zone;
+            }
+            self.etage.traiter(&x, &mut self.rendu);
+        } else {
+            self.etage.traiter(y, &mut self.rendu);
+        }
+        self.ecouler(bit_depth, None);
     }
 
-    /// Fin de piste : la queue du noyau, puis l'étage repart à zéro.
+    /// Fin de piste. Avec un contexte APRÈS (la piste suivante, enchaînée
+    /// sans blanc), la queue est calculée sur ses premières trames : la
+    /// frontière est celle d'un seul flux. Sinon la queue du noyau (sur du
+    /// silence), et un fondu court sur une rupture. Toujours exactement n·L
+    /// trames pour n trames d'entrée ; puis l'étage repart à zéro.
     fn vider(&mut self, bit_depth: u16) {
+        use super::jonction_surech_reseau::Bord;
+        let attendues = self.entrees * self.etage.rapport();
+        if let Bord::Continu(apres) = &self.jonction.apres {
+            let mut x = apres.clone();
+            for v in &mut x {
+                *v *= self.ramene_a_la_zone;
+            }
+            self.etage.traiter(&x, &mut self.rendu);
+            self.ecouler(bit_depth, Some(attendues));
+        }
         self.etage.vider(&mut self.rendu);
-        self.quantifier_le_rendu(bit_depth);
+        self.ecouler(bit_depth, Some(attendues));
+        if !self.retenue.is_empty() {
+            let canaux = self.canaux();
+            let mut y = std::mem::take(&mut self.retenue);
+            let n = y.len() / canaux;
+            let f = self.trames_de_fondu().min(n);
+            for (i, trame) in y.chunks_exact_mut(canaux).enumerate() {
+                // Les `f` dernières trames descendent jusqu'à zéro.
+                if i + f >= n {
+                    let k = n - 1 - i;
+                    let g = super::jonction_surech_reseau::gain_de_fondu(k, f);
+                    for v in trame {
+                        *v *= g;
+                    }
+                }
+            }
+            self.quantifier(&y, bit_depth);
+        }
         self.a_jeter = self.etage.latence_trames();
+        self.entrees = 0;
+        self.emises = 0;
+        self.jonction = Default::default();
     }
 }
 
@@ -744,6 +878,7 @@ impl StreamingDsp {
             enceintes,
             sample_rate,
             surechantillonneur,
+            niveau,
             ..
         } = self;
         let EtatTess {
@@ -792,30 +927,44 @@ impl StreamingDsp {
         // Une sortie de la chaîne : l'amorce de latence retirée, puis vers le
         // puits. En `Direct`, l'écriture reste derrière la lecture : la sortie
         // d'une tranche ne dépasse jamais son entrée, déjà copiée.
-        let emettre = |y: &[f64],
-                       a_jeter: &mut usize,
-                       puits: &mut Puits,
-                       quant: &mut QuantificationPcm,
-                       mots: &mut Vec<i32>,
-                       pcm: &mut [u8],
-                       surech: &mut Option<SurechReseau>| {
-            let trames = y.len() / canaux;
-            let jetees = (*a_jeter).min(trames);
-            *a_jeter -= jetees;
-            let y = &y[jetees * canaux..];
-            if y.is_empty() {
-                return;
-            }
-            match puits {
-                Puits::Direct { ecrits } => match surech.as_mut() {
-                    // rc14 — suréchantillonné, puis quantifié à la cadence
-                    // de sortie : rien n'est écrit en place.
-                    Some(s) => s.pousser(y, bit_depth),
-                    None => quantifier_vers(quant, mots, canaux, bit_depth, y, pcm, ecrits),
-                },
-                Puits::Garde(stock) => stock.ajouter(y),
-            }
-        };
+        let emettre =
+            |y: &[f64],
+             a_jeter: &mut usize,
+             puits: &mut Puits,
+             quant: &mut QuantificationPcm,
+             mots: &mut Vec<i32>,
+             pcm: &mut [u8],
+             surech: &mut Option<SurechReseau>,
+             niveau: &mut Option<super::jonction_surech_reseau::RampeDeNiveau>| {
+                let trames = y.len() / canaux;
+                let jetees = (*a_jeter).min(trames);
+                *a_jeter -= jetees;
+                let y = &y[jetees * canaux..];
+                if y.is_empty() {
+                    return;
+                }
+                match puits {
+                    Puits::Direct { ecrits } => {
+                        // rc15 (M2) — le niveau de la zone, juste avant l'étage.
+                        let mut tampon;
+                        let y = match niveau.as_mut() {
+                            Some(n) => {
+                                tampon = y.to_vec();
+                                n.appliquer(&mut tampon);
+                                &tampon[..]
+                            }
+                            None => y,
+                        };
+                        match surech.as_mut() {
+                            // rc14 — suréchantillonné, puis quantifié à la cadence
+                            // de sortie : rien n'est écrit en place.
+                            Some(s) => s.pousser(y, bit_depth),
+                            None => quantifier_vers(quant, mots, canaux, bit_depth, y, pcm, ecrits),
+                        }
+                    }
+                    Puits::Garde(stock) => stock.ajouter(y),
+                }
+            };
 
         let mut lu = 0;
         while lu < echantillons {
@@ -834,6 +983,7 @@ impl StreamingDsp {
                     mots,
                     pcm,
                     surechantillonneur,
+                    niveau,
                 ),
                 Err(error) => {
                     tracing::warn!(%error, canaux, "tess_network_chain_failed");
@@ -852,6 +1002,7 @@ impl StreamingDsp {
                     mots,
                     pcm,
                     surechantillonneur,
+                    niveau,
                 )
             };
             if let Err(error) = executeur.vidanger(&mut etages, &mut vidange) {
@@ -886,6 +1037,9 @@ impl StreamingDsp {
                         let y = &mut entree[..n];
                         stock.lire(debut, y);
                         comp.appliquer_f64(y, bit_depth);
+                        if let Some(n) = niveau.as_mut() {
+                            n.appliquer(y);
+                        }
                         match surechantillonneur.as_mut() {
                             Some(s) => s.pousser(y, bit_depth),
                             None => {

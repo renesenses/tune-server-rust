@@ -478,6 +478,137 @@ pub fn delai_estime_du_fichier_s(
     Some(duree_s.max(0.0) / facteur * (f64::from(vers) / f64::from(ref_vers)) * FACTEUR_DU_FICHIER)
 }
 
+/// rc15 (M2) — LE niveau d'une zone réseau qui suréchantillonne : la réserve
+/// fixe du greffon (−3 dB), la même pour TOUS les filtres et pour les pistes
+/// qui ne sont pas suréchantillonnées. Un filtre dont la borne L1 permet une
+/// réserve plus faible est ramené à ce niveau (gain ≤ 1) : le niveau perçu ne
+/// dépend ni du filtre, ni du rapport, ni du refus d'une piste.
+pub const RESERVE_DE_ZONE_DB: f64 = greffon::RESERVE_DB;
+
+/// [`RESERVE_DE_ZONE_DB`], linéaire (< 1).
+pub fn gain_de_zone() -> f64 {
+    10f64.powf(RESERVE_DE_ZONE_DB / 20.0)
+}
+
+/// rc15 (M3) — le coût RÉEL du fichier refait sur cette machine, mesuré à
+/// chaque rendition : secondes de rendu par seconde de musique, ramenées à
+/// la cadence de référence du test de la machine (le coût d'un polyphase
+/// entier est proportionnel à la cadence de sortie). Par filtre et par
+/// famille de cadences. Moyenne glissante (poids 1/3 à la dernière mesure).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoutMesure {
+    pub secondes_par_seconde: f64,
+    pub mesures: u32,
+}
+
+fn couts_mesures() -> &'static std::sync::Mutex<std::collections::HashMap<(String, u32), CoutMesure>>
+{
+    static M: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(String, u32), CoutMesure>>,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// rc15 (M3) — note ce qu'a réellement coûté un fichier refait de
+/// `musique_s` secondes, suréchantillonné à `vers` par `filtre`, rendu en
+/// `rendu_s` secondes (décodage, chaîne, étage, encodage, écriture).
+pub fn noter_le_cout_du_fichier(filtre: &str, vers: u32, musique_s: f64, rendu_s: f64) {
+    let Some((_, ref_vers)) = greffon::machine_reference_pair(vers) else {
+        return;
+    };
+    if musique_s.is_nan() || musique_s <= 1.0 || rendu_s.is_nan() || rendu_s < 0.0 {
+        return;
+    }
+    let ramene = rendu_s / musique_s * f64::from(ref_vers) / f64::from(vers);
+    let mut m = couts_mesures().lock().unwrap_or_else(|e| e.into_inner());
+    let e = m
+        .entry((filtre.to_owned(), ref_vers))
+        .or_insert(CoutMesure {
+            secondes_par_seconde: ramene,
+            mesures: 0,
+        });
+    if e.mesures > 0 {
+        e.secondes_par_seconde = e.secondes_par_seconde * 2.0 / 3.0 + ramene / 3.0;
+    }
+    e.mesures = e.mesures.saturating_add(1);
+}
+
+/// Le coût mesuré pour `filtre` vers `vers`, s'il y en a un.
+pub fn cout_mesure_du_fichier(filtre: &str, vers: u32) -> Option<CoutMesure> {
+    let (_, ref_vers) = greffon::machine_reference_pair(vers)?;
+    couts_mesures()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(filtre.to_owned(), ref_vers))
+        .copied()
+}
+
+/// Tests : oublier les coûts mesurés.
+#[cfg(test)]
+pub fn oublier_les_couts_mesures() {
+    couts_mesures()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// rc15 (M3) — le délai avant la première note du fichier refait, au plus
+/// juste : le coût MESURÉ sur cette machine quand il existe
+/// ([`noter_le_cout_du_fichier`]), sinon l'estimation tirée du test de la
+/// machine ([`delai_estime_du_fichier_s`]).
+pub fn delai_du_fichier_s(
+    verdict: &VerdictMachine,
+    filtre: &str,
+    vers: u32,
+    duree_s: f64,
+    mesure: Option<CoutMesure>,
+) -> Option<f64> {
+    if let (Some(c), Some((_, ref_vers))) = (mesure, greffon::machine_reference_pair(vers)) {
+        return Some(
+            duree_s.max(0.0) * c.secondes_par_seconde * f64::from(vers) / f64::from(ref_vers),
+        );
+    }
+    delai_estime_du_fichier_s(verdict, filtre, vers, duree_s)
+}
+
+/// rc15 (m) — les cadences qu'un lecteur a annoncées puis REFUSÉES (refus
+/// de `SetAVTransportURI`/`Play` d'un flux suréchantillonné), par appareil :
+/// elles ne sont plus proposées tant que le serveur tourne.
+fn cadences_refusees()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, std::collections::BTreeSet<u32>>> {
+    static M: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::collections::BTreeSet<u32>>>,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// rc15 (m) — retient que `appareil` a refusé `cadence`.
+pub fn noter_une_cadence_refusee(appareil: &str, cadence: u32) {
+    if appareil.is_empty() || cadence == 0 {
+        return;
+    }
+    cadences_refusees()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(appareil.to_owned())
+        .or_default()
+        .insert(cadence);
+}
+
+/// rc15 (m) — `annoncees` sans les cadences que `appareil` a refusées.
+pub fn sans_les_cadences_refusees(appareil: &str, annoncees: Vec<u32>) -> Vec<u32> {
+    let m = cadences_refusees()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match m.get(appareil) {
+        Some(refus) => annoncees
+            .into_iter()
+            .filter(|r| !refus.contains(r))
+            .collect(),
+        None => annoncees,
+    }
+}
+
 /// rc14 — le MÊME greffon (une [`Instance`]) en `f64`, pour la chaîne
 /// réseau de TESS (`orchestrator::chaine_reseau_tess`) : aucun second
 /// moteur, aucun aller-retour par `f32`. La latence du noyau est RETIRÉE en
@@ -555,6 +686,18 @@ impl SurechantillonneurF64 {
     /// tête du flux, et exactement ce que [`Self::vider`] rend.
     pub fn latence_trames(&self) -> usize {
         self.instance.latency_frames() as usize
+    }
+
+    /// rc15 — la portée du noyau, en trames d'ENTRÉE : le contexte qu'il faut
+    /// de chaque côté d'une frontière de piste pour que deux pistes
+    /// enchaînées sans blanc se suréchantillonnent comme un seul flux.
+    pub fn portee_entree(&self) -> usize {
+        self.instance.span_input_frames()
+    }
+
+    /// rc15 — le gain fixe du filtre (≤ 1), linéaire.
+    pub fn gain_du_filtre(&self) -> f64 {
+        self.instance.gain()
     }
 
     /// Suréchantillonne des trames entrelacées et AJOUTE le rendu à `rendu`.

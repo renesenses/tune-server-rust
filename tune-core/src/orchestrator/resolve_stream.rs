@@ -3579,7 +3579,10 @@ impl PlaybackOrchestrator {
                 de_hz: s.etage.cadence_entree(),
                 vers_hz: s.etage.cadence_sortie(),
                 filtre: s.etage.filtre().to_owned(),
-                reserve_db: s.etage.reserve_db(),
+                reserve_db: s
+                    .etage
+                    .reserve_db()
+                    .min(crate::audio::surechantillonnage::RESERVE_DE_ZONE_DB),
             });
         let wav_info = StreamInfo {
             format: "wav".into(),

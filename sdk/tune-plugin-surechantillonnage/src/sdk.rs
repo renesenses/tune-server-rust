@@ -315,6 +315,14 @@ impl Instance {
         self.gain
     }
 
+    /// rc15 — the kernel span, in INPUT frames: how far back (and, for a
+    /// linear-phase kernel, how far ahead of the aligned output) one output
+    /// frame reaches. A host that splices two streams (gapless tracks) feeds
+    /// this much context on each side to make the splice exact.
+    pub fn span_input_frames(&self) -> usize {
+        self.engine.noyau_etage1().len().div_ceil(self.ratio.max(1)) + self.engine.portee_etage2()
+    }
+
     /// What the limiter did since the stream opened (or the last reset).
     pub fn limiter_counter(&self) -> CompteurDuLimiteur {
         self.limiter.compteur()

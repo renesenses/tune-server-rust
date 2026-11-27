@@ -449,7 +449,10 @@ async fn le_flux_servi_est_a_176_4_khz_longueur_exacte_sans_crete() {
         None,
         None,
         None,
-        Some((reglages(), 176_400)),
+        Some(super::super::transcodage::EtageReseauDuFichier {
+            surech: Some((reglages(), 176_400, Default::default())),
+            niveau: None,
+        }),
     )
     .await
     .unwrap();
@@ -583,15 +586,17 @@ async fn banc_charge_piste_de_10_minutes_44_1_vers_176_4() {
         ("aucun", 44_100, "flac"),
     ] {
         let dest = bac.join(format!("servi-{filtre}-{vers}.{cible}"));
-        let surech = (filtre != "aucun").then(|| {
-            (
+        let surech = (filtre != "aucun").then(|| super::super::transcodage::EtageReseauDuFichier {
+            surech: Some((
                 su::UpsamplerSettings {
                     enabled: true,
                     filter: filtre.into(),
                     ..Default::default()
                 },
                 vers,
-            )
+                Default::default(),
+            )),
+            niveau: None,
         });
         let t0 = std::time::Instant::now();
         let (taille, _, _) = super::super::transcodage::transcode_source_to_file_avec_crossfeed(
@@ -910,4 +915,51 @@ async fn une_radio_est_servie_surechantillonnee() {
     let etat = orch.surechantillonnage_reseau_de_la_zone(zone_id).unwrap();
     assert!(etat.active);
     assert_eq!((etat.from_hz, etat.to_hz), (Some(44_100), Some(176_400)));
+}
+
+/// rc15 (m) — une radio dont l'étage ne se bâtit pas alors que la session
+/// annonce déjà la cible : la session republie la cadence de la STATION, le
+/// flux ne part jamais à la mauvaise vitesse. Contre-épreuve : avant le
+/// relais, la session annonçait bien la cible.
+#[tokio::test]
+async fn une_radio_sans_etage_republie_la_cadence_de_la_station_rc15() {
+    let orch = orchestrateur();
+    let zone_id = zone_dlna(&orch, "uuid:banc-surech-radio-rc15", SINK_L24_192);
+    let info = crate::http::streamer::StreamInfo {
+        format: "wav".into(),
+        mime_type: "audio/wav".into(),
+        sample_rate: 44_100,
+        bit_depth: 16,
+        channels: 2,
+        ..Default::default()
+    };
+    let (_, _tx, _pret, session) = orch.streamer.create_radio_session(info, 256).await;
+    // Un filtre que le greffon ne connaît pas : l'étage ne se bâtit pas.
+    session
+        .surechantillonnage_radio
+        .set(crate::http::streamer::CiblesDeSurechantillonnage {
+            cibles: vec![(44_100, 176_400)],
+            filtre: "filtre-inconnu".into(),
+        })
+        .unwrap();
+    session.publish_detected_pcm_format(44_100, 2, 16);
+    assert_eq!(session.detected_output_format(), Some((176_400, 2)));
+    let (aval, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let entree = super::super::chaine_radio_9346::relayer_la_radio(
+        None,
+        zone_id,
+        Some(orch.noteur_surech(zone_id)),
+        session.clone(),
+        aval,
+    );
+    entree.send(vec![0u8; 4 * 441]).await.unwrap();
+    drop(entree);
+    let mut recu = 0usize;
+    while let Some(c) = rx.recv().await {
+        recu += c.len();
+    }
+    assert_eq!(recu, 4 * 441, "servi tel quel, à la cadence de la station");
+    assert_eq!(session.detected_output_format(), Some((44_100, 2)));
+    assert!(session.effective_output_info().surechantillonnage.is_none());
+    assert_eq!(session.effective_output_info().sample_rate, 44_100);
 }

@@ -2103,6 +2103,11 @@ struct StreamingDsp {
     /// quantification, voir [`chaine_reseau_tess::SurechReseau`]. `None` :
     /// la cadence du flux ne change pas.
     surechantillonneur: Option<chaine_reseau_tess::SurechReseau>,
+    /// rc15 (M2) — l'étage de niveau d'une zone réseau qui suréchantillonne :
+    /// le même niveau pour toutes ses pistes, et une rampe sans clic quand il
+    /// change (voir [`jonction_surech_reseau`]). Appliqué juste avant
+    /// l'étage de suréchantillonnage (ou la quantification). `None` : neutre.
+    niveau: Option<jonction_surech_reseau::RampeDeNiveau>,
 }
 
 impl StreamingDsp {
@@ -2116,6 +2121,7 @@ impl StreamingDsp {
             || self.compensation.is_some()
             || self.enceintes.is_some()
             || self.surechantillonneur.is_some()
+            || self.niveau.is_some()
     }
 
     /// Le crossfeed de ce porteur sera-t-il réellement EXÉCUTÉ ?
@@ -2168,6 +2174,10 @@ impl StreamingDsp {
         }
         if let Some(c) = self.compensation.as_ref() {
             etages.push(format!("compensation:{:+.2}dB@{flux}", c.cible_db()));
+        }
+
+        if self.niveau.is_some() {
+            etages.push(format!("niveau_de_zone@{flux}"));
         }
 
         if etages.is_empty() && self.surechantillonneur.is_none() {
@@ -2536,6 +2546,8 @@ mod acheminement_upnp_t12b_tests;
 pub use acheminement_upnp_t12b::{PisteEnCours, volume_reglable_retenu};
 // rc14 — le suréchantillonnage PCM sur une sortie réseau de la famille UPnP.
 pub mod surechantillonnage_reseau;
+// rc15 — continuité gapless et niveau constant du suréchantillonnage réseau.
+pub mod jonction_surech_reseau;
 // #7965 — radios (au nom de la station) et podcasts dans l'historique.
 mod historique_radio_podcast_7965;
 #[cfg(test)]
