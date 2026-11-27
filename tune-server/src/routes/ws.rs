@@ -279,6 +279,15 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
     })
 }
 
+fn evenement_dans_la_langue(ev: tune_core::event_bus::TuneEvent, lang: &str) -> serde_json::Value {
+    let data = if ev.event_type == "zone.notice" && ev.data["code"] == "renderer_waking" {
+        crate::message_api::avec_message_en(ev.data, lang, "playback.renderer_waking", &[])
+    } else {
+        ev.data
+    };
+    serde_json::json!({ "type": ev.event_type, "data": data })
+}
+
 async fn handle_socket(
     mut socket: WebSocket,
     state: AppState,
@@ -374,10 +383,7 @@ async fn handle_socket(
                         {
                             continue;
                         }
-                        let ws_event = serde_json::json!({
-                            "type": ev.event_type,
-                            "data": ev.data,
-                        });
+                        let ws_event = evenement_dans_la_langue(ev, lang);
                         let json = serde_json::to_string(&ws_event).unwrap_or_default();
                         if socket.send(Message::Text(json.into())).await.is_err() {
                             break;
@@ -528,6 +534,25 @@ mod tests_cadence {
 
 #[cfg(test)]
 mod langue_signal_tests_6496 {
+    #[test]
+    fn le_reveil_air_est_annonce_dans_la_langue_de_la_connexion_3115() {
+        let ev = tune_core::event_bus::TuneEvent {
+            event_type: "zone.notice".into(),
+            data: serde_json::json!({"code": "renderer_waking", "zone_id": 7, "fatal": false}),
+        };
+        for (lang, texte) in [
+            ("fr", "Réveil du lecteur en cours…"),
+            ("en", "Waking up the player…"),
+        ] {
+            let message = super::evenement_dans_la_langue(ev.clone(), lang);
+            assert_eq!(message["type"], "zone.notice");
+            assert_eq!(message["data"]["message"], texte);
+            assert_eq!(message["data"]["message_key"], "playback.renderer_waking");
+            assert_eq!(message["data"]["zone_id"], 7);
+            assert_eq!(message["data"]["fatal"], false);
+        }
+    }
+
     use super::*;
     use axum::{
         Json,

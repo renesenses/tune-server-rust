@@ -175,7 +175,7 @@ async fn une_pause_acceptee_met_la_zone_en_pause() {
 /// Le départ possède le verrou jusqu'à la confirmation. La pause qui
 /// arrive entre-temps est réellement envoyée une fois le départ publié.
 #[tokio::test(start_paused = true)]
-async fn reveil_3115_une_pause_a_15_secondes_est_transmise_apres_le_depart() {
+async fn reveil_3115_transmet_la_pause_aux_instants_du_journal_apres_le_depart() {
     let Renderer {
         output,
         recues,
@@ -192,12 +192,18 @@ async fn reveil_3115_une_pause_a_15_secondes_est_transmise_apres_le_depart() {
     let verrou = arc.lock().await;
     let reveil = orch.reveils.inscrire(zone, &did);
     assert_eq!(orch.statut_de_reveil(zone, Some(&did)), Some("waking"));
+    // Journal 3115 : ALLUMER à t=0, demande de pause à +772 ms,
+    // ancien refus à +5 772 ms, première réponse AIR à +17 225 ms.
+    tokio::time::advance(std::time::Duration::from_millis(772)).await;
     let pause = orch.pause_avec_issue(zone, Some(&did));
     tokio::pin!(pause);
-    tokio::select! {
-        biased;
-        resultat = &mut pause => panic!("pause terminée pendant le réveil : {resultat:?}"),
-        () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+    for delai_ms in [5_000, 11_453] {
+        tokio::select! {
+            biased;
+            resultat = &mut pause => panic!("pause terminée pendant le réveil : {resultat:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(delai_ms)) => {}
+        }
+        assert_eq!(orch.statut_de_reveil(zone, Some(&did)), Some("waking"));
     }
     assert_eq!(compte_dans(&recues, "Pause"), 0);
     drop(verrou);

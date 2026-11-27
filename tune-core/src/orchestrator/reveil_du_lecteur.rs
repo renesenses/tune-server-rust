@@ -121,7 +121,7 @@ impl PlaybackOrchestrator {
                 crate::event_types::EventType::ZoneNotice,
                 serde_json::json!({
                     "zone_id": zone, "code": "renderer_waking", "status": "waking",
-                    "message": "Réveil du lecteur en cours…", "fatal": false
+                    "message": "Waking up the player…", "message_key": "playback.renderer_waking", "fatal": false
                 }),
             );
         }
