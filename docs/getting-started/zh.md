@@ -128,4 +128,12 @@ Tune 支持所有常见的音频格式：
 - **GitHub**：https://github.com/renesenses/tune-server-rust
 - **CLI**：`cargo install tune-cli` 从终端控制
 
+## 9. 在 Tune OS 上重设管理员密码
+
+使用系统账户 `tune` 通过 SSH 或 Cockpit 登录。在终端中运行以下命令，然后输入 Tune 管理员账户的新密码。
+
+```sh
+cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server --reset-admin --password-stdin
+```
+
 祝您聆听愉快！
