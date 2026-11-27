@@ -834,3 +834,16 @@ async fn refus_pendant_la_revocation_annule_toute_la_recuperation() {
         "désinscription des sessions annulée"
     );
 }
+
+/// Relecture de #9576 : la sonde de la table des jetons est un test
+/// d'existence dans le catalogue, qui ne confond pas « absente » et « erreur ».
+#[tokio::test]
+async fn la_sonde_de_la_table_des_jetons_lit_le_catalogue() {
+    let state = etat(":memory:");
+    assert!(ra::table_des_jetons_existe(&state.backend).unwrap());
+    state
+        .backend
+        .execute_batch("DROP TABLE jetons_de_renouvellement")
+        .unwrap();
+    assert!(!ra::table_des_jetons_existe(&state.backend).unwrap());
+}

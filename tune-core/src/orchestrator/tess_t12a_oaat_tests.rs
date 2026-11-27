@@ -366,6 +366,10 @@ async fn crossfeed_sur_oaat_allume_la_voie_droite_t12a() {
         c.droite_max > 500,
         "#9176 : le crossfeed doit allumer la voie droite reçue par OAAT ({c:?})"
     );
+    assert!(
+        c.trous <= TRAMES / 10,
+        "trop de trames perdues au banc pour juger la lecture ({c:?})"
+    );
     // Latence : le flux traité part au fil de l'eau, comme la lecture
     // directe (même plafond que le témoin de démarrage #7331).
     assert!(
@@ -384,9 +388,9 @@ async fn greffon_natif_tiers_sur_oaat_t12a() {
     println!("T12a greffon tiers OAAT : {c:?}");
     assert!(c.trames > TRAMES / 2, "{c:?}");
     // Les trous du transport (paquets UDP perdus au banc) ne sont pas
-    // comparés : ils restent bornés, sinon le témoin ne témoigne de rien.
+    // comparés : ils restent bornés (un dixième), sinon le témoin ne témoigne de rien.
     assert!(
-        c.trous <= TRAMES / 4,
+        c.trous <= TRAMES / 10,
         "trop de trames perdues au banc pour juger le greffon ({c:?})"
     );
     assert!(
@@ -404,6 +408,10 @@ async fn pure_sur_oaat_rien_n_est_traite_t12a() {
     let c = banc::constater_par_position(&l.trames, l.bits, &l.source, 1.0);
     println!("T12a Pure OAAT : {c:?}");
     assert!(
+        c.trous <= TRAMES / 10,
+        "trop de trames perdues au banc pour juger la lecture ({c:?})"
+    );
+    assert!(
         c.identique,
         "Pure : OAAT doit recevoir la source à l'échantillon près ({c:?})"
     );
@@ -418,6 +426,10 @@ async fn sans_chaine_oaat_recoit_la_source_t12a() {
     println!(
         "T12a sans chaîne OAAT : {c:?}, lecture directe = {}, premier paquet {:?}",
         l.file_path_remis, l.premier_paquet
+    );
+    assert!(
+        c.trous <= TRAMES / 10,
+        "trop de trames perdues au banc pour juger la lecture ({c:?})"
     );
     assert!(c.identique, "{c:?}");
 }
