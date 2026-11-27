@@ -202,7 +202,7 @@ Si l'écriture échoue, rien n'est changé et la commande le dit.
 | macOS | dans le Terminal, sous votre compte : `tune-server --reinitialiser-admin` (Homebrew) |
 | Debian / Ubuntu | `sudo -u tune sh -c 'cd /var/lib/tune && set -a && . /etc/default/tune-server && exec /opt/tune/tune-server --reinitialiser-admin'` |
 | Docker (conteneur `tune-server` du docker-compose) | `docker exec -it -u tune tune-server /app/tune-server --reinitialiser-admin --mot-de-passe-stdin` (le navigateur de l'hôte n'est pas « cette machine » pour le conteneur) |
-| Tune OS | en SSH : `sudo sh -c 'cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server --reinitialiser-admin --mot-de-passe-stdin'` |
+| Tune OS | Dans le terminal de Cockpit ou en SSH, sous le compte `tune` : `cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server --reinitialiser-admin --mot-de-passe-stdin` |
 
 > Le mot de passe du **compte système** `tune` de Tune OS (SSH, console) est
 > une autre affaire : voir l'assistant de la console de l'image.

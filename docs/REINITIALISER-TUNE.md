@@ -38,11 +38,24 @@ comme tel à l'utilisateur. Il est dans la nouvelle interface depuis **v0.9.143*
   (`settings`), **les comptes**, **les listes de lecture**, **les collections et
   favoris**, ni **le cache de pochettes sur disque** ;
 - `tune-cli` n'a **aucune** sous-commande de réinitialisation ;
-- le binaire serveur n'accepte **aucun** drapeau de réinitialisation (son seul
-  argument est `--version`).
+- le serveur ne propose pas de commande pour effacer l’ensemble des données.
 
 Repartir vraiment de zéro passe donc, aujourd'hui, par **la suppression manuelle
 des répertoires de données, serveur arrêté**. Ils sont listés ci-dessous.
+
+### Retrouver le mot de passe administrateur sur Tune OS
+
+Connectez-vous en SSH ou dans Cockpit avec le compte système `tune`. Dans son
+terminal, lancez la commande suivante et saisissez le nouveau mot de passe du
+compte administrateur de l’application.
+
+```sh
+cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server --reinitialiser-admin --mot-de-passe-stdin
+```
+
+Le mot de passe de connexion à Tune OS reste celui du compte système. Les
+effets sur les sessions de l’application et la clé d’API sont détaillés dans
+le [guide de démarrage, § 9](getting-started/fr.md#9-mot-de-passe-administrateur-perdu).
 
 ---
 

@@ -199,7 +199,7 @@ paired. If the write fails, nothing is changed and the command says so.
 | macOS | in Terminal, as your own user: `tune-server --reset-admin` (Homebrew) |
 | Debian / Ubuntu | `sudo -u tune sh -c 'cd /var/lib/tune && set -a && . /etc/default/tune-server && exec /opt/tune/tune-server --reset-admin'` |
 | Docker (`tune-server` container from docker-compose) | `docker exec -it -u tune tune-server /app/tune-server --reset-admin --password-stdin` (the host's browser is not "this machine" for the container) |
-| Tune OS | over SSH: `sudo sh -c 'cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server --reset-admin --password-stdin'` |
+| Tune OS | In the Cockpit terminal or over SSH, logged in as `tune`: `cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server --reset-admin --password-stdin` |
 
 > The password of the Tune OS **system account** `tune` (SSH, console) is a
 > different matter: see the image's console helper.

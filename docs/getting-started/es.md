@@ -126,4 +126,12 @@ Solo los endpoints Tune agrupados mediante **OAAT** comparten un reloj y reciben
 - **GitHub**: https://github.com/renesenses/tune-server-rust
 - **CLI**: `cargo install tune-cli` para controlar desde la terminal
 
+## 9. Restablecer la contraseña de administrador en Tune OS
+
+Inicie sesión por SSH o en Cockpit con la cuenta del sistema `tune`. Ejecute este comando en el terminal e introduzca la nueva contraseña de la cuenta de administrador de Tune.
+
+```sh
+cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server --reset-admin --password-stdin
+```
+
 ¡Buena escucha!

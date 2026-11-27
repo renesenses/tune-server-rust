@@ -126,4 +126,12 @@ Nur über **OAAT** gruppierte Tune-Endpunkte teilen eine Uhr und erhalten Präse
 - **GitHub**: https://github.com/renesenses/tune-server-rust
 - **CLI**: `cargo install tune-cli` zur Steuerung vom Terminal
 
+## 9. Administratorpasswort unter Tune OS zurücksetzen
+
+Melden Sie sich per SSH oder in Cockpit mit dem Systemkonto `tune` an. Führen Sie im Terminal folgenden Befehl aus und geben Sie das neue Passwort für das Tune-Administratorkonto ein.
+
+```sh
+cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server --reset-admin --password-stdin
+```
+
 Viel Spaß beim Hören!

@@ -201,3 +201,38 @@ fn vider_la_bibliotheque_ne_touche_ni_reglages_ni_comptes_et_le_document_dit_la_
          playlists (#5973) : le document mentirait sur une opération DESTRUCTIVE."
     );
 }
+
+#[test]
+fn la_recuperation_admin_de_tune_os_se_fait_sous_le_compte_tune() {
+    let verifier = |chemin: &Path, texte: &str, francais: bool| {
+        let options = if francais {
+            "--reinitialiser-admin --mot-de-passe-stdin"
+        } else {
+            "--reset-admin --password-stdin"
+        };
+        let commande =
+            format!("cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server {options}");
+        // Les tableaux utilisent du code en ligne, les autres guides un bloc shell.
+        let commandes: Vec<_> = texte
+            .lines()
+            .flat_map(|ligne| ligne.split('`'))
+            .map(str::trim)
+            .filter(|s| s.contains("TUNE_DATA_DIR=/opt/tune/data"))
+            .collect();
+        assert_eq!(commandes, [commande.as_str()], "{}", chemin.display());
+    };
+    verifier(Path::new(DOC), &lire(DOC), true);
+    for entree in fs::read_dir(racine().join("docs/getting-started")).unwrap() {
+        let chemin = entree.unwrap().path();
+        if chemin.extension().and_then(|s| s.to_str()) != Some("md")
+            || chemin.ends_with("README.md")
+        {
+            continue;
+        }
+        let texte = fs::read_to_string(&chemin).unwrap();
+        let (_, recuperation) = texte
+            .split_once("\n## 9. ")
+            .unwrap_or_else(|| panic!("section 9 absente de {}", chemin.display()));
+        verifier(&chemin, recuperation, chemin.ends_with("fr.md"));
+    }
+}

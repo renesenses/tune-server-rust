@@ -128,4 +128,12 @@ Tune은 모든 일반적인 오디오 형식을 지원합니다:
 - **GitHub**: https://github.com/renesenses/tune-server-rust
 - **CLI**: 터미널에서 제어하려면 `cargo install tune-cli`
 
+## 9. Tune OS에서 관리자 비밀번호 재설정
+
+시스템 계정 `tune`으로 SSH 또는 Cockpit에 로그인하세요. 터미널에서 다음 명령을 실행한 뒤 Tune 관리자 계정의 새 비밀번호를 입력하세요.
+
+```sh
+cd /opt/tune && TUNE_DATA_DIR=/opt/tune/data ./tune-server --reset-admin --password-stdin
+```
+
 즐거운 감상 되세요!
