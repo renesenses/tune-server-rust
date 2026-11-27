@@ -325,16 +325,19 @@ fn jouer_le_client(addr: SocketAddr, chemins: Vec<String>, resultat: Option<&std
 
 #[test]
 fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
-    if let Ok(addr) = std::env::var("TUNE_BANC_5438_CLIENT") {
-        let chemins =
-            serde_json::from_str(&std::env::var("TUNE_BANC_5438_CHEMINS").unwrap()).unwrap();
+    if let Ok(requete) = std::env::var("TUNE_BANC_5438_CLIENT") {
+        let (addr, chemins) = serde_json::from_str(&requete).expect("adresse et chemins du client");
         jouer_le_client(
-            addr.parse().unwrap(),
+            addr,
             chemins,
             std::env::var_os("TUNE_BANC_5438_RESULTAT").as_deref(),
         );
-        return;
+    } else {
+        mesurer_les_clics_sur_la_collection();
     }
+}
+
+fn mesurer_les_clics_sur_la_collection() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(FILS_EXECUTEUR)
         .enable_all()
@@ -494,10 +497,9 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
                 "un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux",
                 "--nocapture",
             ])
-            .env("TUNE_BANC_5438_CLIENT", addr.to_string())
             .env(
-                "TUNE_BANC_5438_CHEMINS",
-                serde_json::to_string(&chemins).unwrap(),
+                "TUNE_BANC_5438_CLIENT",
+                serde_json::to_string(&(addr, &chemins)).unwrap(),
             )
             .env_remove("TUNE_BANC_5438_RESULTAT");
         if clic == 0 {
