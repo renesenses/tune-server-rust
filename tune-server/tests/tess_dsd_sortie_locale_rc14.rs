@@ -44,6 +44,12 @@ impl Banc {
             .unwrap();
         zones.update_volume(zone, 100.0).unwrap();
         zones.update_dsd_mode(zone, dsd_mode).unwrap();
+        // rc14.1 (fils 3123, 3126) — le DoP modulé ne part que sur une sortie
+        // EXCLUSIVE : la case (macOS, Windows) et le PCM `hw:` (Linux).
+        settings.set("local_exclusive_mode", "true").unwrap();
+        zones
+            .update_output_endpoint_id(zone, "alsa:hw:CARD=DAC,DEV=0")
+            .unwrap();
         // La machine de test (debug) n'est pas celle de la production.
         tune_core::tess::modulation_dsd::retenir_mesure_de_la_machine([50.0, 25.0, 12.0]);
         let app = tune_server::routes::router(state.clone());
@@ -220,4 +226,36 @@ async fn une_sortie_reseau_garde_not_applied_on_transport() {
     // Le chemin résolu n'est pas réécrit par les capacités sur le réseau.
     let up = etape(&v, "upsampling").unwrap();
     assert_ne!(up["reason"], "dsd_not_supported_by_output", "{up}");
+}
+
+/// rc14.1 (#9617, fils 3123 et 3126) — sortie PARTAGÉE : la cible DSD rend
+/// 409 `dsd_not_supported_by_output`, `reason = shared_output`, conforme au
+/// schéma, et rien n'est enregistré. Contre-épreuve : la même sortie en
+/// exclusif, la même requête passe et le modulateur tourne.
+#[tokio::test]
+async fn sortie_partagee_409_shared_output_leve_en_exclusif() {
+    let b = Banc::nouveau(true, "local:Mac XMOS", "local", "dop").await;
+    let settings = SettingsRepo::with_backend(b.state.backend.clone());
+    let zones = ZoneRepo::with_backend(b.state.backend.clone());
+    settings.set("local_exclusive_mode", "false").unwrap();
+    zones
+        .update_output_endpoint_id(b.zone, "alsa:default")
+        .unwrap();
+    let (s, v) = b.requete(Method::PUT, Some(dsd("dsd64"))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    conforme_au_schema("refusal", &v).unwrap_or_else(|e| panic!("{e} : {v}"));
+    assert_eq!(v["code"], "dsd_not_supported_by_output");
+    assert_eq!(v["reason"], "shared_output");
+    assert_eq!(cible(&v, "dsd64")["reason"], "shared_output");
+    assert!(!matches!(b.upsampling_enregistre(), Upsampling::Dsd { .. }));
+    // Exclusive : levé.
+    settings.set("local_exclusive_mode", "true").unwrap();
+    zones
+        .update_output_endpoint_id(b.zone, "alsa:hw:CARD=DAC,DEV=0")
+        .unwrap();
+    let (s, v) = b.requete(Method::PUT, Some(dsd("dsd64"))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let m = etape(&v, "dsd_modulator").expect("étape du modulateur");
+    assert_eq!(m["effective"], true, "{m}");
+    assert_eq!(m["params"]["transport"], "dop", "{m}");
 }

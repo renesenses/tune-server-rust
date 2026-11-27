@@ -50,6 +50,9 @@ struct FaitsDeZone {
     /// Faux tant que la sortie de la zone n'a jamais pu être lue (registre ou
     /// sortie occupés, nom jamais retenu) : les capacités sont « inconnues ».
     connue: bool,
+    /// rc14.1 (fils 3123, 3126) — la sortie locale tient-elle le périphérique
+    /// SEULE ([`sortie_locale_exclusive`]) ? Faux : aucun porteur DoP.
+    exclusive: bool,
 }
 
 impl FaitsDeZone {
@@ -66,7 +69,17 @@ impl FaitsDeZone {
 
     /// Un porteur DoP déjà refusé à cette cadence : par la sonde exclusive
     /// (#7265), ou par une rupture constatée à l'ouverture.
+    ///
+    /// rc14.1 (fils 3123, 3126) — d'abord : une sortie PARTAGÉE ne porte
+    /// jamais de DoP modulé. Le mixeur du système y mêle les autres clients
+    /// (navigateur, sons système) : les marqueurs sautent, le DAC bascule
+    /// entre DSD et PCM (gros craquements, coupures de 0,5 s). Le DSD natif
+    /// (ASIO, ALSA `DSD_U32` sur `hw:`) n'est pas concerné : il ne passe
+    /// jamais par un mixeur.
     fn dop_refuse_connu(&self, cadence_dop: u32, voies: u16) -> Option<MotifDsdRefuse> {
+        if !self.exclusive {
+            return Some(MotifDsdRefuse::SharedOutput);
+        }
         let nom = self.peripherique.as_deref()?;
         if modulation::rupture_connue(nom, cadence_dop, voies) {
             return Some(MotifDsdRefuse::CarrierRateNotSupported);
@@ -93,6 +106,47 @@ impl FaitsDeZone {
             temps_reel,
         }
     }
+}
+
+/// rc14.1 (fils 3123, 3126) — la sortie locale tient-elle le périphérique
+/// SEULE, sans mixeur du système entre Tune et le DAC ? Fonction pure, la
+/// plateforme en PARAMÈTRE (même intention que `bras_de_lecture`).
+///
+/// - macOS : seul le mode « hog » de CoreAudio (`exclusif` demandé) ; le
+///   chemin partagé mêle les autres applications au flux (Chrome, alertes) ;
+/// - Windows : WASAPI exclusif ou ASIO (`exclusif`, et ASIO compilé quand le
+///   backend le demande, sinon le bras retombe sur le partagé) ;
+/// - Linux : le PCM `hw:` seul, d'après l'endpoint enregistré de la sortie.
+///   `default`, `pipewire`, `pulse`, `dmix:`, `sysdefault:` passent par un
+///   mixeur ; `plughw:` est exclusif mais convertit EN SILENCE ce que le DAC
+///   ne prend pas (cadence, format) : un porteur DoP converti est du bruit,
+///   et aucune rupture ne serait constatée. Endpoint inconnu : non (sens sûr).
+pub(crate) fn sortie_locale_exclusive(
+    target_os: &str,
+    asio_compile: bool,
+    exclusif: bool,
+    audio_backend: &str,
+    endpoint_id: Option<&str>,
+) -> bool {
+    match target_os {
+        "macos" => exclusif,
+        "windows" => exclusif && (asio_compile || !audio_backend.eq_ignore_ascii_case("asio")),
+        "linux" => endpoint_id.is_some_and(|e| {
+            let pcm = crate::outputs::pseudo_peripherique_alsa::pcm_alsa(e);
+            crate::outputs::pseudo_peripherique_alsa::greffon_alsa(pcm).eq_ignore_ascii_case("hw")
+        }),
+        _ => false,
+    }
+}
+
+/// rc14.1 (relecture de #9617) — la fenêtre de course : la case
+/// « exclusif » décochée PENDANT une lecture DoP ne change le mode de la
+/// sortie qu'au repos (`changer_de_mode_exclusif_au_repos`) ; la piste
+/// suivante, enchaînée sans repos, s'ouvre pourtant sous le réglage
+/// nouveau. La décision exige donc les DEUX : le mode vivant de la sortie
+/// (`None` : sortie non lisible sans attendre) ET la demande de la zone.
+pub(crate) fn exclusif_de_decision(vivant: Option<bool>, demande_de_zone: bool) -> bool {
+    demande_de_zone && vivant.unwrap_or(true)
 }
 
 /// Ce que l'on sait du périphérique d'une sortie locale.
@@ -366,10 +420,12 @@ impl PlaybackOrchestrator {
             natif: SortieDsdLocale::NonAsio,
             peripherique: None,
             connue: true,
+            exclusive: false,
         };
         if !sortie_locale {
             return faits;
         }
+        faits.exclusive = self.sortie_locale_de_zone_exclusive(device_id.as_deref());
         let nom = self.nom_du_peripherique_local(device_id.as_deref());
         faits.connue = !matches!(nom, NomDuPeripherique::Inconnu);
         faits.peripherique = match nom {
@@ -432,6 +488,58 @@ impl PlaybackOrchestrator {
         {
             retenu().map_or(NomDuPeripherique::Absent, NomDuPeripherique::Connu)
         }
+    }
+
+    /// rc14.1 (fils 3123, 3126) — [`sortie_locale_exclusive`] pour la sortie
+    /// `device_id`, sans jamais attendre : le mode de la sortie inscrite
+    /// (celui de sa prochaine ouverture) quand elle est libre, sinon le
+    /// réglage de sa zone, la machine en repli (#3245, #8348).
+    fn sortie_locale_de_zone_exclusive(&self, device_id: Option<&str>) -> bool {
+        let Some(device_id) = device_id else {
+            return false;
+        };
+        let (exclusif, backend) = self.exclusif_retenu(device_id);
+        let endpoint = ZoneRepo::with_backend(self.db.clone()).endpoint_id_de_la_sortie(device_id);
+        sortie_locale_exclusive(
+            std::env::consts::OS,
+            cfg!(feature = "asio"),
+            exclusif,
+            &backend,
+            endpoint.as_deref(),
+        )
+    }
+
+    /// rc14.1 (relecture de #9617) — l'exclusif que la décision retient :
+    /// le mode VIVANT de la sortie inscrite ET la demande de sa zone
+    /// ([`exclusif_de_decision`]), et le backend de la sortie.
+    pub(super) fn exclusif_retenu(&self, device_id: &str) -> (bool, String) {
+        #[cfg(feature = "local-audio")]
+        let lu: Option<(bool, String)> = {
+            let sortie = self
+                .outputs
+                .try_lock()
+                .ok()
+                .and_then(|registre| registre.get(device_id));
+            sortie.and_then(|sortie| {
+                sortie.try_lock().ok().and_then(|sortie| {
+                    sortie
+                        .as_any()
+                        .downcast_ref::<crate::outputs::local::LocalOutput>()
+                        .map(|l| (l.mode_exclusif(), l.audio_backend().to_owned()))
+                })
+            })
+        };
+        #[cfg(not(feature = "local-audio"))]
+        let lu: Option<(bool, String)> = None;
+        let (machine, backend_machine) = self.reglages_sortie_locale();
+        let (vivant, backend) = match lu {
+            Some((mode, backend)) => (Some(mode), backend),
+            None => (None, backend_machine),
+        };
+        let demande = self
+            .exclusif_de_la_sortie_recreee(device_id, &backend, machine)
+            .demande;
+        (exclusif_de_decision(vivant, demande), backend)
     }
 
     /// La capacité native DÉJÀ connue (aucune sonde).

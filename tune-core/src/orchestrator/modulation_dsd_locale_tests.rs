@@ -87,12 +87,37 @@ async fn banc(premium: bool, dsd_mode: &str) -> Banc {
     orch.playback.set_volume(zone_id, 1.0).await;
     // La machine de test (debug) n'est pas celle de la production.
     crate::tess::modulation_dsd::retenir_mesure_de_la_machine([50.0, 25.0, 12.0]);
-    Banc {
+    let b = Banc {
         orch,
         zone_id,
         pistes: std::sync::atomic::AtomicI64::new(0),
         _tour: tour,
-    }
+    };
+    // rc14.1 — le DAC du banc est tenu SEUL (le DoP modulé ne part que là).
+    sortie_exclusive(&b, true);
+    b
+}
+
+/// rc14.1 (fils 3123, 3126) — la sortie du banc, exclusive ou partagée, sur
+/// toutes les plateformes : la case « exclusif » (macOS, Windows) et le PCM
+/// enregistré de la sortie (Linux : `hw:` ou le mixeur `default`).
+fn sortie_exclusive(b: &Banc, exclusive: bool) {
+    SettingsRepo::with_backend(b.orch.db.clone())
+        .set(
+            "local_exclusive_mode",
+            if exclusive { "true" } else { "false" },
+        )
+        .unwrap();
+    ZoneRepo::with_backend(b.orch.db.clone())
+        .update_output_endpoint_id(
+            b.zone_id,
+            if exclusive {
+                "alsa:hw:CARD=DSD,DEV=0"
+            } else {
+                "alsa:default"
+            },
+        )
+        .unwrap();
 }
 
 /// Une piste de la bibliothèque, à un identifiant propre au banc.
@@ -710,4 +735,152 @@ async fn une_relance_qui_repartirait_en_pcm_n_a_pas_lieu() {
     crate::tess::modulation_dsd::retenir_mesure_de_la_machine([50.0, 25.0, 12.0]);
     assert!(!refusee);
     assert!(b.orch.la_relance_resterait_modulee(b.zone_id, &m).await);
+}
+
+/// rc14.1 (fils 3123, 3126) — la règle de l'exclusivité, plateforme par
+/// plateforme, contre-épreuves comprises.
+#[test]
+fn seule_une_sortie_exclusive_peut_porter_le_dop_module() {
+    use super::sortie_locale_exclusive as excl;
+    // macOS : CoreAudio partagé (« Exclusive mode requested=false ») / hog.
+    assert!(!excl("macos", false, false, "auto", None));
+    assert!(excl("macos", false, true, "auto", None));
+    // Windows : WASAPI partagé / exclusif ; ASIO non compilé retombe sur le
+    // partagé, ASIO compilé est exclusif.
+    assert!(!excl("windows", true, false, "wasapi", None));
+    assert!(excl("windows", false, true, "wasapi", None));
+    assert!(!excl("windows", false, true, "asio", None));
+    assert!(excl("windows", true, true, "asio", None));
+    // Linux : `hw:` seul ; le mixeur et `plughw:` (conversion muette) non.
+    assert!(excl(
+        "linux",
+        false,
+        false,
+        "auto",
+        Some("alsa:hw:CARD=E30,DEV=0")
+    ));
+    assert!(excl(
+        "linux",
+        false,
+        false,
+        "auto",
+        Some("hw:CARD=E30,DEV=0")
+    ));
+    for partage in [
+        "alsa:plughw:CARD=E30,DEV=0",
+        "alsa:default",
+        "alsa:default:CARD=E30",
+        "alsa:sysdefault:CARD=E30",
+        "alsa:dmix:CARD=E30,DEV=0",
+        "alsa:pipewire",
+        "alsa:pulse",
+    ] {
+        assert!(
+            !excl("linux", false, true, "auto", Some(partage)),
+            "{partage}"
+        );
+    }
+    assert!(
+        !excl("linux", false, true, "auto", None),
+        "endpoint inconnu"
+    );
+}
+
+/// rc14.1 (fils 3123, 3126) — sortie PARTAGÉE : pas de DoP modulé, la piste
+/// sert le PCM d'avant à l'octet près (aucun saut de niveau), le motif
+/// `shared_output` est retenu et publié ; la relance d'une piste modulée
+/// n'aurait pas lieu. Contre-épreuve : la même sortie en exclusif module.
+#[tokio::test]
+async fn une_sortie_partagee_ne_porte_pas_de_dop_module() {
+    let b = banc(true, "dop").await;
+    let id = piste(&b, FLAC, "flac", 2);
+    ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd64)));
+    // Contre-épreuve d'abord : exclusive, la piste part en DoP.
+    let module = jouer(&b, id).await;
+    let Some(EtatModulation::EnService(m)) = module.etat(&b) else {
+        panic!("piste non modulée en exclusif : {:?}", module.etat(&b));
+    };
+    assert!(b.orch.la_relance_resterait_modulee(b.zone_id, &m).await);
+    // La référence : le PCM d'avant, sans chaîne vers le DSD.
+    ecrire_chaine(&b, None);
+    let reference = jouer(&b, id).await.octets;
+    ecrire_chaine(&b, Some(dsd(TauxDsd::Dsd64)));
+    sortie_exclusive(&b, false);
+    assert!(
+        !b.orch.la_relance_resterait_modulee(b.zone_id, &m).await,
+        "une relance sur la sortie partagée repartirait en PCM"
+    );
+    let j = jouer(&b, id).await;
+    assert!(j.octets == reference, "le repli sert le PCM d'avant");
+    assert_eq!(
+        crate::tess::modulation_dsd::etat_pour(b.zone_id, Some(&j.stream_id), Some(id)),
+        Some(EtatModulation::Repli(MotifDsdRefuse::SharedOutput))
+    );
+    let c = b.orch.capacites_dsd_de_zone(b.zone_id).await;
+    for t in &c.targets {
+        assert!(!t.famille_44k1.accepted, "{:?}", t.rate);
+        assert_eq!(t.famille_44k1.reason, Some(MotifDsdRefuse::SharedOutput));
+    }
+    // Retour en exclusif : la modulation revient.
+    sortie_exclusive(&b, true);
+    let j = jouer(&b, id).await;
+    verifier_dop_stereo(&j, 176_400);
+    assert!(matches!(j.etat(&b), Some(EtatModulation::EnService(_))));
+}
+
+/// rc14.1 (relecture de #9617) — la fenêtre de course : la case décochée
+/// pendant une lecture DoP laisse la sortie en exclusif jusqu'au repos ; la
+/// décision de la piste suivante lit le mode vivant ET la demande de la zone.
+#[test]
+fn exclusif_de_decision_exige_le_mode_vivant_et_la_demande() {
+    use super::exclusif_de_decision as d;
+    assert!(d(Some(true), true));
+    assert!(!d(Some(true), false), "case décochée pendant la lecture");
+    assert!(!d(Some(false), true), "sortie encore ouverte en partagé");
+    assert!(!d(Some(false), false));
+    assert!(d(None, true), "sortie occupée : la demande de la zone");
+    assert!(!d(None, false));
+}
+
+/// Même fenêtre, sur une vraie sortie inscrite : vivante en exclusif, case
+/// décochée → non ; recochée → oui ; sortie partagée, case cochée → non.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn la_case_decochee_pendant_la_lecture_l_emporte_sur_le_mode_vivant() {
+    let b = banc(true, "dop").await;
+    let id = "local:DAC DSD banc";
+    let inscrire = |exclusif: bool| {
+        crate::outputs::local::LocalOutput::new_with_exclusive("DAC DSD banc".into(), exclusif)
+    };
+    b.orch
+        .outputs
+        .lock()
+        .await
+        .register(Box::new(inscrire(true)));
+    assert!(b.orch.exclusif_retenu(id).0, "vivant exclusif, case cochée");
+    SettingsRepo::with_backend(b.orch.db.clone())
+        .set("local_exclusive_mode", "false")
+        .unwrap();
+    assert!(
+        !b.orch.exclusif_retenu(id).0,
+        "case décochée pendant la lecture : la piste suivante ne module plus"
+    );
+    SettingsRepo::with_backend(b.orch.db.clone())
+        .set("local_exclusive_mode", "true")
+        .unwrap();
+    b.orch
+        .outputs
+        .lock()
+        .await
+        .register(Box::new(inscrire(false)));
+    assert!(
+        !b.orch.exclusif_retenu(id).0,
+        "case cochée, sortie encore ouverte en partagé"
+    );
+    b.orch
+        .outputs
+        .lock()
+        .await
+        .register(Box::new(inscrire(true)));
+    assert!(b.orch.exclusif_retenu(id).0);
 }
