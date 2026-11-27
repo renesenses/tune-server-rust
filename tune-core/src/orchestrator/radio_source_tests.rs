@@ -521,7 +521,7 @@ fn radio_3113_un_plafond_16_prime_sur_le_catalogue_la_sonde_et_air() {
     let neutre = crate::device_catalog::DeviceQuirks::default();
     let hires = serde_json::from_str(r#"{"max_bit_depth":24}"#).unwrap();
     let limite = serde_json::from_str(r#"{"max_bit_depth":16}"#).unwrap();
-    let ruark = crate::device_catalog::quirks_for("Ruark", "R3");
+    let ruark = crate::device_catalog::quirks_for("Ruark Audio", "R3");
     assert_eq!(
         wav24_du_profil("devialet_air", &neutre, false, false),
         Some(true)
