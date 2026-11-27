@@ -44,6 +44,12 @@ impl Banc {
             .unwrap();
         zones.update_volume(zone, 100.0).unwrap();
         zones.update_dsd_mode(zone, dsd_mode).unwrap();
+        // rc14.1 (fils 3123, 3126) — le DoP modulé ne part que sur une sortie
+        // EXCLUSIVE : la case (macOS, Windows) et le PCM `hw:` (Linux).
+        settings.set("local_exclusive_mode", "true").unwrap();
+        zones
+            .update_output_endpoint_id(zone, "alsa:hw:CARD=DAC,DEV=0")
+            .unwrap();
         // La machine de test (debug) n'est pas celle de la production.
         tune_core::tess::modulation_dsd::retenir_mesure_de_la_machine([50.0, 25.0, 12.0]);
         let app = tune_server::routes::router(state.clone());

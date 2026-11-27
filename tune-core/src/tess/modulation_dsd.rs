@@ -175,6 +175,11 @@ pub enum MotifDsdRefuse {
     ChannelsNotSupported,
     /// À la lecture : construction du modulateur impossible.
     ModulatorFailed,
+    /// rc14.1 (fils 3123, 3126) — la sortie locale n'est pas EXCLUSIVE
+    /// (CoreAudio sans « hog », WASAPI partagé, ALSA hors `hw:`) : un autre
+    /// client du mixeur (navigateur, son système) se mélange au porteur et
+    /// casse les marqueurs DoP (craquements, coupures). La piste reste en PCM.
+    SharedOutput,
     #[serde(other)]
     Unknown,
 }
@@ -191,12 +196,13 @@ impl MotifDsdRefuse {
             Self::SourceRateNotModulable => "source_rate_not_modulable",
             Self::ChannelsNotSupported => "channels_not_supported",
             Self::ModulatorFailed => "modulator_failed",
+            Self::SharedOutput => "shared_output",
             Self::Unknown => "unknown",
         }
     }
 
     /// Tous les motifs, pour le schéma.
-    pub const TOUS: [Self; 9] = [
+    pub const TOUS: [Self; 10] = [
         Self::OutputNotLocal,
         Self::DsdModeNotEnabled,
         Self::RateAboveZoneMax,
@@ -206,6 +212,7 @@ impl MotifDsdRefuse {
         Self::SourceRateNotModulable,
         Self::ChannelsNotSupported,
         Self::ModulatorFailed,
+        Self::SharedOutput,
     ];
 }
 
