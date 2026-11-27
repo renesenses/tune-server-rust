@@ -120,9 +120,15 @@ struct Banc {
     _dir: tempfile::TempDir,
 }
 
-/// Une zone DLNA réglée sur `cadence_fixe`, une piste FLAC 16 bits de 3 s à
-/// `source_hz`, un renderer qui annonce `sink`.
-async fn banc(nom: &str, source_hz: u32, cadence_fixe: u32, sink: &'static str) -> Banc {
+/// Une zone DLNA réglée sur `cadence_fixe` (et plafonnée à `plafond`), une
+/// piste FLAC 16 bits à `source_hz`, un renderer qui annonce `sink`.
+async fn banc(
+    nom: &str,
+    source_hz: u32,
+    cadence_fixe: Option<u32>,
+    plafond: Option<u32>,
+    sink: &'static str,
+) -> Banc {
     let sqlite = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
     sqlite.init_schema().unwrap();
     crate::db::migrations::run_migrations(&sqlite).unwrap();
@@ -169,12 +175,19 @@ async fn banc(nom: &str, source_hz: u32, cadence_fixe: u32, sink: &'static str) 
     let zone = ZoneRepo::with_backend(db.clone())
         .create(nom, Some("dlna"), Some(&udn))
         .unwrap();
-    SettingsRepo::with_backend(db)
-        .set(
-            &crate::audio::frequence_fixe::cle_de_zone(zone),
-            &cadence_fixe.to_string(),
-        )
-        .unwrap();
+    if let Some(cadence) = cadence_fixe {
+        SettingsRepo::with_backend(db.clone())
+            .set(
+                &crate::audio::frequence_fixe::cle_de_zone(zone),
+                &cadence.to_string(),
+            )
+            .unwrap();
+    }
+    if plafond.is_some() {
+        ZoneRepo::with_backend(db)
+            .update_max_sample_rate(zone, plafond)
+            .unwrap();
+    }
     let (output, etat, serveur) = renderer(&udn, sink).await;
     orch.outputs.lock().await.register(Box::new(output));
     Banc {
@@ -234,6 +247,17 @@ impl Banc {
             .sample_rate
     }
 
+    /// Combien d'avis `fixed_rate_too_slow_fallback` sont arrivés.
+    fn nombre_d_avis(&mut self) -> usize {
+        let mut n = 0;
+        while let Ok(ev) = self.bus.try_recv() {
+            if ev.event_type == "zone.notice" && ev.data["code"] == "fixed_rate_too_slow_fallback" {
+                n += 1;
+            }
+        }
+        n
+    }
+
     fn avis_de_repli(&mut self) -> Option<serde_json::Value> {
         while let Ok(ev) = self.bus.try_recv() {
             if ev.event_type == "zone.notice" && ev.data["code"] == "fixed_rate_too_slow_fallback" {
@@ -249,7 +273,14 @@ impl Banc {
 /// zone joue par le flux WAV progressif, à la même cadence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn un_pretranscodage_abandonne_joue_par_le_flux_progressif_rc15() {
-    let mut b = banc("dmp-a8-abandon", 48_000, 96_000, SINK_FLAC_ET_WAV).await;
+    let mut b = banc(
+        "dmp-a8-abandon",
+        48_000,
+        Some(96_000),
+        None,
+        SINK_FLAC_ET_WAV,
+    )
+    .await;
     super::transcodage::hote_lent_impose::imposer(&b.chemin, FACTEUR_DU_18);
     let r = b.jouer().await.expect("la zone doit jouer quelque chose");
     let uri = b.uri_posee_puis_jouee();
@@ -274,7 +305,7 @@ async fn un_pretranscodage_abandonne_joue_par_le_flux_progressif_rc15() {
 /// pas ; aucun fichier n'est lancé, le flux progressif part directement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn une_mesure_retenue_choisit_le_flux_progressif_avant_de_lancer_le_fichier_rc15() {
-    let mut b = banc("dmp-a8-avant", 22_050, 44_100, SINK_FLAC_ET_WAV).await;
+    let mut b = banc("dmp-a8-avant", 22_050, Some(44_100), None, SINK_FLAC_ET_WAV).await;
     super::repli_du_bras_fichier_rc15::retenir_le_facteur(22_050, 44_100, FACTEUR_DU_18);
     let r = b.jouer().await.expect("la zone doit jouer quelque chose");
     let uri = b.uri_posee_puis_jouee();
@@ -288,7 +319,7 @@ async fn une_mesure_retenue_choisit_le_flux_progressif_avant_de_lancer_le_fichie
 /// native de la piste.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn un_lecteur_flac_seul_joue_a_la_cadence_native_rc15() {
-    let mut b = banc("flac-seul", 24_000, 48_000, SINK_FLAC_SEUL).await;
+    let mut b = banc("flac-seul", 24_000, Some(48_000), None, SINK_FLAC_SEUL).await;
     // 237,6 s à ×1,93 : 123 s projetées, au-delà du budget de 120 s.
     super::repli_du_bras_fichier_rc15::retenir_le_facteur(24_000, 48_000, FACTEUR_DU_18);
     let r = b.jouer().await.expect("la zone doit jouer quelque chose");
@@ -296,5 +327,74 @@ async fn un_lecteur_flac_seul_joue_a_la_cadence_native_rc15() {
     assert!(uri.ends_with(".flac"), "{uri}");
     assert_eq!(b.cadence_servie(&r).await, 24_000, "cadence native");
     assert_eq!(b.avis_de_repli().unwrap()["fallback"], "native_rate");
+    b.orch.stop(b.zone, Some(&b.udn)).await;
+}
+
+/// Revue de #9610, point 1 — le PLAFOND de zone seul (sans cadence fixe)
+/// garde le fichier refait de la rc14, même sur un hôte mesuré lent et un
+/// lecteur qui accepte le WAV : pas de flux progressif, pas d'avis.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_plafond_de_zone_seul_garde_le_fichier_de_la_rc14() {
+    let mut b = banc("plafond-seul", 96_000, None, Some(48_000), SINK_FLAC_ET_WAV).await;
+    super::repli_du_bras_fichier_rc15::retenir_le_facteur(96_000, 48_000, FACTEUR_DU_18);
+    let r = b.jouer().await.expect("lecture");
+    let uri = b.uri_posee_puis_jouee();
+    assert!(
+        uri.ends_with(".flac"),
+        "un plafond seul ne doit pas basculer en WAV progressif : {uri}"
+    );
+    assert_eq!(b.cadence_servie(&r).await, 48_000);
+    assert_eq!(b.nombre_d_avis(), 0, "aucun avis de repli pour un plafond");
+    b.orch.stop(b.zone, Some(&b.udn)).await;
+}
+
+/// Revue de #9610, point 2 — cadence fixe ÉGALE au plafond, source au-dessus :
+/// la « cadence native » serait la même (le plafond), donc le même fichier.
+/// Pas de repli, pas d'avis : le fichier de la rc14, une seule fois.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn une_cadence_native_egale_a_la_demandee_ne_relance_pas_le_fichier() {
+    let mut b = banc(
+        "fixe-egale-plafond",
+        176_400,
+        Some(88_200),
+        Some(88_200),
+        SINK_FLAC_SEUL,
+    )
+    .await;
+    // 123 s projetées : au-delà du budget, le repli serait la cadence native.
+    super::repli_du_bras_fichier_rc15::retenir_le_facteur(176_400, 88_200, FACTEUR_DU_18);
+    let r = b.jouer().await.expect("lecture");
+    let uri = b.uri_posee_puis_jouee();
+    assert!(uri.ends_with(".flac"), "{uri}");
+    assert_eq!(b.cadence_servie(&r).await, 88_200);
+    assert_eq!(
+        b.nombre_d_avis(),
+        0,
+        "un repli « cadence native » au plafond n'est pas un repli : avis faux"
+    );
+    b.orch.stop(b.zone, Some(&b.udn)).await;
+}
+
+/// Revue de #9610, point 3 — un album : deux pistes servies par le repli,
+/// UN seul avis pour la zone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l_avis_de_repli_ne_part_qu_une_fois_par_zone() {
+    let mut b = banc(
+        "un-seul-avis",
+        48_000,
+        Some(192_000),
+        None,
+        SINK_FLAC_ET_WAV,
+    )
+    .await;
+    super::repli_du_bras_fichier_rc15::retenir_le_facteur(48_000, 192_000, FACTEUR_DU_18);
+    for _ in 0..2 {
+        let r = b.jouer().await.expect("lecture");
+        assert!(b.uri_posee_puis_jouee().ends_with(".wav"));
+        assert_eq!(b.cadence_servie(&r).await, 192_000);
+        // Piste suivante : la zone repart de l'arrêt (deux lectures réelles).
+        b.orch.stop(b.zone, Some(&b.udn)).await;
+    }
+    assert_eq!(b.nombre_d_avis(), 1, "un avis par zone, pas un par piste");
     b.orch.stop(b.zone, Some(&b.udn)).await;
 }

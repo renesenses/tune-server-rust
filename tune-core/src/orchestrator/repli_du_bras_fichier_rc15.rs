@@ -23,7 +23,8 @@
 //! #6718, pas la cause.
 //!
 //! Le correctif tient en trois temps, tous bornés au cas où le fichier refait
-//! RÉÉCHANTILLONNE (cadence fixe ou plafond de zone) une source PCM :
+//! applique la CADENCE FIXE de la zone à une source PCM (revue de #9610 : le
+//! plafond de zone et les autres rééchantillonnages gardent la rc14) :
 //!
 //! 1. **avant** de lancer le fichier, la mesure retenue sur cet hôte (même
 //!    cadence source, même cadence cible) projette le délai : s'il ne tient
@@ -37,7 +38,8 @@
 //!   servi aux DSD et aux pistes trop lourdes), si le lecteur annonce le LPCM
 //!   et que l'hôte tient le temps réel avec marge ;
 //! - sinon la **cadence native** de la piste (plafond de zone gardé), sans
-//!   la cadence fixe.
+//!   la cadence fixe — sauf si elle est égale à la cadence demandée : ce
+//!   serait le même fichier, et la rc14 reprend (un seul budget).
 //!
 //! Aucun étage de gain n'est ajouté : les deux replis appliquent la chaîne de
 //! zone qui existait déjà (égaliseur, ReplayGain, compensation, tous ≤ 1).
@@ -64,6 +66,22 @@ pub(super) const MARGE_TEMPS_REEL_DU_FLUX: f64 = 1.25;
 /// Le préfixe de l'erreur par laquelle `transcoder_vers_fichier` rend la
 /// main quand un repli est possible : `transcoder_la_piste` le reconnaît.
 pub(super) const BRAS_FICHIER_A_REPLIER: &str = "bras_fichier_trop_lent_repli: ";
+
+/// Le même préfixe, quand c'est la MESURE des premières secondes qui a rendu
+/// la main (`FinDeTranscodage::TropLent`, ≈ 2 s) et non le budget : sans repli
+/// utile, le fichier peut alors reprendre sous son budget, comme en rc14.
+pub(super) const ABANDON_PAR_LA_MESURE: &str = "bras_fichier_trop_lent_repli: mesure: ";
+
+/// Revue de #9610 — l'avis `zone.notice` du repli part UNE fois par zone et
+/// par cadence demandée, le temps du processus : pas à chaque piste d'un
+/// album. Le journal, lui, garde sa ligne à chaque piste.
+pub(super) fn premier_avis_de_la_zone(zone_id: i64, cadence_demandee: u32) -> bool {
+    static AVIS: OnceLock<Mutex<std::collections::HashSet<(i64, u32)>>> = OnceLock::new();
+    AVIS.get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert((zone_id, cadence_demandee))
+}
 
 /// Ce qui sert la piste quand le fichier refait ne tient pas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +193,14 @@ mod tests {
         assert!(!ne_tient_pas_d_avance(237.6, None, d));
         assert!(!ne_tient_pas_d_avance(0.0, Some(0.5), d));
         assert_eq!(delai_max(false), None);
+    }
+
+    #[test]
+    fn un_seul_avis_par_zone_et_par_cadence() {
+        assert!(premier_avis_de_la_zone(-9610, 768_000));
+        assert!(!premier_avis_de_la_zone(-9610, 768_000));
+        assert!(premier_avis_de_la_zone(-9610, 384_000));
+        assert!(premier_avis_de_la_zone(-9611, 768_000));
     }
 
     #[test]

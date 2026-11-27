@@ -70,6 +70,10 @@ struct DecisionLocale {
     sortie_tire_le_flux: bool,
     local_needs_wav: bool,
     needs_downsample: bool,
+    /// rc15 — la cadence fixe de la zone quand elle diffère de la source :
+    /// SEUL ce rééchantillonnage-là a le repli du fichier refait trop lent
+    /// (`transcoder_la_piste`). Le plafond garde le comportement de la rc14.
+    cadence_fixe_de_zone: Option<u32>,
     needs_transcode_for_output: bool,
     oaat_needs_wav: bool,
     sample_rate: u32,
@@ -174,6 +178,7 @@ type FluxLocal = (
 
 /// Ce que le premier temps du transcodage a décidé du format de sortie,
 /// avant de choisir entre le fichier pré-transcodé et la session à la volée.
+#[derive(Clone)]
 pub(super) struct FormatDeSortie {
     pub(super) out_sr: u32,
     pub(super) out_bd: u16,
@@ -581,6 +586,7 @@ fn assembler_la_decision(
         sortie_tire_le_flux,
         local_needs_wav,
         needs_downsample,
+        cadence_fixe_de_zone,
         needs_transcode_for_output,
         oaat_needs_wav,
         sample_rate,
@@ -2980,37 +2986,69 @@ impl PlaybackOrchestrator {
         if !format.use_file_transcode {
             return self.transcoder_en_session(req, decision, format).await;
         }
-        // rc15 — le fichier refait qui RÉÉCHANTILLONNE une source PCM vers une
-        // zone réseau a un repli : jugé avant, mesuré pendant, pris après.
-        // Ailleurs (cache, DSD, sans rééchantillonnage), rien ne change.
+        // rc15 — le fichier refait d'une zone à CADENCE FIXE (source PCM, zone
+        // réseau) a un repli : jugé avant, mesuré pendant, pris après.
+        // Ailleurs (plafond seul, cache, DSD), rien ne change depuis la rc14.
         let Some(repli) = self.repli_possible_du_fichier(req, decision, &format).await else {
             return self
                 .transcoder_vers_fichier(req, decision, format, None)
                 .await;
         };
+        use super::repli_du_bras_fichier_rc15 as r;
         let (de, vers) = (decision.sample_rate, format.out_sr);
         let piste_s = decision.track_duration_ms.max(0) as f64 / 1000.0;
-        let flux_possible = repli.is_some();
-        let delai = super::repli_du_bras_fichier_rc15::delai_max(flux_possible);
-        let retenu = super::repli_du_bras_fichier_rc15::facteur_retenu(de, vers);
-        let d_avance = super::repli_du_bras_fichier_rc15::ne_tient_pas_d_avance(
+        let delai = r::delai_max(repli.is_some());
+        let retenu = r::facteur_retenu(de, vers);
+        let d_avance = r::ne_tient_pas_d_avance(
             piste_s,
             retenu,
             delai.unwrap_or_else(|| super::transcode_budget_for(&decision.file_path)),
         );
         if d_avance {
+            let choix = r::repli_a_prendre(repli, retenu);
+            if let Some(f) = self.format_du_repli(req, decision, choix, vers).await? {
+                return self
+                    .servir_le_repli_du_fichier(
+                        req,
+                        decision,
+                        choix,
+                        f,
+                        retenu,
+                        vers,
+                        "mesure_retenue",
+                    )
+                    .await;
+            }
+            // Aucun repli utile (la cadence native est celle du fichier) :
+            // le fichier, comme en rc14, sous son seul budget.
             return self
-                .servir_le_repli_du_fichier(req, decision, repli, retenu, vers, "mesure_retenue")
+                .transcoder_vers_fichier(req, decision, format, None)
                 .await;
         }
         match self
-            .transcoder_vers_fichier(req, decision, format, Some(delai))
+            .transcoder_vers_fichier(req, decision, format.clone(), Some(delai))
             .await
         {
-            Err(e) if e.starts_with(super::repli_du_bras_fichier_rc15::BRAS_FICHIER_A_REPLIER) => {
-                let mesure = super::repli_du_bras_fichier_rc15::facteur_retenu(de, vers);
-                self.servir_le_repli_du_fichier(req, decision, repli, mesure, vers, "abandon")
-                    .await
+            Err(e) if e.starts_with(r::BRAS_FICHIER_A_REPLIER) => {
+                let mesure = r::facteur_retenu(de, vers);
+                let choix = r::repli_a_prendre(repli, mesure);
+                match self.format_du_repli(req, decision, choix, vers).await? {
+                    Some(f) => {
+                        self.servir_le_repli_du_fichier(
+                            req, decision, choix, f, mesure, vers, "abandon",
+                        )
+                        .await
+                    }
+                    // Abandonné par la MESURE (≈ 2 s) sans repli utile : le
+                    // fichier reprend sous son budget, comme en rc14. Un seul
+                    // budget de silence, jamais deux.
+                    None if e.starts_with(r::ABANDON_PAR_LA_MESURE) => {
+                        self.transcoder_vers_fichier(req, decision, format, None)
+                            .await
+                    }
+                    // Budget épuisé sans repli utile : l'erreur de la rc14.
+                    None => Err(e.trim_start_matches(r::BRAS_FICHIER_A_REPLIER).to_string()),
+                }
             }
             autre => autre,
         }
@@ -3027,7 +3065,10 @@ impl PlaybackOrchestrator {
         format: &FormatDeSortie,
     ) -> Option<Option<super::bascule_progressive_8558::ProfondeurDeBascule>> {
         let src = decision.source_format.unwrap_or(AudioFormat::Flac);
-        let reechantillonne = decision.needs_downsample
+        // Revue de #9610 — la CADENCE FIXE seule. Un plafond de zone (ou tout
+        // autre rééchantillonnage) garde le fichier de la rc14 : sinon presque
+        // toutes les pistes rééchantillonnées partiraient en WAV progressif.
+        let reechantillonne = decision.cadence_fixe_de_zone.is_some()
             && src != AudioFormat::Dsd
             && format.out_sr != decision.sample_rate;
         if !decision.is_network_output || !reechantillonne {
@@ -3042,41 +3083,83 @@ impl PlaybackOrchestrator {
         Some(self.profondeur_wav_du_renderer(req, decision, format).await)
     }
 
+    /// rc15 — le format du repli `choix`, ou `None` s'il ne servirait à rien :
+    /// le flux progressif que la décision renverrait au fichier, ou une
+    /// « cadence native » égale à la cadence demandée (plafond conservé) —
+    /// ce serait relancer le MÊME fichier, avec un second budget de silence.
+    async fn format_du_repli(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+        choix: super::repli_du_bras_fichier_rc15::Repli,
+        cadence_demandee: u32,
+    ) -> Result<Option<FormatDeSortie>, String> {
+        use super::repli_du_bras_fichier_rc15::Repli;
+        let (bascule, sans_cadence_fixe) = match choix {
+            Repli::FluxProgressif(p) => (Some(p), false),
+            Repli::CadenceNative => (None, true),
+        };
+        let mut format = self
+            .decider_le_format_de_sortie(req, decision, bascule, sans_cadence_fixe)
+            .await?;
+        self.ajuster_m4a_au_sink(req, decision, &mut format).await?;
+        let utile = match choix {
+            Repli::FluxProgressif(_) => !format.use_file_transcode,
+            Repli::CadenceNative => format.out_sr != cadence_demandee,
+        };
+        if !utile {
+            info!(
+                zone_id = req.zone_id,
+                file = %decision.file_path,
+                cadence_demandee,
+                cadence_du_repli = format.out_sr,
+                repli = choix.code(),
+                "fichier_refait_trop_lent_repli_sans_effet"
+            );
+        }
+        Ok(utile.then_some(format))
+    }
+
     /// rc15 — sert la piste par son repli quand le fichier refait ne tient
     /// pas : le flux WAV progressif à la même cadence, ou la cadence native.
-    /// Un avertissement au journal, un avis `zone.notice` (non fatal) pour
-    /// les télécommandes. Aucun étage de gain ajouté : la chaîne de zone est
-    /// celle des deux voies existantes (≤ 1).
+    /// Un avertissement au journal à chaque piste ; un avis `zone.notice`
+    /// (non fatal) UNE fois par zone et par cadence demandée, le temps du
+    /// processus. Aucun étage de gain ajouté : la chaîne de zone est celle des
+    /// deux voies existantes (≤ 1).
+    #[allow(clippy::too_many_arguments)]
     async fn servir_le_repli_du_fichier(
         &self,
         req: &PlayRequest,
         decision: &DecisionLocale,
-        profondeur_wav: Option<super::bascule_progressive_8558::ProfondeurDeBascule>,
+        choix: super::repli_du_bras_fichier_rc15::Repli,
+        format: FormatDeSortie,
         facteur: Option<f64>,
         cadence_demandee: u32,
         motif: &'static str,
     ) -> Result<FluxLocal, String> {
-        use super::repli_du_bras_fichier_rc15::{Repli, repli_a_prendre};
-        let repli = repli_a_prendre(profondeur_wav, facteur);
+        use super::repli_du_bras_fichier_rc15::{Repli, premier_avis_de_la_zone};
         warn!(
             zone_id = req.zone_id,
             file = %decision.file_path,
             cadence_source = decision.sample_rate,
             cadence_demandee,
+            cadence_servie = format.out_sr,
             host_realtime_factor = ?facteur,
             motif,
-            repli = repli.code(),
+            repli = choix.code(),
             "fichier_refait_trop_lent_repli"
         );
-        if let Some(ref bus) = self.event_bus {
+        if let Some(ref bus) = self.event_bus
+            && premier_avis_de_la_zone(req.zone_id, cadence_demandee)
+        {
             bus.emit_typed(
                 crate::event_types::EventType::ZoneNotice,
                 serde_json::json!({
                     "zone_id": req.zone_id,
                     "code": "fixed_rate_too_slow_fallback",
                     "requested_rate": cadence_demandee,
-                    "fallback": repli.code(),
-                    "message": match repli {
+                    "fallback": choix.code(),
+                    "message": match choix {
                         Repli::FluxProgressif(_) => format!(
                             "This server cannot prepare {cadence_demandee} Hz in time: streaming it progressively instead"
                         ),
@@ -3088,34 +3171,13 @@ impl PlaybackOrchestrator {
                 }),
             );
         }
-        match repli {
-            Repli::FluxProgressif(p) => {
-                let mut format = self
-                    .decider_le_format_de_sortie(req, decision, Some(p), false)
-                    .await?;
-                self.ajuster_m4a_au_sink(req, decision, &mut format).await?;
-                if format.use_file_transcode {
-                    return Err(format!(
-                        "fichier_refait_trop_lent_repli: le flux progressif n'a pas pu être choisi ({} Hz)",
-                        format.out_sr
-                    ));
-                }
-                self.transcoder_en_session(req, decision, format).await
-            }
-            Repli::CadenceNative => {
-                let mut format = self
-                    .decider_le_format_de_sortie(req, decision, None, true)
-                    .await?;
-                self.ajuster_m4a_au_sink(req, decision, &mut format).await?;
-                if format.conteneur_natif {
-                    self.servir_en_passthrough(req, decision).await
-                } else if format.use_file_transcode {
-                    self.transcoder_vers_fichier(req, decision, format, None)
-                        .await
-                } else {
-                    self.transcoder_en_session(req, decision, format).await
-                }
-            }
+        if format.conteneur_natif {
+            self.servir_en_passthrough(req, decision).await
+        } else if format.use_file_transcode {
+            self.transcoder_vers_fichier(req, decision, format, None)
+                .await
+        } else {
+            self.transcoder_en_session(req, decision, format).await
         }
     }
 
@@ -4614,7 +4676,7 @@ impl PlaybackOrchestrator {
                         // rc15 — le coût RÉEL de ce fichier (encodage et
                         // écriture compris), pour juger le suivant AVANT de
                         // le lancer.
-                        if out_sr != sample_rate {
+                        if repli.is_some() {
                             let ecoule = file_transcode_start.elapsed().as_secs_f64();
                             if ecoule > 0.0 && track_duration_ms > 0 {
                                 super::repli_du_bras_fichier_rc15::retenir_le_facteur(
@@ -4779,7 +4841,7 @@ impl PlaybackOrchestrator {
                         );
                         return Err(format!(
                             "{}fichier à {out_sr} Hz projeté à {:.0} s (×{facteur:.2})",
-                            super::repli_du_bras_fichier_rc15::BRAS_FICHIER_A_REPLIER,
+                            super::repli_du_bras_fichier_rc15::ABANDON_PAR_LA_MESURE,
                             projection.as_secs_f64(),
                         ));
                     }
