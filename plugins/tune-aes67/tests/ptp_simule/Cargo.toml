@@ -1,0 +1,17 @@
+[package]
+name = "banc-derive-ptp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "lib.rs"
+test = false
+doctest = false
+
+[dependencies]
+tune-aes67 = { path = "../.." }
+statime = { version = "=0.4.0", default-features = false, features = ["std"] }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"

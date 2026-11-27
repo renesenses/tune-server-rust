@@ -1,11 +1,9 @@
 //! Banc E2 (#7336) : le suiveur PTP face à un maître PTPv2 simulé.
 //!
-//! Aucun son, aucun droit, aucun réseau extérieur : maître et suiveur
-//! parlent en unicast sur 127.0.0.1, ports libres. Le maître simulé
-//! (`tune_aes67::ptp::banc`) est écrit à la main d'après IEEE 1588-2008,
-//! indépendamment de `statime` ; son horloge est décalée de ~3 h et dérive
-//! de +40 ppm sur celle de la machine. On compare directement le temps du
-//! suiveur au temps vrai du maître.
+//! La dérive est mesurée sur une liaison IEEE 1588 en temps simulé. Le banc
+//! compile les sources du suiveur et de son horloge telles quelles. Son maître
+//! indépendant avance à +40 ppm et démarre à plus de trois heures de la pendule
+//! locale. Les autres scénarios exercent les sockets UDP sur la boucle locale.
 //!
 //! Seuils, sur la boucle locale avec horodatage logiciel :
 //! - calage en moins de 20 s ;
@@ -20,8 +18,8 @@
 //! est bornée par le délai moyen de chemin que le suiveur mesure lui-même,
 //! `(d_ms + d_sm) / 2`. Sur un runner de CI saturé, l'écart sortait à
 //! [-412, -235] µs, hors des 250 µs. Deux remèdes : les bancs passent un par
-//! un (ils se faussaient l'un l'autre), la fréquence apprise est la médiane
-//! de la fenêtre et non un relevé isolé, et le seuil est 250 µs PLUS le plus
+//! un (ils se faussaient l'un l'autre), la pente
+//! se mesure sur toute la fenêtre et le seuil est 250 µs PLUS le plus
 //! grand délai moyen vu pendant la mesure. Machine calme (délai de quelques
 //! dizaines de µs), il reste à ~250 µs ; un suiveur qui ne suit pas le maître
 //! (dérive non apprise : 40 ppm, soit 200 µs de plus toutes les 5 s, ou pas
@@ -111,24 +109,6 @@ struct Mesure {
     moyenne: i64,
     /// Le plus grand délai moyen de chemin publié par le suiveur.
     delai_max: i64,
-    /// #8460 — la fréquence apprise, MÉDIANE des relevés de la fenêtre : un
-    /// relevé unique pris à la fin tombait parfois sur une correction en
-    /// cours (-9,26 ppm mesuré sur Shrek, écart pourtant sous 102 µs).
-    frequence_ppm: f64,
-    frequence_mesuree_ppm: f64,
-    incertitude_lecture_ns: u64,
-    duree_ns: u64,
-    meme_generation: bool,
-}
-
-/// Encadre une lecture de l'horloge par deux instants monotones : le temps
-/// passé à lire n'est pas confondu avec une erreur de fréquence.
-fn lire_pente(s: &SuiveurPtp) -> (Instant, u64, u64) {
-    let avant = Instant::now();
-    let virtuel = s.maintenant_ns();
-    let apres = Instant::now();
-    let largeur = apres - avant;
-    (avant + largeur / 2, virtuel, largeur.as_nanos() as u64)
 }
 
 /// L'asymétrie du chemin déplace une phase d'au plus le délai moyen ;
@@ -150,35 +130,23 @@ fn la_marge_de_frequence_vient_de_la_mesure_et_rejette_une_horloge_non_corrigee(
     assert!(seuil_frequence_ppm(i64::MAX, u64::MAX, 1) < 40.0);
 }
 
-/// Mesure l'écart, le délai de chemin et la fréquence apprise toutes les
+/// Mesure l'écart et le délai de chemin toutes les
 /// 50 ms pendant `duree`.
 fn mesurer(maitre: &MaitreSimule, s: &SuiveurPtp, duree: Duration) -> Mesure {
     let debut = Instant::now();
-    let generation = s.generation();
-    let (t0, v0, lecture0) = lire_pente(s);
     let mut v = Vec::new();
-    let mut frequences = Vec::new();
     let mut delai_max = 0i64;
     while debut.elapsed() < duree {
         v.push(ecart_ns(maitre, s));
         let e = s.etat();
         delai_max = delai_max.max(e.delai_moyen_ns.unwrap_or(0).abs());
-        frequences.push(e.frequence_ppm);
         std::thread::sleep(Duration::from_millis(50));
     }
-    let (t1, v1, lecture1) = lire_pente(s);
-    let duree_ns = (t1 - t0).as_nanos() as u64;
-    frequences.sort_by(f64::total_cmp);
     Mesure {
         min: *v.iter().min().unwrap(),
         max: *v.iter().max().unwrap(),
         moyenne: v.iter().sum::<i64>() / v.len() as i64,
         delai_max,
-        frequence_ppm: frequences[frequences.len() / 2],
-        frequence_mesuree_ppm: ((v1 as i128 - v0 as i128) as f64 / duree_ns as f64 - 1.0) * 1e6,
-        incertitude_lecture_ns: lecture0.saturating_add(lecture1) / 2,
-        duree_ns,
-        meme_generation: generation == s.generation(),
     }
 }
 
@@ -204,84 +172,79 @@ fn le_seuil_ne_s_elargit_que_du_delai_de_chemin_mesure() {
 
 #[test]
 fn le_suiveur_se_cale_sur_un_maitre_1588_2008_et_suit_sa_derive() {
-    let _banc = un_banc_a_la_fois();
-    let maitre = MaitreSimule::demarrer(ConfigMaitre::par_defaut()).unwrap();
-    let s = suiveur_pour(&maitre);
-    assert_eq!(
-        s.reference(),
-        ReferenceHorloge::Locale,
-        "pas calé au départ"
-    );
-    let avant = ecart_ns(&maitre, &s);
-    assert!(
-        avant.abs() > 3 * 3600 * 1_000_000_000,
-        "écart initial {avant}"
-    );
-
-    let duree = attendre(LIMITE_CALAGE, || s.calee())
-        .unwrap_or_else(|| panic!("pas de calage en {LIMITE_CALAGE:?} : {:?}", s.etat()));
-    eprintln!("calage en {duree:?} ; état {:?}", s.etat());
-    assert_eq!(
-        s.reference(),
-        ReferenceHorloge::Ptp {
-            identite_maitre: maitre.identite(),
-            domaine: 0
+    use banc_derive_ptp::{jouer, temps_du_maitre};
+    const SECONDE: u64 = 1_000_000_000;
+    let maitre = ConfigMaitre::par_defaut();
+    let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+    let mut calage = None;
+    let mut premiere = None;
+    let mut delai_max = 0;
+    let mut mesures = 0;
+    let mut cfg = banc_derive_ptp::ConfigPtp::aes67(None);
+    cfg.reseau = ConfigReseauPtp::unicast(Ipv4Addr::LOCALHOST, local, local);
+    cfg.intervalle_annonce_log2 = maitre.log_annonce;
+    cfg.delai_annonce = 3;
+    cfg.intervalle_delay_req_log2 = -3;
+    cfg.delai_sans_sync = Duration::from_secs(1);
+    let demandes = jouer(cfg, maitre, |t, s| {
+        let virtuel = s.maintenant_ns();
+        let ecart = i128::from(virtuel) - i128::from(temps_du_maitre(maitre, t));
+        if t == 0 {
+            assert_eq!(s.reference(), ReferenceHorloge::Locale);
+            assert!(ecart.abs() > i128::from(3 * 3600 * SECONDE));
         }
-    );
-    assert_eq!(
-        s.reference().attribut_sdp(),
-        "ptp=IEEE1588-2008:00-1D-C1-FF-FE-12-34-56:0"
-    );
-
-    std::thread::sleep(Duration::from_secs(5));
-    let Mesure {
-        min,
-        max,
-        moyenne,
-        delai_max,
-        frequence_ppm,
-        frequence_mesuree_ppm,
-        incertitude_lecture_ns,
-        duree_ns,
-        meme_generation,
-    } = mesurer(&maitre, &s, Duration::from_secs(5));
-    let seuil = seuil_ecart_ns(delai_max);
-    let e = s.etat();
-    eprintln!(
-        "écart suiveur − maître sur 5 s : min {min} ns, max {max} ns, moyenne {moyenne} ns ; \
-         délai moyen de chemin max {delai_max} ns, seuil {seuil} ns ; \
-         fréquence médiane {frequence_ppm:.2} ppm (dernière {:.2}) ; état {e:?}",
-        e.frequence_ppm
-    );
-    assert!(
-        min.abs() < seuil && max.abs() < seuil,
-        "écart hors seuil : [{min}, {max}] ns (seuil {seuil} ns = {SEUIL_ECART_NS} + délai \
-         moyen de chemin max {delai_max} ns)"
-    );
-    let seuil_frequence = seuil_frequence_ppm(delai_max, incertitude_lecture_ns, duree_ns);
-    assert!(
-        meme_generation,
-        "un saut pendant la mesure ne doit pas passer pour une pente"
-    );
-    eprintln!(
-        "pente réellement parcourue {frequence_mesuree_ppm:.2} ppm, marge {seuil_frequence:.2} ppm, lectures ±{incertitude_lecture_ns} ns"
-    );
-    assert!(
-        (frequence_mesuree_ppm - 40.0).abs() < seuil_frequence,
-        "fréquence mesurée {frequence_mesuree_ppm} ppm, attendue 40 ±{seuil_frequence} ppm"
-    );
-    assert!(e.calee && !e.repli_horloge_locale && e.raison_du_repli.is_none());
-    assert_eq!(e.etat_port, "esclave");
-    assert_eq!(e.maitre.as_deref(), Some("00-1D-C1-FF-FE-12-34-56"));
-    assert!(e.sauts >= 1, "le premier calage est un saut de ~3 h");
-    assert!(
-        maitre
-            .compteurs
-            .delay_req
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
-    );
-    s.arreter();
+        if calage.is_none() {
+            assert!(t < LIMITE_CALAGE.as_nanos() as u64, "calage hors délai");
+            if !s.calee() {
+                return true;
+            }
+        }
+        assert_eq!(
+            s.reference(),
+            ReferenceHorloge::Ptp {
+                identite_maitre: maitre.identite,
+                domaine: 0
+            }
+        );
+        assert_eq!(
+            s.reference().attribut_sdp(),
+            "ptp=IEEE1588-2008:00-1D-C1-FF-FE-12-34-56:0"
+        );
+        let depuis = t - *calage.get_or_insert(t);
+        if depuis < 5 * SECONDE || !depuis.is_multiple_of(50_000_000) {
+            return true;
+        }
+        let e = s.etat();
+        assert!(e.calee && !e.repli_horloge_locale && e.raison_du_repli.is_none());
+        assert_eq!(e.etat_port, "esclave");
+        assert_eq!(e.maitre.as_deref(), Some("00-1D-C1-FF-FE-12-34-56"));
+        assert!(e.sauts >= 1);
+        delai_max = delai_max.max(e.delai_moyen_ns.unwrap_or(0).abs());
+        assert!(
+            ecart.abs() < i128::from(seuil_ecart_ns(delai_max)),
+            "écart hors seuil : {ecart} ns"
+        );
+        mesures += 1;
+        let (depart, generation) = *premiere.get_or_insert((virtuel, s.generation()));
+        assert_eq!(generation, s.generation(), "saut pendant la mesure");
+        if depuis == 10 * SECONDE {
+            let duree = 5 * SECONDE;
+            let pente =
+                ((i128::from(virtuel) - i128::from(depart)) as f64 / duree as f64 - 1.0) * 1e6;
+            eprintln!(
+                "calage à {} ms, pente {pente:.4} ppm sur 5 s, délai de chemin maximal {delai_max} ns",
+                (t - depuis) / 1_000_000
+            );
+            assert!(
+                (pente - 40.0).abs() < seuil_frequence_ppm(delai_max, 0, duree),
+                "pente {pente} ppm"
+            );
+            return false;
+        }
+        true
+    });
+    assert_eq!(mesures, 101);
+    assert!(demandes > 0, "aucun Delay_Req servi");
 }
 
 #[test]
@@ -370,7 +333,6 @@ fn perte_du_maitre_repli_sans_saut_puis_calage_sur_un_autre_maitre() {
         max,
         moyenne,
         delai_max,
-        ..
     } = mesurer(&maitre_b, &s, Duration::from_secs(3));
     let seuil = seuil_ecart_ns(delai_max);
     eprintln!(
