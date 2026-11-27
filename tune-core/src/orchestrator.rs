@@ -13,6 +13,7 @@ pub use transcodage::transcoder_vers_un_fichier_8558;
 use transcodage::*;
 /// #8558 (volet B) — piste trop lourde pour le bras fichier : WAV progressif.
 mod bascule_progressive_8558;
+mod repli_du_bras_fichier_rc15;
 
 /// A second play of the SAME track pushed to a NETWORK renderer within this
 /// window is treated as a redundant re-trigger (a slow pre-transcode resolve
@@ -3255,5 +3256,7 @@ mod plafond_16_bits_service_8188_tests;
 
 #[cfg(test)]
 mod format_m4a_sink_8722_tests;
+#[cfg(test)]
+mod repli_du_bras_fichier_rc15_tests;
 #[cfg(test)]
 mod reprise_dlna_701_8738_tests;
