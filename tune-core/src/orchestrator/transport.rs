@@ -1626,7 +1626,7 @@ impl PlaybackOrchestrator {
                 }
                 autre => autre,
             };
-            let media = crate::outputs::traits::PlayMedia {
+            let mut media = crate::outputs::traits::PlayMedia {
                 url: &resolved.url,
                 mime_type: &resolved.mime_type,
                 title: Some(&resolved.title),
@@ -1781,6 +1781,22 @@ impl PlaybackOrchestrator {
                         }
                     }
                 }
+            }
+
+            // Le format initial de la radio est provisoire jusqu'à la sonde.
+            // Annoncer au lecteur le format du WAV qui vient d'être préparé.
+            if resolved.source == "radio"
+                && resolved.mime_type == "audio/wav"
+                && let Some(sid) = &resolved.stream_id
+                && let Some(fil) = self.streamer.stream_output_wire(sid).await
+                && fil
+                    .radio_source
+                    .as_ref()
+                    .is_some_and(|s| s.sample_rate.is_some())
+            {
+                media.sample_rate = Some(fil.sample_rate);
+                media.bit_depth = Some(u32::from(fil.bit_depth));
+                media.channels = Some(u32::from(fil.channels));
             }
 
             // #8404 — point d'arrêt d'essai : vide hors des tests.
