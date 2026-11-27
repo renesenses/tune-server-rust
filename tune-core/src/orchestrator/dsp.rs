@@ -3188,7 +3188,27 @@ impl PlaybackOrchestrator {
         let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
         match crate::audio::surechantillonnage::choix_de_la_zone(&settings, premium, pure, zone_id)
         {
-            Ok(choix) => Ok(choix),
+            Ok(mut choix) => {
+                // rc14.1 (fil 3118, Topping E30 II) — la « Fréquence max » de
+                // la zone (catalogue compris) plafonne la cadence du greffon :
+                // sans elle, ×8 menait 96 kHz à 768 kHz sur une zone réglée à
+                // 384 kHz. Posée dans le choix, elle atteint la négociation
+                // (`choose_rate_for`) et la comparaison des réglages d'une
+                // frontière de piste (un plafond changé rouvre la sortie).
+                let zone = ZoneRepo::with_backend(self.db.clone())
+                    .get(zone_id)
+                    .ok()
+                    .flatten();
+                let quirks = crate::device_catalog::resolve_zone_quirks(&self.db, zone_id);
+                plafonner_par_la_zone(
+                    &mut choix.reglages,
+                    crate::device_catalog::combine_max_sample_rate(
+                        zone.and_then(|z| z.max_sample_rate),
+                        quirks.max_sample_rate,
+                    ),
+                );
+                Ok(choix)
+            }
             Err(ecarte) => {
                 if ecarte != crate::audio::surechantillonnage::Ecarte::Desactive {
                     tracing::info!(zone_id, reason = ecarte.code(), "upsampler_not_engaged");
@@ -4889,4 +4909,18 @@ pub(super) fn niveau_de_l_empreinte(empreinte: &str) -> f64 {
     } else {
         1.0
     }
+}
+
+/// rc14.1 (fil 3118) — le plafond de cadence du suréchantillonneur, borné
+/// par celui de la zone : le plus bas des deux, l'un ou l'autre s'il est
+/// seul. Les candidates restent des multiples entiers de la source : la
+/// famille (44,1 / 48 kHz) est gardée, seul le rapport descend.
+pub(crate) fn plafonner_par_la_zone(
+    reglages: &mut crate::audio::surechantillonnage::UpsamplerSettings,
+    plafond_de_zone: Option<u32>,
+) {
+    reglages.max_rate_hz = match (reglages.max_rate_hz, plafond_de_zone) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
 }

@@ -348,3 +348,95 @@ async fn deux_relances_ne_se_chevauchent_jamais() {
     }
     assert!(lancee, "le plancher est posé dès le début de la relance");
 }
+
+/// rc14.1 (fil 3118) — un verdict qui admet toutes les cadences, jusqu'à
+/// 705,6 et 768 kHz : seul le plafond éprouvé borne la négociation.
+fn verdict_jusqu_a_768k() -> su::VerdictMachine {
+    let mut v = verdict();
+    for f in su::greffon::OFFERED_FILTERS {
+        for (de, vers) in [(44_100, 705_600), (48_000, 768_000)] {
+            v.results.push(su::MesureMachine {
+                filter: f.to_string(),
+                from_hz: de,
+                to_hz: vers,
+                realtime_factor: 10.0,
+                admitted: true,
+            });
+        }
+    }
+    v
+}
+
+/// rc14.1 (fil 3118, Topping E30 II en sortie locale) — la « Fréquence max »
+/// de la zone (384 kHz) plafonne le suréchantillonneur : ×8 mène 96 kHz à
+/// 384 kHz (et non 768), 44,1 kHz à 352,8 kHz, famille gardée. Contre-épreuve :
+/// sans plafond de zone, 768 kHz ; un plafond de l'utilisateur plus bas reste
+/// le plus bas.
+#[tokio::test]
+async fn la_frequence_max_de_la_zone_plafonne_le_surechantillonneur_3118() {
+    let orch = orchestrateur();
+    let zone_id = zone_locale(&orch).await;
+    su::enregistrer_le_verdict(
+        &SettingsRepo::with_backend(orch.db.clone()),
+        &verdict_jusqu_a_768k(),
+    )
+    .unwrap();
+    let mesurees = [
+        88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600, 768_000,
+    ];
+    let filtre = su::greffon::DEFAULT_FILTER;
+    regler(
+        &orch,
+        zone_id,
+        serde_json::json!({"enabled": true, "filter": filtre, "max_ratio": 8}),
+    );
+    // Contre-épreuve : aucune fréquence max sur la zone.
+    let choix = orch.decision_du_surechantillonneur(zone_id, false).unwrap();
+    assert_eq!(choix.reglages.max_rate_hz, None);
+    assert_eq!(choix.negocier(96_000, &mesurees), Some(768_000));
+    assert_eq!(choix.negocier(44_100, &mesurees), Some(352_800));
+    // Le fil 3118 : la zone est plafonnée à 384 kHz.
+    crate::db::zone_repo::ZoneRepo::with_backend(orch.db.clone())
+        .update_max_sample_rate(zone_id, Some(384_000))
+        .unwrap();
+    let choix = orch.decision_du_surechantillonneur(zone_id, false).unwrap();
+    assert_eq!(choix.reglages.max_rate_hz, Some(384_000));
+    assert_eq!(choix.negocier(96_000, &mesurees), Some(384_000));
+    assert_eq!(choix.negocier(44_100, &mesurees), Some(352_800));
+    // « Maximum du périphérique » : 44,1 kHz irait à 705,6 kHz, le plafond
+    // le ramène à 352,8 kHz (famille 44,1 gardée, jamais 384 kHz).
+    regler(
+        &orch,
+        zone_id,
+        serde_json::json!({"enabled": true, "filter": filtre}),
+    );
+    let choix = orch.decision_du_surechantillonneur(zone_id, false).unwrap();
+    assert_eq!(choix.negocier(44_100, &mesurees), Some(352_800));
+    assert_eq!(choix.negocier(48_000, &mesurees), Some(384_000));
+    // Le plafond de l'utilisateur, plus bas, reste le plus bas.
+    regler(
+        &orch,
+        zone_id,
+        serde_json::json!({"enabled": true, "filter": filtre, "max_rate_hz": 192_000}),
+    );
+    let choix = orch.decision_du_surechantillonneur(zone_id, false).unwrap();
+    assert_eq!(choix.reglages.max_rate_hz, Some(192_000));
+    assert_eq!(choix.negocier(96_000, &mesurees), Some(192_000));
+}
+
+/// rc14.1 (fil 3118) — la règle du plafond, seule.
+#[test]
+fn plafond_de_zone_et_plafond_des_reglages_3118() {
+    use super::dsp::plafonner_par_la_zone;
+    let mut r = su::greffon::UpsamplerSettings::default();
+    plafonner_par_la_zone(&mut r, None);
+    assert_eq!(r.max_rate_hz, None);
+    plafonner_par_la_zone(&mut r, Some(384_000));
+    assert_eq!(r.max_rate_hz, Some(384_000));
+    r.max_rate_hz = Some(192_000);
+    plafonner_par_la_zone(&mut r, Some(384_000));
+    assert_eq!(r.max_rate_hz, Some(192_000));
+    r.max_rate_hz = Some(768_000);
+    plafonner_par_la_zone(&mut r, Some(384_000));
+    assert_eq!(r.max_rate_hz, Some(384_000));
+}
