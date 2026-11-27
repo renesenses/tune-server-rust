@@ -342,7 +342,17 @@ impl RelayClient {
 
         let (ws_stream, _) = tokio::time::timeout(
             self.delais.connexion,
-            tokio_tungstenite::connect_async(&self.relay_url),
+            // rc14.1 (fil 3136) — mêmes racines que le client HTTP partagé
+            // (webpki + magasin du système) : derrière un antivirus qui
+            // inspecte le HTTPS, le `wss://` du relais passe lui aussi.
+            tokio_tungstenite::connect_async_tls_with_config(
+                &self.relay_url,
+                None,
+                false,
+                Some(tokio_tungstenite::Connector::Rustls(
+                    crate::http::client::configuration_tls(),
+                )),
+            ),
         )
         .await
         .map_err(|_| "ws connect: timeout".to_string())?
