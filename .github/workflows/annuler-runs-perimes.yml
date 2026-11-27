@@ -66,7 +66,7 @@ env:
 
 jobs:
   nettoyer:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 5
     steps:
       - name: Annuler les runs périmés

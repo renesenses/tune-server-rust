@@ -313,7 +313,7 @@ jobs:
     name: Publish Widget Release
     needs: build
     if: startsWith(github.ref, 'refs/tags/widget-v')
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     steps:
       - uses: actions/download-artifact@v4
         with:

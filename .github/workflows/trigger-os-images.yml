@@ -22,7 +22,7 @@ on:
 
 jobs:
   dispatch:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 360
     # Plus de saut des pre-versions : la 1.0.0-rc1 part chez tout le monde,
     # images Tune OS comprises. Sans elles, `staging-complete` (release.yml)

@@ -41,7 +41,7 @@ jobs:
   web-client:
     name: Build Web Client
     needs: preflight
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 20  # Build Web Client — <1 min
     steps:
       - uses: actions/checkout@v4
@@ -1796,7 +1796,7 @@ jobs:
       needs.preflight.result == 'success'
       && needs.build.result == 'success'
       && needs.widget.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 45  # Create Release — 1 min ; marge pour les 3 essais minisign (10 min 40 au pire)
     steps:
       - uses: actions/checkout@v4
@@ -2015,7 +2015,7 @@ jobs:
       always()
       && needs.build.result == 'success'
       && needs.release.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15  # Publish release — <1 min
     permissions:
       contents: write
@@ -2082,7 +2082,7 @@ jobs:
       && needs.publish.result == 'success'
       && needs.stage-docker.result == 'success'
       && needs.stage-os.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 5
     steps:
       - name: Attester la matrice staged
@@ -2105,7 +2105,7 @@ jobs:
       needs.publish.outputs.promoted == 'true'
       && startsWith(github.ref, 'refs/tags/v')
       && !contains(github.ref_name, '-')
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15  # Update Homebrew tap — <1 min
     steps:
       - uses: actions/checkout@v4
@@ -2210,7 +2210,7 @@ jobs:
       needs.publish.outputs.promoted == 'true'
       && startsWith(github.ref, 'refs/tags/v')
       && !contains(github.ref_name, '-')
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 10  # Update mozaiklabs.fr/download — <1 min
     steps:
       - name: Notify mozaiklabs.fr webhook
@@ -2246,7 +2246,7 @@ jobs:
       needs.publish.outputs.promoted == 'true'
       && startsWith(github.ref, 'refs/tags/v')
       && !contains(github.ref_name, '-')
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15  # Trigger Android build — <1 min
     steps:
       # La CI Android existe déjà dans tune-server-flutter (APK signé +
@@ -2313,7 +2313,7 @@ jobs:
     name: Announce on mozaiklabs forum
     needs: release
     if: false  # Disabled — voir le pave ci-dessus et #2328
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15  # Announce on forum — desactive
     steps:
       - uses: actions/checkout@v4

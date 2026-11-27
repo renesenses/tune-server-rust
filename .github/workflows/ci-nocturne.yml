@@ -42,7 +42,7 @@ permissions:
 jobs:
   lancer:
     name: Lancer la CI complete sur les lots
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
