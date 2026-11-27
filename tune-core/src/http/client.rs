@@ -14,10 +14,28 @@ use std::time::Duration;
 /// platform verifier with webpki roots, which need no platform init and behave
 /// identically on desktop and Android. Every client MUST be built via
 /// [`builder`] / [`blocking_builder`] for this to hold.
-static TLS_CONFIG: LazyLock<rustls::ClientConfig> = LazyLock::new(|| {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+///
+/// rc14.1 (fil 3136) — hors Android, les certificats du magasin du SYSTÈME
+/// s'AJOUTENT aux racines webpki ([`racines_de_confiance`]). Un antivirus qui
+/// inspecte le HTTPS (Kaspersky, Avast, ESET…) ou un proxy d'entreprise
+/// signe les connexions avec sa propre AC, qu'il installe dans le magasin de
+/// Windows (ou de macOS, ou dans `/etc/ssl` sous Linux) : avec les seules
+/// racines webpki, Tune refusait TOUTES ses requêtes HTTPS (connexion
+/// YouTube, mises à jour, mozaiklabs.fr) alors que les radios en HTTP
+/// passaient. Les racines webpki restent toujours là : un magasin illisible
+/// ou vide ne retire rien.
+static TLS_CONFIG: LazyLock<rustls::ClientConfig> =
+    LazyLock::new(|| configuration_tls_avec(racines_de_confiance(magasin_du_systeme())));
 
+/// La configuration rustls partagée, pour un client qui n'est pas `reqwest`
+/// (le WebSocket du relais, `tokio-tungstenite`) : mêmes racines, même
+/// fournisseur cryptographique que [`builder`].
+pub fn configuration_tls() -> Arc<rustls::ClientConfig> {
+    Arc::new(TLS_CONFIG.clone())
+}
+
+/// La configuration rustls bâtie sur `roots`.
+pub(crate) fn configuration_tls_avec(roots: rustls::RootCertStore) -> rustls::ClientConfig {
     // Build with an explicit aws-lc-rs provider (matches reqwest's `rustls`
     // feature) rather than relying on a process-default being installed.
     rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -27,7 +45,56 @@ static TLS_CONFIG: LazyLock<rustls::ClientConfig> = LazyLock::new(|| {
     .expect("aws-lc-rs supports the default protocol versions")
     .with_root_certificates(roots)
     .with_no_client_auth()
-});
+}
+
+/// Les racines webpki, TOUJOURS, plus les certificats de `magasin`. Un
+/// certificat du magasin illisible est ignoré (et compté), jamais fatal.
+pub(crate) fn racines_de_confiance(
+    magasin: Vec<rustls::pki_types::CertificateDer<'static>>,
+) -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if !magasin.is_empty() {
+        let (ajoutes, ignores) = roots.add_parsable_certificates(magasin);
+        tracing::info!(
+            webpki = webpki_roots::TLS_SERVER_ROOTS.len(),
+            systeme = ajoutes,
+            ignores,
+            "tls_racines_du_systeme_ajoutees"
+        );
+    }
+    roots
+}
+
+/// Les certificats du magasin du système (`rustls-native-certs` : magasin
+/// « Racine » de Windows, trousseaux de macOS, fichiers d'`openssl-probe`
+/// sous Linux ; `SSL_CERT_FILE` / `SSL_CERT_DIR` s'ils sont posés). Une
+/// erreur de lecture, même une panique, rend ce qui a pu être lu (au pire
+/// rien) : les racines webpki suffisent alors, comme avant la rc14.1.
+#[cfg(not(target_os = "android"))]
+fn magasin_du_systeme() -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    match std::panic::catch_unwind(rustls_native_certs::load_native_certs) {
+        Ok(resultat) => {
+            for erreur in &resultat.errors {
+                tracing::warn!(error = %erreur, "tls_magasin_du_systeme_illisible");
+            }
+            resultat.certs
+        }
+        Err(_) => {
+            tracing::warn!("tls_magasin_du_systeme_panique");
+            Vec::new()
+        }
+    }
+}
+
+/// Android : rien de plus que webpki. Le magasin d'Android ne se lit que par
+/// JNI, que le binaire FFI (`libtuneserver.so`) n'initialise pas (voir plus
+/// haut) : `tune-core` ne déclare `rustls-native-certs` que hors Android
+/// (la caisse y reste compilée pour `vendor/rust_cast`, qui ne sert pas ici).
+#[cfg(target_os = "android")]
+fn magasin_du_systeme() -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    Vec::new()
+}
 
 /// Nombre d'en-têtes acceptés dans une réponse HTTP/1 (#5522).
 ///
@@ -251,3 +318,7 @@ mod tests_9450 {
 #[cfg(test)]
 #[path = "client_tests_5522.rs"]
 mod tests_5522;
+
+#[cfg(test)]
+#[path = "client_tests_racines_systeme.rs"]
+mod tests_racines_systeme;
