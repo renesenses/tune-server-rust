@@ -78,7 +78,7 @@ jobs:
     name: Windows x86_64
     needs: tests
     if: github.event_name == 'workflow_dispatch'
-    runs-on: windows-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_WINDOWS || '"windows-latest"') }}
     timeout-minutes: 30  # ~3 min de compilation
     steps:
       - uses: actions/checkout@v4

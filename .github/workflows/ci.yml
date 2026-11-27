@@ -586,7 +586,7 @@ jobs:
     name: Windows + ASIO (compilation PR)
     needs: impact
     if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.windows == 'true' && vars.SANS_WINDOWS != '1'
-    runs-on: windows-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_WINDOWS || '"windows-latest"') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -690,7 +690,7 @@ jobs:
             os: windows-latest
             artifact: tune-server-windows-x86_64
 
-    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(inputs.runner || vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
+    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(inputs.runner || vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || (matrix.os == 'windows-latest' && fromJSON(vars.RUNNER_WINDOWS || '"windows-latest"')) || (matrix.os == 'macos-15-intel' && fromJSON(vars.RUNNER_MACOS_INTEL || '"macos-15-intel"')) || matrix.os }}
     timeout-minutes: 60  # build — 18 min au pire observe
     steps:
       - uses: actions/checkout@v4
@@ -1198,7 +1198,7 @@ jobs:
           - {target: x86_64-apple-darwin, os: macos-15-intel, cross: false}
           - {target: aarch64-apple-darwin, os: macos-latest, cross: false}
           - {target: x86_64-pc-windows-msvc, os: windows-latest, cross: false}
-    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(inputs.runner || vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
+    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(inputs.runner || vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || (matrix.os == 'windows-latest' && fromJSON(vars.RUNNER_WINDOWS || '"windows-latest"')) || (matrix.os == 'macos-15-intel' && fromJSON(vars.RUNNER_MACOS_INTEL || '"macos-15-intel"')) || matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
