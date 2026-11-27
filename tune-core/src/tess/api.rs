@@ -22,7 +22,9 @@ use super::VERSION_CONTRAT;
 use super::chaine::{ChaineTess, ErreurChaine, Upsampling};
 use super::greffon::Catalogue;
 use super::modulation_dsd::{CapacitesDsd, MotifDsdRefuse};
-use super::reseau_upnp::{AcheminementUpnp, FaitsUpnp, acheminer, appliquer, famille_upnp};
+use super::reseau_upnp::{
+    AcheminementUpnp, FaitsUpnp, SurechantillonnageUpnp, acheminer_avec, appliquer, famille_upnp,
+};
 use super::resolution::{
     Badge, CodeEtape, ContexteExecution, EtapeResolue, EtatVolume, MotifEtape, PlacementVolume,
     Resolution,
@@ -95,11 +97,35 @@ impl ReponseTessZone {
         ctx: &ContexteExecution<'_>,
         lecteur: Option<&FaitsUpnp>,
     ) -> Self {
+        Self::depuis_avec_le_lecteur_et_surech(
+            zone_id,
+            chain,
+            active_preset,
+            catalog,
+            ctx,
+            lecteur,
+            None,
+        )
+    }
+
+    /// rc14 — comme [`Self::depuis_avec_le_lecteur`], avec la décision de la
+    /// lecture sur le suréchantillonnage PCM vers ce lecteur
+    /// (`delivery.upsampling`, et l'étape `upsampling` qui publie ses
+    /// cadences ou son refus).
+    pub fn depuis_avec_le_lecteur_et_surech(
+        zone_id: i64,
+        chain: ChaineTess,
+        active_preset: Option<String>,
+        catalog: Catalogue,
+        ctx: &ContexteExecution<'_>,
+        lecteur: Option<&FaitsUpnp>,
+        surech: Option<&SurechantillonnageUpnp>,
+    ) -> Self {
         let mut r = chain.resoudre(&catalog, ctx);
         let delivery = lecteur
             .filter(|_| famille_upnp(ctx.transport) && ctx.transport.applicabilite().appliquee())
             .map(|f| {
-                let a = acheminer(&r, f);
+                let a = acheminer_avec(&r, f, surech);
                 appliquer(&mut r, &a);
                 a
             });
@@ -317,10 +343,25 @@ pub fn schema_json() -> Value {
             "route": enumere(&["untouched", "progressive_lpcm", "file_transcode"]),
             "reason": { "enum": ["nothing_to_process", "renderer_without_lpcm",
                                  "progressive_off", "service_not_streamable",
-                                 "dsd_converted_to_pcm", null] },
+                                 "dsd_converted_to_pcm", "upsampling_file_transcode", null] },
             "detail": texte_ou_null.clone(),
             "renderer_lpcm": enumere(&["accepted", "refused", "unknown"]),
-            "lpcm_bits": { "type": "integer" }
+            "lpcm_bits": { "type": "integer" },
+            // rc14 — le suréchantillonnage PCM vers ce lecteur.
+            "upsampling": {
+                "type": "object",
+                "required": ["active", "offered_rates_hz"],
+                "properties": {
+                    "active": { "type": "boolean" },
+                    "reason": { "type": "string" },
+                    "from_hz": { "type": "integer" },
+                    "to_hz": { "type": "integer" },
+                    "filter": { "type": "string" },
+                    "headroom_db": { "type": "number" },
+                    "offered_rates_hz": { "type": "array", "items": { "type": "integer" } }
+                },
+                "additionalProperties": false
+            }
         },
         "additionalProperties": false
     });

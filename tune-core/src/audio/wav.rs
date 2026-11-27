@@ -5,7 +5,7 @@
 /// that reads it into a signed 32-bit integer. Backing off by 36 bytes puts the
 /// RIFF size at exactly `i32::MAX` and keeps both fields positive (#1689). The
 /// 36 bytes lost out of 2 GiB are ~0.2 ms of CD audio.
-const UNKNOWN_DATA_SIZE: u32 = 0x7FFF_FFFF - 36;
+pub const UNKNOWN_DATA_SIZE: u32 = 0x7FFF_FFFF - 36;
 
 /// Total response length announced for a live stream served with the *file*
 /// contract — `Content-Length` + `Range` — instead of a chunked, length-less

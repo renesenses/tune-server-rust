@@ -906,8 +906,9 @@ fn la_capacite_de_volume_retenue_survit_a_une_sortie_occupee() {
 /// Relecture du 24/11 (3e), contre la LECTURE réelle : opt-in armé, lecteur
 /// L24, la lecture sert la source à l'octet (elle ne lit ni `Upsampling` ni
 /// `Headroom`) ; l'état de la même zone, chaîne avec upsampling et headroom
-/// manuel, dit `untouched`, les deux étages `not_applied_on_transport`, et le
-/// badge « Bit-perfect », comme `delivery` et comme les octets.
+/// manuel, dit `untouched`, les deux étages éteints (le headroom
+/// `not_applied_on_transport`, l'upsampling avec son refus motivé depuis
+/// rc14), et le badge « Bit-perfect », comme `delivery` et comme les octets.
 #[tokio::test]
 async fn upsampling_et_headroom_ne_sont_pas_annonces_quand_la_lecture_sert_la_source() {
     let b = banc(SINK_COMPLET).await;
@@ -971,11 +972,15 @@ async fn upsampling_et_headroom_ne_sont_pas_annonces_quand_la_lecture_sert_la_so
     ] {
         let e = etat.signal_path.iter().find(|e| e.code == code).unwrap();
         assert!(e.requested && !e.effective, "{code:?}");
-        assert_eq!(
-            e.reason,
-            Some(MotifEtape::NotAppliedOnTransport),
-            "{code:?}"
-        );
+        // rc14 — l'upsampling est porté sur UPnP par le fichier refait ;
+        // ici la lecture ne l'a pas décidé (réglage du greffon non posé) :
+        // il est éteint avec son refus motivé, pas « non appliqué ».
+        let attendu = if code == crate::tess::CodeEtape::Upsampling {
+            MotifEtape::NotInService
+        } else {
+            MotifEtape::NotAppliedOnTransport
+        };
+        assert_eq!(e.reason, Some(attendu), "{code:?}");
     }
 }
 

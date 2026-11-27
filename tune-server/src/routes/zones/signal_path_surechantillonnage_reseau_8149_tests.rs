@@ -50,13 +50,22 @@ fn zone(output_type: &str) -> (Arc<dyn tune_core::db::backend::DbBackend>, Zone,
 
 fn ligne(lang: &str, output_type: &str) -> (Value, Value) {
     let (backend, zone, _ps) = zone(output_type);
-    etat_du_surechantillonneur_lang(lang, &backend, zone.id.unwrap(), false, output_type, None)
-        .expect("suréchantillonneur réglé : un état et une ligne")
+    etat_du_surechantillonneur_lang(
+        lang,
+        &backend,
+        zone.id.unwrap(),
+        false,
+        output_type,
+        None,
+        Default::default(),
+    )
+    .expect("suréchantillonneur réglé : un état et une ligne")
 }
 
 #[test]
-fn zone_dlna_dit_que_le_surechantillonnage_ne_s_applique_pas_8149() {
-    let (etat, etape) = ligne("fr", "dlna");
+fn zone_airplay_dit_que_le_surechantillonnage_ne_s_applique_pas_8149() {
+    // rc14 — DLNA et OpenHome le portent désormais : AirPlay reste hors champ.
+    let (etat, etape) = ligne("fr", "airplay");
     assert_eq!(etat["active"], false, "{etat}");
     assert_eq!(etat["reason"], "output_not_supported", "{etat}");
     let d = etape["description"].as_str().unwrap();
@@ -70,7 +79,7 @@ fn zone_dlna_dit_que_le_surechantillonnage_ne_s_applique_pas_8149() {
         "#8149 : une zone réseau ne recevra jamais le suréchantillonnage, \
          « à la piste suivante » est faux : {d}"
     );
-    let en = ligne("en", "dlna").1;
+    let en = ligne("en", "airplay").1;
     let en = en["description"].as_str().unwrap();
     assert!(!en.contains("next track"), "{en}");
     assert!(en.contains("this zone"), "{en}");
@@ -98,16 +107,23 @@ fn le_texte_existe_dans_toutes_les_langues_8149() {
 }
 
 #[test]
-fn le_chemin_d_une_zone_dlna_porte_la_ligne_8149() {
-    let (backend, zone, ps) = zone("dlna");
+fn le_chemin_d_une_zone_airplay_porte_la_ligne_8149() {
+    let (backend, zone, ps) = zone("airplay");
     let fil = StreamInfo {
         format: "flac".into(),
         sample_rate: 44_100,
         bit_depth: 16,
         ..Default::default()
     };
-    let sp = build_signal_path(&ps, &zone, &backend, Some("Eversolo"), "dlna", Some(&fil))
-        .expect("un chemin du signal");
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("Eversolo"),
+        "airplay",
+        Some(&fil),
+    )
+    .expect("un chemin du signal");
     assert_eq!(sp["upsampling"]["reason"], "output_not_supported", "{sp}");
     let e = sp["steps"]
         .as_array()
@@ -135,8 +151,16 @@ fn zone_locale_en_bit_perfect_strict_dit_la_raison_8149() {
             "true",
         )
         .unwrap();
-    let (etat, etape) =
-        etat_du_surechantillonneur_lang("fr", &backend, id, false, "local", None).unwrap();
+    let (etat, etape) = etat_du_surechantillonneur_lang(
+        "fr",
+        &backend,
+        id,
+        false,
+        "local",
+        None,
+        Default::default(),
+    )
+    .unwrap();
     assert_eq!(etat["reason"], "strict_bitperfect", "{etat}");
     let d = etape["description"].as_str().unwrap();
     assert_eq!(
@@ -146,8 +170,16 @@ fn zone_locale_en_bit_perfect_strict_dit_la_raison_8149() {
     assert!(d.contains("bit-perfect strict"), "{d}");
     assert!(!d.contains("suivante"), "{d}");
     // PURE garde la priorité : sa ligne ne change pas.
-    let (etat, _) =
-        etat_du_surechantillonneur_lang("fr", &backend, id, true, "local", None).unwrap();
+    let (etat, _) = etat_du_surechantillonneur_lang(
+        "fr",
+        &backend,
+        id,
+        true,
+        "local",
+        None,
+        Default::default(),
+    )
+    .unwrap();
     assert_eq!(etat["reason"], "pure", "{etat}");
 }
 
@@ -174,8 +206,16 @@ fn zone_locale_a_cadence_fixe_dit_la_raison_8428() {
     settings
         .set(&tune_core::audio::frequence_fixe::cle_de_zone(id), "48000")
         .unwrap();
-    let (etat, etape) =
-        etat_du_surechantillonneur_lang("fr", &backend, id, false, "local", None).unwrap();
+    let (etat, etape) = etat_du_surechantillonneur_lang(
+        "fr",
+        &backend,
+        id,
+        false,
+        "local",
+        None,
+        Default::default(),
+    )
+    .unwrap();
     assert_eq!(etat["reason"], "fixed_rate", "{etat}");
     let d = etape["description"].as_str().unwrap();
     assert_eq!(
@@ -186,8 +226,16 @@ fn zone_locale_a_cadence_fixe_dit_la_raison_8428() {
     settings
         .delete(&tune_core::audio::frequence_fixe::cle_de_zone(id))
         .unwrap();
-    let (etat, _) =
-        etat_du_surechantillonneur_lang("fr", &backend, id, false, "local", None).unwrap();
+    let (etat, _) = etat_du_surechantillonneur_lang(
+        "fr",
+        &backend,
+        id,
+        false,
+        "local",
+        None,
+        Default::default(),
+    )
+    .unwrap();
     assert_ne!(etat["reason"], "fixed_rate", "{etat}");
 }
 
@@ -248,4 +296,107 @@ fn cadence_8671_chemin_explique_le_repli_mesure() {
             .expect("traduction du repli");
         assert!(v.contains("{0}") && v.contains("{1}"), "{lang}");
     }
+}
+
+/// rc14 — zone DLNA, piste de la bibliothèque suréchantillonnée par le fichier
+/// refait : le chemin du signal le dit (« 44,1 kHz → 176,4 kHz »), et le
+/// verdict n'est jamais bit-perfect.
+#[test]
+fn zone_dlna_surechantillonnee_le_chemin_le_dit_et_n_est_pas_bit_perfect() {
+    let (backend, zone, ps) = zone("dlna");
+    let fil = StreamInfo {
+        format: "flac".into(),
+        mime_type: "audio/flac".into(),
+        sample_rate: 176_400,
+        bit_depth: 24,
+        channels: 2,
+        surechantillonnage: Some(tune_core::http::streamer::SurechDuFlux {
+            de_hz: 44_100,
+            vers_hz: 176_400,
+            filtre: "polyvalent".into(),
+            reserve_db: -3.0,
+        }),
+        ..Default::default()
+    };
+    let sp = build_signal_path(&ps, &zone, &backend, Some("Eversolo"), "dlna", Some(&fil))
+        .expect("un chemin du signal");
+    assert_eq!(sp["upsampling"]["active"], true, "{sp}");
+    assert_eq!(sp["upsampling"]["to_hz"], 176_400, "{sp}");
+    assert_eq!(sp["bit_perfect"], false, "jamais bit-perfect : {sp}");
+    let e = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["code"] == "upsampling")
+        .unwrap_or_else(|| panic!("étape du suréchantillonneur absente : {sp}"));
+    assert_eq!(e["bit_perfect"], false);
+    assert_eq!(e["from_hz"], 44_100);
+    assert_eq!(e["to_hz"], 176_400);
+    let d = e["description"].as_str().unwrap();
+    assert!(d.contains("44.1 kHz \u{2192} 176.4 kHz"), "{d}");
+    // Une seule étape porte la cadence.
+    assert_eq!(
+        sp["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["code"] == "rate_conversion" || e["code"] == "upsampling")
+            .count(),
+        1,
+        "{sp}"
+    );
+    assert_eq!(sp["rate_conversion"]["to_hz"], 176_400);
+}
+
+/// rc14 — zone DLNA, refus de la lecture : la ligne dit la raison.
+#[test]
+fn zone_dlna_refusee_dit_la_raison() {
+    let (backend, zone, _ps) = zone("dlna");
+    let (etat, etape) = etat_du_surechantillonneur_lang(
+        "fr",
+        &backend,
+        zone.id.unwrap(),
+        false,
+        "dlna",
+        None,
+        ReseauDuSurechantillonneur {
+            flux: None,
+            refus: Some("renderer_rate_unknown"),
+            source_de_la_bibliotheque: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(etat["reason"], "renderer_rate_unknown");
+    assert_eq!(
+        etape["description"],
+        super::textes_signal::texte("fr", "upsampling_network_rate_unknown")
+    );
+    // Un service : pas encore porté sur UPnP.
+    let (etat, _) = etat_du_surechantillonneur_lang(
+        "fr",
+        &backend,
+        zone.id.unwrap(),
+        false,
+        "dlna",
+        None,
+        ReseauDuSurechantillonneur {
+            flux: None,
+            refus: None,
+            source_de_la_bibliotheque: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(etat["reason"], "source_not_supported_on_network");
+    // PURE prime.
+    let (etat, _) = etat_du_surechantillonneur_lang(
+        "fr",
+        &backend,
+        zone.id.unwrap(),
+        true,
+        "dlna",
+        None,
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(etat["reason"], "pure");
 }
