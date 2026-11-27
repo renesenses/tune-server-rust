@@ -2651,6 +2651,11 @@ impl PlaybackOrchestrator {
             en_vol: None,
             convolveur_reste_a_jeter: None,
             tess: Default::default(),
+            // rc14 — le relais progressif ne porte pas le suréchantillonnage :
+            // seul le fichier refait le pose (`transcodage`).
+            surechantillonneur: None,
+            // rc15 — le niveau de zone est posé par l'appelant (UPnP).
+            niveau: None,
         };
         // #5071 — la compensation lit les étages RÉELLEMENT exécutés : un
         // crossfeed n'agit qu'en stéréo (`StreamingDsp::process`).

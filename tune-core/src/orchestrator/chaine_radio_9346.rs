@@ -177,16 +177,88 @@ pub(super) fn relayer_par_la_chaine_radio(
     session: Arc<crate::http::streamer::StreamSession>,
     aval: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+    let zone_id = chaine.zone_id;
+    relayer_la_radio(Some(chaine), zone_id, None, session, aval)
+}
+
+/// rc14 — [`relayer_par_la_chaine_radio`], avec le suréchantillonnage PCM
+/// d'une radio servie à un lecteur UPnP : les cibles sont posées sur la
+/// session (`surechantillonnage_radio`), qui publie la cadence SERVIE ; le
+/// relais bâtit la chaîne à la cadence de la STATION, puis l'étage la porte
+/// à la cible, au fil de l'eau. Le relais note la décision réelle (`noteur`).
+pub(super) fn relayer_la_radio(
+    chaine: Option<ChaineRadio>,
+    zone_id: i64,
+    noteur: Option<super::surechantillonnage_reseau::NoteurSurech>,
+    session: Arc<crate::http::streamer::StreamSession>,
+    aval: tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> tokio::sync::mpsc::Sender<Vec<u8>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     tokio::spawn(async move {
         let Some(premier) = rx.recv().await else {
             return;
         };
-        let (sample_rate, channels) = session.detected_output_format().unwrap_or((44_100, 2));
+        let (sample_rate, channels) = session
+            .detected_source_output_format()
+            .unwrap_or((44_100, 2));
         let bit_depth = session.output_bit_depth();
-        let dsp = chaine.batir(sample_rate, channels);
+        let mut dsp = match chaine.as_ref() {
+            Some(c) => c.batir(sample_rate, channels),
+            None => StreamingDsp {
+                channels,
+                sample_rate,
+                ..Default::default()
+            },
+        };
+        if let Some(c) = session.surechantillonnage_radio.get() {
+            let vers = c.cible(sample_rate);
+            let etage = vers.and_then(|vers| {
+                let reglages = crate::audio::surechantillonnage::UpsamplerSettings {
+                    enabled: true,
+                    filter: c.filtre.clone(),
+                    ..Default::default()
+                };
+                crate::audio::surechantillonnage::SurechantillonneurF64::nouveau(
+                    &reglages,
+                    sample_rate,
+                    vers,
+                    channels,
+                )
+                .map_err(|error| warn!(zone_id, %error, "radio_upsampler_build_failed"))
+                .ok()
+            });
+            if let Some(n) = noteur.as_ref() {
+                n.noter(Some(match etage.as_ref() {
+                    Some(e) => crate::tess::reseau_upnp::SurechantillonnageUpnp {
+                        active: true,
+                        reason: None,
+                        from_hz: Some(sample_rate),
+                        to_hz: Some(e.cadence_sortie()),
+                        filter: Some(c.filtre.clone()),
+                        headroom_db: Some(
+                            (e.reserve_db()
+                                .min(crate::audio::surechantillonnage::RESERVE_DE_ZONE_DB)
+                                * 100.0)
+                                .round()
+                                / 100.0,
+                        ),
+                        offered_rates_hz: c.cibles.iter().map(|(_, v)| *v).collect(),
+                    },
+                    None => crate::tess::reseau_upnp::SurechantillonnageUpnp::refuse(
+                        crate::audio::surechantillonnage::refus_reseau::AUCUNE_CADENCE_PLUS_HAUTE,
+                        Vec::new(),
+                    ),
+                }));
+            }
+            // rc15 (m) — sans étage, la session ne doit plus annoncer la
+            // cible : elle republie la cadence de la station.
+            if etage.is_none() {
+                session.renoncer_au_surechantillonnage_radio();
+            }
+            dsp.surechantillonneur = etage.map(super::chaine_reseau_tess::SurechReseau::nouveau);
+        }
         info!(
-            zone_id = chaine.zone_id,
+            zone_id,
             sample_rate,
             channels,
             bit_depth,

@@ -101,6 +101,13 @@ struct DecisionLocale {
     /// d'une bibliothèque : chaque site qui la lit garde alors son
     /// comportement d'avant, à l'octet près.
     tranche_cue: Option<TrancheCue>,
+    /// rc14 — le suréchantillonnage PCM décidé pour une zone UPnP
+    /// (`surechantillonnage_reseau`). Retiré (`take`) quand la piste ne part
+    /// finalement pas par le fichier refait : le refus est alors noté.
+    surech_reseau: std::sync::Mutex<Option<super::surechantillonnage_reseau::SurechPlanifie>>,
+    /// rc15 (M2) — le niveau de la piste sur une zone UPnP qui suréchantillonne
+    /// (gain total et d'où il part). `None` : niveau plein, rien à faire.
+    niveau_de_zone: Option<super::jonction_surech_reseau::NiveauPlanifie>,
 }
 
 /// Un intervalle nommé à l'intérieur d'un fichier image (#3631).
@@ -184,6 +191,36 @@ pub(super) struct FormatDeSortie {
     l16: bool,
     conteneur_natif: bool,
     pub(super) info: StreamInfo,
+    /// rc14 — l'étage de suréchantillonnage que le fichier refait porte :
+    /// `out_sr` est alors la cadence CIBLE (servie), et le décodage se fait
+    /// à la cadence de la source (`SurechPlanifie::de`).
+    pub(super) surech: Option<super::surechantillonnage_reseau::SurechPlanifie>,
+    /// rc15 (M2) — le niveau de la piste (voir `DecisionLocale::niveau_de_zone`).
+    pub(super) niveau: Option<super::jonction_surech_reseau::NiveauPlanifie>,
+}
+
+/// rc15 — l'empreinte du rendu réseau : celle du suréchantillonnage (filtre,
+/// cadences, bords, niveau) quand il est posé, sinon celle du seul niveau de
+/// la zone, sinon celle d'avant.
+fn empreinte_du_rendu_reseau(
+    surech: Option<&super::surechantillonnage_reseau::SurechPlanifie>,
+    niveau: Option<&super::jonction_surech_reseau::NiveauPlanifie>,
+    empreinte_dsp: Option<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    match (surech, niveau) {
+        (Some(p), _) => p.empreinte(empreinte_dsp),
+        (None, Some(n)) => {
+            let mut h = Sha256::new();
+            h.update(b"niveau-de-zone\0");
+            n.empreinte(&mut h);
+            if let Some(d) = empreinte_dsp {
+                h.update(d);
+            }
+            Some(h.finalize().into())
+        }
+        (None, None) => empreinte_dsp,
+    }
 }
 
 /// Ce que le bras fichier cuit dans le rendu, et l'empreinte de sa clé de
@@ -265,8 +302,12 @@ struct TranscodagePourLaSortie {
 
 /// Sixième temps : le traitement et ses cibles — rééchantillonnage, égaliseur,
 /// WAV progressif de LAT-F1, flux `.ape`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Traitement {
+    /// rc14 — l'étage de suréchantillonnage décidé pour une zone UPnP.
+    surech_reseau: Option<super::surechantillonnage_reseau::SurechPlanifie>,
+    /// rc15 (M2) — le niveau de la piste sur une zone UPnP.
+    niveau_de_zone: Option<super::jonction_surech_reseau::NiveauPlanifie>,
     needs_downsample: bool,
     sortie_tire_le_flux: bool,
     eq_forces_transcode: bool,
@@ -288,11 +329,24 @@ struct TraitementsDeZone {
     /// Faux partout ailleurs : sur une zone réseau, le crossfeed a ses
     /// propres règles (#2742, `crossfeed_bibliotheque_reseau`).
     etage_casque: bool,
+    /// rc14 — le suréchantillonnage PCM d'une zone de la famille UPnP
+    /// (`surechantillonnage_reseau`) : la piste est refaite à la cadence
+    /// cible, par le fichier.
+    surechantillonnage: bool,
+    /// rc15 (M2) — le niveau de la zone (réserve du suréchantillonnage, ou sa
+    /// remontée) : une piste qui n'est pas suréchantillonnée est jouée au
+    /// même niveau que ses voisines, donc refaite.
+    niveau_de_zone: bool,
 }
 
 impl TraitementsDeZone {
     fn un_au_moins(self) -> bool {
-        self.egaliseur || self.correction_de_piece || self.replaygain || self.etage_casque
+        self.egaliseur
+            || self.correction_de_piece
+            || self.replaygain
+            || self.etage_casque
+            || self.surechantillonnage
+            || self.niveau_de_zone
     }
 
     fn noms(self) -> Vec<&'static str> {
@@ -301,6 +355,8 @@ impl TraitementsDeZone {
             (self.correction_de_piece, "correction_de_piece"),
             (self.replaygain, "replaygain"),
             (self.etage_casque, "etage_casque"),
+            (self.surechantillonnage, "surechantillonnage"),
+            (self.niveau_de_zone, "niveau_de_zone"),
         ]
         .into_iter()
         .filter_map(|(vrai, nom)| vrai.then_some(nom))
@@ -476,6 +532,8 @@ fn assembler_la_decision(
     // jusqu'à l'écran du chemin du signal.
     let channels = canaux_reduits.unwrap_or(canaux_source);
     let Traitement {
+        surech_reseau,
+        niveau_de_zone,
         needs_downsample,
         sortie_tire_le_flux,
         eq_forces_transcode,
@@ -579,6 +637,8 @@ fn assembler_la_decision(
         // et ré-encode, l'en-tête neuf ne sert qu'au passthrough.
         conteneur_flac_neuf: conteneur_flac_neuf.filter(|_| !needs_transcode),
         tranche_cue,
+        surech_reseau: std::sync::Mutex::new(surech_reseau),
+        niveau_de_zone,
     }
 }
 
@@ -2183,13 +2243,76 @@ impl PlaybackOrchestrator {
         // `skip_passthrough_levels`.
         let sortie_tire_le_flux =
             la_sortie_tire_le_flux(zone_output_type.as_deref(), is_local_output, is_oaat_output);
-        let traitements_de_zone = if sortie_sujette_au_traitement(
+        let sujette = sortie_sujette_au_traitement(
             is_network_output,
             is_browser_output,
             is_pull_dsp_output,
             dsd_passthrough,
             alac_passthrough,
-        ) {
+        );
+        // rc14 — le suréchantillonnage PCM vers un lecteur de la famille
+        // UPnP : la cible se lit dans ce qu'il annonce pour le format que Tune
+        // lui servira (FLAC, ou WAV/LPCM s'il ne lit pas le FLAC).
+        let surech_reseau = if is_network_output
+            && crate::tess::reseau_upnp::famille_upnp(
+                crate::tess::TransportZone::depuis_type_de_sortie(zone_output_type.as_deref()),
+            ) {
+            if sujette {
+                let did = identifiant_du_renderer(
+                    req.output_device_id.as_deref(),
+                    zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
+                );
+                self.decider_le_surechantillonnage_reseau(
+                    super::surechantillonnage_reseau::DemandeSurechReseau {
+                        zone_id: req.zone_id,
+                        type_de_zone: zone_output_type.as_deref(),
+                        device_id: did,
+                        source_format,
+                        source_hz: sample_rate,
+                        plafond_zone: zone_max_sample_rate,
+                        flac: !transcodage.dlna_needs_wav,
+                    },
+                )
+                .await
+            } else {
+                // Passthrough DSD ou ALAC voulu : rien n'est refait.
+                super::surechantillonnage_reseau::noter_un_refus_si_demande(
+                    self,
+                    req.zone_id,
+                    if dsd_passthrough || source_format == Some(AudioFormat::Dsd) {
+                        crate::audio::surechantillonnage::refus_reseau::DSD
+                    } else {
+                        crate::audio::surechantillonnage::refus_reseau::VOIE_NON_PORTEE
+                    },
+                );
+                None
+            }
+        } else {
+            None
+        };
+        // rc15 (M2) — le niveau de la piste sur une zone de la famille UPnP :
+        // celui de la zone dès que son lecteur se prête au suréchantillonnage
+        // (piste suréchantillonnée ou non), le niveau plein sinon, avec une
+        // rampe depuis celui de la piste précédente. Hors traitement (PURE,
+        // passthrough DSD/ALAC) : niveau plein, noté pour la suivante.
+        let niveau_de_zone = if is_network_output
+            && crate::tess::reseau_upnp::famille_upnp(
+                crate::tess::TransportZone::depuis_type_de_sortie(zone_output_type.as_deref()),
+            ) {
+            use super::jonction_surech_reseau as j;
+            if sujette && !self.zone_audiophile(req.zone_id) {
+                let cible =
+                    j::cible_de_la_piste(j::zone_apte(req.zone_id), surech_reseau.is_some());
+                let plan = j::planifier_le_niveau(req.zone_id, cible);
+                plan.agit().then_some(plan)
+            } else {
+                j::noter_le_niveau(req.zone_id, 1.0);
+                None
+            }
+        } else {
+            None
+        };
+        let traitements_de_zone = if sujette {
             // #7986 — la cadence à laquelle le convolveur sera bâti :
             // `out_sr` du bras fichier, avant plafond. Une zone plafonnée
             // transcode de toute façon (`needs_downsample`) ; on n'y vérifie
@@ -2224,6 +2347,8 @@ impl PlaybackOrchestrator {
                     zone_output_type.as_deref(),
                 ) && (self.zone_has_active_crossfeed(req.zone_id)
                     || self.zone_has_active_enceintes(req.zone_id)),
+                surechantillonnage: surech_reseau.is_some(),
+                niveau_de_zone: niveau_de_zone.is_some(),
             }
         } else {
             TraitementsDeZone::default()
@@ -2274,6 +2399,20 @@ impl PlaybackOrchestrator {
                 crossfeed_reseau,
                 eq_forces_transcode,
             );
+            // rc14 — le suréchantillonnage vaut consentement au WAV
+            // progressif, comme l'étage casque seul : la piste est refaite à
+            // la cible AU FIL DE L'EAU (première note en moins d'une
+            // seconde) au lieu du fichier entier. Sans lui, la règle d'avant
+            // (`progressif_sans_surech`, voie de repli si le lecteur
+            // n'annonce aucune cadence LPCM exploitable).
+            let opt_in_sans_surech = opt_in;
+            let opt_in = opt_in || surech_reseau.is_some();
+            let traitement_sans_surech = TraitementsDeZone {
+                surechantillonnage: false,
+                ..traitements_de_zone
+            }
+            .un_au_moins()
+                || crossfeed_reseau;
             let candidat =
                 cible_wav_pour_traitement(traitement, is_network_output, src_est_dsd, opt_in, true);
 
@@ -2286,13 +2425,54 @@ impl PlaybackOrchestrator {
             } else {
                 false
             };
-            cible_wav_pour_traitement(
+            let progressif = cible_wav_pour_traitement(
                 traitement,
                 is_network_output,
                 src_est_dsd,
                 opt_in,
                 renderer_accepte_lpcm,
-            )
+            );
+            let progressif_sans_surech = cible_wav_pour_traitement(
+                traitement_sans_surech,
+                is_network_output,
+                src_est_dsd,
+                opt_in_sans_surech,
+                renderer_accepte_lpcm,
+            );
+            (progressif, progressif_sans_surech)
+        };
+        // rc14 — la cible du suréchantillonnage suit la VOIE : relais
+        // progressif WAV (cadences LPCM annoncées), sinon fichier refait
+        // (FLAC, ou WAV pour un lecteur sans FLAC).
+        let (dsp_progressif_wav, progressif_sans_surech) = dsp_progressif_wav;
+        let (surech_reseau, dsp_progressif_wav) = match surech_reseau {
+            None => (None, dsp_progressif_wav),
+            Some(p) => {
+                let progressif = dsp_progressif_wav
+                    .then(|| p.pour_la_famille(false).ok())
+                    .flatten();
+                match progressif {
+                    Some(q) => (Some(q), true),
+                    None => match p.pour_la_famille(!transcodage.dlna_needs_wav) {
+                        Ok(q) => (Some(q), progressif_sans_surech),
+                        Err((code, proposees)) => {
+                            info!(
+                                zone_id = req.zone_id,
+                                reason = code,
+                                rates = ?proposees,
+                                "upsampler_network_not_engaged"
+                            );
+                            self.noter_le_surechantillonnage_reseau(
+                                req.zone_id,
+                                Some(super::surechantillonnage_reseau::EtatSurechReseau::refuse(
+                                    code, proposees,
+                                )),
+                            );
+                            (None, progressif_sans_surech)
+                        }
+                    },
+                }
+            }
         };
         // #3311 — le décodeur `.ape` incrémental livré en v0.9.131 (#2505) est
         // branché sur le SEUL bras progressif. Sur une zone réseau la cible est
@@ -2319,6 +2499,8 @@ impl PlaybackOrchestrator {
             cible_wav_pour_le_reseau(source_format, is_network_output, renderer_accepte_lpcm)
         };
         Traitement {
+            surech_reseau,
+            niveau_de_zone,
             needs_downsample,
             sortie_tire_le_flux,
             eq_forces_transcode,
@@ -3634,6 +3816,8 @@ impl PlaybackOrchestrator {
             l16: false,
             conteneur_natif: false,
             info,
+            surech: None,
+            niveau: None,
         })
     }
 
@@ -3787,9 +3971,15 @@ impl PlaybackOrchestrator {
         decision: &DecisionLocale,
         format: &FormatDeSortie,
     ) -> Option<String> {
+        let cadence = format.surech.as_ref().map_or(format.out_sr, |p| p.de);
         let empreinte_dsp = self
-            .traitements_du_fichier(req, decision, format.out_sr)
+            .traitements_du_fichier(req, decision, cadence)
             .empreinte_dsp;
+        let empreinte_dsp = empreinte_du_rendu_reseau(
+            format.surech.as_ref(),
+            format.niveau.as_ref(),
+            empreinte_dsp,
+        );
         crate::transcode_cache::cache_path_dsp(
             &decision.file_path,
             &format.out_ext,
@@ -3975,6 +4165,308 @@ impl PlaybackOrchestrator {
         req: &PlayRequest,
         decision: &DecisionLocale,
     ) -> Result<FormatDeSortie, String> {
+        use crate::audio::surechantillonnage::refus_reseau;
+        // rc14 — le fichier refait porte la piste ENTIÈRE en mémoire, à la
+        // cadence CIBLE : une piste qui serait trop lourde une fois
+        // suréchantillonnée ne l'est pas (refus motivé), plutôt que de
+        // risquer la mémoire de la machine.
+        let planifie = decision
+            .surech_reseau
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // (Avec le relais progressif, une piste trop lourde pour le fichier
+        // part en WAV progressif #8558 : l'étage y est porté, rien à refuser
+        // ici quand le lecteur annonce le LPCM.)
+        if let Some(p) = planifie
+            .as_ref()
+            .filter(|p| !decision.dsp_progressif_wav && p.cadences_lpcm.is_empty())
+        {
+            let src_fmt = decision.source_format.unwrap_or(AudioFormat::Flac);
+            if super::bascule_progressive_8558::basculer_en_progressif(
+                decision.is_network_output,
+                src_fmt,
+                decision.track_duration_ms,
+                p.vers,
+                decision.channels,
+                super::bascule_progressive_8558::memoire_disponible(),
+            ) {
+                self.ecarter_le_surechantillonnage(req, decision, refus_reseau::PISTE_TROP_LOURDE);
+            }
+        }
+        let mut format = self.format_sans_surech_avec_bascule(req, decision).await?;
+        // rc15 (M2) — le niveau de la zone, suréchantillonnée ou non.
+        format.niveau = decision.niveau_de_zone;
+        let planifie = decision
+            .surech_reseau
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(p) = planifie {
+            // rc14 — toute session WAV progressive (relais LPCM, mais aussi
+            // APE/WavPack ou piste trop lourde pour le fichier) porte l'étage
+            // au fil de l'eau : première note immédiate, aucun garde-fou de
+            // délai. La cible y est celle des cadences LPCM annoncées.
+            let session_wav = !format.use_file_transcode
+                && format.target_format_str == "wav"
+                && !format.l16
+                && !format.conteneur_natif;
+            let p = match (session_wav, p.flac) {
+                (true, true) => match p.pour_la_famille(false) {
+                    Ok(q) => q,
+                    Err((code, _)) => {
+                        self.ecarter_le_surechantillonnage(req, decision, code);
+                        return Ok(format);
+                    }
+                },
+                _ => p,
+            };
+            // rc15 — le niveau de la piste et ses bords (voisines enchaînées
+            // sans blanc) entrent dans l'étage et dans la clé du cache.
+            let mut p = p;
+            p.niveau = decision.niveau_de_zone;
+            p.jonction = self.bords_de_la_piste(req, decision, &p).await;
+            let famille_attendue = if p.flac { "flac" } else { "wav" };
+            let progressif = session_wav;
+            let porte = format.use_file_transcode
+                && !format.l16
+                && !format.conteneur_natif
+                && famille_attendue == format.target_format_str
+                && (format.target_format_str != "wav"
+                    || !crate::audio::wav::pcm_depasse_le_plafond_riff(
+                        decision.track_duration_ms.max(0) as u64,
+                        p.vers,
+                        decision.channels,
+                        format.out_bd,
+                    ));
+            // Décision du 26/11 : jamais de long silence avant la première
+            // note. Le relais progressif WAV part tout de suite ; par le
+            // fichier refait (lecteur sans LPCM annoncé), une piste qui
+            // prendrait plus de
+            // `DELAI_MAX_AVANT_LA_PREMIERE_NOTE_S` sur CETTE machine n'est
+            // pas suréchantillonnée — sauf si sa rendition est déjà en cache.
+            //
+            // rc15 (M3) — au plus juste : le coût MESURÉ des fichiers refaits
+            // sur cette machine (sinon l'estimation du test), et, si la cible
+            // la plus haute ne tient pas, la plus haute cadence annoncée qui
+            // tient (le coût suit la cadence de sortie).
+            let duree_s = decision.track_duration_ms.max(0) as f64 / 1000.0;
+            let delai_vers = |q: &super::surechantillonnage_reseau::SurechPlanifie| {
+                crate::audio::surechantillonnage::delai_du_fichier_s(
+                    &q.verdict,
+                    &q.reglages.filter,
+                    q.vers,
+                    duree_s,
+                    crate::audio::surechantillonnage::cout_mesure_du_fichier(
+                        &q.reglages.filter,
+                        q.vers,
+                    ),
+                )
+            };
+            let tient = |d: Option<f64>| {
+                d.is_some_and(|d| {
+                    d <= crate::audio::surechantillonnage::DELAI_MAX_AVANT_LA_PREMIERE_NOTE_S
+                })
+            };
+            let en_cache = |q: &super::surechantillonnage_reseau::SurechPlanifie| {
+                let mut essai = FormatDeSortie {
+                    out_sr: q.vers,
+                    out_mime: format.out_mime.clone(),
+                    out_ext: format.out_ext.clone(),
+                    target_format_str: format.target_format_str.clone(),
+                    info: format.info.clone(),
+                    surech: Some(q.clone()),
+                    ..format
+                };
+                essai.info.sample_rate = q.vers;
+                self.chemin_du_rendu_en_cache(req, decision, &essai)
+                    .is_some_and(|cp| crate::transcode_cache::is_hit(&cp))
+            };
+            let mut p = p;
+            if porte && !progressif && !tient(delai_vers(&p)) && !en_cache(&p) {
+                if let Some(q) = p.cadence_plus_basse_qui_tient(|q| tient(delai_vers(q))) {
+                    info!(
+                        zone_id = req.zone_id,
+                        de_hz = q.de,
+                        vers_hz = q.vers,
+                        visee_hz = p.vers,
+                        duree_s,
+                        "upsampler_network_file_rate_lowered_to_fit"
+                    );
+                    p = q;
+                }
+            }
+            let delai = delai_vers(&p);
+            let trop_lent = porte && !progressif && !tient(delai) && !en_cache(&p);
+            if trop_lent {
+                info!(
+                    zone_id = req.zone_id,
+                    delai_estime_s = ?delai,
+                    duree_ms = decision.track_duration_ms,
+                    filtre = %p.reglages.filter,
+                    vers_hz = p.vers,
+                    "upsampler_network_too_slow_for_file"
+                );
+                self.ecarter_le_surechantillonnage(
+                    req,
+                    decision,
+                    refus_reseau::TROP_LENT_POUR_LE_FICHIER,
+                );
+            } else if porte || progressif {
+                info!(
+                    zone_id = req.zone_id,
+                    de_hz = p.de,
+                    vers_hz = p.vers,
+                    cible = %format.target_format_str,
+                    profondeur = format.out_bd,
+                    progressif,
+                    delai_estime_s = ?delai,
+                    "upsampler_network_engaged_on_route"
+                );
+                self.noter_le_surechantillonnage_reseau(
+                    req.zone_id,
+                    Some(super::surechantillonnage_reseau::etat_applique(&p)),
+                );
+                format.out_sr = p.vers;
+                format.info.sample_rate = p.vers;
+                format.surech = Some(p);
+            } else {
+                self.ecarter_le_surechantillonnage(req, decision, refus_reseau::VOIE_NON_PORTEE);
+            }
+        }
+        Ok(format)
+    }
+
+    /// rc15 (M1) — les bords d'une piste suréchantillonnée : le contexte de
+    /// ses voisines dans la file quand elles s'enchaînent sans blanc (même
+    /// cadence, même canalisation, fichier ordinaire), une rupture (fondu
+    /// court) sinon. Une recherche dans la piste n'a pas de passé ; une image
+    /// CUE n'a pas de bord sûr à l'échantillon près.
+    async fn bords_de_la_piste(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+        p: &super::surechantillonnage_reseau::SurechPlanifie,
+    ) -> super::jonction_surech_reseau::ContexteDeJonction {
+        use super::jonction_surech_reseau as j;
+        let rupture = j::ContexteDeJonction {
+            avant: j::Bord::Rupture,
+            apres: j::Bord::Rupture,
+        };
+        let Some(track_id) = req.track_id else {
+            return rupture;
+        };
+        if decision.tranche_cue.is_some() {
+            return rupture;
+        }
+        let canaux = decision.channels;
+        let Ok(portee) = crate::audio::surechantillonnage::SurechantillonneurF64::nouveau(
+            &p.reglages,
+            p.de,
+            p.vers,
+            canaux,
+        )
+        .map(|e| e.portee_entree()) else {
+            return rupture;
+        };
+        let trames = j::trames_de_contexte(portee);
+        let (avant, apres) = j::voisines_dans_la_file(&self.db, req.zone_id, track_id);
+        let admise = |v: &Option<j::Voisine>| -> Option<(j::Voisine, f64)> {
+            let v = v.as_ref()?;
+            let t = crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
+                .get(v.track_id)
+                .ok()
+                .flatten()?;
+            let dsd = t
+                .format
+                .as_deref()
+                .is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "dsd" | "dsf" | "dff"));
+            if dsd
+                || t.sample_rate.map(|r| r as u32) != Some(p.de)
+                || t.channels as u16 != canaux
+                || t.duration_ms <= 0
+            {
+                return None;
+            }
+            let rg = if self.zone_audiophile(req.zone_id) {
+                1.0
+            } else {
+                crate::audio::replaygain::facteur_de_zone(
+                    &self.db,
+                    req.zone_id,
+                    crate::audio::replaygain::PisteRg::bibliotheque(v.track_id),
+                )
+            };
+            Some((
+                j::Voisine {
+                    duree_ms: t.duration_ms,
+                    ..v.clone()
+                },
+                rg,
+            ))
+        };
+        let avant = if req.seek_ms.unwrap_or(0) > 0 {
+            None
+        } else {
+            admise(&avant)
+        };
+        let apres = admise(&apres);
+        let de = p.de;
+        let bord = move |v: Option<(j::Voisine, f64)>, fin: bool| -> j::Bord {
+            v.and_then(|(v, rg)| j::decoder_un_bord(&v, de, canaux, trames, fin, rg))
+                .map_or(j::Bord::Rupture, j::Bord::Continu)
+        };
+        let (avant, apres) =
+            tokio::task::spawn_blocking(move || (bord(avant, true), bord(apres, false)))
+                .await
+                .unwrap_or((j::Bord::Rupture, j::Bord::Rupture));
+        info!(
+            zone_id = req.zone_id,
+            track_id,
+            avant = matches!(avant, j::Bord::Continu(_)),
+            apres = matches!(apres, j::Bord::Continu(_)),
+            contexte_trames = trames,
+            "upsampler_network_track_edges"
+        );
+        j::ContexteDeJonction { avant, apres }
+    }
+
+    /// rc14 — la piste ne sera pas suréchantillonnée : l'étage décidé est
+    /// retiré et le refus noté pour l'état publié.
+    fn ecarter_le_surechantillonnage(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+        code: &'static str,
+    ) {
+        let retire = decision
+            .surech_reseau
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(p) = retire {
+            info!(
+                zone_id = req.zone_id,
+                reason = code,
+                de_hz = p.de,
+                vers_hz = p.vers,
+                "upsampler_network_not_engaged"
+            );
+            self.noter_le_surechantillonnage_reseau(
+                req.zone_id,
+                Some(super::surechantillonnage_reseau::EtatSurechReseau::refuse(
+                    code,
+                    p.proposees,
+                )),
+            );
+        }
+    }
+
+    async fn format_sans_surech_avec_bascule(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+    ) -> Result<FormatDeSortie, String> {
         use super::bascule_progressive_8558 as b;
         let mut format = self
             .decider_le_format_de_sortie(req, decision, None)
@@ -4092,8 +4584,21 @@ impl PlaybackOrchestrator {
             out_ext,
             target_format_str,
             l16,
+            surech,
+            niveau,
             ..
         } = format;
+        // rc14 — avec le suréchantillonnage, `out_sr` est la cible SERVIE ;
+        // décodage et greffons travaillent à la cadence de la source.
+        let cadence_de_traitement = surech.as_ref().map_or(out_sr, |p| p.de);
+        let surech_du_flux = surech
+            .as_ref()
+            .map(|p| crate::http::streamer::SurechDuFlux {
+                de_hz: p.de,
+                vers_hz: p.vers,
+                filtre: p.reglages.filter.clone(),
+                reserve_db: p.reserve_db(),
+            });
         let flux = {
             // ── Pre-transcode to temp file (FLAC) ──────────────────
             // Decode → encode → write to /tmp, then create a file session.
@@ -4115,7 +4620,9 @@ impl PlaybackOrchestrator {
                 compensation_cuite_db,
                 replaygain_factor,
                 empreinte_dsp,
-            } = self.traitements_du_fichier(req, decision, out_sr);
+            } = self.traitements_du_fichier(req, decision, cadence_de_traitement);
+            let empreinte_dsp =
+                empreinte_du_rendu_reseau(surech.as_ref(), niveau.as_ref(), empreinte_dsp);
             let cache_path_opt = crate::transcode_cache::cache_path_dsp(
                 &file_path,
                 &out_ext,
@@ -4194,6 +4701,7 @@ impl PlaybackOrchestrator {
                     duration_ms: Some(track_duration_ms as u64),
                     crossfeed: crossfeed_cuit,
                     compensation_db: compensation_cuite_db,
+                    surechantillonnage: surech_du_flux.clone(),
                     ..Default::default()
                 };
                 let session_id = self
@@ -4210,16 +4718,20 @@ impl PlaybackOrchestrator {
                     .await;
                 // The current track was a cache hit → warm the next one too,
                 // so an album keeps hitting the cache track after track.
-                self.spawn_warm_next_local(
-                    req.zone_id,
-                    sample_rate,
-                    bit_depth,
-                    channels,
-                    out_ext.clone(),
-                    out_sr,
-                    out_bd,
-                    target_format_str.clone(),
-                );
+                // rc14 — pas sous suréchantillonnage : le pré-chauffage n'a
+                // pas l'étage, sa rendition ne servirait jamais.
+                if surech.is_none() {
+                    self.spawn_warm_next_local(
+                        req.zone_id,
+                        sample_rate,
+                        bit_depth,
+                        channels,
+                        out_ext.clone(),
+                        out_sr,
+                        out_bd,
+                        target_format_str.clone(),
+                    );
+                }
 
                 // …et les VU-mètres avec, sinon ils s'éteignent DÈS la
                 // deuxième écoute.
@@ -4365,7 +4877,7 @@ impl PlaybackOrchestrator {
                 let transcode_result = transcoder_sous_budget(
                     transcode_source_to_file_avec_crossfeed(
                         fp.clone(),
-                        out_sr,
+                        cadence_de_traitement,
                         channels,
                         target_bd,
                         target_format_str.clone(),
@@ -4387,6 +4899,15 @@ impl PlaybackOrchestrator {
                         }),
                         crossfeed.map(|(processeur, _)| processeur),
                         compensation,
+                        // rc15 — l'étage (bords compris) et le niveau de zone.
+                        (surech.is_some() || niveau.is_some()).then(|| {
+                            super::transcodage::EtageReseauDuFichier {
+                                surech: surech
+                                    .as_ref()
+                                    .map(|p| (p.reglages.clone(), p.vers, p.jonction.clone())),
+                                niveau,
+                            }
+                        }),
                     ),
                     progres,
                     politique,
@@ -4481,6 +5002,7 @@ impl PlaybackOrchestrator {
                             duration_ms: Some(track_duration_ms as u64),
                             crossfeed: crossfeed_cuit,
                             compensation_db: compensation_cuite_db,
+                            surechantillonnage: surech_du_flux.clone(),
                             ..Default::default()
                         };
                         let session_id = self
@@ -4505,7 +5027,7 @@ impl PlaybackOrchestrator {
                         // Only when the current was actually cached (Some means
                         // no EQ) — warming an EQ zone would populate an entry
                         // the real (EQ) play never hits.
-                        if cache_path_opt.is_some() {
+                        if cache_path_opt.is_some() && surech.is_none() {
                             self.spawn_warm_next_local(
                                 req.zone_id,
                                 sample_rate,
@@ -4637,8 +5159,16 @@ impl PlaybackOrchestrator {
             out_mime,
             out_ext,
             info,
+            surech,
+            niveau,
             ..
         } = format;
+        // rc14 — le relais progressif porte le suréchantillonnage : le
+        // décodeur et les greffons travaillent à la cadence de la SOURCE,
+        // l'étage porte le flux à la cible (`out_sr`, celle de `StreamInfo`
+        // et donc du DIDL et du `Content-Length`), et le relais réécrit
+        // l'en-tête WAV à la cible.
+        let cadence_de_decodage = surech.as_ref().map_or(out_sr, |p| p.de);
         // #6630 — le décodeur part de `seek_ms` : la durée de la session est
         // celle qui RESTE à servir, comme celle du départ natif (#6059). Sans
         // quoi `Content-Length` annonçait la piste entière et le corps se
@@ -4654,9 +5184,43 @@ impl PlaybackOrchestrator {
             // Chargé AVANT la session (#5114) : le flux doit dire, dans son
             // `StreamInfo`, s'il porte le crossfeed — et seul le porteur
             // réellement posé sur le canal le sait.
-            let mut dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), out_sr, channels);
+            let mut dsp =
+                self.load_streaming_dsp(req.zone_id, req.piste_rg(), cadence_de_decodage, channels);
+            if let Some(p) = surech.as_ref() {
+                dsp.surechantillonneur = Some(
+                    super::chaine_reseau_tess::SurechReseau::nouveau(
+                        crate::audio::surechantillonnage::SurechantillonneurF64::nouveau(
+                            &p.reglages,
+                            p.de,
+                            p.vers,
+                            channels,
+                        )
+                        .map_err(|e| format!("upsampler_network_build_failed: {e}"))?,
+                    )
+                    // rc15 (M1) — les bords (une recherche dans la piste
+                    // n'en a pas : rupture, voir `bords_de_la_piste`).
+                    .avec_jonction(p.jonction.clone()),
+                );
+            }
+            // rc15 (M2) — le niveau de la zone, suréchantillonnée ou non.
+            dsp.niveau = niveau.and_then(|n| {
+                n.rampe(
+                    cadence_de_decodage,
+                    usize::from(channels),
+                    dsp.surechantillonneur.is_some(),
+                )
+            });
             let relais = relais_dsp_progressif(dsp.is_active(), is_local_output);
             let mut info = info;
+            info.surechantillonnage =
+                surech
+                    .as_ref()
+                    .map(|p| crate::http::streamer::SurechDuFlux {
+                        de_hz: p.de,
+                        vers_hz: p.vers,
+                        filtre: p.reglages.filter.clone(),
+                        reserve_db: p.reserve_db(),
+                    });
             info.crossfeed = relais && dsp.crossfeed_executable();
             info.compensation_db = dsp.compensation_cuite_db().filter(|_| relais);
             let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
@@ -4730,15 +5294,20 @@ impl PlaybackOrchestrator {
                     dsp.en_vol = Some(poste);
                 }
                 // #7100 — le relais relève où SA chaîne écrête ; le forwarder
-                // de la même session le lit pour allumer `over_*`.
-                let releve = crate::audio::ecretage_de_traitement::ReleveDEcretage::new(
-                    ecretages.clone(),
-                    req.seek_ms.unwrap_or(0) as f64,
-                    out_sr,
-                    channels,
-                    out_bd,
-                );
-                spawn_streaming_dsp_relay_releve(dsp, out_bd, true, tx, Some(releve))
+                // de la même session le lit pour allumer `over_*`. rc14 —
+                // pas sous suréchantillonnage : la sortie, L fois plus
+                // longue, ne se compare plus octet à octet à l'entrée (le
+                // limiteur du greffon garantit l'absence d'écrêtage).
+                let releve = surech.is_none().then(|| {
+                    crate::audio::ecretage_de_traitement::ReleveDEcretage::new(
+                        ecretages.clone(),
+                        req.seek_ms.unwrap_or(0) as f64,
+                        out_sr,
+                        channels,
+                        out_bd,
+                    )
+                });
+                spawn_streaming_dsp_relay_releve(dsp, out_bd, true, tx, releve)
             } else {
                 tx
             };
@@ -4815,7 +5384,7 @@ impl PlaybackOrchestrator {
                 let result = tokio::task::spawn_blocking(move || {
                     crate::audio::decode::decode_to_pcm_streaming_tranche(
                         &fp_clone,
-                        Some(out_sr),
+                        Some(cadence_de_decodage),
                         Some(channels as u32),
                         Some(out_bd),
                         tx_clone,

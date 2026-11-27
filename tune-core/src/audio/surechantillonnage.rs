@@ -383,6 +383,396 @@ impl EtageSurechantillonneur {
     }
 }
 
+/// rc14 — pourquoi une zone RÉSEAU (famille UPnP) ne suréchantillonne pas
+/// la piste : codes stables, publiés par TESS (`delivery.upsampling`) et par
+/// le chemin du signal.
+pub mod refus_reseau {
+    /// Le lecteur n'annonce aucune cadence exploitable (`rate=` absent de
+    /// son `GetProtocolInfo`, sonde inconcluante, ou type sans sonde).
+    pub const CADENCE_INCONNUE: &str = "renderer_rate_unknown";
+    /// Le lecteur annonce des cadences, mais aucune n'est un multiple entier
+    /// de la source au-dessus d'elle (sous les plafonds du réglage, de la
+    /// zone et du test de la machine).
+    pub const AUCUNE_CADENCE_PLUS_HAUTE: &str = "renderer_rate_not_higher";
+    /// Source DSD : le DoP en UPnP n'est pas dans ce périmètre.
+    pub const DSD: &str = "dsd_not_supported_on_network";
+    /// PURE : bit-perfect.
+    pub const PURE: &str = "pure";
+    /// Service (Qobuz, TIDAL…) ou radio : pas encore porté sur UPnP.
+    pub const SOURCE_NON_PORTEE: &str = "source_not_supported_on_network";
+    /// La piste ne part pas par le fichier refait (flux progressif imposé
+    /// par le format : APE, WavPack, piste trop lourde…).
+    pub const VOIE_NON_PORTEE: &str = "progressive_stream_not_supported";
+    /// Lecteur de la famille UPnP sans sonde de cadences (BluOS,
+    /// Chromecast, Squeezebox).
+    pub const LECTEUR_SANS_SONDE: &str = "renderer_without_rate_probe";
+    /// La piste, une fois suréchantillonnée, serait trop lourde pour le
+    /// fichier refait (mémoire de la machine).
+    pub const PISTE_TROP_LOURDE: &str = "track_too_heavy_for_upsampling";
+    /// Le fichier refait mettrait trop longtemps avant la première note sur
+    /// cette machine (voir [`super::delai_estime_du_fichier_s`]) : on ne
+    /// suréchantillonne pas plutôt que d'imposer un long silence.
+    pub const TROP_LENT_POUR_LE_FICHIER: &str = "upsampling_too_slow_for_file";
+    /// Bit-perfect strict : aucune conversion de cadence.
+    pub const STRICT: &str = "strict_bitperfect";
+}
+
+/// rc14 — la cadence cible d'une zone RÉSEAU : la plus haute que le lecteur
+/// ANNONCE (`annoncees`, lues dans son `GetProtocolInfo`), multiple entier de
+/// la source, sous le plafond de la zone (`plafond_zone`), les plafonds du
+/// réglage (`max_ratio`, `max_rate_hz`) et le test de la machine. Seules les
+/// cadences explicitement annoncées comptent : un lecteur qui annonce
+/// 192 kHz sans 176,4 kHz ne reçoit pas 176,4 kHz.
+pub fn cible_reseau(
+    choix: &ChoixSurechantillonnage,
+    source_hz: u32,
+    annoncees: &[u32],
+    plafond_zone: Option<u32>,
+) -> Result<u32, &'static str> {
+    if annoncees.is_empty() {
+        return Err(refus_reseau::CADENCE_INCONNUE);
+    }
+    let acceptees: Vec<u32> = annoncees
+        .iter()
+        .copied()
+        .filter(|r| plafond_zone.is_none_or(|p| *r <= p))
+        .collect();
+    choix
+        .negocier(source_hz, &acceptees)
+        .ok_or(refus_reseau::AUCUNE_CADENCE_PLUS_HAUTE)
+}
+
+/// rc14 — le délai au-delà duquel une piste n'est pas suréchantillonnée par
+/// le fichier refait : la première note ne doit jamais attendre plus que
+/// cela (décision du 26/11). Le relais progressif WAV, lui, part tout de
+/// suite : ce garde-fou ne vaut que pour un lecteur qui n'annonce pas le
+/// LPCM (fichier FLAC refait).
+pub const DELAI_MAX_AVANT_LA_PREMIERE_NOTE_S: f64 = 3.0;
+
+/// Ce que coûte le fichier refait autour de l'étage (décodage, encodage FLAC
+/// de L fois plus de données, écriture), en multiple du coût de l'étage seul.
+/// Mesuré le 26/11 (banc `banc_charge_piste_de_10_minutes_44_1_vers_176_4`,
+/// Ryzen 9 9950X) : 7,3 s pour le fichier, 4,5 s pour l'étage seul, soit
+/// ×1,6 ; arrondi à ×2 par prudence.
+pub const FACTEUR_DU_FICHIER: f64 = 2.0;
+
+/// rc14 — le délai ESTIMÉ avant la première note d'une piste de `duree_s`
+/// secondes, suréchantillonnée à `vers` par le fichier refait, sur CETTE
+/// machine : le facteur temps réel que le test de la machine a mesuré pour
+/// `filtre` au couple de référence (au moins aussi coûteux que `vers`),
+/// ramené à `vers`, multiplié par [`FACTEUR_DU_FICHIER`]. `None` : aucune
+/// mesure pour ce filtre et cette famille (on ne sait pas : on s'abstient).
+pub fn delai_estime_du_fichier_s(
+    verdict: &VerdictMachine,
+    filtre: &str,
+    vers: u32,
+    duree_s: f64,
+) -> Option<f64> {
+    let (de, ref_vers) = greffon::machine_reference_pair(vers)?;
+    let facteur = verdict
+        .results
+        .iter()
+        .find(|r| r.filter == filtre && r.from_hz == de && r.to_hz == ref_vers)
+        .map(|r| r.realtime_factor)
+        .filter(|f| *f > 0.0)?;
+    Some(duree_s.max(0.0) / facteur * (f64::from(vers) / f64::from(ref_vers)) * FACTEUR_DU_FICHIER)
+}
+
+/// rc15 (M2) — LE niveau d'une zone réseau qui suréchantillonne : la réserve
+/// fixe du greffon (−3 dB), la même pour TOUS les filtres et pour les pistes
+/// qui ne sont pas suréchantillonnées. Un filtre dont la borne L1 permet une
+/// réserve plus faible est ramené à ce niveau (gain ≤ 1) : le niveau perçu ne
+/// dépend ni du filtre, ni du rapport, ni du refus d'une piste.
+pub const RESERVE_DE_ZONE_DB: f64 = greffon::RESERVE_DB;
+
+/// [`RESERVE_DE_ZONE_DB`], linéaire (< 1).
+pub fn gain_de_zone() -> f64 {
+    10f64.powf(RESERVE_DE_ZONE_DB / 20.0)
+}
+
+/// rc15 (M3) — le coût RÉEL du fichier refait sur cette machine, mesuré à
+/// chaque rendition : secondes de rendu par seconde de musique, ramenées à
+/// la cadence de référence du test de la machine (le coût d'un polyphase
+/// entier est proportionnel à la cadence de sortie). Par filtre et par
+/// famille de cadences. Moyenne glissante (poids 1/3 à la dernière mesure).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoutMesure {
+    pub secondes_par_seconde: f64,
+    pub mesures: u32,
+}
+
+fn couts_mesures() -> &'static std::sync::Mutex<std::collections::HashMap<(String, u32), CoutMesure>>
+{
+    static M: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(String, u32), CoutMesure>>,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// rc15 (M3) — note ce qu'a réellement coûté un fichier refait de
+/// `musique_s` secondes, suréchantillonné à `vers` par `filtre`, rendu en
+/// `rendu_s` secondes (décodage, chaîne, étage, encodage, écriture).
+pub fn noter_le_cout_du_fichier(filtre: &str, vers: u32, musique_s: f64, rendu_s: f64) {
+    let Some((_, ref_vers)) = greffon::machine_reference_pair(vers) else {
+        return;
+    };
+    if musique_s.is_nan() || musique_s <= 1.0 || rendu_s.is_nan() || rendu_s < 0.0 {
+        return;
+    }
+    let ramene = rendu_s / musique_s * f64::from(ref_vers) / f64::from(vers);
+    let mut m = couts_mesures().lock().unwrap_or_else(|e| e.into_inner());
+    let e = m
+        .entry((filtre.to_owned(), ref_vers))
+        .or_insert(CoutMesure {
+            secondes_par_seconde: ramene,
+            mesures: 0,
+        });
+    if e.mesures > 0 {
+        e.secondes_par_seconde = e.secondes_par_seconde * 2.0 / 3.0 + ramene / 3.0;
+    }
+    e.mesures = e.mesures.saturating_add(1);
+}
+
+/// Le coût mesuré pour `filtre` vers `vers`, s'il y en a un.
+pub fn cout_mesure_du_fichier(filtre: &str, vers: u32) -> Option<CoutMesure> {
+    let (_, ref_vers) = greffon::machine_reference_pair(vers)?;
+    couts_mesures()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(filtre.to_owned(), ref_vers))
+        .copied()
+}
+
+/// Tests : oublier les coûts mesurés.
+#[cfg(test)]
+pub fn oublier_les_couts_mesures() {
+    couts_mesures()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// rc15 (M3) — le délai avant la première note du fichier refait, au plus
+/// juste : le coût MESURÉ sur cette machine quand il existe
+/// ([`noter_le_cout_du_fichier`]), sinon l'estimation tirée du test de la
+/// machine ([`delai_estime_du_fichier_s`]).
+pub fn delai_du_fichier_s(
+    verdict: &VerdictMachine,
+    filtre: &str,
+    vers: u32,
+    duree_s: f64,
+    mesure: Option<CoutMesure>,
+) -> Option<f64> {
+    if let (Some(c), Some((_, ref_vers))) = (mesure, greffon::machine_reference_pair(vers)) {
+        return Some(
+            duree_s.max(0.0) * c.secondes_par_seconde * f64::from(vers) / f64::from(ref_vers),
+        );
+    }
+    delai_estime_du_fichier_s(verdict, filtre, vers, duree_s)
+}
+
+/// rc15 (m) — les cadences qu'un lecteur a annoncées puis REFUSÉES (refus
+/// de `SetAVTransportURI`/`Play` d'un flux suréchantillonné), par appareil :
+/// elles ne sont plus proposées tant que le serveur tourne.
+fn cadences_refusees()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, std::collections::BTreeSet<u32>>> {
+    static M: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::collections::BTreeSet<u32>>>,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// rc15 (m) — retient que `appareil` a refusé `cadence`.
+pub fn noter_une_cadence_refusee(appareil: &str, cadence: u32) {
+    if appareil.is_empty() || cadence == 0 {
+        return;
+    }
+    cadences_refusees()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(appareil.to_owned())
+        .or_default()
+        .insert(cadence);
+}
+
+/// rc15 (m) — `annoncees` sans les cadences que `appareil` a refusées.
+pub fn sans_les_cadences_refusees(appareil: &str, annoncees: Vec<u32>) -> Vec<u32> {
+    let m = cadences_refusees()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match m.get(appareil) {
+        Some(refus) => annoncees
+            .into_iter()
+            .filter(|r| !refus.contains(r))
+            .collect(),
+        None => annoncees,
+    }
+}
+
+/// rc14 — le MÊME greffon (une [`Instance`]) en `f64`, pour la chaîne
+/// réseau de TESS (`orchestrator::chaine_reseau_tess`) : aucun second
+/// moteur, aucun aller-retour par `f32`. La latence du noyau est RETIRÉE en
+/// tête ([`Self::latence_trames`]) et la vidange rend exactement ce délai :
+/// n trames d'entrée donnent exactement n·L trames, alignées sur la source.
+pub struct SurechantillonneurF64 {
+    instance: Instance,
+    canaux: usize,
+    entree: Vec<f64>,
+    sortie: Vec<f64>,
+    format_entree: AudioFormat,
+    format_sortie: AudioFormat,
+    reglages: UpsamplerSettings,
+}
+
+impl SurechantillonneurF64 {
+    pub fn nouveau(
+        reglages: &UpsamplerSettings,
+        de: u32,
+        vers: u32,
+        canaux: u16,
+    ) -> Result<Self, String> {
+        let layout = match canaux {
+            1 => ChannelLayout::Mono,
+            2 => ChannelLayout::Stereo,
+            n => ChannelLayout::Discrete(n),
+        };
+        let format_entree =
+            AudioFormat::new(de, layout, SampleEncoding::F64).map_err(|e| format!("{e:?}"))?;
+        let requete =
+            RateRequest::new(format_entree, vers, BLOC_MAX).map_err(|e| format!("{e:?}"))?;
+        let instance = Instance::new(requete, &reglages.filter).map_err(|e| format!("{e:?}"))?;
+        let n = usize::from(canaux);
+        Ok(Self {
+            format_sortie: requete.output_format(),
+            instance,
+            canaux: n,
+            entree: vec![0.0; BLOC_MAX * n],
+            sortie: vec![0.0; requete.max_output_frames() * n],
+            format_entree,
+            reglages: reglages.clone(),
+        })
+    }
+
+    pub fn filtre(&self) -> &'static str {
+        self.instance.filter_id()
+    }
+
+    /// La réserve fixe du filtre, en dB (≤ 0 : le gain n'excède jamais 1).
+    pub fn reserve_db(&self) -> f64 {
+        20.0 * self.instance.gain().log10()
+    }
+
+    pub fn cadence_entree(&self) -> u32 {
+        self.format_entree.sample_rate()
+    }
+
+    pub fn cadence_sortie(&self) -> u32 {
+        self.format_sortie.sample_rate()
+    }
+
+    pub fn canaux(&self) -> u16 {
+        self.canaux as u16
+    }
+
+    pub fn rapport(&self) -> usize {
+        (self.cadence_sortie() / self.cadence_entree().max(1)) as usize
+    }
+
+    pub fn reglages(&self) -> &UpsamplerSettings {
+        &self.reglages
+    }
+
+    /// Le délai du noyau, en trames de SORTIE : ce que l'appelant retire en
+    /// tête du flux, et exactement ce que [`Self::vider`] rend.
+    pub fn latence_trames(&self) -> usize {
+        self.instance.latency_frames() as usize
+    }
+
+    /// rc15 — la portée du noyau, en trames d'ENTRÉE : le contexte qu'il faut
+    /// de chaque côté d'une frontière de piste pour que deux pistes
+    /// enchaînées sans blanc se suréchantillonnent comme un seul flux.
+    pub fn portee_entree(&self) -> usize {
+        self.instance.span_input_frames()
+    }
+
+    /// rc15 — le gain fixe du filtre (≤ 1), linéaire.
+    pub fn gain_du_filtre(&self) -> f64 {
+        self.instance.gain()
+    }
+
+    /// Suréchantillonne des trames entrelacées et AJOUTE le rendu à `rendu`.
+    pub fn traiter(&mut self, mots: &[f64], rendu: &mut Vec<f64>) {
+        let ch = self.canaux;
+        for morceau in mots.chunks(BLOC_MAX * ch) {
+            let trames = morceau.len() / ch;
+            if trames == 0 {
+                continue;
+            }
+            self.entree[..trames * ch].copy_from_slice(&morceau[..trames * ch]);
+            let ecrites = {
+                let Ok(entree) = AudioBlock::new(
+                    self.format_entree,
+                    SamplesMut::F64(&mut self.entree[..trames * ch]),
+                    BLOC_MAX,
+                ) else {
+                    continue;
+                };
+                let capacite = self.sortie.len() / ch;
+                let Ok(mut sortie) = AudioBlock::new(
+                    self.format_sortie,
+                    SamplesMut::F64(&mut self.sortie[..]),
+                    capacite,
+                ) else {
+                    continue;
+                };
+                match self.instance.process(
+                    &entree,
+                    &mut sortie,
+                    BlockContext {
+                        zone_id: 0,
+                        generation: 0,
+                        position_frames: 0,
+                    },
+                ) {
+                    Ok(r) => r.frames_written,
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "upsampler_network_block_refused");
+                        0
+                    }
+                }
+            };
+            rendu.extend_from_slice(&self.sortie[..ecrites * ch]);
+        }
+    }
+
+    /// La queue (exactement [`Self::latence_trames`]), AJOUTÉE à `rendu` ;
+    /// puis l'étage repart à zéro.
+    pub fn vider(&mut self, rendu: &mut Vec<f64>) {
+        let ch = self.canaux;
+        loop {
+            let capacite = self.sortie.len() / ch;
+            let rapport = {
+                let Ok(mut sortie) = AudioBlock::new(
+                    self.format_sortie,
+                    SamplesMut::F64(&mut self.sortie[..]),
+                    capacite,
+                ) else {
+                    break;
+                };
+                match self.instance.drain(&mut sortie) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                }
+            };
+            rendu.extend_from_slice(&self.sortie[..rapport.frames_written * ch]);
+            if rapport.complete || rapport.frames_written == 0 {
+                break;
+            }
+        }
+        self.instance.reset(ResetReason::Stop);
+    }
+}
+
 #[cfg(test)]
 #[path = "surechantillonnage_tests.rs"]
 mod tests;

@@ -1639,6 +1639,9 @@ pub struct PlaybackOrchestrator {
     /// LAT-F1 (phase 1) : réponses CONCLUANTES de `dlna_accepte_lpcm`, par
     /// `device_id|profondeur`. Les sondes inconcluantes n'y entrent pas.
     dlna_lpcm_accepte: Mutex<HashMap<String, bool>>,
+    /// rc14 — la décision de suréchantillonnage réseau de la dernière piste
+    /// de la bibliothèque résolue, par zone (`surechantillonnage_reseau`).
+    surech_reseau: surechantillonnage_reseau::MemoireSurech,
     /// #4573 — ce que le Sink du renderer ANNONCE en nombre de canaux, par
     /// `(device_id, mime)`. `Some(None)` veut dire « le Sink a été lu, il ne porte
     /// aucun `channels=` » : une ignorance MESURÉE, qui ne fait rien réduire
@@ -2095,6 +2098,16 @@ struct StreamingDsp {
     /// TESS T04 — l'exécuteur de la chaîne, la quantification finale et leurs
     /// tampons ([`chaine_reseau_tess`]).
     tess: chaine_reseau_tess::EtatTess,
+    /// rc14 — le suréchantillonnage PCM d'une zone de la famille UPnP, posé
+    /// par le transcodage de fichier (`transcodage`) : dernier étage avant la
+    /// quantification, voir [`chaine_reseau_tess::SurechReseau`]. `None` :
+    /// la cadence du flux ne change pas.
+    surechantillonneur: Option<chaine_reseau_tess::SurechReseau>,
+    /// rc15 (M2) — l'étage de niveau d'une zone réseau qui suréchantillonne :
+    /// le même niveau pour toutes ses pistes, et une rampe sans clic quand il
+    /// change (voir [`jonction_surech_reseau`]). Appliqué juste avant
+    /// l'étage de suréchantillonnage (ou la quantification). `None` : neutre.
+    niveau: Option<jonction_surech_reseau::RampeDeNiveau>,
 }
 
 impl StreamingDsp {
@@ -2107,6 +2120,8 @@ impl StreamingDsp {
             || self.crossfeed.is_some()
             || self.compensation.is_some()
             || self.enceintes.is_some()
+            || self.surechantillonneur.is_some()
+            || self.niveau.is_some()
     }
 
     /// Le crossfeed de ce porteur sera-t-il réellement EXÉCUTÉ ?
@@ -2160,13 +2175,27 @@ impl StreamingDsp {
         if let Some(c) = self.compensation.as_ref() {
             etages.push(format!("compensation:{:+.2}dB@{flux}", c.cible_db()));
         }
-        if etages.is_empty() {
+
+        if self.niveau.is_some() {
+            etages.push(format!("niveau_de_zone@{flux}"));
+        }
+
+        if etages.is_empty() && self.surechantillonneur.is_none() {
             return format!("aucun_etage canaux={}", self.channels);
         }
         let etages: Vec<String> = etages
             .into_iter()
             .map(|e| format!("{e}[{flux}->{flux}]"))
             .collect();
+        // rc14 — le seul étage qui change la cadence, en dernier.
+        let mut etages = etages;
+        if let Some(s) = self.surechantillonneur.as_ref() {
+            etages.push(format!(
+                "surechantillonnage:{}[{flux}->{}]",
+                s.etage.filtre(),
+                s.etage.cadence_sortie()
+            ));
+        }
         format!(
             "{} canaux={}{}",
             etages.join(" > "),
@@ -2214,6 +2243,11 @@ impl StreamingDsp {
         if !self.is_active() {
             return;
         }
+        // rc14 — l'étage de suréchantillonnage change la longueur du flux.
+        if self.surechantillonneur.is_some() {
+            self.process_flux_surechantillonne(pcm, bit_depth);
+            return;
+        }
         let lus = pcm.len();
         let ecrits = self.traiter_par_tess(pcm, bit_depth, chaine_reseau_tess::Passage::Flux);
         // Le reste qui n'est pas une trame entière suit la sortie.
@@ -2229,6 +2263,9 @@ impl StreamingDsp {
     /// latence du convolveur retenait encore, passées par les étages qui le
     /// suivent. Vide sans convolveur.
     fn terminer_flux(&mut self, bit_depth: u16) -> Vec<u8> {
+        if self.surechantillonneur.is_some() {
+            return self.terminer_flux_surechantillonne(bit_depth);
+        }
         let Some(conv) = self.convolver.as_ref() else {
             return Vec::new();
         };
@@ -2290,6 +2327,12 @@ fn spawn_streaming_dsp_relay_releve(
         while let Some(mut chunk) = up_rx.recv().await {
             if header_pending {
                 header_pending = false;
+                // rc14 — l'en-tête du décodeur dit la cadence de la SOURCE :
+                // le flux suréchantillonné est servi à la cible.
+                if let Some(s) = dsp.surechantillonneur.as_ref() {
+                    let (vers, rapport) = (s.etage.cadence_sortie(), s.etage.rapport() as u32);
+                    chaine_reseau_tess::reecrire_l_en_tete_wav(&mut chunk, vers, rapport);
+                }
             } else if let Some(r) = releve.as_mut() {
                 // #7100 × #7642 — le relevé passe, lui aussi, par
                 // `process_flux` : l'état du convolveur doit survivre d'un
@@ -2367,6 +2410,7 @@ impl PlaybackOrchestrator {
             appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
+            surech_reseau: Default::default(),
             dlna_canaux_max: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashMap::new()),
             transferts_en_pause: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -2500,6 +2544,10 @@ mod acheminement_upnp_t12b;
 #[cfg(test)]
 mod acheminement_upnp_t12b_tests;
 pub use acheminement_upnp_t12b::{PisteEnCours, volume_reglable_retenu};
+// rc14 — le suréchantillonnage PCM sur une sortie réseau de la famille UPnP.
+pub mod surechantillonnage_reseau;
+// rc15 — continuité gapless et niveau constant du suréchantillonnage réseau.
+pub mod jonction_surech_reseau;
 // #7965 — radios (au nom de la station) et podcasts dans l'historique.
 mod historique_radio_podcast_7965;
 #[cfg(test)]
