@@ -250,6 +250,23 @@ if [ "${1:-}" = "--conteneur" ]; then
         ko "conteneur : Docker indisponible"
     else
         racine="$(cd "$ici/../.." && pwd)"
+        # Rootless Docker (self-hosted runners without root): the container's
+        # root lives in a user namespace, where mknod is refused by the kernel
+        # (EPERM) and host nodes show up as 65534 (unmapped), which chgrp
+        # cannot change. There, a host char device (/dev/null) and a host
+        # block device are BIND-MOUNTED instead, and the real rootless case is
+        # checked: their unmapped group is left out (cases 9 above, for real).
+        # Keeping a host gid (63, 11) stays covered by cases 8 and 10, and by
+        # this container run on a rootful Docker (GitHub's runners).
+        rootless=""
+        if docker info -f '{{.SecurityOptions}}' 2>/dev/null | grep -q 'name=rootless'; then
+            rootless=1
+        fi
+        montages=()
+        if [ -n "$rootless" ]; then
+            montages=(-v /dev/null:/snd/controlC0)
+            if [ -n "$bloc" ]; then montages+=(-v "$bloc:/cd/sr0"); fi
+        fi
         # shellcheck disable=SC2016  # expanded inside the container
         script='set -eu
 groupadd -g 1000 tune && useradd -u 1000 -g tune -m -s /bin/false tune
@@ -261,22 +278,38 @@ echo "AVEC=$(PUID=99 PGID=100 sh /repo/packaging/docker/entrypoint.sh a b 2>/dev
 echo "DATA=$(stat -c "%u:%g" /data /data/tune.db /data/artwork_cache | tr "\n" " ")"
 echo "MUSIC=$(stat -c "%u:%g" /music/piste.flac)"
 touch /music/x 2>/dev/null && echo "MUSIC_RW" || true
-mkdir /snd && mknod /snd/controlC0 c 1 3 && chgrp 63 /snd/controlC0
+if [ -z "${ROOTLESS:-}" ]; then
+    mkdir /snd && mknod /snd/controlC0 c 1 3 && chgrp 63 /snd/controlC0
+    mkdir /cd && mknod /cd/sr0 b 11 0 && chgrp 11 /cd/sr0 && chmod 660 /cd/sr0
+fi
+echo "SND_GID=$(stat -L -c %g /snd/controlC0)"
 printf "#!/bin/sh\necho \"\$(id -G)\"\n" > /grp.sh && chmod 755 /grp.sh
 echo "SND=$(TUNE_ENTRYPOINT_BIN=/grp.sh TUNE_ENTRYPOINT_SND_DIR=/snd sh /repo/packaging/docker/entrypoint.sh)"
-mkdir /cd && mknod /cd/sr0 b 11 0 && chgrp 11 /cd/sr0 && chmod 660 /cd/sr0
+if [ -b /cd/sr0 ]; then echo "CD_GID=$(stat -L -c %g /cd/sr0)"; fi
 echo "CD=$(TUNE_ENTRYPOINT_BIN=/grp.sh TUNE_ENTRYPOINT_CD_DIR=/cd sh /repo/packaging/docker/entrypoint.sh)"'
-        res="$(docker run --rm -v "$racine:/repo:ro" -v "$travail/music:/music:ro" \
-            debian:bookworm-slim sh -c "$script" 2>&1)" || true
-        mu="$(stat -c '%u:%g' "$travail/music/piste.flac" 2>/dev/null || echo '?')"
+        res="$(docker run --rm -e ROOTLESS="$rootless" -v "$racine:/repo:ro" -v "$travail/music:/music:ro" \
+            "${montages[@]+"${montages[@]}"}" debian:bookworm-slim sh -c "$script" 2>&1)" || true
+        if [ -n "$rootless" ]; then
+            # The runner's own uid is the container's root.
+            mu="0:0"
+            snd_attendu="SND=100" cd_attendu="CD=100"
+            if [ -n "$bloc" ]; then cd_attendu_gid="CD_GID=65534"; else cd_attendu_gid=""; fi
+            snd_attendu_gid="SND_GID=65534"
+        else
+            mu="$(stat -c '%u:%g' "$travail/music/piste.flac" 2>/dev/null || echo '?')"
+            snd_attendu="SND=100 63" cd_attendu="CD=100 11"
+            snd_attendu_gid="SND_GID=63" cd_attendu_gid="CD_GID=11"
+        fi
         if grep -qx "SANS=1000 1000 /home/tune a b" <<<"$res" \
             && grep -qx "AVEC=99 100 /home/tune a b" <<<"$res" \
             && grep -qx "DATA=99:100 99:100 99:100 " <<<"$res" \
             && grep -qx "MUSIC=$mu" <<<"$res" && ! grep -q MUSIC_RW <<<"$res" \
-            && grep -qx "SND=100 63" <<<"$res" \
-            && grep -qx "CD=100 11" <<<"$res"; then
-            ok "conteneur bookworm-slim : vrais setpriv/usermod/chown"
-        else ko "conteneur bookworm-slim" "$res"; fi
+            && grep -qx "$snd_attendu_gid" <<<"$res" \
+            && grep -qx "$snd_attendu" <<<"$res" \
+            && { [ -z "$cd_attendu_gid" ] || grep -qx "$cd_attendu_gid" <<<"$res"; } \
+            && grep -qx "$cd_attendu" <<<"$res"; then
+            ok "conteneur bookworm-slim${rootless:+ (Docker rootless : nœuds hôte non mappés écartés)} : vrais setpriv/usermod/chown"
+        else ko "conteneur bookworm-slim${rootless:+ (Docker rootless)}" "$res"; fi
     fi
 fi
 

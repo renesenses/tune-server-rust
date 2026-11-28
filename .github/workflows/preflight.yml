@@ -66,7 +66,7 @@ permissions:
 jobs:
   preflight:
     name: Pre-release checks
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     # 60 minutes depuis #2808 : le controle `ci_status` ATTEND desormais que la
     # porte obligatoire (`ci.yml`) ait FINI sur le commit promu, au lieu de la
     # declarer verte pendant qu'elle tourne encore. Mesure du train v0.9.142 :
