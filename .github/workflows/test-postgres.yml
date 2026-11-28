@@ -150,7 +150,7 @@ jobs:
       # elles qui pèsent le plus en mémoire à l'édition de liens et sur le
       # disque. Trois compilations à la fois (deux, essayées le 05/11, ont
       # dépassé le plafond de durée ; quatre est la valeur par défaut).
-      CARGO_BUILD_JOBS: "3"
+      CARGO_BUILD_JOBS: ${{ vars.CI_CARGO_JOBS_PG || '3' }}  # 3 sur les machines GitHub (mémoire) ; variable sur runner auto-hébergé
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"

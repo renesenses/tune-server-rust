@@ -341,7 +341,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: ${{ vars.CI_CARGO_JOBS || '2' }}  # 2 sur les machines GitHub (mémoire) ; variable sur runner auto-hébergé
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
